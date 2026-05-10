@@ -1,0 +1,606 @@
+---
+title: "Retrieval-Augmented Generation in 2026: a wide field guide"
+description: "What RAG actually is, where it came from, the eight pillars of a production RAG system (ingestion, chunking, embeddings, vector stores, retrieval, re-ranking, generation, evaluation), the four architecture generations (naive, advanced, modular, agentic), Graph RAG and ColBERT and the 2026 frontier, the failure modes that keep teams up at night, and how to actually start."
+date: 2026-05-11
+category: AI
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 210, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const branch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+
+  const R_HEADER = 380;
+  const headerCenter = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
+  nodes.push({
+    id: headerId,
+    position: { x: headerCenter.x - 105, y: headerCenter.y - 25 },
+    data: { label: header },
+    style: branchHeader,
+  });
+  edges.push({
+    id: "trunk_" + headerId,
+    source: "rag",
+    target: headerId,
+    style: { stroke: "#15803d", strokeWidth: 2 },
+  });
+
+  const FORWARD_START = 150;
+  const FORWARD_STEP = 180;
+  const PERP_OFFSET = 100;
+
+  leaves.forEach((label, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+
+    const x = headerCenter.x + forwardDist * dx + perpDist * px;
+    const y = headerCenter.y + forwardDist * dy + perpDist * py;
+
+    const id = headerId + "_" + slug(label);
+    nodes.push({
+      id,
+      position: { x: x - 80, y: y - 15 },
+      data: { label },
+      style: leaf,
+    });
+    edges.push({
+      id: "br_" + id,
+      source: headerId,
+      target: id,
+      style: { stroke: "#9ca3af", strokeWidth: 1 },
+    });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const branches = [
+  branch("Ingestion", -90, ["PDF / DOCX / HTML", "Tables + figures", "OCR (vision LLM)", "Schema extraction", "Crawlers + connectors", "Change-data-capture", "Permissions metadata", "Provenance + lineage"], CX, CY),
+  branch("Chunking", -45, ["Fixed-size sliding", "Recursive splitter", "Semantic chunking", "Markdown-aware", "Code-aware (AST)", "Page-aware (PDF)", "Late chunking", "Parent-child chunks"], CX, CY),
+  branch("Embeddings", 0, ["OpenAI embed-3", "Voyage AI v3", "Cohere Embed v3", "BGE M3 / Nomic v2", "ColBERT v2 / PLAID", "Matryoshka MRL", "Multimodal CLIP", "Domain fine-tune"], CX, CY),
+  branch("Vector Stores", 45, ["pgvector", "Qdrant", "Weaviate", "Pinecone", "Milvus / Zilliz", "Chroma", "Elasticsearch / OpenSearch", "LanceDB / Turbopuffer"], CX, CY),
+  branch("Retrieval", 90, ["Dense (kNN)", "BM25 / sparse", "Hybrid (RRF)", "Metadata filters", "MMR for diversity", "HyDE", "Multi-query", "Self-query LLM"], CX, CY),
+  branch("Re-ranking", 135, ["Cross-encoder reranker", "Cohere Rerank 3", "Voyage Rerank", "BGE Reranker v2", "LLM-as-reranker", "RankLLM", "ListWise rerank", "Reciprocal rank fusion"], CX, CY),
+  branch("Generation", 180, ["Stuff-the-context", "Citation enforcement", "Structured outputs", "Long-context vs RAG", "Refusal on no-hits", "Streaming + grounding", "Multi-turn memory", "Confidence reporting"], CX, CY),
+  branch("Evaluation", -135, ["RAGAS metrics", "LangSmith / LangFuse", "Recall@K + NDCG", "Faithfulness scoring", "Answer relevance", "Context precision", "LLM-as-judge", "Golden eval set"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "rag", position: { x: CX - 110, y: CY - 40 }, data: { label: "RAG" }, style: center },
+  ...branches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = branches.flatMap((b) => b.edges);
+
+export const box = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const dark = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#ffffff", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const decision = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const endpoint = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+
+export const fEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const fEdgeGreen = { style: { stroke: "#15803d", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const fEdgeDashed = { style: { stroke: "#6b7280", strokeWidth: 1.5, strokeDasharray: "5,5" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const flowNodes = [
+  { id: "docs",     position: { x: 60,   y: 40  }, data: { label: "Source documents" }, style: endpoint },
+  { id: "parse",    position: { x: 280,  y: 40  }, data: { label: "Parse + clean" }, style: box },
+  { id: "chunk",    position: { x: 500,  y: 40  }, data: { label: "Chunk" }, style: box },
+  { id: "embed",    position: { x: 720,  y: 40  }, data: { label: "Embed" }, style: dark },
+  { id: "vstore",   position: { x: 940,  y: 40  }, data: { label: "Vector store" }, style: dark },
+  { id: "query",    position: { x: 60,   y: 240 }, data: { label: "User query" }, style: endpoint },
+  { id: "qrewrite", position: { x: 280,  y: 240 }, data: { label: "Query rewrite" }, style: box },
+  { id: "qembed",   position: { x: 500,  y: 240 }, data: { label: "Embed query" }, style: dark },
+  { id: "retrieve", position: { x: 720,  y: 240 }, data: { label: "Retrieve top-K" }, style: dark },
+  { id: "rerank",   position: { x: 940,  y: 240 }, data: { label: "Re-rank" }, style: box },
+  { id: "prompt",   position: { x: 500,  y: 400 }, data: { label: "Construct prompt" }, style: box },
+  { id: "gen",      position: { x: 720,  y: 400 }, data: { label: "LLM generation" }, style: dark },
+  { id: "cite",     position: { x: 940,  y: 400 }, data: { label: "Citations" }, style: box },
+  { id: "answer",   position: { x: 1140, y: 400 }, data: { label: "Answer" }, style: endpoint },
+];
+export const flowEdges = [
+  { id: "i1", source: "docs",     target: "parse",  ...fEdge },
+  { id: "i2", source: "parse",    target: "chunk",  ...fEdge },
+  { id: "i3", source: "chunk",    target: "embed",  ...fEdge },
+  { id: "i4", source: "embed",    target: "vstore", ...fEdge },
+  { id: "q1", source: "query",    target: "qrewrite", ...fEdge },
+  { id: "q2", source: "qrewrite", target: "qembed", ...fEdge },
+  { id: "q3", source: "qembed",   target: "retrieve", ...fEdge },
+  { id: "q4", source: "retrieve", target: "rerank", ...fEdge },
+  { id: "q5", source: "vstore",   target: "retrieve", label: "kNN", ...fEdgeGreen },
+  { id: "g1", source: "rerank",   target: "prompt", ...fEdge },
+  { id: "g2", source: "query",    target: "prompt", ...fEdgeDashed },
+  { id: "g3", source: "prompt",   target: "gen",    ...fEdge },
+  { id: "g4", source: "gen",      target: "cite",   ...fEdge },
+  { id: "g5", source: "cite",     target: "answer", ...fEdge },
+];
+
+In 2020 a paper from Facebook AI Research introduced **Retrieval-Augmented Generation** as a way to combine a parametric language model with a non-parametric memory of documents. The premise was simple: train a model that can *look things up* before generating, so its knowledge isn't frozen in its weights and its outputs can be grounded in retrievable text. Five years later, RAG is the most-deployed architecture pattern in production AI. Every meaningful enterprise AI feature — Q&A over documentation, customer-support copilots, legal-research assistants, internal knowledge bots, code-base agents, financial-analyst tools — is built on some variation of it.
+
+What started as a research technique has become a discipline. There are now eight distinct sub-problems that any production RAG system has to solve, four generations of architectural patterns (naive, advanced, modular, agentic), and a sprawling tool landscape across each layer. Teams that approach RAG as "embed your documents and call an LLM" typically discover within weeks that the actual engineering is in chunking decisions, retrieval failure modes, re-ranking quality, citation enforcement, and the eval discipline needed to know whether any of it is working.
+
+This post is the wide field guide to RAG in 2026. The eight pillars, the four architectural generations, the failure modes, the tool landscape, and the practical sequence for getting from "we should try RAG" to a production system that actually works. For the broader model taxonomy see [the types of AI models post](/blog/types-of-ai-models); for the AI/ML tool landscape see [the landscape map](/blog/ai-ml-landscape-2026); for inference-side engineering see [the AI inferencing post](/blog/ai-inferencing).
+
+## Why RAG exists
+
+Frontier LLMs in 2026 have very large context windows (Gemini 2.5 Pro handles 2M tokens, Claude up to 1M, GPT-5 up to 1M) and decent training-data recall. A reasonable question is: *do we still need RAG?* The answer is yes, for five durable reasons:
+
+- **Recency.** Models have training cutoffs. RAG injects current information without retraining.
+- **Specificity.** Your internal documents, customer records, ticket histories, and product specs are not in any model's training set. RAG is how you give the model access.
+- **Provenance.** Regulated industries need to cite sources. RAG produces verifiable links between answer and document; pure generation cannot.
+- **Cost.** Stuffing 1M tokens of context into every query is expensive. Retrieving the 5 relevant chunks costs 0.1% of that.
+- **Control.** When a document is updated, RAG reflects it within minutes. When a model is updated, that's a multi-month training cycle.
+
+The competing approach is **fine-tuning** — train the model on your data so it absorbs it into weights. Fine-tuning is the right answer for *behaviors* (tone, format, refusal patterns) and a poor answer for *facts* (which change, must be citable, and live in dozens of systems). The 2026 rule of thumb: **fine-tune for behavior, RAG for knowledge.**
+
+A third approach worth naming is **long-context prompting** — just paste the whole document corpus into the prompt. This works for small corpora (a single 100-page PDF) but fails on cost, latency, and quality for anything larger. Long context and RAG are complements, not alternatives.
+
+## The eight pillars
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={900} />
+
+Eight branches; each represents a category of engineering work that any production RAG system has to handle. Skip one and the system fails in predictable ways: poor chunking produces unanswerable questions, bad embeddings retrieve wrong context, weak re-ranking buries good results under noise, missing evaluation means you can't tell whether your changes help.
+
+## The canonical RAG flow
+
+The mechanical picture of what happens when a query comes in:
+
+<Whiteboard client:load data={{ nodes: flowNodes, edges: flowEdges }} height={520} />
+
+Two phases. **Ingestion** (top row) runs offline — parse documents, split them into chunks, embed each chunk, store the vectors. **Query time** (middle and bottom rows) runs per-request — optionally rewrite the query, embed it, retrieve the nearest chunks, re-rank, construct a prompt with the retrieved context, generate, attach citations, return the answer.
+
+The interesting engineering is in every single one of those boxes. Most failures attributed to "the LLM hallucinated" are actually retrieval failures — the right chunk was never fetched, so the model invented an answer.
+
+## The four generations of RAG architecture
+
+| Generation | Defining trait | When it suffices | When it breaks |
+| --- | --- | --- | --- |
+| **Naive RAG** | Embed → store → top-K → stuff in prompt | Small corpus, simple Q&A, prototypes | Multi-hop questions, low retrieval precision, no evaluation |
+| **Advanced RAG** | Query rewriting, hybrid retrieval, re-ranking, citation enforcement | Most enterprise Q&A in 2026 | Cross-document reasoning, complex relational queries |
+| **Modular RAG** | Pluggable components, multi-step retrieval, fusion strategies, conditional flows | Larger systems with diverse query types | Open-ended research tasks, agent-style workflows |
+| **Agentic RAG** | LLM decides what to retrieve, plans multi-step, uses tools, iterates | Complex research, code-base agents, decision-support | Highest latency and cost; quality depends heavily on planner |
+
+Most production systems in 2026 are at **Advanced RAG**, drifting toward **Modular** for the parts that need it and **Agentic** for the highest-value low-volume queries. Naive RAG remains the right starting point for prototypes — the worst mistake is jumping to Modular before you've measured what's actually wrong.
+
+## Pillar 1 — Ingestion
+
+The unglamorous foundation. If you can't get clean text out of source documents, nothing downstream matters.
+
+**The substrate:** PDFs, Word docs, HTML, Markdown, Confluence pages, Notion, SharePoint, S3 buckets of legacy reports, Jira tickets, customer-support transcripts, code repositories, database tables, video transcripts.
+
+**The hard parts:**
+
+- **PDFs.** The dominant document format and the hardest to parse reliably. Multi-column layouts, tables, footnotes, headers, scanned pages, embedded images, broken text order. Best 2026 tools: Unstructured.io, LlamaParse, Docling (IBM open-source), pdfplumber for simple cases, vision LLMs (GPT-4o, Gemini, Claude) for anything complex.
+- **Tables.** Markdown tables embedded in text break naive chunking. Specialized table extractors (Camelot, Tabula, Unstructured's table mode) preserve structure. Vision LLMs are increasingly the default.
+- **OCR.** Scanned documents need OCR before any other processing. Vision LLMs replaced Tesseract for most use cases in 2024-2025.
+- **HTML.** Boilerplate stripping is hard. Trafilatura, Readability.js, Mozilla Readability for content extraction.
+- **Connectors.** Pulling from SaaS sources (Confluence, Notion, Slack, Google Drive, SharePoint) requires per-source auth, rate limiting, incremental sync, and respect for permissions. LlamaHub, LangChain document loaders, and commercial connectors (Glean, Vectara) abstract this.
+- **Permissions metadata.** Each chunk must carry the ACL it inherits from its source. At query time, filter by what the asking user is allowed to see. This is the most-skipped step in early implementations and the most-painful to retrofit.
+- **Change-data-capture.** Documents change. Re-ingest on a schedule or on webhook. Track document version, propagate updates, invalidate stale chunks. Without this, the corpus rots within months.
+- **Provenance.** Every chunk must trace back to a specific document version, page, and offset. When the model produces an answer, the citation must resolve to a verifiable source.
+
+**Modern practice:**
+
+- **Vision LLMs for hard documents.** PDFs with tables, scanned forms, multi-column layouts — send them to a vision-language model with a "extract as structured markdown" prompt. The 2024-2025 quality leap made this viable.
+- **Hybrid pipelines.** Unstructured.io or Docling for the bulk; vision LLM for the failures.
+- **Idempotent ingestion.** Re-ingesting the same document should produce the same chunks with the same IDs. Hash on content; deduplicate.
+- **Test ingestion as code.** A golden set of documents with known expected output; CI runs on every pipeline change.
+
+## Pillar 2 — Chunking
+
+The decision that quietly determines retrieval quality more than any other.
+
+**Why chunking matters:** embedding models have input limits (8K-32K tokens for most), and even when they don't, embedding a whole document into one vector destroys retrieval granularity. You need chunks small enough to be specific but large enough to carry meaning.
+
+**The chunking strategies:**
+
+- **Fixed-size sliding window.** 512 tokens with 50-token overlap. The default; works surprisingly well for many corpora.
+- **Recursive character splitter.** Try paragraph breaks first, then sentence breaks, then word breaks. LangChain's `RecursiveCharacterTextSplitter` is the reference implementation.
+- **Semantic chunking.** Embed each sentence; group consecutive sentences that are semantically similar. Smarter boundaries; more compute at ingestion. Cohere's chunker and the `semantic-chunking` library implement this.
+- **Markdown-aware.** Split at heading boundaries; keep headings with their content. Essential for documentation corpora.
+- **Code-aware (AST chunking).** For code, break at function/class boundaries. Tree-sitter parsers; LlamaIndex code splitters; specialized tools like `code-splitter`.
+- **Page-aware (PDF).** Respect page boundaries; keep figure captions with figures.
+- **Late chunking.** Newer 2024 technique: embed the entire document, then chunk the resulting token-level embeddings. Preserves cross-chunk context. Works with long-context embedding models (Jina, Nomic).
+- **Parent-child / hierarchical chunking.** Index small chunks for retrieval; return their larger parent chunks for generation. Best of both worlds: precise retrieval, ample context.
+
+**The size question:**
+
+| Chunk size | Pros | Cons | Best for |
+| --- | --- | --- | --- |
+| 128-256 tokens | Precise retrieval, low noise | Loses cross-sentence context | FAQ-style Q&A |
+| 512 tokens | Balanced default | Average everything | Most use cases |
+| 1024-2048 tokens | Rich context per chunk | Less precise retrieval | Long-form analysis |
+| Full document | Whole-doc semantics | One vector hides everything | Document classification |
+
+**Overlap:** typically 10-15% of chunk size. Prevents semantic fragmentation at boundaries.
+
+**Modern practice:**
+
+- **Start with recursive character splitter at 512 tokens, 50 overlap.** Measure. Move to semantic or parent-child only if you've seen retrieval failures it would fix.
+- **Don't optimize chunk size in isolation.** Re-rankers and parent-child patterns can compensate for sub-optimal chunking; together they're more important than the exact chunk size.
+- **Chunk metadata is part of the chunk.** Document title, section heading, page number, permissions tags — all stored alongside the vector. Used for filtering and for the prompt context.
+
+## Pillar 3 — Embeddings
+
+The vectors that make retrieval work. Covered in depth in the [types of AI models post](/blog/types-of-ai-models); the RAG-specific notes:
+
+**The 2026 leaders:**
+
+- **OpenAI text-embedding-3-large.** 3072 dimensions, matryoshka (truncatable), strong baseline.
+- **Voyage AI v3.** The highest commercial quality in 2026 English benchmarks. Domain variants (Voyage-Code, Voyage-Law, Voyage-Finance, Voyage-Medical).
+- **Cohere Embed v3.** Multilingual leader; tight integration with Cohere Rerank.
+- **BGE M3 (BAAI).** Open-weights, multilingual, supports dense + sparse + ColBERT-style late-interaction from one model.
+- **Nomic Embed v2.** Open-weights, Apache 2.0, competitive quality.
+- **E5-Mistral-7B.** Decoder-backbone embedding model; state-of-the-art quality at higher cost.
+- **ColBERT v2 / PLAID.** Per-token "late interaction" embeddings — higher cost, higher precision. Increasingly viable in 2026 thanks to engines like Vespa, Qdrant's ColBERT mode, and JinaAI's stack.
+
+**Choosing:**
+
+- **Default to a strong commercial API** (Voyage, Cohere, OpenAI) for the first version. Embedding is the cheapest piece of the system; don't optimize prematurely.
+- **Open-weights when data residency matters** (BGE M3, Nomic, Jina).
+- **Multilingual when your corpus is** (Cohere v3, BGE M3).
+- **Domain-tuned variants when your domain is niche** (Voyage-Medical, Voyage-Law).
+
+**Matryoshka embeddings:** modern embedding APIs return vectors you can truncate (e.g., use the first 256 dimensions for fast scan, full 3072 for fine ranking). Storage savings of 4-12× with minimal quality loss. Underused in 2026 stacks.
+
+**Fine-tuning:** off-the-shelf embeddings hit ~80% of quality on your domain. Fine-tuning on your domain's query-document pairs lifts this to ~90%. The Sentence-Transformers library plus your own retrieval logs is the standard recipe.
+
+**The query-document mismatch:** natural-language queries ("how do I rotate my API key") differ from document chunks ("API key rotation procedure"). Some embedding models have dedicated query encoders or instruction prefixes (Voyage, Cohere, BGE-M3). Use them.
+
+## Pillar 4 — Vector stores
+
+Where the embeddings live.
+
+| Store | Type | When to choose |
+| --- | --- | --- |
+| **pgvector** | Postgres extension | Default for most teams; "you probably already run Postgres" |
+| **Qdrant** | Dedicated vector DB | Open-source, fast, strong filtering; ColBERT support |
+| **Weaviate** | Dedicated vector DB | Strong hybrid retrieval, modular vectorizers |
+| **Pinecone** | Managed service | Hands-off, mature, expensive at scale |
+| **Milvus / Zilliz** | Dedicated, distributed | Very large corpora, billion-vector scale |
+| **Chroma** | Embedded, developer-friendly | Prototyping; small deployments |
+| **Elasticsearch / OpenSearch** | Search engine + vectors | When you already run them; hybrid search is native |
+| **LanceDB** | Columnar, embedded | When you want vectors + analytics in one store |
+| **Turbopuffer** | Object-storage-backed | Cold storage for huge corpora, very cheap |
+| **MongoDB Atlas Vector Search** | Document DB + vectors | If you already live in Mongo |
+| **Redis** | In-memory + vectors | Low-latency layers; not the primary store |
+
+**The 2026 picture:** pgvector has eaten most of the "we need a vector DB" use cases for small-to-medium corpora because Postgres is already there, the surface area is one extension, hybrid search via tsvector is one query, and there's no new operational burden. Dedicated vector DBs win at scale (>100M vectors) and on specialized features (ColBERT, multi-tenancy, sharding, filtering at high QPS).
+
+**The features that matter:**
+
+- **Hybrid retrieval native.** Can you BM25 + dense search and fuse results in one query?
+- **Metadata filtering.** Can you filter by permissions, tenant, document type, date range *during* the kNN search, not after?
+- **Multi-vector per record.** ColBERT-style late interaction needs this.
+- **Index type.** HNSW (the modern default), IVF (older, smaller-memory), DiskANN (for very large indexes).
+- **Quantization.** Scalar, product, or binary quantization for storage compression.
+- **Tenancy.** If you serve multiple customers, the store needs to isolate them efficiently.
+
+**Operational reality:** managed services (Pinecone, Qdrant Cloud, Weaviate Cloud, MongoDB Atlas) are most of the market because running a vector DB at scale is operational work most teams don't want.
+
+## Pillar 5 — Retrieval
+
+The query-time logic that fetches candidate chunks.
+
+**The retrieval techniques:**
+
+- **Dense kNN.** Embed the query; find the K nearest chunks by cosine similarity. The default.
+- **BM25 / sparse.** Keyword-based lexical search. Strong for exact-term queries (product codes, error messages, names).
+- **Hybrid.** Both, fused via Reciprocal Rank Fusion (RRF) or learned fusion. Beats pure dense on most benchmarks.
+- **Metadata filters.** Restrict by document type, date, permissions, tenant. Applied during kNN, not after.
+- **MMR (Maximal Marginal Relevance).** Re-rank for diversity to avoid returning K near-duplicate chunks.
+- **HyDE (Hypothetical Document Embeddings).** Ask an LLM to *write* a hypothetical answer; embed that; search on it. Sometimes outperforms direct query embedding for abstract queries.
+- **Multi-query.** Have an LLM rewrite the query into 3-5 variations; retrieve for each; fuse results. Increases recall on ambiguous queries.
+- **Self-query.** LLM produces a structured query (filter + semantic component) from natural language. "Bugs reported in the API in Q1" becomes `{filter: {team: "api", date: "2026-Q1"}, query: "bugs reported"}`.
+- **Iterative retrieval.** Retrieve, generate, identify gaps in the answer, retrieve more, regenerate. Agentic RAG territory.
+
+**The hybrid retrieval recipe:**
+
+1. BM25 over the chunk text — returns lexical matches.
+2. Dense kNN over chunk embeddings — returns semantic matches.
+3. RRF combines the two ranked lists (no learned model needed).
+4. Take top 20-50 for re-ranking.
+
+Pure dense lost ground to hybrid in 2023-2024 because dense embeddings systematically miss rare technical terms, product codes, and exact-match queries. The 2026 default is hybrid.
+
+**Query rewriting:**
+
+A small but impactful pre-retrieval step. The user's raw query is often a poor retrieval query. Use a small LLM to:
+
+- Expand acronyms.
+- Add context from the conversation history.
+- Generate multiple paraphrases.
+- Decompose multi-part questions into atomic sub-queries.
+
+The cost is negligible (a Haiku-class model in milliseconds); the quality lift is consistent.
+
+## Pillar 6 — Re-ranking
+
+The single highest-ROI addition to most RAG systems.
+
+**Why re-rank:** retrieval is a noisy first pass. The top-K from kNN often has the right chunk but not in position 1. A re-ranker is a cross-encoder model that takes the (query, candidate) pair and scores how well they match, jointly attending to both. Higher cost per candidate, much higher precision.
+
+**The 2026 leaders:**
+
+- **Cohere Rerank 3.** The category leader; very strong on most benchmarks.
+- **Voyage Rerank-2.** Highly competitive; pairs naturally with Voyage embeddings.
+- **BGE Reranker v2.** Open-weights; the open-source default.
+- **Jina Reranker v2.** Open-weights, multilingual.
+- **LLM-as-reranker.** Use a frontier LLM with a few-shot rubric. Higher cost; sometimes higher quality. RankLLM and RankGPT papers describe the pattern.
+- **ColBERT-as-reranker.** Late interaction over candidate tokens; quality competitive with cross-encoders at lower latency.
+
+**The pattern:**
+
+1. Retrieval returns 20-50 candidates (broader than you'll use).
+2. Re-ranker scores all candidates.
+3. Top 3-7 by re-ranker score become the LLM's context.
+
+**Quality lift:** typical re-ranker adds 5-15 percentage points on retrieval metrics (NDCG@10, MRR). This is often more impact than any other single change.
+
+**Cost:** ~$1-3 per million pairs scored. For a system doing 100K queries/day with 20 candidates each, that's $60-180/month on re-ranking. Trivially worth it.
+
+**Listwise vs pairwise:** older re-rankers score each pair independently (pairwise). Newer listwise re-rankers consider the full candidate list jointly. Slightly higher quality on multi-document reasoning.
+
+## Pillar 7 — Generation
+
+How the retrieved context becomes an answer.
+
+**The basic pattern:** stuff the retrieved chunks into the system prompt, then ask the question. Works. Suffices for simple Q&A.
+
+**The patterns that matter for production:**
+
+- **Citation enforcement.** Make the model emit citations alongside its answer. Structured output schema: `{answer: "...", citations: [{chunk_id, quote}]}`. Then validate that each cited quote actually appears in the referenced chunk.
+- **Refusal on no-hits.** When retrieval scores are all low, don't generate. Return "I don't have information on that." This is harder than it sounds; LLMs want to be helpful.
+- **Confidence reporting.** Have the model rate its own confidence. Calibration is imperfect but provides a useful signal for routing or human review.
+- **Structured outputs.** When the downstream is code, emit JSON. Reduces parsing failures.
+- **Streaming with grounding.** Stream tokens for UX; verify citations after the fact; flag answers whose citations don't validate.
+- **Multi-turn memory.** Conversation history feeds back into query rewriting. The user's prior turns disambiguate the current one.
+- **Long-context vs RAG.** For corpora that fit in a single context window (a single 100-page document), skip RAG entirely — paste the document, ask the question. The result is often higher quality than chunked retrieval. RAG wins when the corpus is bigger than the context window or when cost matters.
+- **Prompt structure.** System prompt with task and citation rules → retrieved chunks (with metadata) → user query. Keep retrieved chunks at the *end* so they're closer to the question (recency bias in attention).
+- **Re-reading.** For hard questions, generate an answer, then re-prompt the model to verify each claim against the cited chunks. Catches a class of hallucinations.
+
+**The 2026 evolution:** answer-quality work has shifted from "make the LLM smarter" to "make the prompt clearer and the citations verifiable." Citations are now the primary trust mechanism in regulated industries.
+
+## Pillar 8 — Evaluation
+
+The pillar most teams skip and most regret.
+
+**Why this matters:** RAG systems have many moving parts (chunking, embeddings, retrieval, re-ranking, generation). Each change affects quality in non-obvious ways. Without an eval harness, you cannot tell whether a change is an improvement or a regression. You will ship regressions.
+
+**The metrics that matter:**
+
+- **Retrieval metrics:**
+  - **Recall@K** — what fraction of relevant chunks appear in the top K?
+  - **NDCG@K** — normalized discounted cumulative gain; ranking-aware.
+  - **MRR** — mean reciprocal rank of the first relevant chunk.
+- **Generation metrics:**
+  - **Faithfulness** — does the answer follow from the retrieved chunks (no hallucination)?
+  - **Answer relevance** — does the answer address the question?
+  - **Context precision** — are the retrieved chunks actually relevant to the question?
+  - **Context recall** — were all relevant chunks retrieved?
+- **End-to-end metrics:**
+  - **Accuracy** vs a golden answer set.
+  - **Citation validity** — do citations resolve to real text in real chunks?
+  - **Refusal accuracy** — does the system refuse correctly when it doesn't know?
+
+**The tools:**
+
+- **RAGAS.** RAG-specific metrics library. The reference implementation for faithfulness, answer relevance, context precision/recall.
+- **LangSmith.** LangChain's eval and tracing platform; integrates with their stack.
+- **LangFuse.** Open-source observability + evals. Self-hostable.
+- **Arize Phoenix.** Open-source eval and tracing.
+- **DeepEval.** Eval framework with a wide metric library.
+- **Helicone.** Logging-first; evals on top.
+- **TruLens.** RAG-specific eval and instrumentation.
+
+**The discipline:**
+
+1. **Build a golden eval set.** 50-500 (query, ideal-answer, ideal-source-chunks) triples. Curated by humans. The most important asset in your RAG system.
+2. **Score automatically.** LLM-as-judge for faithfulness and relevance; exact match where possible.
+3. **Run on every change.** CI runs the eval suite on every PR that touches RAG code or prompts.
+4. **Track per-query.** Aggregate metrics hide regressions on specific question types.
+5. **Sample production.** Periodically score real production queries (not just the golden set).
+6. **Human-in-the-loop.** LLM judges are imperfect; periodically validate against human labels.
+
+**LLM-as-judge pitfalls:** position bias, length bias, self-preference (a GPT judge slightly prefers GPT outputs). Use a different model family for judging than for generation when possible.
+
+## Advanced patterns
+
+The techniques that move a system from "advanced RAG" toward "modular" and "agentic":
+
+### Multi-step / iterative retrieval
+
+The model retrieves, partially answers, identifies gaps, retrieves again, refines. Useful for multi-hop questions ("compare the engineering culture in companies X and Y" requires retrieval per entity).
+
+### Self-RAG / corrective RAG
+
+The model decides *whether* to retrieve. For factual questions it retrieves; for chitchat it doesn't. Saves cost and avoids the "irrelevant context degrades the answer" failure mode.
+
+### Graph RAG
+
+Build a knowledge graph from the documents during ingestion (entities + relationships), then retrieve subgraphs at query time. Microsoft's Graph RAG, LlamaIndex's KG patterns, Neo4j's GenAI integration. Best for queries that span entities and relationships ("what are all the contracts involving this vendor mentioned across these documents"). Higher ingestion cost; better cross-document reasoning.
+
+### Agentic RAG
+
+The LLM is the orchestrator. It plans the retrieval, chooses which corpus to query, decides when to stop, when to ask the user a clarifying question. Higher latency, higher cost, higher ceiling. The pattern behind enterprise research assistants and code-base agents.
+
+### RAFT (Retrieval-Augmented Fine-Tuning)
+
+Fine-tune the model on (retrieved context, query, answer) triples. Combines RAG and fine-tuning. Trains the model to make better use of retrieved context. Worth considering for high-volume narrow domains.
+
+### Long-context RAG hybrid
+
+For mid-sized corpora, retrieve the *most* relevant 100 chunks, then stuff them all into a long-context model and let the model attend to the full set. The model becomes its own re-ranker and synthesizer. Higher cost per query; sometimes higher quality on synthesis-heavy questions.
+
+### Hierarchical retrieval
+
+Retrieve documents first, then chunks within those documents. Two-level kNN. Reduces cross-document noise.
+
+### HyDE deeper
+
+Generate not just a hypothetical answer but multiple hypothetical answers from different viewpoints; embed and search each; fuse results. Improves recall on abstract or under-specified queries.
+
+## Multi-modal RAG
+
+The 2024-2026 expansion. RAG that retrieves images, tables, charts, and audio alongside text.
+
+**Approaches:**
+
+- **Caption-then-embed.** Use a vision LLM to caption each image/table/chart; embed the captions; retrieve by caption similarity; show the original at generation time.
+- **Multimodal embeddings.** CLIP-style models embed images and text into the same space. Query "graphs showing revenue decline" retrieves the relevant chart images.
+- **Hybrid corpora.** Mix text chunks, image captions, table summaries, and audio transcripts in one vector store; let the retriever pick the relevant modality.
+
+**Where it's used:** product documentation (screenshots), financial filings (charts), scientific papers (figures), insurance claims (photos), e-commerce (product images), media archives (audio/video).
+
+## Permissions and tenant isolation
+
+The topic that determines whether your RAG system can be deployed in an enterprise.
+
+**The problem:** different users have access to different documents. The RAG system must enforce this at retrieval time, not after generation.
+
+**The pattern:**
+
+- **Inherit ACLs from source.** When ingesting from SharePoint / Drive / Confluence, capture the document's ACL with each chunk.
+- **Filter at retrieval.** The kNN query includes a filter like `WHERE acl_groups && user_groups`. Most vector stores support this; pgvector + standard SQL is the most flexible.
+- **Don't trust the LLM to redact.** Never retrieve a forbidden chunk and then hope the LLM hides it. The chunk must never enter the prompt.
+- **Audit logs.** Every retrieval logged with user, query, returned chunks. Required for compliance.
+- **Multi-tenancy.** If you serve customers, namespace per customer; never let one tenant's vectors influence another's results.
+
+This is the single highest-stakes area in enterprise RAG. Permission failures are data leaks.
+
+## Tool landscape
+
+**Frameworks and orchestrators:**
+
+- **LangChain / LangGraph.** The most-used orchestration framework. LangGraph is the 2025-2026 successor for state-machine-based agents.
+- **LlamaIndex.** RAG-specific framework. Particularly strong on advanced patterns (Graph RAG, hierarchical, multi-modal).
+- **Haystack (deepset).** Production-focused; strong on pipelines and evals.
+- **DSPy.** Programming framework for LLM pipelines with automatic prompt optimization. Increasingly used for RAG.
+- **Pydantic AI.** Typed agent framework; rising fast.
+
+**Vector and search infrastructure:** covered above.
+
+**Embedding and reranking:** Voyage, Cohere, OpenAI, BGE/BAAI, Nomic, Jina.
+
+**Document ingestion:** Unstructured.io, LlamaParse, Docling, Reducto, Mistral Document AI.
+
+**Eval and observability:** RAGAS, LangSmith, LangFuse, Arize Phoenix, TruLens, Helicone, DeepEval.
+
+**End-to-end platforms:**
+
+- **Vectara.** Managed RAG; ingest, retrieve, generate as a service.
+- **Glean.** Enterprise search + RAG over your SaaS surface.
+- **You.com / Perplexity Enterprise.** RAG-as-product.
+- **Azure AI Search, AWS Kendra, Google Vertex AI Search.** Hyperscaler offerings.
+- **Pinecone Assistant, Weaviate Generative Search.** Vector DB vendors moving up the stack.
+
+## Failure modes
+
+The recurring failures in production RAG:
+
+- **Retrieval miss.** The right chunk exists in the corpus but is not in the top-K. Causes: bad chunking, query-document mismatch, missing hybrid retrieval, weak embeddings.
+- **Retrieval poison.** A highly-ranked chunk is plausible-looking but not actually relevant. Causes: dense embedding hallucination, missing re-ranker.
+- **Hallucination from no-context.** Query has no relevant chunks; model invents an answer. Mitigation: refusal on low retrieval scores.
+- **Hallucination with-context.** Retrieved chunks are relevant but the model extrapolates beyond them. Mitigation: citation enforcement, post-hoc verification.
+- **Citation fabrication.** Model cites a chunk ID but the cited quote isn't in that chunk. Mitigation: post-generation validation.
+- **Stale data.** Corpus hasn't been re-ingested; answers reflect old reality. Mitigation: scheduled re-ingestion, change-data-capture.
+- **Permission leak.** User asks a question; retrieval returns chunks they shouldn't see; model uses them. Mitigation: filter at retrieval, never trust the LLM.
+- **Chunking artifacts.** A sentence got split mid-thought; the chunk is meaningless. Mitigation: semantic or paragraph-aware chunking.
+- **Embedding drift.** Vendor changes the embedding model; vectors become incompatible. Mitigation: pin embedding versions; track model identity per chunk.
+- **Prompt injection via retrieval.** A document in the corpus contains "ignore previous instructions"; gets retrieved; overrides the agent. Mitigation: separate retrieved content from instructions; sanitize.
+- **Cross-document confusion.** Multi-hop questions get partial answers from each document; synthesis fails. Mitigation: agentic or iterative retrieval; Graph RAG for highly relational data.
+- **Eval-prod gap.** Eval set passes; production fails. Cause: eval set isn't representative. Mitigation: continuously sample production queries into the eval set.
+
+## When *not* to use RAG
+
+Reality check:
+
+- **Truly small corpus.** Single document, a few pages. Long-context prompting is simpler.
+- **Behavioral changes.** Tone, format, refusal patterns. Fine-tune; RAG won't help.
+- **High-frequency, low-cost queries.** A cached classical-ML answer beats RAG-per-call.
+- **Real-time data.** RAG implies a snapshot. For "the current order status," call an API.
+- **Math or formal reasoning.** RAG retrieves text; doesn't help solve math problems. Use a reasoning model.
+- **Latency-critical UX.** RAG adds 100-500ms minimum (embedding + retrieval + re-ranking + generation). For sub-100ms responses, pre-compute.
+
+## Cost economics
+
+Rough per-query cost in 2026 for a typical advanced RAG system:
+
+| Component | Cost per query |
+| --- | --- |
+| Embedding (query) | $0.00001 - $0.0001 |
+| Vector store kNN | ~$0 (amortized infra) |
+| Re-ranking (20 candidates) | $0.0001 - $0.001 |
+| LLM generation (with retrieved context) | $0.001 - $0.05 |
+| Eval (sampled) | $0 - $0.005 |
+| **Total** | **$0.001 - $0.05 per query** |
+
+Ingestion cost is one-time per document. Re-ingestion cost is per-update. For a corpus of 1M chunks: ~$50-500 to embed once.
+
+**The cost levers:**
+
+- **Cache repeat queries.** Semantic cache can absorb 20-40% of traffic.
+- **Cache the prompt prefix.** System prompt + retrieved chunks are stable per query — cache aggressively at the LLM provider.
+- **Smaller LLM for easy questions.** Route to Haiku/Flash when retrieval confidence is high.
+- **Self-host embeddings.** Embeddings are the cheapest to self-host (CPU-viable for many models).
+- **Quantize the vector store.** Binary or scalar quantization can cut storage 4-32× with modest quality loss.
+
+## Where to start
+
+For a team building a new RAG system in 2026:
+
+1. **Pick a small corpus first.** 100-10,000 documents. Get the end-to-end working before scaling.
+2. **Build the eval set before the system.** 50 query/answer pairs from real users or domain experts. Without this, you're flying blind.
+3. **Use a vanilla stack.** Unstructured.io for ingestion → recursive character splitter 512/50 → OpenAI embed-3-small or BGE M3 → pgvector → top-10 retrieval → Cohere or BGE reranker → top-5 to GPT-4.1 or Claude Sonnet → cite-enforced output. Eight components, mostly off-the-shelf.
+4. **Measure.** Run the eval. Find the bottleneck (usually retrieval).
+5. **Add hybrid retrieval** if pure dense misses keyword-heavy queries.
+6. **Add query rewriting** if user queries are short, ambiguous, or context-dependent.
+7. **Add re-ranking** if you haven't already — it's almost always worth it.
+8. **Add metadata filtering** for permissions, date ranges, document types.
+9. **Add semantic or parent-child chunking** only after measuring that the default chunker is the bottleneck.
+10. **Add citation enforcement and refusal-on-no-hits** before exposing to real users.
+11. **Add multi-step or agentic patterns** only for the specific query types that need them. Don't agent-ify by default.
+12. **Schedule re-ingestion.** Documents change; the corpus must too.
+13. **Instrument production.** Log every retrieval, every generation, every citation. Periodically sample for the eval set.
+14. **Plan for permissions early.** Retrofitting ACLs into a flat corpus is painful.
+
+The biggest mistake to avoid is **building the modular / agentic system first**. A team that builds naive RAG, measures rigorously, and iterates beats a team that builds an elaborate multi-agent retrieval graph from day one. Most production RAG systems run on advanced-RAG patterns with maybe one or two modular extensions — not on the elaborate diagrams that appear in framework documentation.
+
+## The 2026 frontier
+
+Where the field is heading:
+
+- **Long-context models eating low-end RAG.** For corpora under 1M tokens, "paste it all into Gemini" is increasingly viable and sometimes higher quality than chunked retrieval.
+- **ColBERT mainstreaming.** Late-interaction embeddings move from research to production as serving engines (Vespa, Qdrant, Jina) make them affordable.
+- **Graph RAG growing.** For relational corpora (contracts, org charts, scientific papers), knowledge graphs plus vectors outperform vectors alone.
+- **Agentic retrieval.** The model planning its own retrieval is now standard for complex queries; tooling is catching up.
+- **Multimodal retrieval.** Images, charts, audio retrievable alongside text in one query.
+- **Retrieval-aware models.** Models post-trained specifically to use retrieved context well (RAFT, Self-RAG, In-Context RALM). The line between "model" and "RAG system" continues to blur.
+- **Eval as a first-class product.** RAGAS, TruLens, and the next generation of RAG-specific evals are getting better at automated quality measurement.
+- **Permission-aware retrieval as standard.** Enterprise adoption is forcing ACL-aware vector stores into the mainstream.
+
+## Closing
+
+RAG is no longer a technique — it's an architecture. Building a production RAG system in 2026 means making sound decisions in eight layers (ingestion, chunking, embeddings, vector store, retrieval, re-ranking, generation, evaluation), choosing the right architectural generation for the use case (naive, advanced, modular, or agentic), and instrumenting the whole pipeline so you can tell when things break.
+
+The mistake that recurs across teams is treating RAG as a single component to be configured rather than a system to be engineered. The systems that work are the ones where each layer has been considered, measured, and tuned for the corpus and the queries that actually matter. The systems that fail are the ones that copy a framework tutorial and ship.
+
+The eight pillars are the map. The four generations are the architecture choices. The evaluation discipline is what separates a RAG demo from a RAG product. Build in that order, and the rest follows.

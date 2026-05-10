@@ -1,0 +1,344 @@
+---
+title: "Agentic AI in 2026: agents, MCP, and the wide stack"
+description: "What agentic AI actually means in 2026 — the agent loop, the Model Context Protocol (MCP) as the universal tool interface, the framework landscape (LangChain / LangGraph / CrewAI / Pydantic AI / Claude Agent SDK / OpenAI Agents SDK), code and browser agents, multi-agent patterns, evaluation, and production concerns."
+date: 2026-05-10
+category: AI
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const accent = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const mcpEdge  = { style: { stroke: "#15803d", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, animated: true, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { style: { stroke: "#6b7280", strokeWidth: 1 }, markerEnd: { type: "arrowclosed", color: "#6b7280" } };
+
+export const archNodes = [
+  { id: "user",     position: { x: 480, y: 0 },   data: { label: "user / app" },                         style: stage },
+  { id: "agent",    position: { x: 470, y: 110 }, data: { label: "Agent Runtime\n(loop + planner)" },   style: ctrl },
+  { id: "llm",      position: { x: 200, y: 240 }, data: { label: "LLM\n(reasoning + tool calls)" },     style: ctrl },
+  { id: "memory",   position: { x: 740, y: 240 }, data: { label: "Memory\n(short + long-term)" },       style: accent },
+  { id: "mcpc",     position: { x: 470, y: 240 }, data: { label: "MCP Client" },                         style: accent },
+  { id: "fs",       position: { x: 80,  y: 400 }, data: { label: "MCP: filesystem" },                    style: accent },
+  { id: "gh",       position: { x: 250, y: 400 }, data: { label: "MCP: GitHub" },                        style: accent },
+  { id: "db",       position: { x: 420, y: 400 }, data: { label: "MCP: Postgres" },                      style: accent },
+  { id: "slack",    position: { x: 590, y: 400 }, data: { label: "MCP: Slack" },                         style: accent },
+  { id: "web",      position: { x: 760, y: 400 }, data: { label: "MCP: web search" },                    style: accent },
+  { id: "extFs",    position: { x: 80,  y: 540 }, data: { label: "files" },                              style: ext },
+  { id: "extGh",    position: { x: 250, y: 540 }, data: { label: "GitHub API" },                         style: ext },
+  { id: "extDb",    position: { x: 420, y: 540 }, data: { label: "Postgres" },                           style: ext },
+  { id: "extSlack", position: { x: 590, y: 540 }, data: { label: "Slack API" },                          style: ext },
+  { id: "extWeb",   position: { x: 760, y: 540 }, data: { label: "Brave / Bing / Google" },              style: ext },
+];
+
+export const archEdges = [
+  { id: "a1", source: "user",   target: "agent",  label: "task",        ...reqEdge },
+  { id: "a2", source: "agent",  target: "llm",    label: "prompt + tools", ...reqEdge },
+  { id: "a3", source: "llm",    target: "agent",  label: "tool call",   ...reqEdge },
+  { id: "a4", source: "agent",  target: "memory", label: "read / write", ...dataEdge },
+  { id: "a5", source: "agent",  target: "mcpc",   label: "invoke",      ...mcpEdge },
+  { id: "m1", source: "mcpc",   target: "fs",     ...mcpEdge },
+  { id: "m2", source: "mcpc",   target: "gh",     ...mcpEdge },
+  { id: "m3", source: "mcpc",   target: "db",     ...mcpEdge },
+  { id: "m4", source: "mcpc",   target: "slack",  ...mcpEdge },
+  { id: "m5", source: "mcpc",   target: "web",    ...mcpEdge },
+  { id: "e1", source: "fs",     target: "extFs",   ...dataEdge },
+  { id: "e2", source: "gh",     target: "extGh",   ...dataEdge },
+  { id: "e3", source: "db",     target: "extDb",   ...dataEdge },
+  { id: "e4", source: "slack",  target: "extSlack", ...dataEdge },
+  { id: "e5", source: "web",    target: "extWeb",  ...dataEdge },
+  { id: "r1", source: "agent",  target: "user",   label: "result",      ...reqEdge },
+];
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const mkBranch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+  const R_HEADER = 380;
+  const hc = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
+  nodes.push({ id: headerId, position: { x: hc.x - 100, y: hc.y - 25 }, data: { label: header }, style: branchHeader });
+  edges.push({ id: "trunk_" + headerId, source: "agentic_ai", target: headerId, style: { stroke: "#15803d", strokeWidth: 2 } });
+
+  const FORWARD_START = 150;
+  const FORWARD_STEP = 170;
+  const PERP_OFFSET = 95;
+
+  leaves.forEach((label, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+    const x = hc.x + forwardDist * dx + perpDist * px;
+    const y = hc.y + forwardDist * dy + perpDist * py;
+    const id = headerId + "_" + slug(label);
+    nodes.push({ id, position: { x: x - 75, y: y - 15 }, data: { label }, style: leaf });
+    edges.push({ id: "br_" + id, source: headerId, target: id, style: { stroke: "#9ca3af", strokeWidth: 1 } });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const mindBranches = [
+  mkBranch("Frameworks", -90, ["LangChain", "LangGraph", "LlamaIndex", "CrewAI", "AutoGen (MS)", "Pydantic AI", "Claude Agent SDK", "OpenAI Agents SDK", "Vercel AI SDK"], CX, CY),
+  mkBranch("MCP Ecosystem", -45, ["MCP spec (Anthropic)", "stdio + HTTP/SSE", "Tools / Resources / Prompts", "Filesystem server", "GitHub server", "Postgres server", "Slack server", "Brave Search server"], CX, CY),
+  mkBranch("Tool Use", 0, ["Function calling (OpenAI)", "Tool use (Anthropic)", "JSON Schema", "Parallel tool calls", "Structured outputs", "Tool retries", "Auth scopes", "MCP tool definitions"], CX, CY),
+  mkBranch("Memory", 45, ["Short-term (context)", "Long-term (vector)", "Episodic (chat history)", "Semantic (KB)", "Mem0", "Letta (MemGPT)", "Zep", "Context compression"], CX, CY),
+  mkBranch("Planning Patterns", 90, ["ReAct", "Chain of thought", "Plan-and-execute", "Reflection", "Tree of Thoughts", "Self-consistency", "o-style reasoning", "Critic-actor"], CX, CY),
+  mkBranch("Multi-Agent", 135, ["Orchestrator-worker", "Peer-to-peer", "Role-based (Crew)", "OpenAI Swarm", "A2A protocol (Google)", "Handoffs", "Specialist routing", "Debate / consensus"], CX, CY),
+  mkBranch("Specialized Agents", 180, ["Code: Cursor / Claude Code", "Code: Aider / Cline / Devin", "Browser: Operator", "Browser: Computer Use", "Research: Perplexity", "Deep Research", "Data: Hex / Julius", "CS: Intercom Fin / Sierra"], CX, CY),
+  mkBranch("Production", -135, ["LangSmith / LangFuse", "Helicone / Phoenix", "OpenTelemetry GenAI", "RAGAS / Braintrust", "Promptfoo / DeepEval", "Guardrails (NeMo, Lakera)", "Rate limits + cost", "Human-in-the-loop"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "agentic_ai", position: { x: CX - 110, y: CY - 40 }, data: { label: "Agentic AI" }, style: center },
+  ...mindBranches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = mindBranches.flatMap((b) => b.edges);
+
+The shift from "LLM applications" to "AI agents" is the most consequential operational change in the AI stack since 2023's GPT-4 moment. Where 2023-2024 looked like *prompts produce completions*, 2026 looks like *agents loop through tools, write code, browse websites, query databases, and produce results over minutes-to-hours of autonomous work*. The shift dragged with it a new protocol (MCP), a new framework wave (LangGraph, Pydantic AI, Claude Agent SDK), a new category of products (Cursor, Claude Code, Devin, Operator), and a whole production stack that didn't need to exist for simple chat applications.
+
+This post is the wide introduction — what agentic AI actually means in 2026, how MCP changed the tool-use story, the framework landscape, the categories of agents, multi-agent patterns, evaluation, and production concerns. The diagrams are an architecture view and a mindmap; the prose fills in the why and the gotchas.
+
+## What agentic AI actually means
+
+A definition that survives scrutiny: an **agent** is an LLM application that operates in a *loop*, deciding what action to take next based on the result of the previous action, with access to tools that can affect the world. Three properties matter:
+
+1. **Loop, not single turn.** The model is invoked multiple times within one user task. It plans, acts, observes the result, plans again.
+2. **Tools.** The model can do more than emit text — it can read files, call APIs, run code, browse the web, query a database.
+3. **State.** Between iterations, the agent retains context — the original task, prior actions, observed results, intermediate plans.
+
+Everything else (multi-agent orchestration, memory, planning frameworks, RAG-as-a-tool) is built on top of those three. The 2025 wave of "agentic AI" was largely about productizing those three properties — making them reliable, observable, and economically viable.
+
+## The agent + MCP architecture
+
+<Whiteboard client:load data={{ nodes: archNodes, edges: archEdges }} height={680} />
+
+Reading the diagram:
+
+- **User / app** sends a task to the agent.
+- **Agent Runtime** holds the loop. Each iteration, it constructs a prompt (task + history + tool definitions), invokes the LLM, parses the response. If the LLM emitted a tool call, the agent dispatches it; if it emitted a final answer, the agent returns it.
+- **LLM** is the reasoning brain. The agent doesn't *embody* intelligence; it orchestrates a model that has it.
+- **Memory** sits to the side — short-term context (recent turns), long-term store (vector DB), or both. The agent reads from and writes to it.
+- **MCP Client** is the standardized interface to tools. Instead of bespoke `if-then-else` for every tool, the agent speaks one protocol.
+- **MCP Servers** are independent processes (or hosted services) implementing the MCP server side. Each server exposes a set of tools, resources, or prompts. Hundreds exist for common systems — filesystem, GitHub, Postgres, Slack, web search, Notion, Linear, Sentry, Stripe, Gmail, Google Drive, and so on.
+- **External systems** are the actual backends behind each MCP server. The MCP server is the *adapter*; the external system is the truth.
+
+The green animated edges are the MCP protocol path. Solid edges are control flow. The two-way edge between Agent and LLM captures the tool-call loop — agent prompts the model, model returns a tool call, agent calls the tool, agent prompts the model again with the result.
+
+## MCP: the protocol that changed everything
+
+The **Model Context Protocol** was introduced by Anthropic in November 2024 and rapidly became the de-facto standard for LLM-to-tool communication. The framing — and it's accurate — is **"USB-C for AI."** Before MCP, every framework had its own way to expose tools to models; integration between frameworks was a perpetual translation problem.
+
+**The shape of the protocol:**
+
+- **Client-server architecture.** Agent runtimes embed an MCP client. Each tool / data source runs as an MCP server.
+- **Two transports.** `stdio` (local, child-process model — most developer tooling uses this) and HTTP/SSE (remote, multi-tenant — production deployments use this).
+- **Three primitives:**
+  - **Tools** — callable functions with JSON Schema parameters. Like OpenAI's function calling but standardized across providers.
+  - **Resources** — read-only data the LLM can consume (file contents, query results, screenshots).
+  - **Prompts** — reusable prompt templates the server can offer to the client.
+
+**Why it spread so fast:**
+
+- **Anthropic backed it open-spec from day one.** Reference implementations in TypeScript, Python, and other languages. No proprietary lock.
+- **The protocol is small.** A complete MCP server is ~100 lines of code. Building integrations is a weekend project, not a quarter.
+- **The "tool sprawl" problem was acute.** By mid-2024, every agent framework had its own tool registry. Engineers were tired of writing the same GitHub-tool wrapper four times. MCP gave them one to write and many runtimes to use.
+- **The major model providers adopted it.** Anthropic Claude Desktop first; then OpenAI (Agents SDK), Google (ADK), Microsoft (Copilot Studio), and most IDEs (Cursor, Cline, Zed, Continue, Windsurf) by 2025.
+
+**The MCP server ecosystem in 2026** counts in the thousands. The major categories:
+
+- **Developer tools.** Filesystem, Git, GitHub, GitLab, Terraform, Kubernetes, Docker.
+- **Communication.** Slack, Teams, Discord, Gmail, Outlook.
+- **Productivity.** Notion, Linear, Jira, Asana, Google Drive, Dropbox, OneDrive.
+- **Data.** Postgres, MySQL, MongoDB, SQLite, Snowflake, BigQuery.
+- **Web.** Brave Search, Google Search, Puppeteer (browser automation), Bright Data.
+- **CRM / commerce.** HubSpot, Salesforce, Stripe, Shopify.
+- **Observability.** Sentry, Datadog, PagerDuty, Grafana.
+- **Custom internal servers** — every enterprise of any size now writes a handful of internal MCP servers exposing their proprietary systems.
+
+The strategic implication: tool-use is no longer the moat. Frameworks that built their own tool registries (LangChain Tools, LlamaIndex Tools) are absorbing MCP as a first-class adapter. The differentiation moved to *agent runtime quality* — planning, error recovery, observability, multi-agent orchestration — not "how many tools we ship with."
+
+## Tool use and function calling
+
+The mechanic underneath everything. Both OpenAI's function-calling and Anthropic's tool-use work the same way: the prompt includes structured tool definitions (JSON Schema); the model is trained to emit a structured tool-call response when it wants to use a tool; the runtime parses that response, executes the tool, and feeds the result back as another message.
+
+What changed in 2024-2026:
+
+- **Parallel tool calls** — the model can request multiple tools in one response, executed concurrently.
+- **Structured outputs** — JSON schema can be applied to the final response too, not just tool inputs. Eliminates "the model returned almost-JSON" failures.
+- **Streaming tool calls** — partial tool-call parameters stream alongside text, so latency for the user starts immediately even before the tool call is complete.
+- **MCP tool definitions** — a server-side tool registry the client reads at startup rather than the prompt-engineer hand-maintaining the tool list.
+
+## Memory
+
+Three useful categorizations:
+
+| Type | What it stores | Storage |
+| --- | --- | --- |
+| **Short-term** | Recent conversation turns | LLM context window |
+| **Long-term** | Facts, documents, history beyond the context window | Vector DB + retrieval |
+| **Episodic** | Specific past events ("yesterday we discussed X") | Vector + metadata |
+| **Semantic** | Curated knowledge base | Vector DB or structured KB |
+| **Procedural** | Skills / learned methods | Fine-tuned model + tool catalog |
+
+Library / service options:
+
+- **Mem0** — popular open-source memory layer; per-user fact storage with retrieval.
+- **Letta (formerly MemGPT)** — research-derived "self-editing" agent memory; the agent decides what to remember and when to forget.
+- **Zep** — long-term memory for chat applications, with conversation summarization.
+- **DIY** — pgvector + custom code; what most teams end up with for production once they've absorbed the trade-offs.
+
+Memory's hard problem is **what to retrieve**. Too little context and the agent loses thread; too much and it gets distracted or the cost balloons. The trick is *relevance ranking* and *summarization*. Long-context models (1M tokens) reduce the pressure but don't eliminate it.
+
+## Planning patterns
+
+The "how does the agent decide what to do next" question. The dominant patterns:
+
+- **ReAct (Reason + Act).** The model alternates between thoughts and actions in its output. Simple, effective baseline. Most agent frameworks default to this.
+- **Plan-and-Execute.** First the model produces a multi-step plan; then it executes each step. Better for complex tasks; weaker on dynamic ones where the plan needs to change.
+- **Reflection.** After each action (or at the end), the agent reflects on what went well or wrong and adjusts. Improves quality at the cost of more LLM calls.
+- **Tree of Thoughts.** Branch-and-explore — generate multiple candidate next-steps, score them, expand the best. Expensive; reserved for hard problems.
+- **Self-consistency.** Sample N independent solutions, take the majority answer. Expensive; useful for high-stakes single-shot answers.
+- **Reasoning models (o-style).** The model itself does long chain-of-thought internally before responding. Shifts the planning burden from the framework to the model. Higher cost per call, often higher quality.
+- **Critic-actor / debate.** One agent proposes, another critiques. A multi-agent pattern dressed as a planning pattern.
+
+The 2026 consensus: **start with ReAct + a reasoning model** (Claude Sonnet, GPT-5, Gemini 2.5 Pro). It's the baseline that beats most clever planning frameworks on most benchmarks. Layered planning (Plan-and-Execute, Tree of Thoughts) becomes useful at the margins for specific problem shapes.
+
+## Multi-agent systems
+
+The architectures that emerged once "one agent doing everything" hit ceilings:
+
+- **Orchestrator-worker.** A "lead" agent breaks a task into subtasks and dispatches each to a specialist worker agent. Results aggregate back. Anthropic uses this pattern for many of its production research / coding agents.
+- **Role-based crew.** Multiple agents with distinct personas (researcher, analyst, writer, reviewer) collaborate on a task. CrewAI is the framework for this pattern.
+- **Swarm / handoffs.** Light-weight agents pass control to each other based on which is best-suited for the current step. OpenAI's Swarm pattern (now in the Agents SDK).
+- **Peer-to-peer / debate.** Agents argue or vote on the right answer. Useful for high-stakes reasoning.
+- **A2A (Agent-to-Agent) protocol.** Google introduced this in 2025 as the multi-agent companion to MCP — a protocol for agents to discover and communicate with each other, regardless of which framework they're built on.
+
+Multi-agent is real and useful for some problems. It's also frequently over-engineered for problems that one agent + better tools would handle. The trap: "this would be easier with multiple agents" can be true, or it can be a way to avoid solving the harder problem of making one agent reliable.
+
+## Specialized agents
+
+The category that exploded:
+
+- **Code agents.** Cursor, Claude Code, Aider, Cline (formerly Claude Dev), Continue, Devin, OpenAI Codex CLI. The breakout productivity category of 2025-2026 for engineers. The shift from "autocomplete++" to "implement this feature across files, run tests, iterate."
+- **Browser / computer-use agents.** Anthropic Computer Use, OpenAI Operator, Adept (acquired by Amazon), Brave Leo. Models that can drive a screen — clicking, typing, reading. Still rough at the edges; gaining adoption for narrow tasks (form-filling, data extraction).
+- **Research agents.** Perplexity, ChatGPT Deep Research, Claude with web search, Tavily-powered tools. "Find me everything about X and synthesize."
+- **Data agents.** Hex, Julius, Notion AI, Sigma. Convert a natural-language question into SQL / spreadsheet operations / chart, with iterative refinement.
+- **Customer-support agents.** Intercom Fin, Sierra, Decagon, Ada. Customer-facing agents handling tier-1/2 support tickets autonomously.
+- **Marketing / creative agents.** Jasper, Copy.ai, Lindy, embedded into many SaaS tools.
+
+Each category has its own quality bar, eval methodology, and operational considerations. The convergence direction is increasingly *general* agents (Claude, GPT-5, Gemini) doing all of these via MCP + tool sets, rather than dozens of specialized models per category.
+
+## The agentic AI landscape
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={1000} />
+
+Eight branches; ~65 nodes covering the major surface. Each branch's leaves are the things to actually know names of in that category.
+
+## Framework comparison
+
+The dominant agent-runtime / framework choices:
+
+| Framework | Origin | Strengths | Best for |
+| --- | --- | --- | --- |
+| **LangChain** | OG agent framework, 2022 | Largest community, most integrations, mature | Most teams' first stack; lots of community recipes |
+| **LangGraph** | LangChain's newer graph-based framework | Explicit state machine; better for complex agents | Production agents needing observability + control |
+| **LlamaIndex** | RAG-focused | Strong RAG primitives, agent layer built on top | RAG-heavy applications |
+| **CrewAI** | Multi-agent role-based | Role / persona modeling; readable for non-engineers | Marketing / content / structured multi-step tasks |
+| **AutoGen** (Microsoft) | Multi-agent conversation framework | Strong on agent-to-agent dialogue | Research on multi-agent patterns |
+| **Pydantic AI** | Newer; type-safe Python | Type system + dependency injection; lightweight | Teams that value type safety, FastAPI-style ergonomics |
+| **Claude Agent SDK** | Anthropic | Tight integration with Claude; MCP-native | Anthropic-centric stacks |
+| **OpenAI Agents SDK** | OpenAI (2025) | Tight integration with OpenAI; Swarm-style handoffs; MCP support | OpenAI-centric stacks |
+| **Google ADK** | Google (2025) | A2A protocol native; Gemini-integrated | Google-centric stacks |
+| **Vercel AI SDK** | Vercel | Web/streaming-first; React Server Components | Web app developers (TypeScript) |
+| **Mastra** | TS-first agent framework | Modern TypeScript ergonomics; Vercel-adjacent | TS-only teams |
+| **Microsoft Semantic Kernel** | Microsoft, 2023 | .NET + Java first-class; enterprise positioning | Microsoft-stack enterprises |
+
+The honest 2026 picture: **LangChain has the mindshare; LangGraph has the production-quality story; the model-vendor SDKs are converging on a common shape (MCP for tools, agents-as-loops, structured outputs).** Many teams use combinations — LangGraph for orchestration with Claude Agent SDK for one specialized agent.
+
+## Evaluation
+
+The category that went from "nobody bothered" in 2023 to "table stakes" by 2026:
+
+- **Eval frameworks.** RAGAS (retrieval-quality metrics), DeepEval, Promptfoo (test-suite style), Braintrust (LLM-as-judge), Phoenix, OpenAI Evals.
+- **Benchmarks.** SWE-Bench Verified (code agents on real GitHub issues), GAIA (general assistant), WebArena (browser agents), AgentBench (multi-domain), Berkeley Function-Calling Leaderboard (tool use), TAU-bench (customer support).
+- **LLM-as-judge.** Use a strong model to grade outputs. Cheap, scalable, surprisingly aligned with human judgment for many tasks.
+- **Trace-based eval.** Score each agent step rather than just the final output — diagnose where in the loop quality regressions appear.
+
+The pattern: every production agent needs (a) **regression tests** — known scenarios with expected outcomes; (b) **online eval** — sample of real production traces graded; (c) **A/B testing** — compare model or prompt changes against baseline before rollout.
+
+## Production concerns
+
+What separates a demo agent from a production one:
+
+- **Observability.** LangSmith, LangFuse, Helicone, Phoenix, OpenLLMetry (OpenTelemetry's GenAI semantic conventions). Trace every LLM call + every tool call with inputs, outputs, latency, and cost.
+- **Cost control.** Rate limiting per user, per tenant, per workflow. Caching repeated calls. Routing easy tasks to small / cheap models.
+- **Latency budgets.** Time-to-first-token, total task time. Agent loops can easily run for minutes; UX must accommodate.
+- **Retry policy.** Tool calls fail. Token limits hit. The model produces malformed JSON. Each failure mode needs explicit handling — retry, fallback, surface to user.
+- **Guardrails.** Input filters (prompt injection detection), output filters (PII redaction, toxicity), tool-call gating (which tools can the agent invoke without confirmation).
+- **Human-in-the-loop.** For high-stakes actions (sending email, executing a transaction, deploying code), require human confirmation. Designed-in approval steps, not bolted-on regret prevention.
+- **Audit logging.** Every prompt, every tool call, every result — to immutable storage. Required for compliance; invaluable for incident investigation.
+
+For the broader observability framing see [the distributed tracing post](/blog/distributed-tracing); for security around LLM applications see [shift-left/shift-right](/blog/shift-left-shift-right).
+
+## Common failure modes
+
+- **Hallucination in tool calls.** The agent fabricates a tool the server doesn't expose, or invents a parameter format. Tight JSON Schema + retry helps.
+- **Prompt injection from tool results.** A web page or document the agent reads contains "ignore previous instructions and..." The agent obeys. Treat all tool outputs as untrusted input; sandbox aggressively.
+- **Infinite loops.** The agent keeps trying the same thing. Hard limit on iterations; circuit-break on no-progress.
+- **Goal drift.** The agent solves the wrong problem because the original task got lost in context. Re-anchor by restating the goal periodically.
+- **Tool-use overconfidence.** The model claims it ran a tool when it didn't, or invents a result. Always show the tool-call structured response to verify execution.
+- **Context window exhaustion.** Long agent runs accumulate context. Without summarization, you OOM the context window. Periodic summarization is mandatory past ~10 iterations.
+- **Cost runaway.** A bug in the loop logic ran 10,000 LLM calls in 5 minutes. Per-task cost ceilings + alerting are non-optional.
+
+## Trends in 2026
+
+- **MCP becomes the universal tool interface.** Every major framework has first-class MCP support; tool registries become public infrastructure.
+- **Reasoning models eat planning frameworks.** When the model itself does long internal chain-of-thought, much of the planning framework's value evaporates. ReAct + reasoning model > most explicit planning frameworks.
+- **Code agents go from autocomplete to colleagues.** Devin-class systems doing meaningful multi-day work on real codebases. Senior engineers' jobs shift from typing to specifying and reviewing.
+- **Browser / computer-use agents mature.** Still rough but improving fast. The pattern of "model drives a screen" will replace many traditional automation tools.
+- **Agent-to-agent protocols (A2A).** Google's framework gains adoption; expect a winner protocol by 2027.
+- **Smaller specialist models in agent loops.** The cost economics push toward using 8-30B specialist models for routine tool calls, reserving frontier models for the hard reasoning steps.
+- **Evaluation becomes a product layer.** Just like observability, evaluation grew from a research practice into a commercial category. Braintrust, Promptfoo, LangSmith Evals.
+
+## Where to start
+
+For an organization beginning to adopt agents:
+
+1. **Start with a single-agent ReAct loop using a frontier model.** Claude Sonnet, GPT-5, or Gemini 2.5 Pro. Don't over-architect.
+2. **Use MCP from day one.** Even if you only have 2-3 tools, write them as MCP servers. The portability dividend compounds.
+3. **Pick an agent framework deliberately.** LangGraph or your model-vendor's SDK (Claude Agent SDK, OpenAI Agents SDK) are safe choices. Don't churn through frameworks.
+4. **Add observability before the second agent ships.** LangSmith or LangFuse. Without traces, debugging agent issues is impossible.
+5. **Write 10-20 regression tests in Promptfoo or DeepEval.** Run them on every change.
+6. **Set per-task cost ceilings + per-user rate limits.** Day-zero, not later.
+7. **Human-in-the-loop for any irreversible action.** Sending email, making payments, modifying production data. No exceptions until you have months of reliability data.
+8. **Resist multi-agent until single-agent fails on your specific problem.** Multi-agent is more complexity, more failure modes, more cost. Earn it.
+
+## Traps
+
+- **Building a tool registry instead of using MCP.** You're rebuilding what's now standardized. The maintenance burden compounds.
+- **Going multi-agent prematurely.** The "this would be easier with multiple agents" feeling usually means "I haven't given the single agent the right tools or instructions yet."
+- **No evals.** You don't know your agent regressed until users complain. Build evals before launch.
+- **Trusting tool output as instructions.** Prompt injection from a webpage, document, or API response. Sanitize aggressively.
+- **Ignoring cost.** A bug-in-the-loop can blow through a month's budget in an hour. Per-task and per-tenant ceilings.
+- **Treating reasoning models as a silver bullet.** They're great but not magic. Bad data, bad tools, bad prompts still produce bad agents.
+- **Buying every framework on the slide.** Most teams need *one* runtime, *one* observability tool, *MCP* for tools, and *one* eval framework. Sprawl is the enemy of reliability.
+
+The deeper observation: agentic AI is the *operational* maturity moment of LLM applications. The model is no longer the bottleneck. The orchestration around it — the agent loop, the tool interface, the memory, the eval, the observability, the cost controls — is the engineering surface that matters in 2026. Get those right and the underlying model becomes interchangeable. Get them wrong and even a frontier model produces a frustrating agent.
