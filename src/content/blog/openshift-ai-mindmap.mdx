@@ -21,10 +21,19 @@ export const branch = (header, angleDeg, leaves, cx, cy) => {
   const nodes = [];
   const edges = [];
   const headerId = slug(header);
-  const headerPos = polar(angleDeg, 320, cx, cy);
+
+  // Direction vector along the branch (forward) and perpendicular to it
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+
+  const R_HEADER = 360;
+  const headerCenter = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
   nodes.push({
     id: headerId,
-    position: { x: headerPos.x - 90, y: headerPos.y - 25 },
+    position: { x: headerCenter.x - 90, y: headerCenter.y - 25 },
     data: { label: header },
     style: branchHeader,
   });
@@ -35,17 +44,24 @@ export const branch = (header, angleDeg, leaves, cx, cy) => {
     style: { stroke: "#15803d", strokeWidth: 2 },
   });
 
-  const n = leaves.length;
-  const spreadDeg = Math.min(55, 6 * n);
-  const startAngle = angleDeg - spreadDeg / 2;
+  // Leaves in two columns extending outward from the header along the branch direction.
+  const FORWARD_START = 140;
+  const FORWARD_STEP = 60;
+  const PERP_OFFSET = 80;
+
   leaves.forEach((label, i) => {
-    const a = n === 1 ? angleDeg : startAngle + (spreadDeg / (n - 1)) * i;
-    const r = 600 + ((i % 3) * 35);
-    const pos = polar(a, r, cx, cy);
-    const id = slug(header) + "_" + slug(label);
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+
+    const x = headerCenter.x + forwardDist * dx + perpDist * px;
+    const y = headerCenter.y + forwardDist * dy + perpDist * py;
+
+    const id = headerId + "_" + slug(label);
     nodes.push({
       id,
-      position: { x: pos.x - 65, y: pos.y - 15 },
+      position: { x: x - 65, y: y - 15 },
       data: { label },
       style: leaf,
     });
