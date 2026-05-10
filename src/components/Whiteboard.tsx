@@ -3,7 +3,6 @@ import {
   ReactFlow,
   Background,
   Controls,
-  MiniMap,
   type Node,
   type Edge,
 } from "@xyflow/react";
@@ -50,7 +49,6 @@ export default function Whiteboard({ data, height = 560 }: Props) {
         proOptions={{ hideAttribution: true }}
       >
         <Background color="#d1d5db" gap={20} />
-        <MiniMap pannable zoomable maskColor="rgba(243,244,246,0.6)" />
         <Controls showInteractive={false} />
       </ReactFlow>
     </div>
