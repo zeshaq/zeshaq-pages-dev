@@ -1,0 +1,175 @@
+---
+title: "How to become a data scientist in 2026"
+description: "What 'data scientist' actually means in 2026 after LLMs reshaped the field, the three paths the role has bifurcated into, the skill stack to learn, the resources worth your time, and an honest read on the job market."
+date: 2026-05-10
+category: DATA
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const path  = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const found = { background: "#e5e7eb", border: "1px dashed #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const upEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const branchEdge = { style: { stroke: "#15803d", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const stackNodes = [
+  { id: "analytics",   position: { x: 80,  y: 0   }, data: { label: "Analytics / Product DS\n(BI + experimentation)" }, style: path },
+  { id: "mleng",       position: { x: 320, y: 0   }, data: { label: "ML Engineering\n(train + deploy models)" }, style: path },
+  { id: "aieng",       position: { x: 560, y: 0   }, data: { label: "AI / LLM Engineering\n(RAG, agents, fine-tuning)" }, style: path },
+  { id: "engineering", position: { x: 320, y: 150 }, data: { label: "Engineering practice\n(Git, Docker, cloud, MLOps)" }, style: ctrl },
+  { id: "ml",          position: { x: 320, y: 290 }, data: { label: "ML fundamentals\n(scikit-learn + PyTorch)" }, style: ctrl },
+  { id: "math",        position: { x: 80,  y: 430 }, data: { label: "Math + Stats" }, style: found },
+  { id: "python",      position: { x: 320, y: 430 }, data: { label: "Python + SQL" }, style: found },
+  { id: "data",        position: { x: 560, y: 430 }, data: { label: "Data wrangling\n(Pandas / Polars / DuckDB)" }, style: found },
+];
+
+export const stackEdges = [
+  { id: "f1", source: "math",        target: "ml", ...upEdge },
+  { id: "f2", source: "python",      target: "ml", ...upEdge },
+  { id: "f3", source: "data",        target: "ml", ...upEdge },
+  { id: "m1", source: "ml",          target: "engineering", ...upEdge },
+  { id: "b1", source: "engineering", target: "analytics", label: "lighter ML",      ...branchEdge },
+  { id: "b2", source: "engineering", target: "mleng",     label: "training + serving", ...branchEdge },
+  { id: "b3", source: "engineering", target: "aieng",     label: "LLM ecosystem",   ...branchEdge },
+];
+
+The honest answer to "how do I become a data scientist in 2026" starts with: **the role you trained for in 2018 isn't quite the role being hired today.** LLMs reshaped the field. The 2022-2023 tech layoffs ended the "every company needs 20 data scientists" era. The job title has fractured into three pretty different jobs, and the path you take depends on which of those you actually want.
+
+This post is an opinionated walkthrough of what those three paths look like, the skill stack you need under all of them, the resources worth your time, the portfolio expectations, and the honest read on the job market. Optimized for someone considering the field seriously rather than someone wanting to be sold a bootcamp.
+
+## What "data scientist" means in 2026
+
+The 2015-2020 "data scientist" job description — "build models, analyze data, present results, also do some engineering" — has bifurcated into three more specific roles:
+
+| Path | What you actually do | Where it's hired |
+| --- | --- | --- |
+| **Analytics / Product DS** | SQL, dashboards, A/B testing, causal inference, business storytelling. Light ML. | Most large product companies, marketplaces, fintech. Title sometimes "Product Analyst" or "Data Scientist (Analytics)" |
+| **ML Engineering** | Train, evaluate, deploy classical ML and DL models. Heavy engineering. Production systems. | Marketplaces, search/rec/ads teams, ML-first startups. Most-hireable category in 2026. |
+| **AI / LLM Engineering** | RAG, agents, fine-tuning, evals, prompt engineering, AI applications. | Every company. Newest category, fastest-growing, least standardized. |
+
+Pure "data scientist" jobs that span everything are still posted, but the senior-mid range is most often one of those three specialties. The role you target shapes what you learn.
+
+## The skill stack
+
+<Whiteboard client:load data={{ nodes: stackNodes, edges: stackEdges }} height={620} />
+
+Reading the diagram from bottom to top:
+
+- **Math + Statistics** — probability distributions, hypothesis testing, regression intuition, basic linear algebra. You don't need a math PhD; you do need to know why a t-test exists and what overfitting actually means.
+- **Python + SQL** — the unkillable foundation. Python is the working language; SQL is the data-access lingua franca. Mastery beats familiarity in both.
+- **Data wrangling** — Pandas, Polars, DuckDB. Cleaning, aggregating, joining, exploring real-world messy data.
+- **ML fundamentals** — scikit-learn for classical ML (regression, trees, ensembles); PyTorch for deep learning. Know how training, validation, regularization, and evaluation actually work.
+- **Engineering practice** — Git, Docker, cloud basics (one of AWS / GCP / Azure), MLOps (experiment tracking, model registries, monitoring). The thing that separates "hobbyist with Kaggle notebooks" from "hireable engineer."
+- **Specialization** — pick one of the three top boxes after the foundation is in place. The green branches show what comes after the shared base.
+
+The path is sequential. Skipping foundations to chase the LLM job will work for about three months and then break when something doesn't behave like the tutorial.
+
+## The toolkit by tier
+
+The tools that actually matter, by importance:
+
+**Non-negotiable (you must know these well)**
+
+| Tool | Why |
+| --- | --- |
+| Python | The working language for everything outside pure SQL analytics |
+| SQL | Every job, every data layer. Window functions, CTEs, query plans — yes, all of it. |
+| Git + GitHub | Code lives in repos; you collaborate via PRs. Non-optional. |
+| Pandas | Still the default for tabular data |
+| Jupyter | Where analysis lives. Also know `nbconvert` or [Marimo](https://marimo.io/) for sharing |
+| scikit-learn | Classical ML — regression, trees, evaluation metrics. The "if it works with sklearn, ship it" baseline. |
+| Linux / shell basics | `grep`, `awk`, `ssh`, `cron`, file permissions. You'll need these. |
+
+**Strongly recommended (most jobs)**
+
+| Tool | Why |
+| --- | --- |
+| PyTorch | The de-facto deep-learning framework in 2026. TensorFlow has lost mindshare. |
+| Polars | The successor-to-Pandas conversation has played out. Polars is faster and the API is cleaner for new code. |
+| DuckDB | Single-node analytics on Parquet / CSV — the right answer for ~1TB and under |
+| Docker | Containerize your work; this is how it ships |
+| One cloud (AWS / GCP / Azure) | Pick one; learn the ML and data services |
+| MLflow or Weights & Biases | Experiment tracking. Required for serious ML work. |
+| HuggingFace | Models, datasets, transformers library. Central to anything LLM-flavored. |
+| LangChain or LlamaIndex | RAG / agent orchestration. The libraries are flawed but ubiquitous. |
+| FastAPI | Lightweight Python API serving. The default for "expose your model as a service." |
+| dbt | Analytics engineering / data transformation. Increasingly part of the analytics DS toolkit. |
+
+**Specialization-specific**
+
+| For Analytics DS | For ML Eng | For AI / LLM Eng |
+| --- | --- | --- |
+| Looker / Tableau / Mode | XGBoost / LightGBM | vLLM / Ollama |
+| Experimentation platforms | Ray / Spark | Vector DBs (pgvector, Qdrant) |
+| Causal inference (DoWhy, EconML) | TorchServe / KServe | Triton Inference Server |
+| Mixpanel / Amplitude | MLflow / DVC | RAGAS / LangSmith for evals |
+| Snowflake / BigQuery deep | Feature stores (Feast) | InstructLab / Axolotl (fine-tuning) |
+| Statistical modeling (statsmodels) | Kubernetes + Argo Workflows | Tool-calling SDKs (OpenAI, Anthropic) |
+
+You don't learn all of these. You pick the column matching your path and learn 4-5 from it deeply.
+
+## Education paths
+
+Realistic options ranked by signal-to-effort:
+
+- **CS / ML degree (BS or MS).** Still the highest-signal credential. If you're young and can afford it, do this. An MS in CS with ML coursework opens more doors than a bootcamp + 5 projects, fair or not.
+- **Online specializations done seriously.** Andrew Ng's Coursera / DeepLearning.AI, fast.ai, Hugging Face NLP course, Karpathy's "Zero to Hero" YouTube series. Done well, these compete with formal coursework on substance — but they're zero-credential, so the work has to show in your portfolio.
+- **Kaggle competitions.** Genuine differentiator if you reach Expert or Master tier. Below that, every applicant has done Titanic.
+- **Bootcamps.** Saturated market in 2026. Some are still good (and expensive); most are graveyards. Treat as a focused study schedule, not a credential.
+- **Self-taught with real projects.** Works at any level — junior to senior. Requires more discipline; the proof is in the GitHub.
+
+The honest math: **what you can build matters more than where you learned.** A self-taught person with three serious open-source projects, a clean GitHub, and one paper they reimplemented in a blog post will outcompete a bootcamp grad with five generic capstone projects.
+
+## Portfolio: what actually works
+
+The portfolio rules in 2026 that aren't on the bootcamp websites:
+
+- **One depth project beats five breadth projects.** Spend 200 hours on one substantial thing (an end-to-end RAG system you actually use, a fine-tuned model on real data, a deployed ML pipeline that's been running for 6 months). Skip the Iris / Titanic / Boston Housing demos. Recruiters have seen them.
+- **Write about your work.** A blog post explaining what you built, what didn't work, what you'd do differently, ranks higher in interview-prep than the project itself. (You're reading one right now.)
+- **Reproduce one paper.** Pick a recent-ish NeurIPS / ICML / ICLR / EMNLP paper, implement it, write up what was hard. This signals "can read research and execute on it" — rare and valued.
+- **Open-source contribution beats personal repo.** A merged PR to PyTorch, scikit-learn, HuggingFace Transformers, LangChain, or any genuinely-used library is worth 10 personal projects.
+- **Live model > Github model.** Deploy something. Anyone can write a Jupyter notebook. Far fewer can ship a model with a public endpoint that handles real traffic.
+
+## The job market in 2026, honestly
+
+What's actually happening:
+
+- **Junior data scientist hiring contracted significantly** from 2023 onward and hasn't fully recovered. Cold-applying to "Data Scientist" entry-level roles has a low hit rate.
+- **ML engineering hiring is strong** — companies that used to have 10 data scientists and 1 ML engineer now have 4 data scientists and 5 ML engineers.
+- **AI / LLM engineering hiring is white-hot** but the bar is unclear. Many roles are first-of-their-kind at the hiring company; the interview process is improvised.
+- **Senior data scientists** are still hired at companies with established DS teams; the bar is high.
+- **Data analyst → DS** internal transitions still work and are often the cleanest entry path.
+
+The geographic and industry tilt: SaaS / fintech / marketplaces hire ML eng + analytics. Healthcare / finance hire interpretable ML (regulated). Defense / government hire ML eng with clearance. Big tech still hires across all three roles but with high bars.
+
+Networking matters. A referred candidate is ~5× more likely to land an interview than a cold applicant. Engage with the community — open-source contributions, blog posts, conference talks (PyData, MLOps Community, AI Engineer Summit), tech Discords. Show up consistently for 12 months and people will remember you when roles open.
+
+## A realistic 12-month path
+
+For someone starting from "I can program a bit, no ML background":
+
+1. **Months 1-2: Foundations.** Python + SQL + Git fluently. Andrew Ng's *Machine Learning* and *Deep Learning* specializations. Build a small project at the end (a simple classifier on a real dataset, end-to-end).
+2. **Months 3-4: Real ML.** scikit-learn + PyTorch. Implement a paper. Start a blog. Read Hands-On Machine Learning (Géron) cover to cover.
+3. **Months 5-6: Engineering.** Docker, AWS or GCP basics, FastAPI, MLflow. Deploy your project from month 4 as a real service. Make it monitorable.
+4. **Months 7-9: Specialization.** Pick analytics / ML eng / AI eng based on the work that interests you. Go deep — 3 months on the matching column of tools.
+5. **Months 10-12: Portfolio + applications.** One substantial project in your specialization. Open-source contribution. Two blog posts. Start applying with the portfolio as evidence.
+
+Compression below 12 months is possible but the foundation gets thin. Stretching to 18-24 months alongside a current job is more realistic for most people.
+
+## Traps to avoid
+
+- **Chasing the LLM hype before knowing the fundamentals.** Prompt engineering and RAG are easier to learn than ML training. You won't stand out as "another person who can call OpenAI's API."
+- **Collecting certificates instead of shipping projects.** Coursera completions are a study log, not a portfolio.
+- **Optimizing only for Kaggle.** Kaggle teaches feature engineering and ensembling. It doesn't teach experiment design, business communication, MLOps, or causal inference.
+- **Ignoring SQL because "everyone knows SQL."** Mediocre SQL is the most common gap in mid-level interviews.
+- **Math intimidation.** You don't need to derive backprop on a whiteboard. You do need to know why your model is overfitting.
+- **Specializing too early.** The shared foundation matters. A "LLM engineer" who can't train a small classifier is one library deprecation away from unemployed.
+
+## The closing reality
+
+The field rewards persistence and curiosity over credentials. Show up consistently for 12-24 months, ship things, write about them, talk to people in the field. The path is harder than it was in 2019 and the job titles are murkier, but the demand for people who can actually move data → model → product → business outcome hasn't gone anywhere. It's just more honest about what skills get you there.
+
+The mistake to avoid: treating "data scientist" as a single career and a single learning path. It isn't anymore. Pick one of the three lanes, commit to it for a year of focused work, and you'll be substantially ahead of the generalist who's still trying to be all three.
