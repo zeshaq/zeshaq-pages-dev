@@ -1413,6 +1413,64 @@ A condensed reference for the vocabulary used throughout:
 - **Tool use / function calling.** Model emits structured tool-call requests; calling code executes them.
 - **Transformer.** The neural architecture underneath nearly every modern AI model.
 - **vLLM.** The dominant open-source LLM inference engine.
+- **Whisper.** OpenAI's open-weights ASR model; the speech-recognition default in 2026.
+- **WER (Word Error Rate).** The standard metric for ASR quality; lower is better.
+- **XGBoost.** The most widely-used gradient-boosted-tree library; the tabular ML workhorse.
+- **Zero-shot.** Asking a model to do a task with no examples in the prompt.
+- **ASR (Automatic Speech Recognition).** Audio to text; the input half of voice agents.
+- **TTS (Text-to-Speech).** Text to audio; the output half of voice agents.
+- **MOS (Mean Opinion Score).** Subjective quality rating for TTS, typically 1-5.
+- **CLIP.** A 2021 vision-language model whose encoders still anchor much of the multimodal landscape.
+- **C2PA.** Content provenance standard for tracking the origin of AI-generated media.
+- **MMLU-Pro.** A 2024 upgrade to the original MMLU benchmark; harder, more reasoning-heavy.
+
+## Frequently asked questions
+
+A few questions that come up repeatedly when teams sit down with this taxonomy:
+
+### Is a reasoning model always better than a generalist for hard problems?
+
+No. Reasoning models are better at problems where the reasoning *generalizes* from verifiable training domains. They're frequently overkill for hard problems that are merely knowledge-intensive. A frontier generalist with good RAG often outperforms a reasoning model on "what does our internal policy say about X" because the bottleneck is retrieval, not reasoning.
+
+### Should I fine-tune?
+
+Almost certainly not as a first step. The 2026 hierarchy: prompt → few-shot → structured outputs → RAG → router across models → *then* fine-tune. Fine-tuning is real engineering work with real ongoing costs (re-tuning on every base-model update, eval maintenance, deployment overhead). Reach for it when the prior layers exhaust their headroom and you have eval data showing the gap.
+
+### Open-weights or closed-API?
+
+For most teams in 2026, the answer is *both*. Closed-API for the hard low-volume cases where frontier quality matters. Self-hosted open-weights for the high-volume commodity calls where cost dominates. Single-provider lock-in is an avoidable risk; the 2026 stacks routinely span 3-5 providers and self-hosted endpoints.
+
+### How important is the context window?
+
+Less than people assume. Most production tasks fit in 8-32K tokens. Long-context models (200K-2M) unlock specific patterns — full-document analysis, large codebase reasoning, long-form chat history — but for most work, *retrieval* (RAG) beats *long context* on both cost and quality. The exception is genuinely long-form reasoning over a single document, where modern long-context models shine.
+
+### Do I need an agent framework?
+
+If you're building a multi-step product, eventually yes. LangGraph, Pydantic AI, and the proprietary SDKs (OpenAI Assistants, Anthropic Tool Use, Google Agent Builder) have made this much easier than 2023's string-soup chains. For a single LLM call producing structured output, raw SDK is fine.
+
+### Will small models replace big models?
+
+For a growing subset of tasks, yes — distillation, on-device, and the steady "what was frontier last year is small this year" pattern compress costs aggressively. For the open-ended frontier (novel problems, complex reasoning, agentic behavior), big models remain the right tool. Most production stacks will continue to use a mix.
+
+### Which families should I learn first if I'm new?
+
+In order of practical impact: generalist LLMs (especially API patterns + structured outputs + tool use), then embeddings (everything RAG-related), then vision-language (because so many real inputs are images), then classical/tabular (because most enterprise data is tabular), then the rest as use cases demand.
+
+### How fast is the taxonomy changing?
+
+The eight families have been stable for about 18 months. Reasoning models were the last new family; they emerged in late 2024. The next likely additions are time-series foundation models, robotics foundation models, and a possible split between "omnimodal" (text+image+audio+video) and current "vision-language." Expect the eight to become nine or ten in the next 18-24 months.
+
+### How do I evaluate vendor claims?
+
+Treat all benchmark numbers as marketing until verified on your data. The most reliable signal: build your own 50-input eval set, run candidate models against it, score with a separate judge model and (where possible) human review. Vendor benchmark rankings change weekly; your eval ranking changes only when the underlying behavior does.
+
+### What about agents that "just work"?
+
+The 2025-2026 wave of agent products (Claude Code, Cursor Agent, Devin, OpenAI Operator) have made multi-step agentic work much more reliable for narrow domains. They are not yet general-purpose autonomous workers. Treat them as power tools for specific job categories — coding, research, customer support — not as universal employees.
+
+### How do I decide between RAG and fine-tuning for domain knowledge?
+
+RAG when the knowledge is large, changes frequently, or requires citation. Fine-tuning when the knowledge is small, stable, and you need the *behavior* (not just the facts) to shift. Most enterprise knowledge bases are large and changing — RAG wins. Some narrow behavioral shifts (medical-record summarization style, legal-brief tone) benefit from fine-tuning.
 
 ## Closing thoughts
 
@@ -1421,5 +1479,22 @@ The mistake to avoid is *family confusion* — picking a frontier generalist LLM
 The second mistake to avoid is *family stagnation* — picking the right family in 2024 and assuming the choice is still right in 2026. Reasoning models did not exist as a deployable category two years ago. Vision-language models that read screenshots well are a 2024-2025 capability. Open-weights frontier was a contradiction in terms three years ago. The taxonomy itself is a moving target; the families consolidate or split every 12-18 months.
 
 The third mistake to avoid is *model maximalism* — believing that every problem benefits from the largest, most expensive, most frontier model available. A 70B reasoning model run against every classification query is a great way to burn $50,000 a month producing the same outputs a fine-tuned 7B classifier would have produced for $50. Cost and quality are both axes; ignoring either is bad engineering.
+
+The fourth mistake to avoid is *infrastructure neglect* — treating model selection as the only interesting decision and ignoring the surrounding stack. Evals, observability, prompt caching, routing, fallback, cost tracking, guardrails, version pinning — none of these are model choices, but each one separates teams that ship reliable AI from teams that fight fires. The model is the most visible component; the infrastructure around it is what determines whether the product works in week 47.
+
+The fifth mistake is *staleness*. Models, prices, tooling, and best practices in this space turn over every 6-12 months. A 2024 decision to use a specific embedding model, a specific vector database, a specific inference engine — each of those was likely correct then and likely suboptimal now. Build the infrastructure that lets you swap components without rewriting the application. Abstract behind a provider-neutral interface where you can. Keep eval suites that let you re-validate cheaply when something changes.
+
+### A capsule view: one line per family
+
+If everything else fades from memory, these eight one-liners are the load-bearing summary:
+
+- **Generalist LLMs** — text in, text out; the default for anything language-shaped; cache the prefix, structure the output, route the traffic.
+- **Reasoning models** — pay 10-100× for hard verifiable problems; use sparingly via routing; never default-on.
+- **Vision-Language** — read screenshots, documents, charts, photos; output structured text; pair with detection models for precise localization.
+- **Embeddings** — the vectors that power retrieval; quality matters more than cost; hybrid search and re-ranking are 2026 defaults.
+- **Image and video generation** — diffusion-derived models for marketing, design, mockups, B-roll; LoRA for brand fidelity; ControlNet for composition.
+- **Speech and audio** — ASR + TTS + music; streaming end-to-end for voice agents; sub-500ms first byte is the latency budget.
+- **Code models** — autocomplete (specialist), conversational coding (generalist), agentic coding (the breakout pattern); review is mandatory.
+- **Classical / tabular** — the boring foundation; cheaper, faster, more interpretable than LLMs for tabular problems; most enterprise ML still lives here.
 
 The model is a part. The system is the product. The taxonomy is a map of parts. Spend the time to learn the map, and the systems get easier to build.
