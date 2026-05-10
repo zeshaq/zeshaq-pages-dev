@@ -1,0 +1,241 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ReactFlow,
+  ReactFlowProvider,
+  Background,
+  Controls,
+  MiniMap,
+  ConnectionMode,
+  MarkerType,
+  addEdge,
+  useNodesState,
+  useEdgesState,
+  useReactFlow,
+  type Connection,
+  type Edge,
+  type Node,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import ShapeNode, { EditableContext, type Shape } from "./ShapeNode";
+
+const nodeTypes = { shape: ShapeNode };
+const DRAFT_KEY = "session-draft-v1";
+
+const slugify = (s: string) =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "session";
+
+function EditorInner() {
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [copied, setCopied] = useState(false);
+  const [restored, setRestored] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const { screenToFlowPosition } = useReactFlow();
+  const hydrated = useRef(false);
+
+  // Restore draft on first mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY);
+      if (raw) {
+        const draft = JSON.parse(raw);
+        if (typeof draft.title === "string") setTitle(draft.title);
+        if (typeof draft.description === "string") setDescription(draft.description);
+        if (Array.isArray(draft.nodes) && draft.nodes.length) setNodes(draft.nodes);
+        if (Array.isArray(draft.edges) && draft.edges.length) setEdges(draft.edges);
+        if ((draft.nodes?.length ?? 0) + (draft.title?.length ?? 0) > 0) setRestored(true);
+      }
+    } catch {
+      // ignore parse errors
+    }
+    hydrated.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Autosave
+  useEffect(() => {
+    if (!hydrated.current) return;
+    const draft = { title, description, nodes, edges };
+    try {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    } catch {
+      // ignore quota errors
+    }
+  }, [title, description, nodes, edges]);
+
+  const onConnect = useCallback(
+    (conn: Connection) =>
+      setEdges((es) =>
+        addEdge(
+          {
+            ...conn,
+            style: { stroke: "#4b5563", strokeWidth: 1.5 },
+            markerEnd: { type: MarkerType.ArrowClosed, color: "#4b5563" },
+          },
+          es
+        )
+      ),
+    [setEdges]
+  );
+
+  const addShape = (shape: Shape) => {
+    const rect = wrapperRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const center = screenToFlowPosition({
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    });
+    const jitter = ((nodes.length * 23) % 80) - 40;
+    const id = `n_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const labels: Record<Shape, string> = {
+      rect: "node",
+      ellipse: "node",
+      text: "text",
+    };
+    setNodes((ns) => [
+      ...ns,
+      {
+        id,
+        type: "shape",
+        position: { x: center.x - 60 + jitter, y: center.y - 20 + jitter },
+        data: { label: labels[shape], shape },
+      },
+    ]);
+  };
+
+  const buildPayload = () => ({
+    title: title.trim() || "Untitled session",
+    description: description.trim() || "",
+    date: new Date().toISOString().slice(0, 10),
+    nodes,
+    edges,
+  });
+
+  const onExport = () => {
+    const slug = slugify(title.trim() || "untitled");
+    const blob = new Blob([JSON.stringify(buildPayload(), null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${slug}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(buildPayload(), null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      alert("Clipboard not available — use export json instead.");
+    }
+  };
+
+  const onClear = () => {
+    if (!confirm("Clear all nodes and edges?")) return;
+    setNodes([]);
+    setEdges([]);
+  };
+
+  const onDiscardDraft = () => {
+    if (!confirm("Discard saved draft and reset everything?")) return;
+    localStorage.removeItem(DRAFT_KEY);
+    setTitle("");
+    setDescription("");
+    setNodes([]);
+    setEdges([]);
+    setRestored(false);
+  };
+
+  return (
+    <EditableContext.Provider value={true}>
+      <div className="editor-meta">
+        <input
+          type="text"
+          placeholder="Session title"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+        />
+        <textarea
+          placeholder="Description (optional)"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={2}
+        />
+      </div>
+
+      <div className="editor-toolbar">
+        <button type="button" className="editor-btn" onClick={() => addShape("rect")}>
+          + rectangle
+        </button>
+        <button type="button" className="editor-btn" onClick={() => addShape("ellipse")}>
+          + ellipse
+        </button>
+        <button type="button" className="editor-btn" onClick={() => addShape("text")}>
+          + text
+        </button>
+        <span className="editor-spacer" />
+        <button type="button" className="editor-btn" onClick={onCopy}>
+          {copied ? "copied!" : "copy json"}
+        </button>
+        <button
+          type="button"
+          className="editor-btn editor-btn-primary"
+          onClick={onExport}
+        >
+          export json
+        </button>
+        <button type="button" className="editor-btn" onClick={onClear}>
+          clear
+        </button>
+        {restored && (
+          <button type="button" className="editor-btn editor-btn-warn" onClick={onDiscardDraft}>
+            discard draft
+          </button>
+        )}
+      </div>
+
+      <div ref={wrapperRef} className="diagram editor-canvas" style={{ height: "70vh" }}>
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          connectionMode={ConnectionMode.Loose}
+          deleteKeyCode={["Delete"]}
+          fitView
+          fitViewOptions={{ padding: 0.2 }}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background color="#d1d5db" gap={20} />
+          <Controls showInteractive={false} />
+          <MiniMap pannable zoomable maskColor="rgba(243,244,246,0.6)" />
+        </ReactFlow>
+      </div>
+
+      <p className="editor-hints">
+        drag handles to connect • double-click a shape to edit text • select &amp; press <kbd>Delete</kbd> to remove • drag to reposition • autosaved to your browser
+      </p>
+
+      <div className="editor-howto">
+        <strong>To publish:</strong> click <em>export json</em>, save the file as
+        {" "}<code>src/content/sessions/&lt;slug&gt;.json</code>, then commit and push. The session shows up in the sidebar after deploy.
+      </div>
+    </EditableContext.Provider>
+  );
+}
+
+export default function WhiteboardEditor() {
+  return (
+    <ReactFlowProvider>
+      <EditorInner />
+    </ReactFlowProvider>
+  );
+}

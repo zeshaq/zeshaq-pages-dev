@@ -8,6 +8,7 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import ShapeNode from "./ShapeNode";
 
 interface SessionData {
   nodes: Node[];
@@ -18,6 +19,8 @@ interface Props {
   data: SessionData;
   height?: number | string;
 }
+
+const nodeTypes = { shape: ShapeNode };
 
 export default function Whiteboard({ data, height = 560 }: Props) {
   const id = `wb_${useId().replace(/:/g, "_")}`;
@@ -39,6 +42,7 @@ export default function Whiteboard({ data, height = 560 }: Props) {
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        nodeTypes={nodeTypes}
         fitView
         nodesDraggable={false}
         nodesConnectable={false}
