@@ -1,0 +1,268 @@
+---
+title: "AI inferencing: the serving side of ML"
+description: "What inferencing actually is in 2026 — the prefill / decode split that defines LLM serving, the runtime engines that compete (vLLM, Triton, TGI, TensorRT-LLM, llama.cpp), the optimization techniques (quantization, speculative decoding, paged attention, multi-LoRA), the hardware spectrum, and the economics that make inference the bigger half of any AI budget."
+date: 2026-05-10
+category: AI
+---
+
+import Whiteboard from "../../components/Whiteboard";
+import Mermaid from "../../components/Mermaid";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const accel = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const cache = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const respEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5, strokeDasharray: "5,5" }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const gpuEdge   = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const telemetryEdge = { style: { stroke: "#6b7280", strokeWidth: 1 }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const infNodes = [
+  { id: "client",     position: { x: 80,   y: 80  }, data: { label: "client app" }, style: stage },
+  { id: "gateway",    position: { x: 290,  y: 80  }, data: { label: "API Gateway\n+ auth + rate limit" }, style: ctrl },
+  { id: "semcache",   position: { x: 290,  y: 220 }, data: { label: "Semantic Cache\n(Redis + embeddings)" }, style: cache },
+  { id: "router",     position: { x: 510,  y: 80  }, data: { label: "Model Router\n(cost / capability)" }, style: ctrl },
+  { id: "engine",     position: { x: 730,  y: 80  }, data: { label: "Inference Engine\n(vLLM / Triton / TGI)" }, style: ctrl },
+  { id: "prefill",    position: { x: 620,  y: 260 }, data: { label: "Prefill Workers\n(compute-bound)" }, style: ctrl },
+  { id: "decode",     position: { x: 820,  y: 260 }, data: { label: "Decode Workers\n(memory-bound)" }, style: ctrl },
+  { id: "kvcache",    position: { x: 730,  y: 400 }, data: { label: "Paged KV Cache" }, style: cache },
+  { id: "gpus",       position: { x: 730,  y: 540 }, data: { label: "GPU Pool\n(H100 / B200 / MI300X)" }, style: accel },
+  { id: "observe",    position: { x: 980,  y: 220 }, data: { label: "Observability\n(latency, tokens/s, $)" }, style: ctrl },
+  { id: "guardrails", position: { x: 510,  y: 220 }, data: { label: "Guardrails\n(input + output filter)" }, style: ctrl },
+];
+
+export const infEdges = [
+  { id: "e1", source: "client",   target: "gateway",  label: "request", ...reqEdge },
+  { id: "e2", source: "gateway",  target: "semcache", label: "check",   ...reqEdge },
+  { id: "e3", source: "semcache", target: "router",   label: "miss",    ...reqEdge },
+  { id: "e3b", source: "semcache", target: "client",   label: "hit (return)", ...respEdge },
+  { id: "e4", source: "router",   target: "guardrails", ...reqEdge },
+  { id: "e5", source: "guardrails", target: "engine", label: "approved", ...reqEdge },
+  { id: "e6", source: "engine",   target: "prefill",  ...gpuEdge },
+  { id: "e7", source: "engine",   target: "decode",   ...gpuEdge },
+  { id: "e8", source: "prefill",  target: "kvcache",  label: "write",   ...gpuEdge },
+  { id: "e9", source: "decode",   target: "kvcache",  label: "read+grow", ...gpuEdge },
+  { id: "e10", source: "kvcache", target: "gpus",     label: "in HBM",  ...gpuEdge },
+  { id: "e11", source: "engine",  target: "client",   label: "stream tokens", ...respEdge },
+  { id: "e12", source: "engine",  target: "observe",  label: "metrics", ...telemetryEdge },
+  { id: "e13", source: "gateway", target: "observe",  ...telemetryEdge },
+];
+
+If 2023-2024 was the era of "look what LLMs can do," 2025-2026 is the era of "how do we serve this without bankrupting ourselves." The training run that produces a frontier model is a multi-hundred-million-dollar event that happens *once*. The inference compute that serves that model to users happens *every request, forever, at scale*. Inference is the bigger half of every meaningful AI budget, the differentiator between products that work and products that ship slowly, and the layer where the actual engineering art of modern ML lives.
+
+This post is what AI inferencing is in 2026 — the prefill/decode split that defines LLM serving, the runtime engines competing for the layer, the optimization techniques, the hardware spectrum, and the operational realities.
+
+## What is inferencing
+
+"Inferencing" is the serving side of ML: using a trained model to produce predictions. The training/inference split:
+
+- **Training** — feed data, run gradient descent, produce model weights. Compute-heavy, one-time-ish, batch-oriented.
+- **Inference** — feed input, run a forward pass, produce output. Latency-sensitive, continuous, scales with traffic.
+
+For classical ML (XGBoost, scikit-learn, traditional deep learning), inference is straightforward — load the model, hit it with a request, return a prediction. The interesting engineering happens in serving frameworks (TorchServe, TF Serving, BentoML) wrapping a known-cost operation.
+
+For LLMs, inference is its own discipline. The cost is non-uniform per request, the memory profile is unusual, and the optimization techniques unique enough that an entire industry has sprung up around it.
+
+## The training-vs-inference economic split
+
+The math that surprises people:
+
+- Training a frontier 70B-parameter model: $10M-$100M one-time compute.
+- Serving that model to 1M daily users: easily $10M-$100M *per year* in inference compute.
+
+Over a model's lifetime, inference compute exceeds training compute by 5-10× for popular models. For startups using API-based inference, this is the only line item that matters. For self-hosters, it dictates the cluster size, the GPU procurement plan, and ultimately the unit economics.
+
+This is why the bulk of recent AI infrastructure innovation — paged attention, continuous batching, quantization, speculative decoding, disaggregated prefill — has been on the inference side.
+
+## Inference workload types
+
+| Type | What it is | Examples |
+| --- | --- | --- |
+| **Batch** | Run predictions over a large dataset, offline | Nightly recommendation jobs, document classification on a corpus, embedding generation |
+| **Real-time (synchronous)** | Single request, latency-bound | LLM chat, search ranking, fraud detection, recommendation API |
+| **Streaming** | Continuous data, token-by-token or frame-by-frame | LLM token streaming, video analysis, speech recognition |
+| **Edge / on-device** | Inference on user hardware | Mobile keyboards, on-device translation, smart cameras |
+
+LLMs spanned all four. The streaming model — generate one token at a time, send each to the user — is what makes chatbot UX feel responsive even when total generation takes seconds.
+
+## What makes LLM inference unusual: prefill vs decode
+
+The two-phase nature of LLM generation is the central technical insight that shaped the modern serving stack:
+
+<Mermaid client:load chart={`flowchart LR
+  P[Prompt: "Once upon a time, there"] --> Prefill
+  subgraph Prefill["Prefill phase (compute-bound)"]
+    P1[Process all input tokens in parallel] --> P2[Build KV cache]
+  end
+  Prefill --> Decode
+  subgraph Decode["Decode phase (memory-bound, sequential)"]
+    D1[Generate 1 token] --> D2[Append to KV cache]
+    D2 --> D3[Generate next token]
+    D3 --> D2
+  end
+  Decode --> Output[Stream tokens to client]
+
+  classDef compute fill:#fafafa,stroke:#15803d,color:#1f2937
+  classDef memory fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  class P1,P2 compute
+  class D1,D2,D3 memory`} />
+
+**Prefill** processes the entire input prompt in one pass. Every token attends to every other token; the compute scales quadratically with input length but happens in parallel. **Compute-bound**: limited by GPU FLOPS.
+
+**Decode** generates one output token at a time. Each new token needs to attend to all previous tokens (input + previously generated output), so the model reads its entire **KV cache** for every single token. **Memory-bound**: limited by GPU memory bandwidth, not raw FLOPS.
+
+The asymmetry matters everywhere:
+
+- A long prompt (10K tokens) takes one expensive prefill but allows fast decoding.
+- A short prompt with a long output (100 tokens in, 5000 out) does cheap prefill but expensive decode.
+- The optimal hardware for prefill (lots of FLOPS) is different from the optimal hardware for decode (lots of memory bandwidth).
+- This asymmetry drove the **disaggregated prefill** trend in 2024-2025 — run prefill on one cluster (FLOPS-dense), decode on another (bandwidth-dense), shuffle the KV cache between them.
+
+## The KV cache, briefly
+
+When the model decodes token N, it needs to attend to all previous tokens 0 through N-1. Recomputing those attention values every step would be O(N²) per token. Instead, the model caches the *key* and *value* tensors for every layer, every previous token. This is the **KV cache**, and it dominates the memory bill for LLM inference.
+
+For a 70B model with 80 layers, the KV cache for a single 8K-context request occupies multiple gigabytes of HBM. A server serving 100 concurrent users with 8K context windows needs hundreds of GB of HBM just for KV cache. **The KV cache is why H100s have 80GB of memory and B200s have 192GB**; it's why InfiniBand-class interconnects matter for multi-GPU inference; it's why **paged attention** (vLLM's innovation: managing KV cache like virtual memory with pages) became the dominant inference architecture.
+
+## A modern LLM inference stack
+
+<Whiteboard client:load data={{ nodes: infNodes, edges: infEdges }} height={680} />
+
+Reading the diagram:
+
+- **Client → API Gateway**: auth, rate limiting, request normalization. Standard ingress.
+- **Semantic Cache**: vector-similarity lookup against previous request/response pairs. If a new request is semantically near a cached one, return the cached response. Saves 30-50% of inference cost for chat-style traffic where users ask similar questions.
+- **Model Router**: decides *which model* to serve. Simple queries → 8B model (cheap, fast). Complex queries → 70B model (expensive, slow). Reasoning queries → o-style chain-of-thought model. Router decisions can be heuristic or model-based.
+- **Guardrails**: input filters (prompt injection detection, PII scrub) and output filters (toxicity, hallucination detection). Wraps the inference engine.
+- **Inference Engine**: the actual model serving. vLLM, Triton + TensorRT-LLM, TGI, llama.cpp under the hood. Handles request batching, KV cache management, token streaming.
+- **Prefill / Decode workers**: in modern stacks these can be separately scaled. Prefill needs FLOPS; decode needs bandwidth. Disaggregating lets you size each independently.
+- **Paged KV Cache**: vLLM's contribution. Treats GPU memory as pages; allocates KV cache to pages on demand. Eliminates fragmentation, enables much higher concurrency.
+- **GPU Pool**: H100 / B200 (NVIDIA), MI300X (AMD), Gaudi (Intel). The actual silicon.
+- **Observability**: tokens/sec, time-to-first-token, time-per-output-token, cost per request, GPU utilization. Without this, optimization is guesswork.
+
+The green dashed edges show GPU-side data flow (prefill → KV cache, KV cache living in HBM). Solid edges are request flow. The dashed return edge from engine to client carries the streaming token response.
+
+## Inference engines: the landscape
+
+The pure inference runtime — the thing that owns the model weights and produces tokens — has consolidated to a handful of dominant choices:
+
+| Engine | What it is | Best for |
+| --- | --- | --- |
+| **vLLM** | The open-source default. Paged attention, continuous batching, multi-LoRA, prefix caching, speculative decoding. Apache 2.0. | Most self-hosted production deployments. Strong NVIDIA support, growing AMD/Intel support. |
+| **NVIDIA Triton + TensorRT-LLM** | NVIDIA's commercial-grade inference stack. TensorRT-LLM compiles model graphs to optimized CUDA kernels per GPU. Triton serves them. | Maximum NVIDIA performance, multi-model serving, enterprise support. Common in [NVIDIA AI Enterprise](/blog/nvidia-ai-enterprise) deployments. |
+| **TGI (Text Generation Inference)** | Hugging Face's open-source server. Solid features, smaller ecosystem than vLLM. | Hugging Face-centric workflows. Reasonable for production. |
+| **NVIDIA NIM** | Pre-packaged containerized inference microservices. Triton + TensorRT-LLM + model + API exposed as a single Docker image. | Plug-and-play model serving without integration work. |
+| **llama.cpp / GGUF** | C++ inference engine, CPU + Apple Silicon + minimal GPU support. Quantization-friendly. | Local / edge / single-user inference. Ollama wraps this. |
+| **Ollama** | Friendly wrapper around llama.cpp for local development. | Developer laptops, small-scale production. |
+| **LMDeploy** | OpenMMLab's inference toolkit. Strong on multi-GPU, comparable to vLLM. | Common in research and Asian hyperscaler deployments. |
+| **SGLang** | Newer engine focused on structured generation, constrained decoding. | Use cases needing JSON/function-calling at scale. |
+| **MLX** | Apple's framework. Apple Silicon only. | macOS-native development, edge use. |
+| **DeepSpeed-Inference** | Microsoft's inference stack. Strong on multi-GPU + ZeRO-style sharding. | Less popular than vLLM but still maintained. |
+| **OpenVINO** | Intel's runtime. CPU and Intel GPU optimized. | Intel-heavy edge deployments. |
+| **ONNX Runtime** | Cross-vendor, multi-hardware. | Classical ML and smaller models with portability needs. |
+
+**The 2026 landscape consolidation**: For self-hosted LLM inference at meaningful scale, the choice is essentially **vLLM** (open source, fastest-evolving) or **NVIDIA Triton + TensorRT-LLM** (commercial, maximum NVIDIA performance). Everything else is for specific niches (Apple Silicon, edge, structured generation, etc.).
+
+## Optimization techniques
+
+The dominant techniques that make modern inference economical:
+
+**Quantization.** Reducing weight precision from FP16 (2 bytes/param) to INT8 (1 byte), INT4 (0.5 bytes), or even FP4 on Blackwell (also 0.5 bytes). A 70B model at FP16 is 140GB; at INT4 it's 35GB and fits on a single H100. **Methods**: GPTQ (post-training, fast), AWQ (activation-aware, higher quality), SmoothQuant, FP8 (newer, fits Hopper/Blackwell native FP8 cores). Quality degradation is usually 1-3% on benchmarks; for many production use cases, undetectable.
+
+**Continuous batching.** Instead of waiting for a batch of requests to fill before processing, vLLM-style engines admit requests into the batch as they arrive and complete them as they finish. Without this, throughput collapses under variable-length workloads. **The single most important inference engine feature**.
+
+**Paged attention.** Instead of pre-allocating contiguous KV cache memory per request (which wastes memory and limits concurrency), treat KV cache memory as pages. Allocate pages on demand. The OS-level virtual memory analogy is exact. vLLM's foundational technique.
+
+**Speculative decoding.** Use a small "draft" model to predict the next 5-10 tokens; verify them in parallel with the large target model. If the verification matches, you got 5-10 tokens for the cost of one forward pass. Throughput gains of 2-3× for many workloads.
+
+**Multi-LoRA serving.** Serve one large base model with many small LoRA adapters loaded simultaneously. Route each request to the right adapter. Eliminates the need to host N copies of a base model when you have N fine-tuned variants.
+
+**Prefix caching.** When many requests share a long prefix (system prompts, document context), cache the KV state of that prefix and reuse across requests. Saves the prefill cost for the shared part. Huge for RAG with shared context.
+
+**Chunked prefill.** Instead of doing one giant prefill for a long prompt, break it into chunks and interleave with decode operations. Smooths latency for long-context requests.
+
+**Grouped-Query Attention (GQA).** Architectural — fewer K/V heads than Q heads. Llama 2 onward. Roughly halves KV cache size without quality loss.
+
+**MoE inference.** Mixture-of-experts models (Mixtral, DeepSeek-V3, etc.) activate only some experts per token. Cleverer routing + expert parallelism lets you serve a 200B parameter model with 30B active. Inference engines need MoE-aware scheduling.
+
+**Disaggregated prefill.** Separate compute pools for the compute-bound prefill phase and the memory-bound decode phase. Better economics; complex orchestration.
+
+## Hardware: the silicon spectrum
+
+| Vendor | Chip | Slot |
+| --- | --- | --- |
+| **NVIDIA** | H100 (80GB), H200 (141GB), B200 (192GB), GB200 (NVL72) | Dominant in production inference. H100 is the workhorse; B200 is the new top end. |
+| **NVIDIA** | L40S (48GB), L4 (24GB) | Smaller, inference-focused (no NVLink needed for small models). |
+| **NVIDIA** | A100 (80GB) | Previous-generation. Still in heavy production use; getting cheaper on resale market. |
+| **AMD** | MI300X (192GB), MI350 | Increasingly viable for inference. Huge HBM advantage. ROCm software gap is narrowing. |
+| **Intel** | Gaudi 2, Gaudi 3 | Specific niche; price/perf advantage for certain models on Intel hardware. |
+| **Google** | TPU v5p, TPU Trillium | GCP-only. Strong for Google's own models and Google Cloud customers. |
+| **AWS** | Trainium / Inferentia | AWS-only. Inferentia 2 has reasonable cost/perf for specific models. |
+| **Groq** | LPU | Purpose-built for very-low-latency LLM inference. Sub-millisecond time-per-token. Specialty. |
+| **Cerebras** | Wafer-scale | Niche; wafer-scale-engine for extreme-large-model inference. |
+| **SambaNova** | RDU | Niche; integrated training+inference for enterprise. |
+| **Apple Silicon** | M-series (M3 Ultra 192GB unified memory) | Excellent for local dev, single-user inference. Not for production-scale serving. |
+
+The 2026 inference deployment reality:
+- **Frontier labs** run on B200 / GB200 clusters with InfiniBand.
+- **Enterprise self-hosters** run on H100 or H200 with some MI300X experimentation.
+- **Edge / specialty** uses L40S, L4, Inferentia, or Apple Silicon.
+- **API consumers** don't see the hardware — they pay OpenAI / Anthropic / Bedrock / Vertex per token and the provider figures it out.
+
+## Serving frameworks vs inference engines
+
+Two different layers often confused:
+
+- **Inference engine** (vLLM, Triton, TGI, llama.cpp): the thing that actually runs the model weights and produces tokens.
+- **Serving framework** (KServe, BentoML, Ray Serve, Seldon Core): the Kubernetes-aware layer that handles autoscaling, multi-model deployment, traffic routing, canary rollouts, observability.
+
+You typically use both. KServe (the [OpenShift AI](/blog/openshift-ai) standard) runs vLLM under the hood — KServe handles the K8s side, vLLM handles the inference side. Splitting the layers like this is what lets you upgrade your inference engine without changing your serving architecture, and vice versa.
+
+## Cost and latency: the numbers
+
+Order-of-magnitude figures for 2026 (will move):
+
+| Metric | Range |
+| --- | --- |
+| Time-to-first-token (TTFT) | 100ms - 2s depending on prefill length |
+| Time-per-output-token (TPOT) | 10-50ms for medium models, 50-200ms for large/reasoning models |
+| Throughput per H100 (70B model, FP8) | ~3000-8000 tokens/sec aggregate across concurrent users |
+| Cost per million tokens (closed APIs) | $0.10-$15 input / $0.30-$60 output, varies wildly by model |
+| Cost per million tokens (self-hosted, amortized) | $0.05-$2.00 depending on utilization |
+
+The economics flip dramatically based on **utilization**. A self-hosted H100 cluster running at 80% utilization is dramatically cheaper than the same cluster at 20%. Most teams under-utilize because their traffic is bursty and they over-provision for peak. The optimization that matters most is **driving utilization up** — caching, batching, multi-tenancy, routing easy queries to cheap models.
+
+## Inference trends in 2026
+
+- **Reasoning models inflate inference cost.** o-style models that generate long chain-of-thought before answering use 10-100× more output tokens per query. The inference economics for "reasoning" features are fundamentally different from chat.
+- **Long context becoming routine.** 1M-token context windows (Gemini, Claude) shift the bottleneck back to prefill compute and KV cache size. Most production deployments still use 8-32K because the economics aren't there yet for routine 1M.
+- **Multi-tier routing dominates.** Real applications route 60-80% of requests to cheap small models and reserve large models for the genuinely hard ones. The router is the highest-leverage architectural component in most production stacks.
+- **Disaggregated prefill goes mainstream.** Separate clusters for prefill and decode is now table stakes at top-1% scale.
+- **Inference-time scaling laws.** More compute at inference (multiple sample, best-of-N, search) produces better answers. The "inference budget" per query is now a deliberate product decision.
+- **Open-weights catching up.** Llama 4, Qwen 3, DeepSeek-V3, Granite have closed enough of the quality gap that "default to open weights for self-hosting" is a defensible position for most use cases.
+- **Specialty silicon emerging.** Groq for ultra-low-latency, Cerebras for ultra-large models, custom ASICs (AWS Trainium 3, Google TPU v6) for hyperscaler workloads.
+
+## Where to start
+
+For an organization standing up production inference:
+
+1. **Use an API first.** OpenAI, Anthropic, Bedrock, Vertex. Don't self-host until your token spend justifies the operational complexity (~$50K-$100K/month typically). Build the product; learn the workload shape.
+2. **Add a semantic cache.** 30-50% cost reduction is achievable; complexity is moderate.
+3. **Build the model router.** Don't send every query to GPT-4-class models. Most queries are answerable by a 3-8B model.
+4. **Instrument everything.** TTFT, TPOT, tokens/sec, cost per request, cache hit rate. You'll be optimizing all of these.
+5. **Decide on the open-weights path.** If self-hosting makes sense, start with **vLLM** on a small H100 cluster (or rent through Modal / Together / Anyscale / Lambda Cloud while you size). Pick an open model (Llama 3.3 70B or Mistral Large at minimum) and validate quality against your closed-API baseline.
+6. **Add the optimization stack as needed.** Quantization (FP8 or AWQ first), then prefix caching for shared system prompts, then multi-LoRA if you have fine-tunes, then speculative decoding if latency-sensitive.
+7. **Move to a serving framework** ([KServe](/blog/openshift-ai), BentoML, Ray Serve) once you have multiple models and care about K8s-style operations.
+8. **Long-term: evaluate disaggregated prefill** if your workloads have extreme TTFT vs TPOT asymmetry.
+
+## The traps
+
+- **Optimizing for benchmarks, not real workloads.** Tokens/sec on a synthetic benchmark says little about your actual user experience. Measure TTFT and TPOT under your real prompt-length distribution.
+- **Treating inference as "just deployment."** It isn't. Inference architecture choices (engine, batching, caching, routing) compound into 10× cost differences between teams running the same model.
+- **Ignoring utilization.** A self-hosted cluster at 20% utilization is more expensive than the API. Drive utilization or pay the cloud bill.
+- **Over-quantizing for prestige.** INT4 is great if your eval shows it doesn't hurt your specific use case. Don't quantize past what your eval supports.
+- **Skipping the eval.** Inference optimizations *will* introduce subtle quality regressions. Without a quality eval running on every deployment, you'll ship them.
+- **Forgetting cost when planning capacity.** Reasoning models, long context, multi-modal — each can multiply per-request cost by 10× or more. Capacity plans built on chat-style assumptions break when the product adds these features.
+
+The bigger picture: inference is no longer an afterthought of training. It's the layer where most ML engineering value gets created or destroyed at scale. For most teams in 2026, the inference stack is *the* AI stack — model selection, runtime engine, caching, routing, hardware. Get this right and the rest of the application stack follows. Get it wrong and the bill arrives before the product does.

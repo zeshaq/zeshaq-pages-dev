@@ -1,0 +1,1320 @@
+---
+title: "Types of AI models in 2026: a wide field guide"
+description: "The eight families of AI models that matter in production today — generalist LLMs, reasoning models, vision-language models, embeddings, image and video generation, speech and audio, code models, and classical tabular ML — plus the emerging families (small/on-device, time-series, domain-specialized, robotics, MoE, state-space). What each family is for, how they were trained, how the leading 2026 products compare, the serving stack underneath, the eval methodology, the cost economics, the safety landscape, and the modern practices that have settled around each."
+date: 2026-05-11
+category: AI
+---
+
+import Whiteboard from "../../components/Whiteboard";
+import Mermaid from "../../components/Mermaid";
+
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 210, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const branch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+
+  const R_HEADER = 380;
+  const headerCenter = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
+  nodes.push({
+    id: headerId,
+    position: { x: headerCenter.x - 105, y: headerCenter.y - 25 },
+    data: { label: header },
+    style: branchHeader,
+  });
+  edges.push({
+    id: "trunk_" + headerId,
+    source: "ai_models",
+    target: headerId,
+    style: { stroke: "#15803d", strokeWidth: 2 },
+  });
+
+  const FORWARD_START = 150;
+  const FORWARD_STEP = 180;
+  const PERP_OFFSET = 100;
+
+  leaves.forEach((label, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+
+    const x = headerCenter.x + forwardDist * dx + perpDist * px;
+    const y = headerCenter.y + forwardDist * dy + perpDist * py;
+
+    const id = headerId + "_" + slug(label);
+    nodes.push({
+      id,
+      position: { x: x - 80, y: y - 15 },
+      data: { label },
+      style: leaf,
+    });
+    edges.push({
+      id: "br_" + id,
+      source: headerId,
+      target: id,
+      style: { stroke: "#9ca3af", strokeWidth: 1 },
+    });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const branches = [
+  branch("Generalist LLMs", -90, ["GPT-5 / 4.1", "Claude Opus 4.7", "Gemini 2.5 Pro", "Llama 4", "Mistral Large 2", "DeepSeek V3", "Qwen 2.5 72B", "IBM Granite 3"], CX, CY),
+  branch("Reasoning Models", -45, ["OpenAI o-series", "Claude w/ thinking", "DeepSeek R1", "Gemini Thinking", "Qwen QwQ", "Test-time compute", "Self-consistency", "Verifier loops"], CX, CY),
+  branch("Vision-Language", 0, ["GPT-4o Vision", "Claude Vision", "Gemini Multimodal", "Llama 3.2 Vision", "Pixtral 12B", "Qwen2-VL 72B", "InternVL 2.5", "LLaVA-NeXT"], CX, CY),
+  branch("Embedding Models", 45, ["OpenAI embed-3", "Cohere Embed v3", "Voyage AI v3", "Nomic Embed v2", "BGE M3 (BAAI)", "E5 Mistral 7B", "jina-embeddings v3", "Sentence-Transformers"], CX, CY),
+  branch("Image & Video Gen", 90, ["Flux.1 (BFL)", "Stable Diffusion 3.5", "Midjourney v7", "DALL·E 3", "Imagen 3", "Sora 2", "Runway Gen-4", "ControlNet + LoRA"], CX, CY),
+  branch("Speech & Audio", 135, ["Whisper Large v3", "ElevenLabs v3", "OpenAI TTS HD", "Cartesia Sonic", "Deepgram Nova-3", "Suno v4 (music)", "AudioCraft", "Coqui XTTS"], CX, CY),
+  branch("Code Models", 180, ["Codestral 25B", "DeepSeek Coder V2", "Qwen2.5-Coder 32B", "Code Llama 70B", "StarCoder 2", "CodeGemma", "Granite Code", "Cursor SWE-1"], CX, CY),
+  branch("Classical / Tabular", -135, ["XGBoost", "LightGBM", "CatBoost", "scikit-learn", "Random Forest", "Gradient boosting", "Prophet / NeuralProphet", "TabNet / TabTransformer"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "ai_models", position: { x: CX - 110, y: CY - 40 }, data: { label: "AI Models" }, style: center },
+  ...branches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = branches.flatMap((b) => b.edges);
+
+"AI model" used to be a small phrase. For most of the last decade it meant *one* thing — a neural network trained on a specific task — and the interesting questions were about architecture (CNN? RNN? Transformer?) and training loss. In 2026 the phrase covers at least eight distinct families of artifacts (plus a handful of emerging ones), each with their own training recipe, serving stack, evaluation methodology, cost curve, license structure, and set of failure modes. A team that picks the wrong family for a use case can spend six months building something that a different family would have solved in two weeks — and most teams pick wrong at least once before they internalize the taxonomy.
+
+This post is the wide field guide. Eight core families, what each one is good at, the leading products in 2026, when to use it, when not to, how it was trained, the serving stack underneath it, how you actually call it, and the modern practices that have settled around each. Then the emerging families that don't yet fit into the eight — small/on-device, time-series foundation, domain-specialized, robotics foundation, mixture-of-experts, state-space — and the cross-cutting topics that touch every family: post-training, hardware, serving, evaluation, cost economics, safety, and the open-weights vs closed-API decision.
+
+For the broader tool landscape (vector DBs, agent frameworks, MLOps, evals) see [the AI/ML landscape map](/blog/ai-ml-landscape-2026). For platform-level operationalization see [OpenShift AI](/blog/openshift-ai), [NVIDIA AI Enterprise](/blog/nvidia-ai-enterprise), and [H2O.ai](/blog/h2o-ai). For the workflow side see [GitOps in 2026](/blog/gitops-wide-introduction) and [the data scientist path post](/blog/become-data-scientist-2026).
+
+## The eight families
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={900} />
+
+Eight branches; each one is a *family of models* with a coherent training recipe, serving pattern, and use-case fit. Within each family the leaves are the leading products as of mid-2026. The list is opinionated — a comprehensive catalog would have hundreds — but these are the ones that show up in real production stacks. Beyond the eight there is a long tail of emerging and specialized families that are covered later in the post.
+
+## Why this taxonomy and not another
+
+Several other groupings are reasonable. By **modality** (text, image, audio, video, tabular, multimodal). By **architecture** (transformer, diffusion, state-space, GBDT). By **deployment** (closed-API, open-weights, on-device, hybrid). By **size** (frontier, mid-tier, small, tiny). All defensible.
+
+The reason this post groups by **use-case-shaped family** is that the cuts a practitioner cares about are not "which architecture" but "what does it do, and what do I call it for." A diffusion model and a transformer can both generate images; the family that matters is "image generation," not "diffusion." A vision-language model and a generalist LLM are both decoder-only transformers; the family that matters is what they do, not their architecture.
+
+What this taxonomy deliberately *excludes*:
+
+- **Agent frameworks** (LangChain, LangGraph, CrewAI). These orchestrate models; they are not models themselves.
+- **Vector databases** (Pinecone, Weaviate, pgvector). These store embeddings; they are not models.
+- **MLOps tools** (MLflow, W&B). These manage lifecycles.
+- **Inference servers** (vLLM, Triton, NIM). These serve models. Covered later as cross-cutting infrastructure.
+
+The shape of the rest of the post: a quick cheat-sheet, then a deep section per family covering history, leading products, training recipe, API patterns, modern practices, evaluation, and failure modes. Then emerging families, then the cross-cutting topics, then how to put it together.
+
+## The cheat-sheet
+
+If you only remember one table from this post:
+
+| Family | Input → Output | Lead use cases | Typical serving cost | Where it fails |
+| --- | --- | --- | --- | --- |
+| **Generalist LLMs** | Text → text | Chat, drafting, summarization, classification, extraction | $-$$ per million tokens | Math, multi-step planning, long-horizon tasks |
+| **Reasoning models** | Text + hidden CoT → text | Math, code debug, planning, scientific Q&A | $$$ — 10-100× generalists | Latency-sensitive UX, simple lookups (overkill) |
+| **Vision-Language** | Image(s) + text → text | OCR, diagram interpretation, UI agents, visual QA | $$ | Pixel-perfect localization, very long videos |
+| **Embedding models** | Text / image → vector | Retrieval (RAG), semantic search, clustering, dedup | ¢ per million tokens | Generation tasks; you still need an LLM downstream |
+| **Image/Video gen** | Text (+ image) → image / video | Marketing assets, mockups, video shorts, design iteration | $$ per asset | Editable text inside images, brand fidelity, long-form coherence |
+| **Speech & audio** | Audio ↔ text | Transcription, voice agents, dubbing, content production | $ per minute | Heavy accents, overlapping speakers, real-time at the edge |
+| **Code models** | Code + context → code | Autocomplete, IDE agents, refactors, test generation | $ — $$ | Architecture choices, security trade-offs, domain logic |
+| **Classical / tabular** | Tabular features → label / score | Fraud, churn, pricing, ranking, forecasting | $ (CPU only) | Unstructured inputs, deep relational reasoning |
+
+The cost columns are deliberately fuzzy — the right comparison is *relative cost per query*, not list price per token. Generalist LLMs are commoditizing fast; reasoning models still command 10-100× premium; embeddings are nearly free; classical models cost almost nothing to serve once trained.
+
+## Timeline — how the families emerged
+
+The eight families did not all appear at once. Tracing the lineage helps understand which categories are mature, which are still settling, and which are about to split:
+
+| Year | Family | Defining event |
+| --- | --- | --- |
+| 1995-2010 | Classical / tabular | scikit-learn (2007), XGBoost paper (2014), the GBDT consolidation |
+| 2013-2017 | Embeddings (precursor) | word2vec (2013), GloVe (2014), the dense-vector turn |
+| 2017 | All transformer families | "Attention Is All You Need" — the paper that enabled everything below |
+| 2018-2019 | Embeddings (modern) | BERT (2018), Sentence-Transformers (2019) |
+| 2018-2021 | Image generation | StyleGAN (2018), DALL·E (2021), Stable Diffusion (2022) |
+| 2020-2022 | Generalist LLMs | GPT-3 (2020), ChatGPT (2022), GPT-4 (2023) |
+| 2021-2023 | Code models | Codex (2021), Copilot (2021), Code Llama (2023) |
+| 2022-2023 | Speech (modern) | Whisper (2022), ElevenLabs (2022-2023), Suno (2023) |
+| 2023-2024 | Vision-Language | GPT-4V (2023), Gemini natively multimodal (2024), GPT-4o (2024) |
+| 2024 | Reasoning models | OpenAI o1 (2024), DeepSeek R1 (2025), the test-time-compute era |
+| 2024-2025 | Video generation | Sora (2024), Runway Gen-3 (2024), Veo (2024) |
+| 2025-2026 | Agentic coding | Claude Code, Cursor Agent, Aider — the breakout pattern |
+| 2026+ | Time-series foundation, robotics foundation | TimesFM, Chronos, PI π0, NVIDIA GR00T — still emerging |
+
+Two observations from the timeline:
+
+- Most families took 2-4 years from "research demo" to "production-grade." Reasoning models compressed this to under 12 months; the field is accelerating.
+- The 2017 transformer paper underlies seven of the eight families. The exception is classical ML, which predates it by decades and remains the right tool for tabular problems.
+
+## Family 1 — Generalist LLMs
+
+### What they are
+
+The flagship category. A decoder-only transformer trained autoregressively on internet-scale text — typically 5-30 trillion tokens spanning web crawls, books, code repositories, scientific papers, and curated synthetic data. Post-trained with a stack of techniques (SFT → RLHF → DPO or RLAIF) to follow instructions, refuse harmful requests, produce coherent extended text, and emit structured outputs when asked.
+
+The defining property: they are *generalist*. The same set of weights handles chat, summarization, classification, extraction, translation, drafting, brainstorming, math (poorly), and code (often well). This generality is what makes them disruptive — and what makes the boundary between "model" and "platform" so blurry.
+
+### Lineage in a paragraph
+
+GPT-3 (2020) demonstrated few-shot learning. ChatGPT (2022) added instruction-tuning and reached a billion users. GPT-4 (2023) raised the quality bar. Llama (2023) and Llama 2 made open-weights credible. Llama 3 and Mixtral (2024) made open-weights *competitive*. DeepSeek V3 (late 2024) demonstrated that frontier-class generalist models could be trained for under $10M of compute. GPT-5, Claude 4 family, Gemini 2.5, and Llama 4 (2025-2026) compressed the gap between closed-API frontier and open-weights to a single quality tier on most benchmarks. The story of 2026 is commoditization at the top and continued differentiation only on reasoning, agentic behavior, and specific verticals.
+
+### Leading products in 2026
+
+**Closed-API frontier:**
+
+- **OpenAI GPT-5 family** — frontier general intelligence, native tool use, 1M-token context, integrated vision and voice. The default for "I need the best general-purpose model" in many shops, though increasingly contested.
+- **OpenAI GPT-4.1** — cost-optimized tier of the same generation, ~10× cheaper than GPT-5, used as the production workhorse for high-volume features.
+- **Anthropic Claude Opus 4.7** — the frontier model in Anthropic's lineup. Particularly strong on code, agentic tool use, long-context reasoning, and following nuanced instructions. The Opus tier is where Anthropic places the latest research.
+- **Anthropic Claude Sonnet 4.6** — mid-tier, the most-used Anthropic model. Strong cost/quality balance; powers many enterprise deployments.
+- **Anthropic Claude Haiku 4.5** — fast, cheap tier. Used for classification, routing, and high-throughput summarization.
+- **Google Gemini 2.5 Pro** — natively multimodal from the ground up, 2M-token context, deep Google Workspace integration. The category leader on long-context tasks.
+- **Google Gemini 2.5 Flash** — Google's mid-tier; very low latency, strong cost profile, the routing default for Google's own apps.
+
+**Open-weights frontier:**
+
+- **Meta Llama 4** — the open-weights model with the broadest deployment in 2026. Released in three sizes (8B, 70B, 405B), all under the Llama Community License (permissive for most uses, restrictions for the largest companies).
+- **Mistral Large 2** — French frontier model, Apache 2.0 license, strong on European languages and coding.
+- **DeepSeek V3** — 671B-parameter mixture-of-experts model from China, released with open weights in early 2025. Genuinely competitive with frontier closed models on most benchmarks; trained for ~$6M of compute, which redefined what was thought possible.
+- **Alibaba Qwen 2.5 72B** — Chinese-English bilingual frontier, very strong on math and code, Apache 2.0.
+- **IBM Granite 3** — enterprise-focused, Apache 2.0, fully transparent training data provenance for regulated industries.
+
+**Small but capable (the "tiny frontier"):**
+
+- Claude Haiku 4.5, GPT-5 mini, Gemini 2.5 Flash, Llama 3.3 8B, Mistral Small 3, Microsoft Phi-4, Google Gemma 2 9B. These are the models that fit in 16-24GB of GPU memory and can serve thousands of requests per second on a single H100. The quality gap to frontier has been closing roughly 1 year per generation — what was frontier in 2024 is the small-model tier in 2026.
+
+### Training recipe in detail
+
+A frontier generalist LLM in 2026 is the output of a pipeline that looks roughly like this:
+
+<Mermaid client:load chart={`flowchart LR
+  Web[Web corpora] --> Mix[Data mix + filtering]
+  Books[Books + papers] --> Mix
+  Code[Code repos] --> Mix
+  Synth[Synthetic data] --> Mix
+  Mix --> PT[Pre-training: next-token prediction]
+  PT --> Base[Base model]
+  Base --> SFT[Supervised fine-tuning]
+  SFT --> RLHF[RLHF / DPO / RLAIF]
+  RLHF --> Safety[Safety + refusal training]
+  Safety --> Released[Released model]
+
+  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  classDef alert fill:#fafafa,stroke:#15803d,color:#1f2937
+  class Mix,PT,SFT,RLHF,Safety phase
+  class Web,Books,Code,Synth,Base,Released alert`} />
+
+- **Pre-training.** Next-token prediction over 5-30 trillion tokens. The model learns to predict the next token given everything before it. This phase consumes 95% of the total compute and produces the *base model* — a model that completes text but does not yet follow instructions.
+- **Supervised fine-tuning (SFT).** Hundreds of thousands of instruction-response pairs, written or curated by humans, teach the base model to follow instructions. The output is an "instruct" model.
+- **Preference optimization.** Either RLHF (Reinforcement Learning from Human Feedback — train a reward model from human preferences, then optimize the policy against it) or DPO (Direct Preference Optimization — a closed-form variant that skips the reward model) or RLAIF (use AI feedback instead of human). This is where the model learns to produce responses humans prefer.
+- **Safety training.** Red-team adversarial prompts; train refusals. Constitutional AI (Anthropic's approach) uses a written constitution and self-critique to make safety training scalable.
+- **Tool-use and structured-output training.** Modern models are post-trained with explicit tool-call and JSON-schema-output examples. This is what makes the function-calling APIs feel natural.
+
+The frontier of training research in 2026 is **post-training**, not pre-training. Most of the visible quality differences between frontier models come from how each lab post-trains, not from the underlying base models.
+
+### How you actually use them
+
+The patterns that landed in production:
+
+- **Direct API call.** REST or SDK, one request at a time. Fine for low-volume features. The default for prototypes.
+- **Streaming.** Server-sent events stream tokens as they're produced. Essential for chat UX; useful even in pipelines for early-stopping on bad outputs.
+- **Structured outputs.** `response_format={type: "json_schema", schema: ...}` (OpenAI), Pydantic models (Anthropic SDK), or response schemas (Gemini). The model is *guaranteed* (via constrained decoding) to emit JSON matching your schema. The 2024-2026 shift away from "parse free-form text" toward "the model emits typed JSON" is one of the most important upgrades to the practical workflow.
+- **Tool use / function calling.** Function definitions exposed to the model; it emits `tool_call` blocks; your code executes them; you loop. This is the foundation of every agent stack.
+- **Prompt caching.** OpenAI, Anthropic, and Google all support caching the static prefix of a prompt (system message, instructions, RAG context, few-shot examples) for repeated queries. The cache TTL is typically 5 minutes (Anthropic) or longer (OpenAI's "cached input" pricing tier). Cache hits cost 10-25% of un-cached tokens. For pipelines with stable prefixes this is a 50-90% cost reduction — always on for production.
+- **Multi-turn conversation.** Pass the full message history each turn; the model has no memory of its own. Cache the history prefix to avoid re-paying for it.
+- **System prompts.** A separate role for the developer's instructions, treated with higher priority than user input by all major providers. Where you put "you are a helpful assistant" and the rest of the persona / task instructions.
+- **Few-shot prompting.** A handful of input-output examples in the system prompt. Still surprisingly effective; often beats zero-shot by 10-20 percentage points on hard tasks.
+- **Self-hosted via vLLM / TGI / NIM.** For open-weights models when data residency, throughput, cost, or customization dictates.
+
+### Modern practice
+
+The patterns that production teams have converged on:
+
+- **Route across models by task.** Cheap models for classification and extraction; mid-tier for drafting and rewriting; frontier only for the open-ended hard cases. Most production systems use 2-3 generalist LLMs across the same product.
+- **Always cache the static prefix.** Anthropic and OpenAI both have explicit cache APIs; Gemini and others have implicit caching. The cache delta between "smart use" and "default use" is often >50% cost.
+- **Always use structured outputs when the consumer is code.** Free-form text outputs are for humans; code consumers should ask for JSON.
+- **Evaluate before you deploy.** A test set of 50-500 inputs with gold outputs and an automated scorer. The "I changed the prompt and now things might be better or worse" era should be over.
+- **Log every call.** Inputs, outputs, latency, cost, model version. LangSmith, LangFuse, Helicone, or in-house. Without this you cannot debug regressions or measure improvements.
+- **Version your prompts like code.** Prompts in source control, tagged by version. Models change underneath you; pin model versions.
+
+### Where it fails
+
+- **Multi-step reasoning.** A frontier generalist will confidently produce wrong answers to multi-step math, logic puzzles, or planning problems. This is what reasoning models (Family 2) exist to fix.
+- **Long-horizon agency.** Even with tool use, generalist LLMs drift over long agent sessions. Coherence past 50-100 tool calls is fragile.
+- **Recency.** The training cutoff means the model doesn't know about events after some date. RAG or tool use fixes this for specific facts; the model's *understanding* of recent shifts is harder to patch.
+- **Hallucination on facts.** The model emits plausible-sounding text whether or not the underlying fact is true. RAG, citation requirements, and external verification are the practical mitigations.
+- **Domain-specific accuracy.** Frontier generalists are *good* at most domains but rarely *great*. Medical, legal, and scientific applications often benefit from domain-fine-tuned models or RAG over authoritative sources.
+
+## Family 2 — Reasoning models
+
+### What changed
+
+The category that emerged in late 2024 and reshaped the frontier through 2025-2026. Instead of producing tokens left-to-right and committing, these models generate a long *internal* chain of thought before producing the final answer. The "thinking" is hidden from the user (or partially summarized) but increases the compute spent per response by 10-100×.
+
+The technical breakthrough underneath was **RLVR — Reinforcement Learning from Verifiable Rewards**. The model is trained to generate reasoning traces that lead to *verified-correct* answers, then to compress and refine those traces. Math problems and code problems are ideal training substrates because correctness can be checked automatically. Once the model learns to reason in those verifiable domains, the skill generalizes (partially) to non-verifiable domains.
+
+### Leading products
+
+- **OpenAI o-series** (o3, o4-mini, and the upcoming o5). The category-defining family. OpenAI keeps the reasoning traces almost entirely hidden; you see only a summary.
+- **Anthropic Claude with extended thinking.** A *mode* of Claude (Opus or Sonnet 4.6/4.7) that allocates a configurable thinking budget. The reasoning is partially visible — Claude exposes its thinking as a separate content block, which is useful for debugging.
+- **DeepSeek R1.** The open-weights breakthrough of early 2025. Released the reasoning traces alongside the model and described the GRPO (Group Relative Policy Optimization) training technique that made it work. Catalyzed an open-weights reasoning ecosystem.
+- **Google Gemini 2.5 Thinking.** Google's reasoning variant; integrated tightly with Gemini's native multimodality.
+- **Alibaba Qwen QwQ.** Open-weights, very strong on math and code reasoning.
+- **OpenAI o-series mini.** Cost-reduced reasoning models; the workhorse tier for production reasoning.
+
+### The cost math
+
+Reasoning models typically generate 10-50× more output tokens than they would have without the thinking step. Per-token pricing is similar to or slightly above the equivalent generalist, but the total spend per query is dramatically higher. A simple summary that would cost $0.001 with a generalist might cost $0.05-0.20 with a reasoning model. This is why the **router pattern** (below) is non-optional for production reasoning use.
+
+### When to use
+
+- Math, formal logic, theorem-shaped problems
+- Multi-step planning where the order matters
+- Code debugging across multiple files
+- Scientific Q&A where the right answer is checkable
+- Hard extraction problems where the schema requires multi-step alignment
+- Strategic decisions where the model needs to consider multiple options
+
+### When *not* to use
+
+- Latency-sensitive UX (the thinking phase often takes seconds-to-minutes)
+- Simple lookups, classification, summarization — generalist LLMs are 10-100× cheaper and just as good
+- Anything where the failure mode is "model produces plausible-looking output." Reasoning models can still hallucinate confidently — they just do so after thinking longer about it.
+- High-volume background tasks where cost dominates
+
+### Modern practice — the router pattern
+
+<Mermaid client:load chart={`flowchart LR
+  Q[Request] --> R{Router}
+  R -- simple --> Cheap[Cheap generalist LLM]
+  R -- complex --> Reasoning[Reasoning model]
+  R -- needs world knowledge --> RAG[Generalist + RAG]
+  Cheap --> Out[Response]
+  Reasoning --> Out
+  RAG --> Out
+
+  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  classDef alert fill:#fafafa,stroke:#15803d,color:#1f2937
+  class R,Cheap,Reasoning,RAG phase
+  class Q,Out alert`} />
+
+A small classifier model (often a fine-tuned generalist or a few-prompt zero-shot classifier) decides which path the request takes. Reasoning models become a *premium tier* the router escalates to, not the default. This is now the standard architecture for any product spending more than a few thousand dollars per month on inference.
+
+### Self-consistency and verifier loops
+
+Two patterns that augment reasoning models without replacing them:
+
+- **Self-consistency.** Run the same reasoning model N times with sampling, take the majority answer. Trades inference cost for accuracy. Worth it on hard verifiable problems.
+- **Verifier loops.** A separate verifier model (or rule-based checker) scores the reasoning model's answer; if it fails, try again with different sampling or a different model. Common in production math, code, and scientific Q&A pipelines.
+
+### Where the field is heading
+
+Reasoning models are still early. The 2026 frontier has three open questions: (1) how to extend reasoning skill beyond verifiable domains, (2) how to control the thinking budget dynamically per query, (3) how to combine reasoning with tool use without latency exploding. Expect substantial product changes here in 2027.
+
+## Family 3 — Vision-Language models
+
+### Definition
+
+Models that accept images alongside (or instead of) text and produce text output. Not to be confused with image *generation* (Family 5) — vision-language models are about *interpretation*. The output is always text (or structured text); the visual input is the new ingredient.
+
+### Architectural lineage
+
+Two generations of architecture have shipped:
+
+- **First-generation (2022-2024): CLIP-encoder + LLM.** A vision encoder (often CLIP or SigLIP) produces image embeddings; a projection layer maps them into the LLM's token space; the LLM is trained or fine-tuned to handle these "image tokens" alongside text. LLaVA, BLIP-2, and the original GPT-4V all worked this way.
+- **Second-generation (2024-2026): natively multimodal.** Image, text, audio tokens are mixed into the same training stream from the start. The model has no separation between modalities. Gemini was the first major model trained this way; GPT-4o, Llama 3.2 Vision, and Pixtral followed. The 2025-2026 shift was from "vision is bolted on" to "the model thinks in pixels and tokens equally."
+
+### Leading products
+
+- **GPT-4o, GPT-5 native vision.** Top quality on most benchmarks; very strong on chart and diagram interpretation.
+- **Claude with vision.** Particularly strong at "what's in this screenshot" tasks and computer-use agent scenarios.
+- **Gemini 2.5 multimodal.** The category leader on long-document and video tasks because of the 2M-token context.
+- **Meta Llama 3.2 Vision (11B, 90B).** Open-weights, the default open vision model in 2026.
+- **Mistral Pixtral 12B.** Strong open-weights option, good cost profile.
+- **Alibaba Qwen2-VL (7B, 72B).** Particularly strong on OCR and Chinese-language documents.
+- **OpenGVLab InternVL 2.5.** Open research model, very strong on benchmarks.
+- **LLaVA-NeXT.** The academic-lineage open model; less polished than the labs' models but useful as a baseline.
+
+### Use cases that work well
+
+- **OCR and document understanding.** Reading PDFs, scanned forms, screenshots, handwriting. Modern vision-language models replace both Tesseract and most form-extraction SaaS for ~80% of use cases. The killer feature is that you can ask for the output in a specific JSON schema in one call.
+- **Diagram and chart interpretation.** Describing what a flowchart, architecture diagram, or business chart says. Useful for accessibility, slide-deck QA, and automated diagram-to-text conversion.
+- **UI agent perception.** Computer-use agents (Anthropic's Computer Use, OpenAI Operator, browser-use agents) rely on vision-language models to *see* what's on screen. The model decides where to click, what to type, when to scroll.
+- **Visual QA over photos.** "Is the person in this photo wearing safety equipment?" "What plant is this?" "Are these two products the same SKU?"
+- **Video frame understanding.** Sample frames, feed them in, get a description. Native video is starting to land (Gemini 2.5 handles video natively up to ~1 hour) but frame sampling is still the workhorse pattern.
+- **Receipt and invoice extraction.** A category that was a SaaS line of business in 2022 is now a 50-line script in 2026.
+- **Accessibility.** Alt-text generation, scene description for visually impaired users.
+- **Defect detection.** "Does this manufactured part have a visible defect?" — paired with classical CV for precise localization.
+
+### Failure modes
+
+- **Pixel-perfect localization.** Models are good at "the cat is in the top-right." They're bad at "the bounding box is (412, 87, 580, 230)." For precise localization, pair with a detection model (YOLO, DETR, SAM).
+- **Long videos.** Context windows are growing, but 2-hour videos are still not natively processable; sample-frame strategies remain necessary.
+- **Tiny text in low-resolution images.** OCR is good, not magic. Resolution matters; pre-process before sending.
+- **Counting many objects.** "How many bottles are in this image?" past ~10 starts to be unreliable. Use detection models for counting.
+- **Spatial reasoning.** "What's behind the chair?" — hit or miss; explicit prompts help.
+
+### How you actually use them
+
+The API surface mirrors text LLMs — same SDK, same tool use, but the `content` blocks include `image` types. Most teams treat vision-language models as drop-in upgrades to the generalist family for any flow that might touch a screenshot or a document.
+
+A typical structured-extraction call:
+
+```python
+response = client.messages.create(
+    model="claude-opus-4-7",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+            {"type": "text", "text": "Extract the invoice as JSON: {invoice_number, date, line_items, total}."}
+        ]
+    }],
+    response_format={"type": "json_schema", "schema": invoice_schema}
+)
+```
+
+The same pattern works for OCR, diagram interpretation, defect inspection, and UI-state extraction. The unification of "image input + structured output" is the practical breakthrough.
+
+### Modern practice
+
+- **Always provide a schema** if the downstream is code. Free-form descriptions of images are useful for humans, useless for pipelines.
+- **Pre-process images** to reasonable resolutions. Most APIs cap input resolution; over-resolution costs tokens without helping quality.
+- **Pair with detection models** when you need exact bounding boxes. Vision-language models describe; detection models localize.
+- **Sample video frames** at 1-2 FPS for short clips. For long videos, use a two-pass approach: cheap model summarizes per-minute, frontier model digests the summaries.
+
+## Family 4 — Embedding models
+
+### The unsung load-bearing family
+
+An embedding model takes a chunk of text (or image, or code) and produces a fixed-size vector. Vectors that are close together represent semantically similar content. This is what every RAG system, semantic search, recommendation engine, deduplication pipeline, and clustering job depends on.
+
+The economics are dramatic: embedding all of English Wikipedia costs less than running a single reasoning-model query. The cost of inference for embeddings is essentially zero compared to the LLMs that consume them. This means **embedding quality matters far more than embedding cost** — don't optimize the wrong axis.
+
+### Leading products
+
+- **OpenAI text-embedding-3-large.** 3072-dimensional, matryoshka (truncatable), strong baseline.
+- **Cohere Embed v3.** Multilingual, particularly strong on retrieval benchmarks, dedicated re-ranker companion.
+- **Voyage AI v3.** The highest-quality 2026 commercial option for English in many benchmarks. Specialized variants (Voyage-Code, Voyage-Finance, Voyage-Law) for domain-tuned retrieval.
+- **Nomic Embed v2.** Open-weights, Apache 2.0, competitive with commercial offerings.
+- **BAAI BGE M3.** Multilingual + multi-granularity (token, sentence, document-level embeddings from one model). Open-weights, very widely deployed.
+- **E5-Mistral-7B.** The "embedding model on a decoder backbone" pattern. Higher cost but state-of-the-art quality.
+- **Jina embeddings v3.** Open-weights, very strong on multilingual.
+- **Sentence-Transformers ecosystem.** The library + zoo of models. The reference implementation for open-source embedding work.
+
+### Why this family is harder than it looks
+
+A common mistake: pick an off-the-shelf embedding model, plug it in, ship. RAG quality is roughly 60% retrieval quality. The fanciest LLM cannot compensate for a retrieval system that fetches the wrong chunks. The embedding model — and the chunking strategy that feeds it — is where most RAG systems live or die.
+
+Specific gotchas:
+
+- **Chunking matters.** 512-token chunks with 50-token overlap is a reasonable default, but the right answer depends on the document type. Code chunks should break at function boundaries; markdown chunks at section boundaries; legal docs at clause boundaries.
+- **The query and the document are different shapes.** A natural-language query like "how do I rotate my API key" must retrieve a document chunk like "API key rotation procedure: navigate to settings..." These have different surface forms. Some embedding models (Voyage, Cohere) have separate query and document encoders or instructions to handle this; others do not.
+- **Domain shift.** General-purpose embeddings hit ~80% of quality on your domain. Fine-tuning on your domain's query-document pairs adds 10-15 percentage points.
+- **Multilingual is not free.** Many "multilingual" embeddings are dominated by English in their training data; non-English retrieval quality is often 20% worse.
+
+### Modern practice
+
+- **Hybrid retrieval.** Dense embeddings *plus* BM25 keyword search, fused via reciprocal rank fusion (RRF) or learned re-rankers. Pure vector search lost its mindshare to hybrid by mid-2024.
+- **Re-rankers.** A separate (often smaller, cross-encoder) model that takes the query and top-K candidates and re-scores them. Cohere Rerank, Voyage Rerank, BGE Reranker. Substantial quality lift (typically +5 to +15 percentage points on retrieval metrics) for modest cost.
+- **Matryoshka embeddings.** New embedding APIs return truncatable vectors — you can use the first 256 dimensions for fast filtering and the full 3072 for fine ranking, from the same model. Storage savings of 4-12× with minimal quality loss.
+- **Domain fine-tuning.** Off-the-shelf embeddings hit ~80% of quality. Fine-tuning on your domain's query/document pairs takes you to ~90%. Sentence-Transformers + your own retrieval logs is the standard recipe.
+- **Multimodal embeddings.** CLIP-style models that embed images and text into the same space. Used for image search, multimodal RAG, product catalog dedup.
+- **ColBERT-style late interaction.** A different paradigm — each token gets its own embedding, scoring happens via per-token max-similarity. Higher cost, higher quality. Used by Voyage and increasingly by self-hosted systems via PLAID and similar.
+
+### How you actually use them
+
+The API is dead simple:
+
+```python
+embeddings = client.embeddings.create(
+    model="text-embedding-3-large",
+    input=["chunk 1", "chunk 2", ...],
+    encoding_format="float"
+)
+```
+
+The complexity is everywhere except the API call:
+
+- The chunking pipeline that produces the inputs.
+- The vector store (pgvector, Qdrant, Pinecone, Weaviate, Milvus) that stores and queries them.
+- The retrieval-time logic (hybrid, re-rank, filter, MMR for diversity).
+- The evaluation pipeline that measures retrieval quality with metrics like Recall@K, NDCG, MRR.
+
+### Where to start
+
+For a new RAG system in 2026: pgvector + OpenAI embed-3 small + Cohere Rerank + 512-token chunks with 50-token overlap + RRF for hybrid fusion. Eight components, four of them off-the-shelf. Optimize specific layers only when they're measurably the bottleneck.
+
+## Family 5 — Image and video generation
+
+### Architectural variety
+
+The most architecturally diverse of the eight families. Three approaches coexist:
+
+- **Diffusion models.** Start with random noise, iteratively denoise toward the target image guided by a text encoder. Stable Diffusion, Flux, Midjourney all started here. Still the dominant approach for image generation.
+- **Transformer-based.** Tokenize images via a VQ-VAE or similar, then autoregressively generate image tokens. OpenAI's DALL·E was originally this; the lineage continues in image-token models.
+- **Hybrid (latent diffusion).** Diffusion in a learned latent space rather than pixel space. Faster, lower memory. The Stable Diffusion family.
+
+Video generation is where the architecture is most contested in 2026:
+
+- **Sora 2** uses a transformer-based "video tokens" approach with diffusion training, on patches of spacetime.
+- **Runway Gen-4** and **Pika** use diffusion on temporal video latents.
+- **Kling** and **Luma** use latent video diffusion.
+
+### Leading products
+
+**Image, frontier closed:**
+
+- Midjourney v7 — aesthetic quality leader, opinionated style, web-and-Discord interface, no API for v7 yet.
+- OpenAI's GPT-image-1 (the DALL·E-3 successor inside the GPT-5 stack) — integrated with chat, strong at prompt adherence.
+- Google Imagen 3 — Google Cloud / Vertex integration, strong at text-in-images.
+
+**Image, open-weights:**
+
+- Black Forest Labs Flux.1 (dev / pro / schnell variants) — the open-weights leader for image quality in 2026. Apache 2.0 for the schnell variant, non-commercial for dev, commercial license for pro.
+- Stability AI Stable Diffusion 3.5 — the reference open-weights model, with the broadest ecosystem of LoRAs, ControlNets, and finetunes.
+
+**Video:**
+
+- OpenAI Sora 2 — frontier closed, very high quality up to ~1 minute clips with audio.
+- Runway Gen-4 — production-grade for filmmakers, strong control surface.
+- Pika 2.x — strong on social-media-format video.
+- Kling — Chinese frontier video model, very competitive.
+- Luma Dream Machine — strong on artistic and stylized output.
+
+**Control and customization:**
+
+- ControlNet — condition image generation on depth maps, edge maps, poses, segmentation masks. The "I want this *exact* composition" tool.
+- IP-Adapter — condition on a reference image's style or subject.
+- LoRA fine-tuning — train a small adapter on 20-50 reference images of a subject or style. The dominant customization pattern.
+- DreamBooth — older subject-injection technique; mostly superseded by LoRA.
+
+### Use cases that actually work in production
+
+- **Marketing asset generation.** Hero images, social media variants, A/B testing creative. Has eaten meaningful share from stock photography vendors.
+- **Mockups and design iteration.** Wireframe → rendered concept in seconds. UI designers use Midjourney + ControlNet daily.
+- **Stock photography replacement.** Custom imagery instead of Shutterstock. Particularly for blogs, social media, and internal communications.
+- **Video shorts and explainers.** Sora 2 + an LLM-generated script + ElevenLabs voiceover is the 2026 "1-minute explainer" stack.
+- **Product photography augmentation.** Real product photo + AI-generated background variants. E-commerce shops use this at scale.
+- **Storyboarding.** Concept artists generate dozens of variations before manual refinement.
+- **Game asset generation.** Backgrounds, NPC portraits, environmental assets. Increasingly common in indie game development.
+
+### Failure modes
+
+- **Text inside images.** Improved drastically (Flux and Imagen handle short text well) but still fragile for paragraphs, brand wordmarks, and non-Latin scripts.
+- **Brand fidelity.** Putting *your* logo in 50 different shots requires LoRA fine-tuning or IP-Adapter — not just a text prompt.
+- **Long-form video coherence.** 10-second clips are excellent. Multi-minute coherent narratives are still hard. Sora 2 made progress but didn't fully solve.
+- **Hands, anatomy, edges.** Vastly improved but still the canonical "AI image" tell.
+- **Same subject across multiple images.** Without LoRA or IP-Adapter, generating "the same character in three different scenes" is unreliable.
+- **Physical accuracy.** Reflections, shadows, perspective are mostly correct but not always; engineering and architecture work needs human review.
+
+### Modern practice
+
+- **One-off creative**: Midjourney or DALL·E. Best quality with no setup; pay per image.
+- **Programmatic generation** (millions of images, A/B testing creative variants): self-host Flux.1 dev or SD 3.5 on a GPU pool, drive it from your own service. Cost per image at scale is 10-50× cheaper than API.
+- **Brand-specific subjects**: train a LoRA on 20-50 reference images. Costs ~$5-50 and produces shockingly good subject-faithful results.
+- **Strict composition control**: ControlNet on top of Flux or SD. Provide depth map, edge map, or pose; generate within those constraints.
+- **Video production**: Sora 2 or Runway Gen-4 for hero shots; cheaper models for B-roll; manual edit in Premiere or DaVinci.
+- **Inpainting and editing**: rather than full re-generation, edit specific regions. The 2026 image-editing UX has stabilized around "select a region, describe the change, regenerate just that region."
+
+### Serving and infrastructure
+
+A 24GB GPU can run Flux.1 dev quantized; full-precision needs 40GB+. ComfyUI is the dominant open-source workflow tool; A1111 is the older "stable diffusion web UI" reference; Diffusers (Hugging Face) is the library for Python integration. For production scale, custom inference servers built on Diffusers + Triton are standard.
+
+## Family 6 — Speech and audio
+
+### Three sub-families
+
+Two distinct sub-families share this branch, with a third emerging:
+
+- **ASR** (automatic speech recognition, audio → text). Transcription.
+- **TTS** (text-to-speech, text → audio). Voice generation.
+- **Music and sound effect generation.** The newest; quality is now strong enough for production use.
+
+### Leading products
+
+**ASR:**
+
+- **OpenAI Whisper Large v3.** The open-weights default. Excellent quality across 100+ languages. The model that defined the modern ASR baseline.
+- **Deepgram Nova-3.** Commercial, very low latency, particularly strong on conversational audio and accents.
+- **AssemblyAI.** Commercial, strong on speaker diarization and topic detection.
+- **AWS Transcribe, Google STT, Azure Speech.** Hyperscaler offerings; the right answer when you're already in that cloud.
+- **faster-whisper, whisper.cpp, Parakeet (NVIDIA).** Optimized open-weights inference engines.
+
+**TTS:**
+
+- **ElevenLabs v3.** The quality leader for English. Excellent voice cloning (30 seconds of reference audio).
+- **Cartesia Sonic.** Low-latency leader; built for real-time voice agents.
+- **OpenAI TTS HD.** Strong quality, widely deployed, OpenAI's official voices.
+- **Coqui XTTS.** Open-weights, voice cloning, the open-source default.
+- **Hume AI.** Emotion-aware; the only major TTS that produces controllable affect.
+- **Google Cloud TTS, Azure TTS, Amazon Polly.** Hyperscaler offerings; reliable, polished, less personality.
+
+**Music and sound:**
+
+- **Suno v4.** Frontier music generation; lyrics + style → full song.
+- **Udio.** Competing frontier; very strong on certain genres.
+- **Meta AudioCraft.** Open-weights, includes MusicGen and AudioGen.
+
+**Voice cloning:**
+
+- ElevenLabs, Cartesia, Resemble AI — give 30 seconds of reference audio, get back a model that speaks anything in that voice.
+
+### Where they're production-grade
+
+- **Meeting transcription** (Otter, Read, Fireflies all run Whisper-derived models). Now a commodity feature inside every video conferencing tool.
+- **Voice agents** — phone-tree replacement, customer support, outbound calling. The 2026 voice-agent stack: ASR → LLM → TTS, with sub-300ms round-trip latency for natural-feeling conversation.
+- **Dubbing and localization** — translate the transcript, generate matching voice in target language, time-align with video.
+- **Accessibility** — real-time captioning, audio descriptions.
+- **Audiobook and podcast production** — AI narration is now indistinguishable for non-fiction; fiction with character voices still has tells.
+- **Voice memos to structured notes** — common product feature in 2026 productivity tools.
+- **Compliance recording analysis** — call center QA, customer service quality scoring.
+
+### Failure modes
+
+- **Heavy accents and code-switching.** ASR accuracy drops noticeably for non-mainstream accents in any major language.
+- **Overlapping speakers.** Diarization (who-said-what) is much harder than transcription. Multi-speaker meetings are still the hard case.
+- **Real-time at the edge.** Quality models are large; on-device ASR is much worse than cloud ASR.
+- **Pronunciation of proper nouns.** TTS still mispronounces unusual names; SSML or pronunciation dictionaries are necessary workarounds.
+- **Emotion control.** Only a few TTS products genuinely control emotion; most produce a single "professional" register.
+- **Music longer than ~2 minutes.** Suno and Udio handle short songs well; coherent multi-minute compositions are still hard.
+
+### Modern practice for voice agents
+
+Streaming everywhere. Streaming ASR partial results, streaming LLM tokens, streaming TTS audio. The end-to-end pipeline must produce the first audio byte within ~500ms or the conversation feels broken. This is what Cartesia and ElevenLabs Turbo optimize for.
+
+A 2026 voice-agent architecture:
+
+<Mermaid client:load chart={`flowchart LR
+  Mic[Microphone] --> VAD[Voice Activity Detection]
+  VAD --> ASR[Streaming ASR]
+  ASR --> Buf[Partial transcript buffer]
+  Buf -- on endpoint --> LLM[LLM with tool use]
+  LLM --> TTS[Streaming TTS]
+  TTS --> Spk[Speaker]
+  LLM -- tool calls --> Backend[Backend systems]
+  Backend --> LLM
+
+  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  classDef alert fill:#fafafa,stroke:#15803d,color:#1f2937
+  class VAD,ASR,Buf,LLM,TTS,Backend phase
+  class Mic,Spk alert`} />
+
+The "endpointing" decision — when has the user finished speaking — is one of the harder design choices. Too eager and you cut the user off; too patient and the agent feels slow.
+
+## Family 7 — Code models
+
+### Definition
+
+A specialized variant of LLM, trained with a much higher fraction of code in the training mix, often with **fill-in-the-middle** (FIM) objectives and repo-level context. The output is code (or code with explanation); the input is code, code-context, or natural-language descriptions.
+
+The line between "code model" and "generalist LLM that's good at code" has blurred in 2026. Frontier generalists (GPT-5, Claude Opus 4.7, Gemini 2.5) often outperform dedicated code models on programming benchmarks because they're larger and benefit from more diverse training data. Dedicated code models still win on three axes: cost per token, latency for inline autocomplete, and the ability to self-host without exposing source code.
+
+### Leading products
+
+- **Mistral Codestral 25B.** Frontier open-weights code model. Strong at FIM.
+- **DeepSeek Coder V2.** 236B parameter MoE, open-weights, frontier-class.
+- **Alibaba Qwen2.5-Coder 32B.** Multilingual code, very strong on Python and JavaScript.
+- **Meta Code Llama 70B.** Legacy but still widely deployed for autocomplete.
+- **StarCoder 2 (BigCode).** Open research-driven, transparent training data.
+- **Google CodeGemma.** Small, fast, FIM-optimized.
+- **IBM Granite Code.** Enterprise-licensed, fully transparent provenance.
+- **Cursor SWE-1.** Cursor's in-house, optimized for the agent-loop use case.
+
+### Note on models vs. tools
+
+Cursor, GitHub Copilot, Claude Code, Aider, Continue, Replit Agent, Devin are *products that use* code models. The model family is the underlying weights; the products are the orchestration around them — file editing, terminal access, test execution, tool use, multi-file context, agent loops. Most of those products use frontier generalist LLMs (Claude, GPT, Gemini) under the hood, with code-specific prompting and tool sets.
+
+### Three modes of use
+
+1. **In-editor autocomplete (Tab to accept).**
+   - Fast, local-ish, predictable.
+   - Copilot's original mode; still the most-used.
+   - Typical model: small dedicated code model (Codestral 25B, CodeGemma) for self-hosted; proprietary fine-tunes for Copilot, Cursor.
+   - Latency target: <200ms.
+2. **Conversational coding.**
+   - Chat-style "implement this function."
+   - Powered by generalist LLMs more often than code-specialist models in 2026, because frontier generalists pulled even on code benchmarks.
+   - Latency target: streaming response, first token <1s.
+3. **Agentic coding.**
+   - The model runs in a loop with tools — read files, edit files, run tests, iterate.
+   - Claude Code, Cursor Agent, Aider, Devin, OpenAI Codex CLI.
+   - This is the breakout 2025-2026 pattern; it changes what "writing code" feels like for many engineers.
+   - Latency target: doesn't matter — user is in async-review mode, not synchronous typing.
+
+### What changed in 2026
+
+The biggest practical shift: **agentic coding became reliable enough to trust for non-trivial tasks**. A 2024 agent could draft a function; a 2026 agent (Claude Code, Cursor Agent) can implement a feature across multiple files, run tests, fix the failures, and produce a reviewable PR. The senior engineer's job has shifted from typing to specifying, reviewing, and architecting.
+
+This created a new failure mode: agents produce *plausible-looking* code that does the wrong thing in subtle ways. Code review of agent output is mandatory, and many teams discovered they had no good review process for code they didn't write. The "agent-augmented engineer" workflow is real but requires new habits.
+
+### Where they fail
+
+- **Architecture decisions.** Should this be a separate service or part of the existing one? Code models don't know.
+- **Security trade-offs.** Choosing between two designs with different threat profiles requires context the model rarely has.
+- **Choosing the right abstraction.** When to extract a helper, when to inline, when to introduce a class. Models default to over-abstraction.
+- **Domain logic that lives in your team's head.** Business rules, undocumented conventions, regulatory requirements.
+- **Cross-cutting changes.** Renaming a concept across 100 files reliably is still flaky.
+
+### Modern practice
+
+- **Generalist frontier model for agentic and conversational coding.** Claude Opus 4.7, GPT-5, or Gemini 2.5 Pro. These dominate code benchmarks and handle the complex multi-step cases.
+- **Specialist open-weights code model for high-throughput autocomplete.** DeepSeek Coder, Codestral, where cost per token matters and accepting one bad suggestion in twenty is fine.
+- **Self-hosted code models** are common at companies whose source code can't leave the perimeter (financial services, defense, healthcare).
+- **Code review of agent output is mandatory.** Plausible-looking code that does the wrong thing is the dominant failure mode.
+- **Tests are the contract.** Agents that can run tests in a loop produce dramatically better output than agents that can't.
+- **Context matters.** Long-context models (1M tokens) plus repo indexing produce noticeably better results than short-context models. Cursor, Claude Code, and Aider all invest heavily in retrieval and context management.
+
+## Family 8 — Classical and tabular ML
+
+### The unglamorous, load-bearing family
+
+Gradient-boosted trees, linear models, random forests — the algorithms scikit-learn shipped a decade ago. Boring on the surface, dominant in production. Most enterprise ML is *still* tabular ML; the LLM revolution hasn't displaced this family, it's added a new family alongside it.
+
+### Leading products
+
+- **XGBoost.** The de facto default for tabular ML since ~2016. Robust, well-documented, ecosystem of tooling around it.
+- **LightGBM.** Microsoft's gradient boosting library. Faster training, slightly different leaf-growth strategy. Often the better choice for very large datasets.
+- **CatBoost.** Yandex's GBDT. Handles categorical features natively without manual encoding. The right choice when your data has many categoricals.
+- **scikit-learn.** The reference Python ML library. Linear models, SVMs, random forests, gradient boosting, clustering, preprocessing, model selection. The boring but essential foundation.
+- **Facebook Prophet.** Forecasting library. The "I need a quick time-series baseline" default.
+- **NeuralProphet.** Neural-network variant of Prophet with more flexibility.
+- **TabNet, TabTransformer, SAINT.** Deep-tabular architectures. Niche; rarely outperform XGBoost in practice.
+- **H2O.ai.** AutoML platform; runs many of the above under a unified API. See [the H2O.ai post](/blog/h2o-ai) for depth.
+
+### Why this family is *not* going away
+
+- **Most enterprise ML is tabular.** Fraud, churn, default risk, click prediction, demand forecasting, lead scoring, pricing, inventory. The data lives in a data warehouse as rows and columns; the LLM-shaped hammer is wrong for the nail.
+- **Cost.** A trained XGBoost model serves millions of predictions per second on a single CPU. Cost-per-prediction is essentially zero.
+- **Interpretability.** SHAP values, feature importance, partial dependence plots. Regulated industries (BFSI, healthcare) often *require* explainable models, which rules out frontier LLMs for the core decision and reserves them for explanation generation.
+- **Sample efficiency.** A few thousand rows of labeled data trains a great XGBoost model. The same data is barely enough to fine-tune a tiny LLM.
+- **Operational simplicity.** No GPUs to manage. No quantization. No vLLM. Pickled model + Python service.
+- **Latency.** Sub-millisecond inference, even at high concurrency.
+
+### Where this family meets the LLM family
+
+The hybrid patterns:
+
+- **Feature engineering with LLMs.** LLMs read free-text fields (call transcripts, complaint descriptions, free-form comments) and emit structured features (sentiment, topic, urgency) that feed an XGBoost model. This is the modern hybrid pattern for cases that combine structured and unstructured signals.
+- **LLM-generated explanations on classical-model outputs.** XGBoost decides; LLM writes the customer-facing explanation. Best of both worlds: rigorous decision + readable rationale.
+- **Synthetic data augmentation.** LLM generates plausible edge-case training examples for the classical model. Careful — distribution drift is the failure mode.
+- **Classical model as a router.** Cheap XGBoost classifier decides which LLM to route to. Costs nothing, runs fast, scales linearly.
+
+### Modern practice
+
+If your input is a row of numbers and categories and your output is a number or class, **start here**. Always. Reach for an LLM only when:
+
+1. The input includes unstructured text or images, and
+2. You've ruled out the LLM-as-feature-extractor pattern.
+
+Read [the data scientist path post](/blog/become-data-scientist-2026) for the broader pipeline view.
+
+### Where it fails
+
+- **Unstructured inputs.** Tables of free-form text, images, audio — wrong family.
+- **Deep relational reasoning.** "Given these 5 events in this order, what likely happened" — wrong family; LLM or sequence model fits better.
+- **Zero-shot generalization.** Tabular models are trained on a specific feature schema. New features mean retraining.
+
+## Emerging and adjacent families
+
+The eight cover most production workloads. Several emerging families are worth tracking:
+
+### Small / on-device models
+
+**The trend:** quality compression. What was frontier in 2024 is the small-model tier in 2026 — and what's small in 2026 will run on phones in 2027.
+
+**Leading products:** Microsoft Phi-4, Google Gemma 2 (2B, 9B, 27B), Llama 3.3 8B and 1B, Mistral Small 3, Qwen 2.5 1.5B/7B, Apple's on-device foundation models (powers Apple Intelligence).
+
+**Why it matters:**
+
+- **Privacy.** Inference on-device means no data leaves the user's hardware.
+- **Latency.** No network round-trip; sub-100ms responses are possible.
+- **Cost.** Marginal cost of inference approaches zero for the operator.
+- **Offline.** Works without connectivity.
+
+**Where it's used:** keyboard suggestions, on-device summarization, smart reply, photo organization, accessibility features, real-time translation, embedded systems.
+
+**Limitations:** quality gap to frontier remains substantial (small models are 1-2 generations behind), context windows are smaller, multi-step reasoning is much worse.
+
+### Domain-specialized models
+
+Models pre-trained or fine-tuned heavily on a specific domain. The right approach when generalist frontier + RAG hits a quality ceiling.
+
+**Examples:**
+
+- **Medical:** Google Med-PaLM 2, Microsoft BioGPT, Stanford's MedAlpaca lineage. Used for clinical note summarization, differential diagnosis assistance, medical Q&A.
+- **Legal:** Harvey AI (built on closed-API frontier with legal fine-tuning), CoCounsel (Thomson Reuters), Lexis+ AI. Used for case research, contract analysis, brief drafting.
+- **Scientific:** Meta Galactica (mostly retracted; lessons learned), AlphaFold and AlphaFold 3 (protein structure — a different kind of specialization), Nougat (academic PDF parsing).
+- **Financial:** BloombergGPT (one of the early domain models), Goldman's in-house models, JPMorgan's IndexGPT-derived systems.
+- **Biology:** ESM-3 (protein language model), Evo (genomic foundation model). Specialized enough that they almost form their own family.
+
+**Modern practice:** start with a frontier generalist + RAG over your domain corpus. Specialize only when you've measured a specific quality gap that domain fine-tuning would close.
+
+### Time-series foundation models
+
+A nascent family that's looking promising. The premise: train a single foundation model on millions of time-series across domains (sales, weather, energy, financial, biological signals), then zero-shot or fine-tune for specific forecasting tasks.
+
+**Examples:** Google TimesFM, Salesforce Moirai, Amazon Chronos, NixtlaTimeGPT.
+
+**Status in 2026:** competitive with classical time-series methods (Prophet, ARIMA, simple neural networks) on many tasks, materially better on cold-start. Not yet displacing XGBoost-on-tabular-features for forecasts that depend heavily on side information, but the gap is closing.
+
+### Robotics foundation models
+
+Models that take perceptual input (camera, depth, proprioception) and emit robot actions (joint torques, end-effector poses).
+
+**Examples:** Google RT-2 and RT-X, Physical Intelligence (PI) π0, NVIDIA GR00T, Tesla's Optimus models.
+
+**Status:** rapidly improving, not yet at the "drop in for any robot" level. Specific to embodiment. The 2025-2026 work has been on cross-embodiment training and on integrating with vision-language models for high-level planning.
+
+### Mixture-of-experts (MoE) — an architectural pattern, not a family
+
+MoE is an architectural choice, not a separate model family — but it's reshaping every other family. The pattern: instead of one dense neural network, have many "expert" sub-networks and a router that picks 2-8 experts per token. Total parameter count is high (DeepSeek V3 is 671B), but only a fraction (37B for V3) are active per token.
+
+**Why it matters:** higher quality at fixed inference cost, or lower inference cost at fixed quality. Most frontier 2026 models — GPT-4 was rumored to be MoE, DeepSeek V3 is explicitly MoE, Mixtral and Mistral Large 2 are MoE — use this pattern.
+
+**Operational implication:** serving MoE models needs more memory but less compute. The vLLM and SGLang inference engines added MoE support in 2024-2025 as a major feature.
+
+### State-space models (Mamba, RWKV)
+
+Alternatives to transformers with linear (rather than quadratic) cost in sequence length. Promising for long contexts and edge devices.
+
+**Examples:** Mamba, Mamba-2, RWKV, RecurrentGemma.
+
+**Status:** the architecture works, but the model and tooling ecosystems are 1-2 years behind transformers. Some hybrid transformer-Mamba models (Jamba, Zamba) ship in production for long-context use cases.
+
+### Diffusion language models
+
+The non-autoregressive bet: generate all tokens in parallel via diffusion, then iteratively refine. Promising for code completion (because you can edit the middle, not just append).
+
+**Examples:** Mercury (Inception Labs), LLaDA.
+
+**Status:** small but growing. Worth watching; not yet a production category.
+
+## Cross-cutting topic: post-training techniques
+
+The visible quality differences between frontier models in 2026 come overwhelmingly from post-training, not pre-training. The techniques:
+
+- **Supervised Fine-Tuning (SFT).** Take a base model; train on curated (instruction, response) pairs. The first step of every modern post-training stack.
+- **RLHF (Reinforcement Learning from Human Feedback).** Train a reward model on human pairwise preferences ("response A is better than response B"). Optimize the policy model against the reward via PPO. The OpenAI ChatGPT recipe.
+- **DPO (Direct Preference Optimization).** Skip the reward model — derive a closed-form objective that matches preferences directly. Simpler, more stable, became the default for open-source post-training.
+- **RLAIF (Reinforcement Learning from AI Feedback).** Replace human preference labels with AI judgments. Scalable. Used as a component in Constitutional AI and many modern stacks.
+- **Constitutional AI.** Anthropic's approach. A written "constitution" describing desired behaviors; the model critiques its own outputs against the constitution; trains on the self-improved outputs.
+- **RLVR (Reinforcement Learning from Verifiable Rewards).** The breakthrough that made reasoning models work. Reward = correctness on math/code problems, computed automatically. Generalizes from verifiable domains.
+- **GRPO (Group Relative Policy Optimization).** DeepSeek's RLVR variant. Compare a group of candidate responses to each other rather than to a learned baseline. Computationally efficient.
+- **Rejection sampling fine-tuning.** Generate many candidates per prompt; keep only the best (judged by a model or rule); train on the survivors. Simple, effective.
+- **Distillation.** Train a small model to imitate a large one. The most cost-effective way to ship small models with frontier-like behavior on specific tasks.
+- **LoRA / QLoRA (Low-Rank Adaptation).** Fine-tune via small low-rank adapter weights instead of updating the full model. Reduces fine-tuning cost by 10-100×. The dominant fine-tuning pattern.
+- **DoRA, MoRA.** LoRA refinements; marginal improvements, not yet dominant.
+
+The 2026 production reality: most teams don't post-train base models themselves. They either use the post-trained model the lab released, or they fine-tune with LoRA on top. Full post-training is reserved for labs with substantial compute and the use cases where it pays back.
+
+## Cross-cutting topic: training data and provenance
+
+The category of "where did the training data come from" became a first-class concern in 2024-2026 because of three forces:
+
+- **Litigation.** New York Times v. OpenAI, Getty v. Stability AI, multiple author class actions. The legal status of training on copyrighted material is being contested in every major jurisdiction.
+- **EU AI Act compliance.** As of 2026, providers must publish "sufficiently detailed summaries" of training data for general-purpose AI models above a compute threshold.
+- **Enterprise procurement.** Regulated industries (BFSI, healthcare, government) increasingly require provenance attestations before deploying a model.
+
+### Provenance tiers
+
+| Tier | What's disclosed | Examples |
+| --- | --- | --- |
+| Transparent | Full dataset list, often reproducible | IBM Granite, BigCode StarCoder, Allen AI OLMo |
+| Summarized | High-level descriptions; some specifics | EU AI Act-compliant providers |
+| Opaque | Almost nothing about training data | Most closed-API frontier models |
+| Open-weights, opaque data | Weights public, data not | Llama, DeepSeek, Mistral, Qwen |
+
+The "open-weights but opaque data" category is the largest and most contested. The weights are downloadable; the question of *what they were trained on* is often unanswered.
+
+### Modern practice
+
+- **Match disclosure to use case.** Internal experiments can use opaque-data models. Regulated production deployments increasingly require transparent provenance.
+- **Synthetic data is here to stay.** A growing fraction of post-training data is generated by other models. The provenance chain is recursive: model A trained on data generated by model B trained on... eventually web data.
+- **Watermarking and content credentials.** C2PA-style provenance for generated content is moving from voluntary to mandatory in some jurisdictions.
+
+## Cross-cutting topic: serving stack
+
+How models actually run in production.
+
+### Inference engines
+
+- **vLLM.** The open-source default. PagedAttention (memory-efficient KV cache), continuous batching, supports most open-weights models. Self-hosted serving at scale runs vLLM.
+- **NVIDIA Triton Inference Server.** Multi-framework, multi-model, production-grade. Often wraps vLLM as a backend.
+- **NVIDIA NIM.** Pre-built optimized containers per model. The "I want to deploy a model and not think about it" answer if you're paying for NVIDIA AI Enterprise.
+- **Hugging Face TGI (Text Generation Inference).** vLLM competitor; the HuggingFace-native serving stack.
+- **SGLang.** Newer high-performance engine; particularly strong on complex multi-prompt patterns.
+- **Ollama.** Developer-friendly local serving. Runs quantized models on laptops. Not for production but invaluable for development.
+- **llama.cpp.** CPU/GPU mixed inference, GGUF format. The foundation for Ollama, LM Studio, and most local-LLM tooling.
+- **mlx-lm.** Apple Silicon-optimized inference; Mac fleet deployments use this.
+
+### Serving techniques
+
+- **Continuous batching.** Don't wait for a fixed batch; add and remove requests from the batch as they arrive and finish. 5-10× throughput improvement.
+- **PagedAttention.** Manage the KV cache as virtual memory pages. Eliminates KV cache fragmentation.
+- **Speculative decoding.** A small fast model proposes tokens; the big model verifies them in parallel. 2-3× latency improvement when the small model is well-aligned.
+- **KV cache reuse.** Cache the attention key-value tensors for common prefixes. This is what prompt caching is implemented on top of.
+- **Tensor parallelism.** Split the model across GPUs along the model dimension. For very large models that don't fit on a single GPU.
+- **Pipeline parallelism.** Split the model across GPUs by layer. Lower communication but higher latency.
+- **Expert parallelism.** For MoE models, distribute experts across devices.
+
+### Quantization
+
+The art of running models with less memory by using lower-precision weights.
+
+- **FP16 / BF16.** The training default. Most "full precision" deployments.
+- **FP8.** Half the memory; minimal quality loss on most models. Standard for H100/H200 deployments.
+- **INT8.** Long-established quantization tier; some quality loss; broad hardware support.
+- **INT4 (GPTQ, AWQ, GGUF).** Quarter the memory; noticeable but manageable quality loss. Standard for consumer-hardware deployment.
+- **INT2, INT1.** Research frontier; usable for the smallest models.
+
+A 70B model in FP16 needs ~140GB of memory; in INT4 it fits in ~35GB. The quantization choice is *the* knob that determines what hardware you can run a model on.
+
+## Cross-cutting topic: AI gateways and proxies
+
+A 2024-2026 category that didn't exist a few years ago: middleware that sits between your application and the model APIs.
+
+### What they do
+
+- **Multi-provider routing.** One client SDK; the gateway translates to OpenAI, Anthropic, Google, or self-hosted endpoints.
+- **Fallback and retry.** Provider A is down or rate-limited; gateway transparently fails over to provider B.
+- **Cost tracking and budgets.** Per-team, per-feature, per-user spend tracking. Hard cost caps.
+- **Caching.** Semantic cache for similar prompts; exact-match cache for repeated calls.
+- **PII redaction.** Strip personal data before the prompt leaves the perimeter.
+- **Prompt logging.** Centralized observability.
+- **Rate limiting and quotas.** Application-level rate limits independent of provider limits.
+- **A/B testing.** Route a fraction of traffic to a new model; compare outputs.
+
+### Leading products
+
+- **LiteLLM.** Open-source unified SDK; the most-used gateway in 2026.
+- **Portkey.** Commercial gateway with strong observability.
+- **Helicone.** Logging-first; gateway features layered on.
+- **OpenRouter.** Multi-provider routing as a service.
+- **AWS Bedrock, Azure AI, Google Vertex AI.** The hyperscalers' own gateways; route across their hosted models.
+- **Cloudflare AI Gateway.** Edge-deployed gateway; particularly strong on caching.
+
+### Modern practice
+
+Most production stacks above ~$10K/month inference spend have a gateway by 2026. Not having one means duplicating logging, retry, caching, and cost-tracking logic across every team that calls a model.
+
+## Cross-cutting topic: hardware landscape
+
+### Training and frontier inference
+
+- **NVIDIA H100, H200.** The 2024-2025 workhorses. Most frontier training and large-scale inference runs on these.
+- **NVIDIA B100, B200, GB200.** The 2025-2026 generation. 2-3× the H100 in many configurations. The frontier training substrate.
+- **AMD MI300X, MI325X.** AMD's serious entry. Materially competitive on memory bandwidth; software stack (ROCm) maturing fast.
+- **Google TPU v5e, v5p, v6e (Trillium).** Google Cloud only. The backbone of Gemini training; also rented to outside customers.
+- **AWS Trainium, Inferentia.** AWS's custom silicon. Particularly attractive at AWS list pricing.
+
+### Specialized accelerators
+
+- **Cerebras.** Wafer-scale chip; extreme single-chip memory and bandwidth. Particularly strong for inference; some training niches.
+- **Groq.** LPU (Language Processing Unit); record-setting LLM inference latency. The first place to look for "lowest latency LLM serving."
+- **SambaNova.** Reconfigurable dataflow; both training and inference; strong for enterprise on-prem.
+
+### On-device
+
+- **Apple Silicon (M-series).** Unified memory architecture; excellent for local LLM serving on Macs. Apple's own foundation models run here.
+- **NVIDIA Jetson.** Edge AI; robotics; embedded systems.
+- **Qualcomm Snapdragon AI engines.** The mobile NPU; powers on-device Android AI.
+- **Mobile NPUs (Apple Neural Engine, Tensor on Pixel).** What runs the small on-device models.
+
+### Cloud rental
+
+- **AWS, GCP, Azure.** Hyperscaler GPU rental. Mature, expensive, broadly available.
+- **CoreWeave.** GPU-first cloud; the largest specialized provider.
+- **Lambda Labs.** GPU rental focused on AI/ML teams.
+- **RunPod.** Spot-priced GPU rental; popular for batch and ad-hoc training.
+- **Modal, Replicate, Together.** Higher-level "deploy a model" services.
+
+### The hardware decision
+
+The strategic question for AI infrastructure in 2026: own vs. rent, hyperscaler vs. specialized, frontier vs. mid-tier. The answer depends on workload steady-state. Predictable steady utilization → reserved/owned. Spiky/experimental → rented spot. Frontier training → wherever you can get the cluster.
+
+## Cross-cutting topic: evaluation
+
+### Why this matters more than people think
+
+The teams shipping reliable AI features in 2026 share one habit: **eval-driven development**. A dataset of inputs and gold outputs, an automated scorer, CI runs on every prompt change. The 2024 "vibes-driven prompting" era is dying because shipping LLM features without evals is shipping regressions without noticing.
+
+### Benchmark vs. eval
+
+- **Benchmarks** (MMLU, HumanEval, GSM8K, MMLU-Pro, HellaSwag, GPQA, ARC, etc.) measure *general* model capability across standardized tasks. Useful for choosing a model. Useless for measuring your specific use case.
+- **Evals** measure *your* application on *your* data with *your* scoring criteria. This is what actually predicts whether changes are improvements.
+
+If you use benchmarks as evals, you'll optimize for benchmark scores and ship product regressions.
+
+### Per-family evaluation methodologies
+
+| Family | Eval approach |
+| --- | --- |
+| Generalist LLMs | Reference-based + LLM-as-judge on use-case examples |
+| Reasoning | Exact-match on verifiable answers + reasoning quality scoring |
+| Vision-Language | Schema validation + LLM-as-judge on description quality |
+| Embeddings | Recall@K, NDCG, MRR on retrieval benchmarks built from your data |
+| Image generation | Aesthetic scoring + CLIP score + human ratings |
+| Speech | WER (word error rate) for ASR; MOS (mean opinion score) for TTS |
+| Code | Test pass rate; HumanEval and SWE-bench for benchmarks |
+| Classical / tabular | Standard ML metrics (AUC, F1, RMSE, MAE) |
+
+### Modern eval tools
+
+- **LangSmith.** LangChain's eval platform. Trace-aware; runs eval datasets against pipelines.
+- **LangFuse.** Open-source observability + evals. Self-hostable.
+- **Arize Phoenix.** Open-source LLM observability and eval.
+- **RAGAS.** RAG-specific metrics (faithfulness, answer relevance, context precision).
+- **DeepEval.** Eval framework with a wide metric library.
+- **Helicone.** Logging-first; evals on top.
+- **Inspect AI.** Anthropic's eval framework.
+- **MLflow Evaluation.** The classical-MLops player extended to LLMs.
+
+### LLM-as-judge
+
+The dominant scoring method for non-reference tasks. A frontier LLM scores outputs on a defined rubric. Cheap, fast, surprisingly correlated with human judgment when the rubric is well-designed.
+
+Pitfalls:
+
+- **Position bias.** Judges prefer the first or second option systematically. Randomize.
+- **Length bias.** Judges prefer longer responses. Watch for it.
+- **Self-preference.** GPT-judge prefers GPT outputs slightly. Use a different family for judging than for generating when possible.
+- **Calibration.** Validate against human labels on a sample.
+
+### Red-teaming
+
+A specialized form of evaluation: deliberately try to break the model. Find prompts that produce harmful, biased, or wrong outputs. Tools: Lakera Red, Garak, PyRIT (Microsoft), the AI Red Team frameworks from major labs. Increasingly a regulatory requirement.
+
+## Cross-cutting topic: cost economics
+
+### The cost landscape
+
+Per-million-token API prices in mid-2026 (input / output, in USD, indicative):
+
+| Tier | Example models | Input | Output |
+| --- | --- | --- | --- |
+| Frontier | GPT-5, Claude Opus 4.7, Gemini 2.5 Pro | $5-15 | $15-60 |
+| Mid | Claude Sonnet 4.6, GPT-4.1, Gemini 2.5 Flash | $1-3 | $3-15 |
+| Small | Claude Haiku 4.5, GPT-5 mini, Gemini Flash Lite | $0.10-0.50 | $0.30-1.50 |
+| Reasoning | o-series, Claude w/ thinking | $5-30 | $20-120 |
+| Embedding | text-embedding-3, Voyage, Cohere | $0.02-0.20 | n/a |
+
+Self-hosted economics flip the picture. A 70B model on H100s at 80% utilization costs ~$0.10-0.30 per million tokens — 10-50× cheaper than API frontier — but you pay even when idle.
+
+### The cache math
+
+If 80% of your prompt is a stable prefix and you have a 5-minute cache TTL, with cached input at 10% of normal price:
+
+- Naive cost: 100% input × $5 = $5
+- Cached cost: 80% × $5 × 10% + 20% × $5 = $0.40 + $1 = $1.40
+- Savings: 72%
+
+Production pipelines that don't use prompt caching are leaving 50-80% of their inference budget on the table.
+
+### Self-hosted breakeven
+
+Rough rule: self-hosted open-weights breaks even on cost vs. API around 5-10 million tokens per day per model, assuming you can saturate your GPU. Below that, API is cheaper because you're paying for under-utilized hardware. Above that, owning the inference stack starts to pay back.
+
+The non-cost reasons to self-host:
+
+- Data residency / privacy
+- Customization (LoRA fine-tunes, custom guardrails)
+- Latency consistency
+- No rate limits
+- Predictable cost
+
+### The reasoning model premium
+
+A reasoning model query is typically 10-50× the cost of the same prompt to a generalist. This is why **routing** is non-optional. Reasoning models should be ~5-15% of total calls, not 100%.
+
+## Cross-cutting topic: safety, alignment, guardrails
+
+### What "safe" means in 2026
+
+The category covers:
+
+- **Refusal.** The model refuses harmful requests (weapons synthesis, CSAM, etc.).
+- **Truthfulness.** The model doesn't confidently produce false information.
+- **Bias.** The model doesn't produce systematically unfair output across protected categories.
+- **Robustness.** The model resists adversarial inputs (jailbreaks, prompt injection).
+- **Compliance.** The model meets regulatory requirements (EU AI Act, sector-specific rules).
+
+### The threats
+
+- **Jailbreaks.** Prompts designed to bypass safety training. The arms race continues; perfect prevention is impossible.
+- **Prompt injection.** Hostile content embedded in retrieved documents or tool outputs that overrides the model's instructions. The hard problem of agent security.
+- **Data poisoning.** Adversarial content in training data that creates specific failure modes.
+- **Hallucination.** The model produces confident but false output. Not adversarial but operationally serious.
+- **PII leakage.** The model reveals training data, particularly personal information.
+
+### Guardrails
+
+External systems that sit between the model and the world:
+
+- **Llama Guard (Meta).** Open-weights model trained to classify model outputs as safe or unsafe.
+- **NeMo Guardrails (NVIDIA).** Programmable guardrails framework. Topic restrictions, fact-checking, dialogue rails.
+- **Lakera Guard.** Commercial prompt-injection and jailbreak detection.
+- **Constitutional AI.** Built into the model rather than external; Anthropic's approach.
+- **Output filtering.** Regex, content-policy classifiers, PII detectors.
+- **Input filtering.** Prompt injection detection before the prompt reaches the model.
+
+### Modern practice
+
+- **Defense in depth.** Don't rely on the model's own refusal; layer external guardrails.
+- **Separate-channel system prompts.** Modern APIs distinguish system from user roles; instructions in the system slot are harder to override.
+- **Tool sandboxing.** Agents that can execute code must execute it in sandboxes (containers, VMs, ephemeral environments).
+- **Audit logging.** Log every prompt and response. Required for compliance, invaluable for incident response.
+- **Red-team before launch.** Adversarial testing as a release gate.
+
+## Cross-cutting topic: open-weights vs closed-API
+
+### The shape of the choice
+
+Closed-API (OpenAI, Anthropic, Google): you call an endpoint; they handle hosting, scaling, safety, evals, model updates. You pay per token. You don't see the weights. The model can be deprecated by the provider with limited notice.
+
+Open-weights (Llama, Mistral, DeepSeek, Qwen, Granite): you download the weights; you host them; you control everything; you take on the operational burden. License terms vary materially.
+
+### License taxonomy
+
+| License | Examples | Commercial use | Notes |
+| --- | --- | --- | --- |
+| Apache 2.0 / MIT | Granite, Mistral, Nomic Embed | Yes | Most permissive |
+| Llama Community License | Llama 3, Llama 4 | Yes, with restrictions | Restrictions for very large companies (>700M MAU) |
+| Gemma | Google Gemma 2 | Yes | Use-restriction terms |
+| Non-commercial research | Flux.1 dev, some research models | No | Read carefully |
+| Custom enterprise | Granite enterprise, Cohere | Variable | Per-contract |
+
+### When closed-API wins
+
+- You don't have an ML team
+- Your volume is low (<10M tokens/day)
+- You need frontier quality and want zero operational overhead
+- You value fast iteration over total control
+- Your use case is general enough that you don't need customization
+
+### When open-weights wins
+
+- Data residency / privacy / compliance requires it
+- Your volume is high enough to justify owned infrastructure
+- You need customization (LoRA fine-tuning, custom adapters)
+- You need predictable cost
+- You need rate-limit independence
+- You need to deploy on air-gapped or disconnected networks
+
+### The 2026 reality
+
+Most enterprise stacks are now *hybrid*: frontier closed-API for the hard cases, self-hosted open-weights for the high-volume commodity calls. A two-model architecture is the new normal.
+
+## Putting it together — architecture patterns
+
+### Pairing patterns
+
+Real systems compose families. The patterns that recur:
+
+<Mermaid client:load chart={`flowchart TD
+  User[User input] --> Vision{Image?}
+  Vision -- yes --> VLM[Vision-Language Model]
+  Vision -- no --> Embed[Embedding Model]
+  VLM --> Embed
+  Embed --> VS[(Vector Store)]
+  VS --> Retrieve[Retrieve top-K]
+  Retrieve --> Router{Router}
+  Router -- simple --> LLM[Generalist LLM]
+  Router -- hard --> Reason[Reasoning Model]
+  LLM --> Tool{Tool call?}
+  Reason --> Tool
+  Tool -- yes --> Tools[Execute tool]
+  Tools --> LLM
+  Tool -- no --> Resp[Response]
+
+  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  classDef alert fill:#fafafa,stroke:#15803d,color:#1f2937
+  class VLM,Embed,VS,Retrieve,Router,LLM,Reason,Tool,Tools phase
+  class User,Resp alert`} />
+
+A typical 2026 AI feature touches four families in a single request: vision-language to read the screenshot the user pasted, embeddings to retrieve relevant docs, a generalist LLM for the response, occasional escalation to a reasoning model. Each family is a tool in the toolbox; the architectural skill is composition.
+
+### The cascade pattern
+
+Try the cheap model first. If it fails (low confidence, schema validation fails, judge model rejects), escalate. If it still fails, escalate again.
+
+- Tier 1: Haiku / Flash / mini
+- Tier 2: Sonnet / GPT-4.1 / Flash Pro
+- Tier 3: Opus / GPT-5 / Gemini Pro
+- Tier 4: Reasoning model
+
+Cost-effective when the easy cases are common. Less effective when most queries are hard (most calls escalate anyway, plus the cascade overhead).
+
+### The RAG pattern
+
+The canonical retrieval-augmented generation flow:
+
+1. Embed and index documents (one-time, periodically updated).
+2. At query time: embed the query.
+3. Retrieve top-K chunks via hybrid search.
+4. Re-rank.
+5. Construct a prompt with the retrieved chunks + the query.
+6. Generate with a generalist LLM.
+7. Optionally cite sources back to the chunks.
+
+### The agent loop pattern
+
+1. System prompt defines the agent's role and available tools.
+2. User issues a request.
+3. Model decides: respond, or call a tool.
+4. If tool call: execute the tool, return result to model.
+5. Loop until the model produces a final response.
+
+The 2026 evolution: agents with persistent memory (separate from the conversation), with planning steps (an explicit plan-then-execute decomposition), with subagents (one agent spawning others for parallelizable work).
+
+## How model selection actually happens
+
+The decision tree most teams converge on:
+
+| If the task is... | Use family... | Notable caveats |
+| --- | --- | --- |
+| Tabular prediction with labeled data | Classical / tabular | Don't reach for LLMs first |
+| Free-form chat or content drafting | Generalist LLM | Cache the system prompt |
+| Multi-step reasoning, math, hard code | Reasoning model | Router pattern; don't use as default |
+| Reading documents, screenshots, charts | Vision-Language | Pair with detection model for precise boxes |
+| Semantic search / RAG retrieval | Embedding + re-ranker | Hybrid (BM25 + dense) is standard |
+| Generating marketing images | Image generation | LoRA for brand consistency |
+| Speech in / speech out | ASR + TTS | Streaming end-to-end for voice agents |
+| IDE coding assistance | Code model or generalist | Frontier generalists now match specialists |
+| Time-series forecasting | Classical or TS foundation | Try TS foundation models for cold-start |
+| On-device features | Small / on-device | Quality gap is real but closing |
+
+In practice the same product touches 3-5 families. Trying to use one model for everything is the most common architectural mistake; treating each family as a specialized component is the mature approach.
+
+## Modern practices that cut across families
+
+The cross-cutting techniques that landed in production between 2024 and 2026:
+
+- **Structured outputs everywhere.** JSON schema, Pydantic, response-format enforcement. The "parse free-form text" era is over.
+- **Tool use as the unit of agency.** Models call functions; functions return results; models continue. This is the universal contract for agents.
+- **Prompt caching.** Static prefixes (system prompts, RAG context, few-shot examples) cached at the provider — 50-90% cost reduction. Always on.
+- **Routing.** Cheap classifier picks the model; the right model handles the request. Saves 2-10× on cost vs. always-frontier.
+- **Eval-driven development.** A dataset of inputs and gold outputs, an automated scorer (often an LLM judge), CI runs on every prompt change. The 2024 "vibes-driven prompting" era is dying.
+- **Observability as table stakes.** LangSmith, LangFuse, Helicone, Arize Phoenix. Every prod LLM call is logged with inputs, outputs, latency, cost.
+- **Fine-tuning as last resort.** Used to be the first lever. Now: prompt → few-shot → RAG → fine-tune. Fine-tuning is reserved for cases where the prior three exhaust their headroom.
+- **Distillation pipelines.** Big model generates training data; small model trained on it. Production serves the small one. This is the most cost-effective way to ship LLM features at scale.
+- **Guardrails and content moderation as a separate model.** Llama Guard, NeMo Guardrails, Lakera. Don't trust the main model to refuse — layer an external guard.
+- **On-device and edge models.** Phi-4, Llama 3.2 1B/3B, Gemini Nano. The "AI runs locally" trend matters more for privacy and latency than for cost.
+- **Open-weights as a defensible default.** Llama 4, DeepSeek V3, Qwen 2.5, Mistral, Granite. For many enterprise use cases the open-weights option is now genuinely competitive on quality and decisively better on cost, data residency, and customization.
+- **Streaming everywhere.** Streamed tokens for chat, streamed audio for voice, streamed events for tool use. Latency perception dominates UX.
+- **Model versioning as a discipline.** Pin model versions in code; track which version produced which output; plan for deprecation.
+- **Multi-model architectures.** Production stacks routinely use 3-7 different models from 2-3 providers. Single-provider lock-in is risk.
+
+## What still doesn't work well
+
+A reality check that holds across all eight families:
+
+- **Long-horizon agency.** Tasks that require coherent action over hours or days remain hard. Reasoning models help; they don't solve it.
+- **Self-correction on subtle errors.** A model that's confidently wrong stays wrong unless an external verifier catches it.
+- **Truly novel reasoning.** Models combine and recombine training-distribution patterns. Genuine out-of-distribution reasoning (truly new science, genuinely new code architectures) remains a research frontier.
+- **Real-time learning.** Models update at training time. Online adaptation to a single user's feedback over a session is fragile.
+- **Privacy-preserving by default.** Closed-API providers can see what you send them. Confidential computing, on-prem deployment, or open-weights self-hosting are the actual solutions; promise-based privacy is not.
+- **Strong negation and constraint satisfaction.** "Don't mention X" and "the answer must satisfy these 5 constraints" are still surprisingly hard.
+- **Calibrated uncertainty.** Models say things confidently regardless of whether they should. Asking for "confidence" usually gets you a number that isn't calibrated.
+- **Mathematical reasoning beyond pattern matching.** Reasoning models help but don't solve. Outside their training distribution they fail predictably.
+
+## The landscape view
+
+If you zoom out, the family-by-family picture matches a coarser market view:
+
+| Layer | Closed-API frontier | Open-weights frontier | Self-hosted serving |
+| --- | --- | --- | --- |
+| Generalist text | OpenAI, Anthropic, Google | Llama 4, DeepSeek V3, Qwen, Mistral, Granite | vLLM, TGI, NIM, Ollama |
+| Reasoning | OpenAI o, Claude w/ thinking, Gemini Thinking | DeepSeek R1, Qwen QwQ | vLLM with longer ctx, paged attention |
+| Vision-Language | GPT-4o, Claude, Gemini | Llama Vision, Pixtral, Qwen2-VL | vLLM (with vision adapter), SGLang |
+| Embeddings | OpenAI, Cohere, Voyage | Nomic, BGE, E5, Jina | TEI (HuggingFace), Sentence-Transformers |
+| Image gen | Midjourney, DALL·E, Imagen | Flux.1, SD 3.5 | ComfyUI, A1111, Diffusers |
+| Speech | ElevenLabs, Cartesia, OpenAI TTS, Deepgram | Whisper, Coqui XTTS, Parakeet | Whisper.cpp, faster-whisper, Triton |
+| Code | (use generalists or Copilot/Cursor) | DeepSeek Coder, Codestral, Qwen-Coder | vLLM, Continue self-hosted |
+| Tabular | (rarely API-based) | XGBoost / LightGBM / CatBoost | Treelite, ONNX, native libs |
+
+The two-axis picture: **closed-API vs open-weights** on one axis, **family** on the other. Every cell has at least one credible option in 2026. The strategic question is not "what's the best model" — it's "which cells of this matrix do I want my system to depend on, and how do I route across them."
+
+## Where to start
+
+For a team building its first AI-powered feature:
+
+1. **Define success as a metric, not a vibe.** Pick a dataset of 50-500 inputs and gold answers before you write any prompts. Pick a scorer. This is the eval; everything downstream optimizes for it.
+2. **Start with the cheapest model that might work.** Often a mid-tier generalist (Claude Haiku, GPT-5 mini, Gemini Flash) and a good prompt. Establish the baseline.
+3. **Layer RAG before fine-tuning.** Embedding + retrieval + the same generalist often outperforms a fine-tuned smaller model on knowledge-intensive tasks, at a fraction of the engineering cost.
+4. **Add a router** when you have two distinct types of requests with different cost/latency budgets. Don't pre-optimize; wait until the bimodal distribution is visible.
+5. **Reach for reasoning models** for the specific hard cases that fail the baseline, not as the default. Watch the cost; reasoning is 10-100× generalist.
+6. **Add evals to CI** before you have prompt-change regressions. Every prompt edit should run the eval before merging.
+7. **Move to self-hosted open-weights** when API cost crosses a few thousand dollars a month *and* the use case is stable enough to justify the operational lift. [OpenShift AI](/blog/openshift-ai) and [NVIDIA AI Enterprise](/blog/nvidia-ai-enterprise) are the production substrates of choice.
+8. **Treat each family as a separate tool.** When your product touches images, voice, structured data, and free-form text, that's four families. Don't try to make one model do all four jobs.
+9. **Plan for model deprecation.** Frontier models get retired. Pin versions; test against new versions before flipping; have a rollback plan.
+10. **Build the observability stack early.** Inputs, outputs, latency, cost, errors — logged for every call from day one. Without this you cannot improve.
+
+## Glossary
+
+A condensed reference for the vocabulary used throughout:
+
+- **Autoregressive.** Generating one token at a time, left to right, each token conditioned on all previous ones.
+- **Base model.** A pre-trained model before instruction-tuning or RLHF.
+- **BERT.** An early (2018) bidirectional transformer used for embeddings and classification.
+- **BF16 / FP16 / FP8 / INT8 / INT4.** Numerical precision tiers; lower precision = less memory = some quality loss.
+- **Chain-of-thought (CoT).** The reasoning trace a model produces before its final answer.
+- **Constitutional AI.** Anthropic's approach to safety training via a written constitution and self-critique.
+- **Context window.** The maximum number of tokens a model can attend to in one call.
+- **Continuous batching.** Inference optimization that adds/removes requests from a batch dynamically.
+- **DPO (Direct Preference Optimization).** A closed-form alternative to RLHF.
+- **Diffusion model.** A generative model that learns to reverse a noising process; dominant for image generation.
+- **Distillation.** Training a small model to imitate a large one.
+- **Embedding.** A fixed-size vector representation of text, image, or other content.
+- **Few-shot.** Providing examples in the prompt; opposite of zero-shot.
+- **Fill-in-the-middle (FIM).** Training a model to generate a middle section given a prefix and suffix; standard for code models.
+- **Foundation model.** A large general-purpose model that can be adapted to many downstream tasks.
+- **GBDT (Gradient-Boosted Decision Tree).** The architecture underneath XGBoost, LightGBM, CatBoost.
+- **GRPO.** Group Relative Policy Optimization; DeepSeek's RLVR training algorithm.
+- **GGUF.** File format for quantized models, popularized by llama.cpp.
+- **Hallucination.** Confident but incorrect model output.
+- **KV cache.** The cached attention key-value tensors that speed up sequential generation.
+- **LoRA / QLoRA.** Low-Rank Adaptation; efficient fine-tuning via small adapter weights.
+- **LLM.** Large Language Model.
+- **MoE (Mixture of Experts).** A sparse architecture with many sub-networks and a router.
+- **MMLU.** A benchmark covering 57 academic subjects.
+- **Multimodal.** Handles multiple input modalities (text, image, audio).
+- **PagedAttention.** vLLM's memory-management technique for the KV cache.
+- **Prompt caching.** Caching the static prefix of a prompt for repeated queries.
+- **PPO.** Proximal Policy Optimization; the RL algorithm in RLHF.
+- **RAG.** Retrieval-Augmented Generation; combining retrieval with LLM generation.
+- **Re-ranker.** A model that re-scores retrieved candidates for relevance.
+- **RLHF.** Reinforcement Learning from Human Feedback.
+- **RLVR.** Reinforcement Learning from Verifiable Rewards; the training technique behind reasoning models.
+- **SFT.** Supervised Fine-Tuning.
+- **SHAP.** A model-explanation technique based on Shapley values.
+- **Speculative decoding.** Inference acceleration via a draft model.
+- **State-space model.** A non-transformer architecture (Mamba, RWKV) with linear sequence cost.
+- **Token.** The unit of text the model processes; roughly 0.75 words for English.
+- **Tool use / function calling.** Model emits structured tool-call requests; calling code executes them.
+- **Transformer.** The neural architecture underneath nearly every modern AI model.
+- **vLLM.** The dominant open-source LLM inference engine.
+
+## Closing thoughts
+
+The mistake to avoid is *family confusion* — picking a frontier generalist LLM for a tabular fraud problem, or trying to make embeddings generate text, or asking a code model to do reasoning over financial statements, or asking an image generator to read text from a screenshot. Each family was shaped by a specific training recipe to do a specific thing well. Modern AI engineering is mostly **composition** — choosing the right family for each step of the pipeline and stitching them together cleanly. The teams that internalize the taxonomy ship features in weeks; the teams that don't spend months making one model do four jobs badly.
+
+The second mistake to avoid is *family stagnation* — picking the right family in 2024 and assuming the choice is still right in 2026. Reasoning models did not exist as a deployable category two years ago. Vision-language models that read screenshots well are a 2024-2025 capability. Open-weights frontier was a contradiction in terms three years ago. The taxonomy itself is a moving target; the families consolidate or split every 12-18 months.
+
+The third mistake to avoid is *model maximalism* — believing that every problem benefits from the largest, most expensive, most frontier model available. A 70B reasoning model run against every classification query is a great way to burn $50,000 a month producing the same outputs a fine-tuned 7B classifier would have produced for $50. Cost and quality are both axes; ignoring either is bad engineering.
+
+The model is a part. The system is the product. The taxonomy is a map of parts. Spend the time to learn the map, and the systems get easier to build.
