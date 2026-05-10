@@ -1,0 +1,140 @@
+---
+title: "Kiali: a console for service meshes"
+description: "What Kiali is, how it stitches together Kubernetes, Istio, Prometheus, and tracing into one mesh-wide console, and where it earns its keep on a real cluster."
+date: 2026-05-10
+---
+
+import Whiteboard from "../../components/Whiteboard";
+import Mermaid from "../../components/Mermaid";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const obs   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const ctrl  = { background: "#f3f4f6", border: "1px dashed #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 130, textAlign: "center" };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const queryEdge = { style: { stroke: "#4b5563" }, markerEnd: { type: "arrowclosed", color: "#4b5563" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge  = { animated: true, style: { stroke: "#9ca3af", strokeDasharray: "5,5" }, markerEnd: { type: "arrowclosed", color: "#9ca3af" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const kialiNodes = [
+  { id: "user",   position: { x: 400, y: 0 },   data: { label: "operator's browser" }, style: stage },
+  { id: "kiali",  position: { x: 400, y: 90 },  data: { label: "Kiali" },               style: obs },
+  { id: "k8s",    position: { x: 90,  y: 210 }, data: { label: "Kubernetes API" },     style: obs },
+  { id: "prom",   position: { x: 400, y: 210 }, data: { label: "Prometheus" },          style: obs },
+  { id: "jaeger", position: { x: 720, y: 210 }, data: { label: "Jaeger / Tempo" },      style: obs },
+  { id: "istiod", position: { x: 90,  y: 360 }, data: { label: "istiod" },              style: ctrl },
+  { id: "podA",   position: { x: 320, y: 480 }, data: { label: "service A\n+ envoy" }, style: stage },
+  { id: "podB",   position: { x: 510, y: 480 }, data: { label: "service B\n+ envoy" }, style: stage },
+  { id: "podC",   position: { x: 700, y: 480 }, data: { label: "service C\n+ envoy" }, style: stage },
+];
+
+export const kialiEdges = [
+  { id: "u1", source: "user",  target: "kiali",  ...reqEdge },
+  { id: "q1", source: "kiali", target: "k8s",    label: "topology + CRDs", ...queryEdge },
+  { id: "q2", source: "kiali", target: "prom",   label: "metrics",         ...queryEdge },
+  { id: "q3", source: "kiali", target: "jaeger", label: "traces",          ...queryEdge },
+  { id: "i0", source: "istiod", target: "k8s",   label: "watch", ...queryEdge },
+  { id: "i1", source: "istiod", target: "podA",  label: "xDS", ...dataEdge },
+  { id: "i2", source: "istiod", target: "podB",  ...dataEdge },
+  { id: "i3", source: "istiod", target: "podC",  ...dataEdge },
+  { id: "m1", source: "podA",   target: "prom",  label: "scrape", ...dataEdge },
+  { id: "m2", source: "podB",   target: "prom",  ...dataEdge },
+  { id: "m3", source: "podC",   target: "prom",  ...dataEdge },
+  { id: "t1", source: "podA",   target: "jaeger", label: "spans", ...dataEdge },
+  { id: "t2", source: "podB",   target: "jaeger", ...dataEdge },
+  { id: "t3", source: "podC",   target: "jaeger", ...dataEdge },
+];
+
+Kiali is the management console for Istio service mesh. It's the screen you stare at when something is wrong on the mesh and you don't yet know which service, which workload, which version, or which config rule is at fault. It pulls together Kubernetes metadata, Istio configuration, Prometheus metrics, and (optionally) distributed traces, and presents them as one unified view.
+
+It is *not* a metrics store, a tracing backend, or a control plane. It's a thin, opinionated UI on top of all of those.
+
+## The problem it solves
+
+A service mesh adds a lot of moving parts: sidecar proxies, an istiod control plane, and a fan of CRDs (`VirtualService`, `DestinationRule`, `AuthorizationPolicy`, `PeerAuthentication`, `Sidecar`, `Gateway`, …) that interact in non-obvious ways. The same configuration knobs that give you canary releases and zero-trust mTLS also make the system hard to reason about under load.
+
+Without a console, debugging becomes a multi-tool dance:
+
+- `kubectl get virtualservice -A` to find the relevant config
+- `istioctl analyze` to see if it's valid
+- A Prom query to check whether traffic is actually flowing
+- A Jaeger search to see what an end-to-end request looks like
+- `kubectl exec` into a sidecar to dump its Envoy config when nothing else explains the behavior
+
+Kiali is the unification of those views. It won't replace any of them entirely — but it'll cut the time-to-find-it for ~80% of mesh issues.
+
+## What you actually do in Kiali
+
+In rough order of how often each gets used:
+
+1. **Service graph** — the live topology of your mesh. Nodes are services, workloads, or apps; edges are the actual traffic, annotated with rate and error rate. Health is color-coded.
+2. **Workload health** — click any node to see its replicas, sidecar version, recent errors, and which Istio configs are touching it.
+3. **Config validation** — Kiali continuously validates Istio CRDs and flags conflicts: a `VirtualService` routing to a subset that doesn't exist in any `DestinationRule`, two policies fighting over the same workload, etc. This alone justifies the install.
+4. **Traffic shifting wizards** — define canaries, A/B, fault injection, timeouts via a UI that generates the YAML for you.
+5. **mTLS overview** — see which workloads are missing `PeerAuthentication`, where mTLS is forced vs. permissive, where you have plaintext traffic you didn't expect.
+6. **Drill-out to traces and dashboards** — every workload page links into the relevant Jaeger search and Grafana dashboard.
+
+## How Kiali gets its data
+
+Kiali doesn't generate telemetry. It's a read-mostly aggregator that queries the systems already on your cluster:
+
+<Whiteboard client:load data={{ nodes: kialiNodes, edges: kialiEdges }} height={620} />
+
+Reading the diagram:
+
+- **Solid arrows** are query paths Kiali walks: Kubernetes API for topology and Istio CRDs, Prometheus for sidecar metrics, Jaeger/Tempo for traces.
+- **Dashed arrows** are the mesh's own data plane: `istiod` watches K8s for config changes and pushes them to every sidecar via xDS. Sidecars are scraped by Prometheus for metrics and emit spans to the tracing backend.
+- **Kiali sits one layer above all of that** as a pane of glass. It writes back to the K8s API only when you use a wizard to create or edit Istio CRDs.
+
+Click ⛶ to view the diagram full-screen.
+
+## What the service graph looks like
+
+A typical Kiali graph view on a small mesh, with health indicated by border color:
+
+<Mermaid client:load chart={`flowchart LR
+  user([browser]) --> gw([api-gateway])
+  gw --> orders([orders])
+  orders --> auth([auth])
+  orders --> inv([inventory])
+  orders --> pay([payments])
+  pay --> stripe([stripe])
+
+  classDef healthy fill:#fafafa,stroke:#22c55e,stroke-width:2px,color:#1f2937
+  classDef warning fill:#fafafa,stroke:#eab308,stroke-width:2px,color:#1f2937
+  classDef error fill:#fafafa,stroke:#ef4444,stroke-width:2px,color:#1f2937
+  classDef ext fill:#fafafa,stroke:#9ca3af,stroke-dasharray:4 4,color:#1f2937
+
+  class user,gw,orders,auth,inv healthy
+  class pay warning
+  class stripe ext`} />
+
+In the real UI, edges show RPS and error % live (e.g. `12 rps, 0.3% 5xx`), and nodes can be grouped by app, version, or workload. The view updates every 15s.
+
+## Strengths
+
+- **Tight Istio integration.** Wizards generate the exact YAML you'd otherwise hand-write — and validate it before applying.
+- **Live state, not declared state.** The graph reflects actual traffic over a recent window, not just what's deployed. That difference catches a lot of "config looks right but nothing's flowing" bugs.
+- **Validation catches real bugs.** `VirtualService` referencing a non-existent subset, conflicting `AuthorizationPolicy`, mTLS misconfig — Kiali surfaces these without you knowing to look.
+- **Free, Apache-2.0, CNCF-incubating.** No vendor lock; runs entirely in your cluster.
+
+## Limitations
+
+- **Istio-only.** Linkerd users have Buoyant Cloud / `linkerd viz`. Cilium service mesh users have Hubble UI. Kiali doesn't help you on those.
+- **Prometheus-bound.** Without Prometheus (or a compatible remote-write target), most of Kiali's views go blank — the graph generation, health, and validation all rely on metric queries.
+- **Cost on large meshes.** Graph generation queries Prom across the selected namespaces and time window. On a 1000-service mesh, the wide-graph + long-window combination is expensive. In practice you scope by namespace and keep the time window short.
+- **Not a tracing tool.** Kiali shows topology and aggregate metrics; for "what happened to this exact request," you still need Jaeger or Tempo. Kiali just links you there.
+- **Power-user configs still need YAML.** EnvoyFilters, complex routing trees, and lower-level mesh tuning aren't in any wizard.
+
+## Kiali on OpenShift
+
+If you're on OpenShift, **Service Mesh ships Kiali bundled** with istiod, Jaeger, and Prometheus, all provisioned through the Service Mesh operator. The trade-off is being a release or two behind upstream Istio while Red Hat curates the bundle — for most enterprise users this is a feature, not a constraint. The Kiali experience itself is the same as upstream.
+
+## Where to start
+
+1. Install Istio + Kiali via the Kiali operator, the helm chart, or (on OpenShift) the Service Mesh operator.
+2. Deploy a sample app like `bookinfo` and watch the graph populate.
+3. Switch the graph to **versioned-app** view to see how Istio sees your services.
+4. Open the **Istio Config** page on day one — even on a clean install, Kiali usually flags something you didn't know about.
+5. Add your own namespaces to the mesh one at a time. The graph will tell you immediately when sidecar injection is missing or when traffic isn't going through the proxy.
+
+The common Kiali mistake is treating it as just a topology dashboard. The real value is in the **validation** and the **wizards** — those are what save you at 3am when a production rollout is going sideways and the YAML you applied isn't doing what you expected.
