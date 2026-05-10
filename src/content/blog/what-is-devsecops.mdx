@@ -1,0 +1,96 @@
+---
+title: "What is DevSecOps?"
+description: "Why security got bolted onto DevOps, what 'shift left' actually means in practice, and the patterns that separate teams doing it from teams running scanners and calling it done."
+date: 2026-05-10
+---
+
+import Mermaid from "../../components/Mermaid";
+
+DevSecOps is the practice of treating security as a continuous, automated, owned-by-everyone concern across the software lifecycle — instead of a gate at the end. The "Sec" in the middle isn't a stage; it's a property that has to hold at every stage.
+
+That's the slogan. The reality is messier and worth unpacking.
+
+## The problem it actually solves
+
+Pre-DevOps security worked like this: developers wrote code, ops ran it, and a security team did a review before release. That model survived because release cycles were quarterly. When teams started shipping daily, three things broke:
+
+1. **Security review became the bottleneck.** A 2-week review on a 1-day change is a nonstarter.
+2. **Findings arrived too late to act on cheaply.** A SQL injection found in staging after the feature has already shipped is roughly 100× more expensive to fix than catching it at code review.
+3. **The security team didn't know the system well enough.** Microservices meant the central team couldn't keep up with what each service did, what it talked to, what data it held.
+
+DevSecOps responds to this by *moving security work into the loop* — into the same repos, pipelines, dashboards, and on-call rotations engineers already use. Security stops being a gate and becomes a continuous signal.
+
+## The lifecycle
+
+<Mermaid client:load chart={`flowchart LR
+  P([Plan]) --> C([Code])
+  C --> B([Build])
+  B --> T([Test])
+  T --> R([Release])
+  R --> D([Deploy])
+  D --> O([Operate])
+  O --> M([Monitor])
+  M --> P
+  classDef stage fill:#e5e7eb,stroke:#9ca3af,color:#1f2937
+  class P,C,B,T,R,D,O,M stage`} />
+
+The diagram is the standard DevOps loop. DevSecOps is what you do at each stage:
+
+| Stage | Security activity |
+| --- | --- |
+| Plan | Threat modeling, abuse cases, security stories on the backlog |
+| Code | IDE linters, pre-commit hooks, secret scanning, signed commits |
+| Build | SAST, SCA (dependency CVEs), container image scan, SBOM |
+| Test | DAST, fuzzing, IaC scanning (Checkov / tfsec / KICS), policy tests |
+| Release | Artifact signing (Sigstore / cosign), provenance attestation (SLSA), policy gates |
+| Deploy | Admission control (OPA / Kyverno), least-privilege runtime config, sealed secrets |
+| Operate | Runtime detection (Falco / eBPF), audit log shipping, key rotation |
+| Monitor | SIEM correlation, anomaly detection, post-incident threat-model updates |
+
+## What "shift left" actually means
+
+"Shift left" gets used to mean "do security earlier," which is true but lossy. The more useful framing:
+
+> **The cheapest place to fix something is the place where the person who can fix it is already paying attention.**
+
+For a developer, that's their editor and their PR. So:
+
+- A secret committed to a feature branch should be flagged by a pre-commit hook — not by a Slack message from the security team three days later.
+- A vulnerable dependency should fail CI on the PR that added it — not show up on a quarterly report.
+- An IaC change that opens a security group to `0.0.0.0/0` should be blocked at `terraform plan` review — not discovered by a runtime scanner after deploy.
+
+If a finding lands somewhere a developer *isn't* looking, you haven't shifted left — you've just moved the bottleneck.
+
+## The pillars
+
+Cleaning up the buzzword soup, there are roughly six categories of work:
+
+1. **Threat modeling.** At design time, ask "what would an attacker do here?" before code is written. Cheapest moment to redesign.
+2. **Code & secrets hygiene.** SAST, secret scanning, pre-commit hooks. Catches the bottom 30% of issues automatically.
+3. **Supply chain.** SCA, SBOMs, signed artifacts, pinned base images. The XZ backdoor of early 2024 made this non-negotiable.
+4. **Infrastructure-as-code scanning.** Checkov, tfsec, KICS. Catches misconfig before it becomes runtime exposure.
+5. **Policy as code.** OPA/Rego, Kyverno. Enforces "no public S3 buckets" or "all pods drop CAP_NET_RAW" automatically at admission time.
+6. **Runtime defense + audit.** Falco, eBPF-based detection, audit-log shipping. The last line of defense — and where you catch what bypassed everything else.
+
+You don't need all six on day one. You need to know which one you're missing most.
+
+## Common anti-patterns
+
+A few things that look like DevSecOps but aren't:
+
+- **Buying a scanner and treating its dashboard as the program.** The dashboard is not the program. The program is what happens when a finding is generated — who gets paged, on what SLA, who's accountable for the fix.
+- **Wrapping everything in a manual approval step.** Adding a "security review" gate that's a human approval is just bringing back the original bottleneck with extra steps.
+- **Failing CI on every CVE.** When you fail builds on noise, developers learn to bypass the check. Tune severity gates and fix the high ones fast — so developers trust the signal.
+- **Letting the security team own the pipeline.** Pipelines should be owned by the team that ships through them. Security provides the controls, not the train.
+
+## Where to start
+
+Starting from zero on a real codebase, the highest-leverage sequence is roughly:
+
+1. Turn on secret scanning + pre-commit hooks. *(One day. Stops the bleeding.)*
+2. Add SCA on every PR with severity gates. *(One week. Cuts known-vuln deps.)*
+3. Sign your artifacts and produce SBOMs. *(Two weeks. Makes you respond-able to the next supply-chain incident.)*
+4. Add IaC + admission policies on the things that matter most: network exposure, secrets, privileged containers. *(Ongoing.)*
+5. Threat-model the *next* major feature — not the existing system. You won't catch up; don't try.
+
+The trap is doing all of these at 30%. None of them work at 30%. Pick the next one, do it well, then move on.
