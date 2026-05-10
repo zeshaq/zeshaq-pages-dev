@@ -1,0 +1,288 @@
+---
+title: "GitOps in 2026: a wide introduction"
+description: "Where GitOps came from, the four operating principles, the Argo CD vs Flux landscape, and the surprising breadth of use cases it now covers — application delivery, platform management, infrastructure-as-code, security policy, secrets, multi-cluster fleet, compliance, and AI/ML pipelines."
+date: 2026-05-10
+category: WORKFLOWS
+---
+
+import Whiteboard from "../../components/Whiteboard";
+import Mermaid from "../../components/Mermaid";
+
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const branch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+
+  const R_HEADER = 380;
+  const headerCenter = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
+  nodes.push({
+    id: headerId,
+    position: { x: headerCenter.x - 100, y: headerCenter.y - 25 },
+    data: { label: header },
+    style: branchHeader,
+  });
+  edges.push({
+    id: "trunk_" + headerId,
+    source: "gitops",
+    target: headerId,
+    style: { stroke: "#15803d", strokeWidth: 2 },
+  });
+
+  const FORWARD_START = 150;
+  const FORWARD_STEP = 170;
+  const PERP_OFFSET = 95;
+
+  leaves.forEach((label, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+
+    const x = headerCenter.x + forwardDist * dx + perpDist * px;
+    const y = headerCenter.y + forwardDist * dy + perpDist * py;
+
+    const id = headerId + "_" + slug(label);
+    nodes.push({
+      id,
+      position: { x: x - 75, y: y - 15 },
+      data: { label },
+      style: leaf,
+    });
+    edges.push({
+      id: "br_" + id,
+      source: headerId,
+      target: id,
+      style: { stroke: "#9ca3af", strokeWidth: 1 },
+    });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const branches = [
+  branch("Application Delivery", -90, ["App-of-apps", "ApplicationSet", "Progressive delivery", "Canary + blue/green", "Sync waves", "Health checks", "Auto-rollback", "Helm + Kustomize"], CX, CY),
+  branch("Platform Management", -45, ["Cluster bootstrap", "Operator install", "RBAC + namespaces", "Quotas + limits", "Service Mesh config", "Ingress controllers", "Storage classes", "Cluster lifecycle"], CX, CY),
+  branch("Infrastructure as Code", 0, ["Terraform via Atlantis", "Crossplane CRs", "Cluster API", "Cloud accounts", "DNS + certs", "Networking (BGP)", "Object storage", "Database provisioning"], CX, CY),
+  branch("Security & Policy", 45, ["OPA + Gatekeeper", "Kyverno policies", "Network Policies", "Image signing", "Admission gates", "SCC + PSS", "Audit trails", "Drift as alert"], CX, CY),
+  branch("Secrets & Config", 90, ["Sealed Secrets", "External Secrets Op", "SOPS + age / gpg", "Vault Secrets Op", "1Password / Akeyless", "CSI Secrets driver", "Cert-manager", "Config maps + IaC"], CX, CY),
+  branch("Multi-cluster & Edge", 135, ["RHACM pull model", "ApplicationSet", "Fleet (Rancher)", "ZTP for telco edge", "argocd-agent", "Cluster API multi-cluster", "Sync windows per region", "Disconnected install"], CX, CY),
+  branch("Compliance & Audit", 180, ["Git as change log", "Signed commits + tags", "PR-as-change-control", "SLSA provenance", "in-toto attestation", "Cosign signatures", "Approval workflows", "Backstage scorecards"], CX, CY),
+  branch("AI/ML & Data", -135, ["Model registry → KServe", "MLflow → ArgoCD", "Vector DB schemas", "RAG corpus updates", "Notebook → pipeline", "DAG-as-CR", "Feature store config", "Dataset versioning"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "gitops", position: { x: CX - 110, y: CY - 40 }, data: { label: "GitOps" }, style: center },
+  ...branches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = branches.flatMap((b) => b.edges);
+
+GitOps started life as a slogan from Weaveworks in 2017: **"Operations by pull request."** Eight years later it's a mature, CNCF-blessed discipline with two dominant tools (Argo CD and Flux), a published set of operating principles, and a footprint that has spread well beyond the original use case of *deploying Kubernetes applications*. Today GitOps is the default mechanism for provisioning entire platforms, enforcing security policy, managing fleets of clusters at telco edge, deploying ML models, and producing audit-grade change history for regulated industries.
+
+This post is the wide introduction — what GitOps is, the principles that define it, the tooling landscape, and the surprising breadth of use cases it now covers in 2026. For depth on a specific implementation, see [the OpenShift GitOps post](/blog/openshift-gitops); for workflow-engine context, see the posts on [Argo Workflows](/blog/argo-workflows) and [Temporal](/blog/temporal).
+
+## The four operating principles
+
+The CNCF OpenGitOps working group standardized the definition in 2021. GitOps is the practice where:
+
+1. **System state is declarative.** Configuration describes the desired end state, not the steps to reach it. Kubernetes YAML is the prototypical example, but Crossplane CRs, Terraform with state in Git, and any other declarative format qualify.
+2. **Desired state is versioned and immutable.** Stored in a versioned system (Git, in practice), with full history. Rollback = revert a commit. The history is the change log.
+3. **State changes are pulled automatically.** A controller running inside the target environment pulls the desired state from the source repo. **No CI system pushes into production.** No service account credentials for production leave the production environment.
+4. **State is continuously reconciled.** The controller doesn't just apply once — it compares actual state against declared state on a loop, and either converges or alerts on drift.
+
+The fourth principle is the one that distinguishes GitOps from "CI/CD that uses Git." Plain CI/CD pushes a change once and walks away. GitOps watches the cluster forever. If someone `kubectl edit`s a deployment manually, the controller notices and either re-applies the declared state or fires an alert.
+
+## The reconciliation loop
+
+What that looks like in practice:
+
+<Mermaid client:load chart={`flowchart LR
+  Dev[developer / system] --> PR[Pull Request]
+  PR -- review + merge --> Main[main branch]
+  Main --> Controller{GitOps Controller}
+  Controller -- compare --> Live[Live cluster state]
+  Live -- drift detected --> Controller
+  Controller -- apply --> Cluster[Target cluster]
+  Cluster -- status --> Dashboard[Dashboard + alerts]
+
+  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  classDef alert fill:#fafafa,stroke:#15803d,color:#1f2937
+  class PR,Main,Controller,Cluster phase
+  class Dev,Live,Dashboard alert`} />
+
+Two properties of this loop matter:
+
+- **Pull-based architecture.** The controller initiates outbound connections to Git and the cluster API. No inbound channel into production from outside. This is what makes GitOps work across firewalls, air-gaps, edge sites, NAT, and the unstable WANs of telco far-edge — the spoke initiates everything.
+- **Reconciliation is continuous, not transactional.** Drift, partial failures, transient errors all converge eventually. There's no "deploy script that may or may not have completed correctly."
+
+## The tooling landscape
+
+Two products dominate; everything else is built on or around them.
+
+| Tool | What it is | Who runs it |
+| --- | --- | --- |
+| **Argo CD** | Application-focused GitOps controller, Kubernetes-native, CNCF graduated 2022. UI-first, sync-wave model, app-of-apps pattern, **ApplicationSet** for templated multi-app. | Most enterprise adopters, OpenShift shops, anyone wanting a polished UI |
+| **Flux v2** | Modular GitOps toolkit, set of controllers (Source, Kustomize, Helm, Notification, Image Automation), CNCF graduated 2022. Less of a UI, more of a building-block toolkit. | Teams who prefer composability and minimalism; integrated with Weave GitOps (now sunset post-Flexera acquisition) |
+| **Jenkins X** | Earlier (2018) attempt at opinionated GitOps + CI. Mostly historical interest now. | Legacy adopters |
+| **Atlantis** | Terraform-specific GitOps — PR-driven `terraform plan` and apply. | Terraform-heavy teams that want Git-driven IaC |
+| **Crossplane** | Universal control plane: cloud resources as Kubernetes CRs. Pairs with Argo CD / Flux as the reconciler. | Platform engineering teams managing multi-cloud |
+| **Akuity** | Commercial managed Argo CD with extra enterprise features. Founded by Argo CD's original creators. | Enterprises wanting Argo CD without the operational burden |
+| **Codefresh** | Commercial Argo CD distribution, runtime + analytics. Acquired Octopus competitor positioning. | CD-platform-as-service customers |
+| **Weave GitOps Enterprise** | Now sunset. Was the commercial Flux distribution. | Migrating off |
+| **Cluster API** | Not GitOps itself, but the Kubernetes-native cluster lifecycle CRD set. Combined with Argo CD / Flux, becomes "GitOps for clusters." | Multi-cluster shops |
+| **argocd-agent** | Newer Red Hat-driven project: split-control-plane GitOps for disconnected fleets. Covered in [the OpenShift GitOps post](/blog/openshift-gitops). | Telco edge, regulated networks |
+
+In practice, the choice in 2026 is **Argo CD or Flux v2**. Both are mature, both are CNCF graduated. Argo CD has the larger mindshare and a strong UI. Flux is more modular and pairs better with code-first / no-UI workflows.
+
+## The use case landscape
+
+The original 2017 framing was "GitOps for deploying applications to Kubernetes." That's still its largest use, but the practice has spread:
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={900} />
+
+Eight branches; each represents a category of work that GitOps now standardly handles.
+
+## Application delivery — the original use case
+
+The thing GitOps was invented for. Application manifests (Deployment, Service, Ingress, ConfigMap) committed to Git; Argo CD or Flux reconciles them to a cluster.
+
+The patterns that emerged:
+
+- **App-of-apps** — a root Argo CD `Application` that points at a directory of more `Application` manifests. Bootstrap pattern; still useful for cluster-init.
+- **ApplicationSet** — generators (cluster, list, Git directory, pull-request, ClusterDecisionResource) that template Applications. Modern alternative to app-of-apps for fleet-scale deployment.
+- **Sync waves** — declare ordering between resources within an Application (e.g., wait for the database CR to be ready before deploying the app that uses it).
+- **Progressive delivery** — pair with Argo Rollouts for canary, blue/green, or experiment-based rollouts. Traffic splitting via Service Mesh, success metrics from Prometheus.
+- **Auto-rollback** — Argo Rollouts auto-reverts if defined metrics regress during the canary window.
+- **Helm + Kustomize** — Argo CD and Flux both natively render either before applying. The native format wars settled into "use both, mostly Kustomize for environment overlays, Helm for vendor-provided charts."
+
+## Platform management
+
+GitOps for managing the cluster itself, not just the apps on it.
+
+What gets managed via Git: cluster operators (subscriptions), namespaces, RBAC role bindings, NetworkPolicies, ResourceQuotas, IngressController configs, Service Mesh control plane, storage classes, OAuth identity providers, monitoring config, logging config.
+
+The mental shift: **the cluster's own configuration is just more YAML in Git**. A new cluster bootstrapped from a single root Application brings up the entire platform stack in 20-30 minutes with no manual `kubectl apply`. Same configuration, applied identically across dev / staging / prod.
+
+Combined with Cluster API or RHACM, this extends to **cluster provisioning itself** — Git declares "I want 3 prod clusters in 3 regions," Cluster API creates them, Argo CD installs the platform stack onto them.
+
+## Infrastructure as Code
+
+Beyond Kubernetes, into cloud resources. Two paths:
+
+- **Terraform GitOps via Atlantis** — PRs trigger `terraform plan`; reviewers see the plan output in the PR; merge triggers `terraform apply`. State remains in cloud (S3) but the workflow is Git-driven.
+- **Crossplane** — cloud resources (S3 buckets, RDS instances, IAM roles, VPCs) declared as Kubernetes CRs. Argo CD / Flux reconciles. The same controller that deploys your app deploys the database it talks to.
+
+The second pattern — Crossplane + Argo CD — is the "everything is a CRD" endpoint. It scales but introduces operational coupling (cluster outage = inability to manage cloud resources).
+
+## Security and policy
+
+Probably the use case with the highest under-appreciated value.
+
+- **Policy as code.** OPA/Gatekeeper or Kyverno constraint templates and constraints stored in Git, reconciled to the cluster. Admission policy changes go through the same PR review as application changes.
+- **Image signing enforcement.** Sigstore policies committed to Git; admission webhook references them. Unsigned images get rejected; the *policy* itself is auditable in Git.
+- **NetworkPolicies as default-deny.** Egress / ingress rules per namespace declared in Git. New namespaces get their NetPol when bootstrapped.
+- **RBAC declared in Git.** Cluster role bindings versioned. Quarterly access review = `git log` filtered on the relevant files.
+- **Audit trails.** Every change is a commit. Signed commits with verified GPG / GitSign signatures provide non-repudiation. Branch protection enforces approval count and reviewer identity.
+- **Drift detection as a security signal.** Argo CD reports OutOfSync — that's not just an operational issue, it's a security alert. Someone changed something not in Git. The same controller doubles as a tamper-detection system.
+
+Covered in more depth in [the DevSecOps post](/blog/what-is-devsecops) and [the shift-left/shift-right post](/blog/shift-left-shift-right).
+
+## Secrets and config
+
+The trick: Git is great for declarative state, but secrets in plaintext in Git is a non-starter. Several patterns solve this:
+
+- **Sealed Secrets** — encrypt secrets to a cluster-specific key; commit the encrypted version. The cluster's controller decrypts on apply. Simple, but you can't read secrets from outside the cluster.
+- **External Secrets Operator** — manifests in Git declare *where* a secret lives (Vault path, AWS Secrets Manager, Akeyless, etc.). The operator fetches at apply time. Secret values never enter Git.
+- **SOPS** — encrypt YAML files with age, GPG, or KMS. Commit encrypted files; decrypt via tooling (Flux has native SOPS support, Argo CD via plugins).
+- **HashiCorp Vault Secrets Operator** — Vault-native equivalent of External Secrets.
+- **CSI Secrets Store Driver** — mount secrets directly into pods from an external store; cluster never persists secret values.
+- **cert-manager** — certificates as CRs; cert-manager issues them. Used for both TLS certs and signing certs.
+
+The pattern that won broadly is **External Secrets Operator** — Git declares *which* secret to fetch and *where to put it*; the value lives in an enterprise secrets store. Audit, rotation, access control all happen at the secrets-store layer.
+
+## Multi-cluster and edge
+
+This is where pull-model GitOps proves itself. The architecture in three flavors:
+
+- **Push model** — central Argo CD with kubeconfigs to each spoke. Easy for small fleets; falls apart at scale and across networks.
+- **Pull model via RHACM** — Hub creates ManifestWork; klusterlet on each spoke pulls. Covered in [the RHACM post](/blog/rhacm).
+- **Agent model** — argocd-agent. Principal on the hub, agent on each spoke, gRPC over a spoke-initiated connection. Strategic direction for far-edge.
+
+Other variants exist (Rancher Fleet, Anthos Config Management, etc.). The unifying property: declarative state lives in Git, controllers pull, reconciliation is local to each cluster, no central choke point.
+
+The killer use case is **telco edge / ZTP** (Zero Touch Provisioning). A new cell tower comes online; a controller on the hub recognizes it via RHACM; ApplicationSet generates the cluster's manifests; the local cluster's agent pulls and reconciles. Thousands of edge sites managed from a central control plane without anyone SSHing into anything.
+
+## Compliance and audit
+
+Regulated industries discovered an unexpected benefit: GitOps produces **audit-grade change records by default**.
+
+- **Every change is a commit.** With author, timestamp, message, and (if signed) cryptographic non-repudiation.
+- **Every commit has a PR.** With approvers, reviewers, and (configurably) required CI checks.
+- **The PR can require business approval** — CAB ticket linked, security review acknowledgment, compliance attestation in the PR description.
+- **SLSA framework provenance.** Builds attach provenance attestations describing what they were built from. GitOps deploys them.
+- **in-toto attestations** for the supply chain. Every step in build → deploy traces back to signed steps.
+- **Backstage scorecards** measure GitOps adoption per service. Compliance dashboards become almost free.
+
+The compliance story for GitOps-based platforms is materially better than for click-ops or push-CD platforms. Auditors notice.
+
+## AI/ML pipelines
+
+Newest application area. The patterns are still settling:
+
+- **Model registry → KServe.** Trained models registered in a registry (MLflow, OpenShift AI Model Registry). A controller watches the registry; when a new version is approved, it updates the `InferenceService` manifest in Git. Argo CD reconciles to the cluster.
+- **Notebook → pipeline → manifest.** Data scientists develop in workbenches; the pipeline that promotes them runs in Kubeflow Pipelines or Tekton; output is a `Workflow` CR or model artifact, deployment manifest committed to Git.
+- **Vector database schema and RAG corpus** versioned in Git. Schema migrations are commits; corpus updates are PR-reviewed.
+- **Feature store definitions** in Git (Feast). Reconciled into the feature store.
+- **DAG-as-CR.** Airflow / Argo Workflows DAGs themselves stored in Git, reconciled into the engine.
+
+The deeper claim some teams are exploring: **the entire MLOps lifecycle is a GitOps workflow**. Model promotion = commit. Rollback = revert. Audit = `git log`. See [the OpenShift AI post](/blog/openshift-ai) for the platform that operationalizes this stack.
+
+## Adjacent and emerging use cases
+
+A few that don't fit neatly into the eight branches:
+
+- **Database schema management.** Atlas, Bytebase, SQLMesh — declarative schema-as-code with GitOps reconciliation against running databases. Migrations review like Kubernetes manifests.
+- **Network device config.** BGP configs, switch fabrics — historically Ansible push, now increasingly Crossplane / GitOps.
+- **Service catalog / IDP.** Backstage + GitOps. Developer self-service that produces PRs against the platform repo.
+- **Cost / FinOps.** Resource quotas, GPU allocation, autoscale config — all in Git. Cost changes review like code.
+- **AI agent deployment.** Agent prompts, tool definitions, model versions — committed to Git. The shape isn't novel; the content is.
+
+## What GitOps doesn't do well
+
+A reality check:
+
+- **High-frequency state.** GitOps reconciles every few seconds to minutes. For state that changes per request or per millisecond, it's the wrong tool. Use a real-time control plane.
+- **Imperative operations.** "Run this one-time migration job" doesn't fit the declarative model well. Job CRs work but feel awkward.
+- **Truly secret state.** Even with Sealed Secrets, the *existence* of the secret is in Git. For genuinely sensitive bootstrapping (initial root credentials), GitOps comes *after* a manual seed.
+- **Long-running orchestrations.** Multi-day business processes belong in [Temporal](/blog/temporal), not in a GitOps controller's reconciliation loop.
+- **Real-time event handling.** GitOps is steady-state. Use an event bus + workers for the dynamic part.
+
+## Where to start
+
+For an organization adopting GitOps:
+
+1. **One application, one repo, one cluster.** Get the end-to-end loop working: commit a manifest, Argo CD syncs, cluster has the workload. ~1 day.
+2. **Use Helm or Kustomize from the start.** Pick one. Even simple apps benefit from environment overlays.
+3. **Move secrets to External Secrets Operator** as part of step 1. Plaintext secrets in Git is the easiest mistake to make.
+4. **Add a second environment** (staging). Practice promotion via PR / Git merge to a different overlay.
+5. **Adopt ApplicationSet** when you have a third app or third environment. App-of-apps gets unwieldy.
+6. **Bring platform config into Git** — RBAC, NetworkPolicies, operators. The "cluster as Git" milestone is when GitOps starts paying its biggest dividends.
+7. **Add policy-as-code** (Gatekeeper or Kyverno) with policies reconciled via the same loop.
+8. **Move to pull-model multi-cluster** before you have more than ~10 clusters. Retrofitting later is painful.
+
+The mistake to avoid: treating GitOps as just "CD with Git" and stopping at application deployment. The reason GitOps spread far beyond its original use case is that **a versioned, declarative, continuously-reconciled, audit-trailed source of truth is useful for an enormous range of operational concerns** — not just app delivery. Teams that adopt GitOps for app delivery and don't extend it to platform, security, infrastructure, and policy end up with one well-managed slice and seven hand-managed ones. The slogan "operations by pull request" works at full strength only when it's the *whole* operational model.
