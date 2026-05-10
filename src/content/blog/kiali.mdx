@@ -6,7 +6,30 @@ category: OBSERVABILITY
 ---
 
 import Whiteboard from "../../components/Whiteboard";
-import Mermaid from "../../components/Mermaid";
+
+export const healthy = { background: "#fafafa", border: "2px solid #22c55e", borderRadius: 999, padding: 10, color: "#1f2937", width: 140, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const warning = { background: "#fafafa", border: "2px solid #eab308", borderRadius: 999, padding: 10, color: "#1f2937", width: 140, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const extDashed = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 999, padding: 10, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const meshEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+
+export const meshNodes = [
+  { id: "user",    position: { x: 60,  y: 220 }, data: { label: "browser" },     style: healthy },
+  { id: "gw",      position: { x: 240, y: 220 }, data: { label: "api-gateway" }, style: healthy },
+  { id: "orders",  position: { x: 420, y: 220 }, data: { label: "orders" },      style: healthy },
+  { id: "auth",    position: { x: 600, y: 80 },  data: { label: "auth" },        style: healthy },
+  { id: "inv",     position: { x: 600, y: 220 }, data: { label: "inventory" },   style: healthy },
+  { id: "pay",     position: { x: 600, y: 360 }, data: { label: "payments" },    style: warning },
+  { id: "stripe",  position: { x: 800, y: 360 }, data: { label: "stripe" },      style: extDashed },
+];
+
+export const meshEdges = [
+  { id: "m1", source: "user",   target: "gw",     ...meshEdge },
+  { id: "m2", source: "gw",     target: "orders", ...meshEdge },
+  { id: "m3", source: "orders", target: "auth",   ...meshEdge },
+  { id: "m4", source: "orders", target: "inv",    ...meshEdge },
+  { id: "m5", source: "orders", target: "pay",    ...meshEdge },
+  { id: "m6", source: "pay",    target: "stripe", ...meshEdge },
+];
 
 export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
 export const obs   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
@@ -92,22 +115,7 @@ Click ⛶ to view the diagram full-screen.
 
 A typical Kiali graph view on a small mesh, with health indicated by border color:
 
-<Mermaid client:load chart={`flowchart LR
-  user([browser]) --> gw([api-gateway])
-  gw --> orders([orders])
-  orders --> auth([auth])
-  orders --> inv([inventory])
-  orders --> pay([payments])
-  pay --> stripe([stripe])
-
-  classDef healthy fill:#fafafa,stroke:#22c55e,stroke-width:2px,color:#1f2937
-  classDef warning fill:#fafafa,stroke:#eab308,stroke-width:2px,color:#1f2937
-  classDef error fill:#fafafa,stroke:#ef4444,stroke-width:2px,color:#1f2937
-  classDef ext fill:#fafafa,stroke:#9ca3af,stroke-dasharray:4 4,color:#1f2937
-
-  class user,gw,orders,auth,inv healthy
-  class pay warning
-  class stripe ext`} />
+<Whiteboard client:load data={{ nodes: meshNodes, edges: meshEdges }} height={500} />
 
 In the real UI, edges show RPS and error % live (e.g. `12 rps, 0.3% 5xx`), and nodes can be grouped by app, version, or workload. The view updates every 15s.
 

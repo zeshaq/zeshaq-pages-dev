@@ -5,7 +5,27 @@ date: 2026-05-10
 category: SECURITY
 ---
 
-import Mermaid from "../../components/Mermaid";
+import Whiteboard from "../../components/Whiteboard";
+
+export const phaseStyle = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const phaseEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+
+export const killchainNodes = [
+  { id: "recon",   position: { x: 40,   y: 100 }, data: { label: "Recon" },                  style: phaseStyle },
+  { id: "scan",    position: { x: 230,  y: 100 }, data: { label: "Scan + enum" },             style: phaseStyle },
+  { id: "exploit", position: { x: 420,  y: 100 }, data: { label: "Exploit / initial access" }, style: phaseStyle },
+  { id: "post",    position: { x: 610,  y: 100 }, data: { label: "Post-exploit" },            style: phaseStyle },
+  { id: "lateral", position: { x: 800,  y: 100 }, data: { label: "Lateral movement" },        style: phaseStyle },
+  { id: "exfil",   position: { x: 990,  y: 100 }, data: { label: "Exfil / impact" },          style: phaseStyle },
+];
+
+export const killchainEdges = [
+  { id: "k1", source: "recon",   target: "scan",    ...phaseEdge },
+  { id: "k2", source: "scan",    target: "exploit", ...phaseEdge },
+  { id: "k3", source: "exploit", target: "post",    ...phaseEdge },
+  { id: "k4", source: "post",    target: "lateral", ...phaseEdge },
+  { id: "k5", source: "lateral", target: "exfil",   ...phaseEdge },
+];
 
 Kali Linux is the Debian-based distribution maintained by Offensive Security (OffSec) that ships with 600-plus pre-installed offensive security tools. It's the *de facto* standard environment for penetration testing, vulnerability research, CTF play, and security training. If you've taken the OSCP, attended a SANS pentest class, watched any hacking YouTube channel made after 2015, or worked an authorized red team engagement, you've used Kali.
 
@@ -39,15 +59,7 @@ It's not the *only* pentest distribution — Parrot Security OS, BlackArch Linux
 
 The 600+ tools in Kali are noise without a mental model. The standard pentest kill chain (or a defender's threat model) provides the structure:
 
-<Mermaid client:load chart={`flowchart LR
-  R[Recon] --> S[Scan + enum]
-  S --> X[Exploit / initial access]
-  X --> P[Post-exploit]
-  P --> L[Lateral movement]
-  L --> E[Exfil / impact]
-
-  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
-  class R,S,X,P,L,E phase`} />
+<Whiteboard client:load data={{ nodes: killchainNodes, edges: killchainEdges }} height={250} />
 
 Tool families mapped to phases:
 

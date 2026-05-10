@@ -6,7 +6,54 @@ category: WORKFLOWS
 ---
 
 import Whiteboard from "../../components/Whiteboard";
-import Mermaid from "../../components/Mermaid";
+
+export const clusterHdr = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 13, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const monoNode = { background: "#e5e7eb", border: "1.5px solid #15803d", borderRadius: 6, padding: 6, color: "#1f2937", width: 130, textAlign: "center", fontSize: 12 };
+export const polyNode = { background: "#fafafa", border: "1px solid #6b7280", borderRadius: 6, padding: 6, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const fedNode  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 6, padding: 6, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const repoEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const sharedEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const repoPatternNodes = [
+  // Monorepo cluster
+  { id: "monoHdr", position: { x: 100, y: 20 },  data: { label: "Monorepo" }, style: clusterHdr },
+  { id: "M",       position: { x: 130, y: 110 }, data: { label: "Single repository" }, style: monoNode },
+  { id: "MA",      position: { x: 30,  y: 230 }, data: { label: "apps/" },  style: monoNode },
+  { id: "MB",      position: { x: 230, y: 230 }, data: { label: "libs/" },  style: monoNode },
+  { id: "MC",      position: { x: 30,  y: 320 }, data: { label: "infra/" }, style: monoNode },
+  { id: "MD",      position: { x: 230, y: 320 }, data: { label: "docs/" },  style: monoNode },
+
+  // Polyrepo cluster
+  { id: "polyHdr", position: { x: 460, y: 20 },  data: { label: "Polyrepo" }, style: clusterHdr },
+  { id: "PA",      position: { x: 470, y: 110 }, data: { label: "repo: auth-service" },   style: polyNode },
+  { id: "PB",      position: { x: 470, y: 175 }, data: { label: "repo: api-gateway" },    style: polyNode },
+  { id: "PC",      position: { x: 470, y: 240 }, data: { label: "repo: web-app" },        style: polyNode },
+  { id: "PD",      position: { x: 470, y: 305 }, data: { label: "repo: data-pipeline" },  style: polyNode },
+  { id: "PE",      position: { x: 470, y: 370 }, data: { label: "repo: shared-libs" },    style: polyNode },
+
+  // Federation cluster
+  { id: "fedHdr",  position: { x: 820, y: 20 },  data: { label: "Federation" }, style: clusterHdr },
+  { id: "FA",      position: { x: 750, y: 110 }, data: { label: "group: platform" },     style: fedNode },
+  { id: "FA1",     position: { x: 950, y: 110 }, data: { label: "platform repos" },      style: fedNode },
+  { id: "FB",      position: { x: 750, y: 230 }, data: { label: "group: product-a" },    style: fedNode },
+  { id: "FB1",     position: { x: 950, y: 230 }, data: { label: "product-a repos" },     style: fedNode },
+  { id: "FC",      position: { x: 750, y: 350 }, data: { label: "group: product-b" },    style: fedNode },
+  { id: "FC1",     position: { x: 950, y: 350 }, data: { label: "product-b repos" },     style: fedNode },
+];
+
+export const repoPatternEdges = [
+  // Monorepo edges
+  { id: "rm1", source: "M",   target: "MA", ...repoEdge },
+  { id: "rm2", source: "M",   target: "MB", ...repoEdge },
+  { id: "rm3", source: "M",   target: "MC", ...repoEdge },
+  { id: "rm4", source: "M",   target: "MD", ...repoEdge },
+  // Federation edges
+  { id: "rf1", source: "FA",  target: "FA1", ...repoEdge },
+  { id: "rf2", source: "FB",  target: "FB1", ...repoEdge },
+  { id: "rf3", source: "FC",  target: "FC1", ...repoEdge },
+  { id: "rf4", source: "FA1", target: "FB1", label: "shared modules", ...sharedEdge },
+  { id: "rf5", source: "FA1", target: "FC1", label: "shared modules", ...sharedEdge },
+];
 
 export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
 export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
@@ -98,40 +145,7 @@ This post is the wide introduction: the three patterns that exist (monorepo, pol
 
 ## The three repository patterns
 
-<Mermaid client:load chart={`flowchart TD
-  subgraph Monorepo
-    M[Single repository]
-    M --> MA[apps/]
-    M --> MB[libs/]
-    M --> MC[infra/]
-    M --> MD[docs/]
-  end
-
-  subgraph Polyrepo
-    PA[repo: auth-service]
-    PB[repo: api-gateway]
-    PC[repo: web-app]
-    PD[repo: data-pipeline]
-    PE[repo: shared-libs]
-  end
-
-  subgraph Federation
-    FA[group: platform]
-    FB[group: product-a]
-    FC[group: product-b]
-    FA --> FA1[platform repos]
-    FB --> FB1[product-a repos]
-    FC --> FC1[product-b repos]
-    FA1 -.shared modules.-> FB1
-    FA1 -.shared modules.-> FC1
-  end
-
-  classDef monorepo fill:#e5e7eb,stroke:#15803d,color:#1f2937
-  classDef polyrepo fill:#fafafa,stroke:#6b7280,color:#1f2937
-  classDef federation fill:#e5e7eb,stroke:#6b7280,color:#1f2937
-  class M,MA,MB,MC,MD monorepo
-  class PA,PB,PC,PD,PE polyrepo
-  class FA,FB,FC,FA1,FB1,FC1 federation`} />
+<Whiteboard client:load data={{ nodes: repoPatternNodes, edges: repoPatternEdges }} height={480} />
 
 **Monorepo.** Everything in one repository. Apps, libraries, infrastructure, docs all share a tree. **Polyrepo.** Many small repositories, one per service or library. **Federation.** Hybrid — a small number of shared monorepos plus team-owned polyrepos.
 

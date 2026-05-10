@@ -5,7 +5,32 @@ date: 2026-05-10
 category: SECURITY
 ---
 
-import Mermaid from "../../components/Mermaid";
+import Whiteboard from "../../components/Whiteboard";
+
+export const cycleStyle = { background: "#e5e7eb", border: "1px solid #9ca3af", borderRadius: 999, padding: 10, color: "#1f2937", width: 110, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const cycleEdge = { style: { stroke: "#15803d", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" } };
+
+export const lifecycleNodes = [
+  { id: "plan",    position: { x: 440, y: 60 },  data: { label: "Plan" },    style: cycleStyle },
+  { id: "code",    position: { x: 615, y: 130 }, data: { label: "Code" },    style: cycleStyle },
+  { id: "build",   position: { x: 685, y: 290 }, data: { label: "Build" },   style: cycleStyle },
+  { id: "test",    position: { x: 615, y: 450 }, data: { label: "Test" },    style: cycleStyle },
+  { id: "release", position: { x: 440, y: 520 }, data: { label: "Release" }, style: cycleStyle },
+  { id: "deploy",  position: { x: 265, y: 450 }, data: { label: "Deploy" },  style: cycleStyle },
+  { id: "operate", position: { x: 195, y: 290 }, data: { label: "Operate" }, style: cycleStyle },
+  { id: "monitor", position: { x: 265, y: 130 }, data: { label: "Monitor" }, style: cycleStyle },
+];
+
+export const lifecycleEdges = [
+  { id: "e1", source: "plan",    target: "code",    ...cycleEdge },
+  { id: "e2", source: "code",    target: "build",   ...cycleEdge },
+  { id: "e3", source: "build",   target: "test",    ...cycleEdge },
+  { id: "e4", source: "test",    target: "release", ...cycleEdge },
+  { id: "e5", source: "release", target: "deploy",  ...cycleEdge },
+  { id: "e6", source: "deploy",  target: "operate", ...cycleEdge },
+  { id: "e7", source: "operate", target: "monitor", ...cycleEdge },
+  { id: "e8", source: "monitor", target: "plan",    ...cycleEdge },
+];
 
 DevSecOps is the practice of treating security as a continuous, automated, owned-by-everyone concern across the software lifecycle — instead of a gate at the end. The "Sec" in the middle isn't a stage; it's a property that has to hold at every stage.
 
@@ -23,17 +48,7 @@ DevSecOps responds to this by *moving security work into the loop* — into the 
 
 ## The lifecycle
 
-<Mermaid client:load chart={`flowchart LR
-  P([Plan]) --> C([Code])
-  C --> B([Build])
-  B --> T([Test])
-  T --> R([Release])
-  R --> D([Deploy])
-  D --> O([Operate])
-  O --> M([Monitor])
-  M --> P
-  classDef stage fill:#e5e7eb,stroke:#9ca3af,color:#1f2937
-  class P,C,B,T,R,D,O,M stage`} />
+<Whiteboard client:load data={{ nodes: lifecycleNodes, edges: lifecycleEdges }} height={620} />
 
 The diagram is the standard DevOps loop. DevSecOps is what you do at each stage:
 

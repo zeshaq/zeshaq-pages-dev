@@ -6,7 +6,34 @@ category: OPENSHIFT
 ---
 
 import Whiteboard from "../../components/Whiteboard";
-import Mermaid from "../../components/Mermaid";
+
+export const hubNode    = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const spokeNode  = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const flowEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullDashed = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const pullModelNodes = [
+  { id: "gitrepo", position: { x: 80,  y: 100 }, data: { label: "Git repo" },                  style: hubNode },
+  { id: "as",      position: { x: 320, y: 100 }, data: { label: "ApplicationSet\non hub" },    style: hubNode },
+  { id: "place",   position: { x: 80,  y: 260 }, data: { label: "RHACM Placement" },           style: hubNode },
+  { id: "pd",      position: { x: 320, y: 260 }, data: { label: "PlacementDecision" },         style: hubNode },
+  { id: "mw",      position: { x: 560, y: 180 }, data: { label: "ManifestWork CRs\non hub" }, style: hubNode },
+  { id: "k1",      position: { x: 780, y: 80 },  data: { label: "klusterlet\nspoke A" },       style: spokeNode },
+  { id: "k2",      position: { x: 780, y: 280 }, data: { label: "klusterlet\nspoke B" },       style: spokeNode },
+  { id: "a1",      position: { x: 1000, y: 80 }, data: { label: "Application\n+ workloads on A" }, style: spokeNode },
+  { id: "a2",      position: { x: 1000, y: 280 }, data: { label: "Application\n+ workloads on B" }, style: spokeNode },
+];
+
+export const pullModelEdges = [
+  { id: "p1", source: "gitrepo", target: "as",  ...flowEdge },
+  { id: "p2", source: "place",   target: "pd",  ...flowEdge },
+  { id: "p3", source: "pd",      target: "as",  ...flowEdge },
+  { id: "p4", source: "as",      target: "mw",  ...flowEdge },
+  { id: "p5", source: "mw",      target: "k1",  label: "pulled by", ...pullDashed },
+  { id: "p6", source: "mw",      target: "k2",  label: "pulled by", ...pullDashed },
+  { id: "p7", source: "k1",      target: "a1",  ...flowEdge },
+  { id: "p8", source: "k2",      target: "a2",  ...flowEdge },
+];
 
 export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
 export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
@@ -114,20 +141,7 @@ In the RHACM pull model, **the spoke pulls its own desired state from the hub**,
 
 The wiring:
 
-<Mermaid client:load chart={`flowchart LR
-  Git[Git repo] --> AS[ApplicationSet<br/>on hub]
-  P[RHACM Placement] --> PD[PlacementDecision]
-  PD --> AS
-  AS --> MW[ManifestWork CRs<br/>on hub]
-  MW -. pulled by .-> K1[klusterlet<br/>spoke A]
-  MW -. pulled by .-> K2[klusterlet<br/>spoke B]
-  K1 --> A1[Application<br/>+ workloads on A]
-  K2 --> A2[Application<br/>+ workloads on B]
-
-  classDef hub fill:#e5e7eb,stroke:#6b7280,color:#1f2937
-  classDef spoke fill:#fafafa,stroke:#9ca3af,color:#1f2937
-  class Git,AS,P,PD,MW hub
-  class K1,K2,A1,A2 spoke`} />
+<Whiteboard client:load data={{ nodes: pullModelNodes, edges: pullModelEdges }} height={460} />
 
 Reading it:
 

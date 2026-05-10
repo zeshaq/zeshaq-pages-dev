@@ -6,7 +6,33 @@ category: AI
 ---
 
 import Whiteboard from "../../components/Whiteboard";
-import Mermaid from "../../components/Mermaid";
+
+export const phaseLabel = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const prefillStep = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const decodeStep  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ioNode      = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const phaseEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const loopEdge    = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const phaseNodes = [
+  { id: "prompt",      position: { x: 40,   y: 220 }, data: { label: "Prompt: \"Once upon a time, there\"" }, style: ioNode },
+  { id: "prefillHdr",  position: { x: 270,  y: 60 },  data: { label: "Prefill (compute-bound)" },             style: phaseLabel },
+  { id: "p1",          position: { x: 240,  y: 160 }, data: { label: "Process all\ninput tokens in parallel" }, style: prefillStep },
+  { id: "p2",          position: { x: 240,  y: 280 }, data: { label: "Build KV cache" },                       style: prefillStep },
+  { id: "decodeHdr",   position: { x: 590,  y: 60 },  data: { label: "Decode (memory-bound, sequential)" },    style: phaseLabel },
+  { id: "d1",          position: { x: 560,  y: 160 }, data: { label: "Generate 1 token" },                     style: decodeStep },
+  { id: "d2",          position: { x: 560,  y: 280 }, data: { label: "Append to KV cache" },                   style: decodeStep },
+  { id: "output",      position: { x: 880,  y: 220 }, data: { label: "Stream tokens to client" },              style: ioNode },
+];
+
+export const phaseEdges = [
+  { id: "p_in",  source: "prompt", target: "p1",     ...phaseEdge },
+  { id: "p_a",   source: "p1",     target: "p2",     ...phaseEdge },
+  { id: "p_to_d", source: "p2",    target: "d1",     label: "begin decoding", ...phaseEdge },
+  { id: "d_a",   source: "d1",     target: "d2",     ...phaseEdge },
+  { id: "d_loop", source: "d2",    target: "d1",     label: "next token", ...loopEdge },
+  { id: "d_out", source: "d1",     target: "output", label: "stream", ...phaseEdge },
+];
 
 export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
 export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
@@ -90,23 +116,7 @@ LLMs spanned all four. The streaming model — generate one token at a time, sen
 
 The two-phase nature of LLM generation is the central technical insight that shaped the modern serving stack:
 
-<Mermaid client:load chart={`flowchart LR
-  P[Prompt: "Once upon a time, there"] --> Prefill
-  subgraph Prefill["Prefill phase (compute-bound)"]
-    P1[Process all input tokens in parallel] --> P2[Build KV cache]
-  end
-  Prefill --> Decode
-  subgraph Decode["Decode phase (memory-bound, sequential)"]
-    D1[Generate 1 token] --> D2[Append to KV cache]
-    D2 --> D3[Generate next token]
-    D3 --> D2
-  end
-  Decode --> Output[Stream tokens to client]
-
-  classDef compute fill:#fafafa,stroke:#15803d,color:#1f2937
-  classDef memory fill:#e5e7eb,stroke:#6b7280,color:#1f2937
-  class P1,P2 compute
-  class D1,D2,D3 memory`} />
+<Whiteboard client:load data={{ nodes: phaseNodes, edges: phaseEdges }} height={460} />
 
 **Prefill** processes the entire input prompt in one pass. Every token attends to every other token; the compute scales quadratically with input length but happens in parallel. **Compute-bound**: limited by GPU FLOPS.
 

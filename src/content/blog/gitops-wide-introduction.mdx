@@ -6,7 +6,31 @@ category: WORKFLOWS
 ---
 
 import Whiteboard from "../../components/Whiteboard";
-import Mermaid from "../../components/Mermaid";
+
+export const loopNode = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const loopAlert = { background: "#fafafa", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const loopEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const driftEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const loopNodes = [
+  { id: "dev",        position: { x: 60,  y: 220 }, data: { label: "developer / system" }, style: loopAlert },
+  { id: "pr",         position: { x: 250, y: 220 }, data: { label: "Pull Request" },       style: loopNode },
+  { id: "main",       position: { x: 440, y: 220 }, data: { label: "main branch" },        style: loopNode },
+  { id: "controller", position: { x: 630, y: 220 }, data: { label: "GitOps Controller" },  style: loopNode },
+  { id: "live",       position: { x: 850, y: 100 }, data: { label: "Live cluster state" }, style: loopAlert },
+  { id: "cluster",    position: { x: 850, y: 340 }, data: { label: "Target cluster" },     style: loopNode },
+  { id: "dashboard",  position: { x: 1060, y: 340 }, data: { label: "Dashboard + alerts" }, style: loopAlert },
+];
+
+export const loopEdges = [
+  { id: "l1", source: "dev",        target: "pr",         ...loopEdge },
+  { id: "l2", source: "pr",         target: "main",       label: "review + merge", ...loopEdge },
+  { id: "l3", source: "main",       target: "controller", ...loopEdge },
+  { id: "l4", source: "controller", target: "live",       label: "compare",        ...loopEdge },
+  { id: "l5", source: "live",       target: "controller", label: "drift detected", ...driftEdge },
+  { id: "l6", source: "controller", target: "cluster",    label: "apply",          ...loopEdge },
+  { id: "l7", source: "cluster",    target: "dashboard",  label: "status",         ...loopEdge },
+];
 
 export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
 export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
@@ -111,19 +135,7 @@ The fourth principle is the one that distinguishes GitOps from "CI/CD that uses 
 
 What that looks like in practice:
 
-<Mermaid client:load chart={`flowchart LR
-  Dev[developer / system] --> PR[Pull Request]
-  PR -- review + merge --> Main[main branch]
-  Main --> Controller{GitOps Controller}
-  Controller -- compare --> Live[Live cluster state]
-  Live -- drift detected --> Controller
-  Controller -- apply --> Cluster[Target cluster]
-  Cluster -- status --> Dashboard[Dashboard + alerts]
-
-  classDef phase fill:#e5e7eb,stroke:#6b7280,color:#1f2937
-  classDef alert fill:#fafafa,stroke:#15803d,color:#1f2937
-  class PR,Main,Controller,Cluster phase
-  class Dev,Live,Dashboard alert`} />
+<Whiteboard client:load data={{ nodes: loopNodes, edges: loopEdges }} height={460} />
 
 Two properties of this loop matter:
 
