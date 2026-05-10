@@ -1,0 +1,140 @@
+---
+title: "Distributed tracing: the landscape"
+description: "What traces add over metrics and logs, the OpenTelemetry-led tool landscape, and the parts of running it in production that are still genuinely hard."
+date: 2026-05-10
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center" };
+export const obs = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const traceNodes = [
+  { id: "client", position: { x: 340, y: 0 },   data: { label: "browser" },        style: stage },
+  { id: "gw",     position: { x: 340, y: 90 },  data: { label: "API gateway" },    style: stage },
+  { id: "orders", position: { x: 340, y: 190 }, data: { label: "orders service" }, style: stage },
+  { id: "auth",   position: { x: 80,  y: 300 }, data: { label: "auth" },           style: stage },
+  { id: "inv",    position: { x: 340, y: 300 }, data: { label: "inventory" },      style: stage },
+  { id: "pay",    position: { x: 600, y: 300 }, data: { label: "payments" },       style: stage },
+  { id: "pg",     position: { x: 80,  y: 410 }, data: { label: "postgres" },       style: stage },
+  { id: "redis",  position: { x: 340, y: 410 }, data: { label: "redis" },          style: stage },
+  { id: "stripe", position: { x: 600, y: 410 }, data: { label: "stripe" },         style: stage },
+  { id: "otel",   position: { x: 880, y: 190 }, data: { label: "OTel collector" }, style: obs },
+  { id: "tempo",  position: { x: 880, y: 410 }, data: { label: "Tempo / Jaeger" }, style: obs },
+];
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const spanEdge  = { animated: true, style: { stroke: "#9ca3af", strokeDasharray: "5,5" }, markerEnd: { type: "arrowclosed", color: "#9ca3af" } };
+
+export const traceEdges = [
+  { id: "r1", source: "client", target: "gw",     label: "POST /checkout", ...reqEdge, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "r2", source: "gw",     target: "orders", ...reqEdge },
+  { id: "r3", source: "orders", target: "auth",   ...reqEdge },
+  { id: "r4", source: "orders", target: "inv",    ...reqEdge },
+  { id: "r5", source: "orders", target: "pay",    ...reqEdge },
+  { id: "r6", source: "auth",   target: "pg",     ...reqEdge },
+  { id: "r7", source: "inv",    target: "redis",  ...reqEdge },
+  { id: "r8", source: "pay",    target: "stripe", ...reqEdge },
+  { id: "s1", source: "gw",     target: "otel",   label: "spans", ...spanEdge, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "s2", source: "orders", target: "otel",   ...spanEdge },
+  { id: "s3", source: "auth",   target: "otel",   ...spanEdge },
+  { id: "s4", source: "inv",    target: "otel",   ...spanEdge },
+  { id: "s5", source: "pay",    target: "otel",   ...spanEdge },
+  { id: "x1", source: "otel",   target: "tempo",  label: "OTLP", ...reqEdge, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+];
+
+A trace tells you what happened to a single request across every service it touched, in time order, with the latency and status of each step. Metrics tell you how often something happened. Logs tell you what individual events looked like. Traces tell you the *shape* of a request.
+
+That third axis is what makes tracing indispensable the moment your system grows past one process.
+
+## Three signals, one job
+
+The "three pillars of observability" framing is overused but useful as a cheat sheet:
+
+| Signal | Question it answers | Cardinality | Cost shape |
+| --- | --- | --- | --- |
+| Metrics | Is anything broken? How fast? | Low | Cheap, aggregated |
+| Logs | What did this event look like? | High | Linear in event volume |
+| Traces | Where did this request spend its time? | Highest | Linear in requests × spans |
+
+The pitch for traces specifically: when a checkout takes 4.2 seconds and the customer gives up, metrics say "P99 spiked," logs say "a hundred services fired warnings," and the trace says "the auth call hit a cold cache and waited 3.8s on Redis." Without a trace, you reconstruct that from logs and timestamps, badly.
+
+## The model: trace, span, context
+
+A **trace** is a tree (sometimes a DAG) of **spans**. A span is one unit of work — a service handling a request, a DB query, a queue publish — with a start time, end time, status, and arbitrary attributes (`user_id`, `http.route`, `db.statement`, …).
+
+What makes it work end-to-end is **context propagation**: every outgoing call carries trace headers (W3C `traceparent`, `tracestate`) so the next service stitches its spans onto the same trace. If propagation breaks anywhere — usually at a queue, lambda, or third-party SDK that doesn't forward headers — the trace splits, and the picture goes dark from that point.
+
+## A request, traced
+
+The diagram below is one checkout request through a typical service graph. **Solid edges** are the request path. **Dashed edges** are spans being exported to the OpenTelemetry collector, which forwards them to a backend.
+
+<Whiteboard client:load data={{ nodes: traceNodes, edges: traceEdges }} height={620} />
+
+A few things worth pointing out:
+
+- The **request path** is the trace's logical shape. Each hop is a span; each span's `parent_span_id` points to the caller's span. Reassembled, that gives you the tree.
+- The **OTel collector** sits between your services and the backend. It batches, filters, redacts PII, samples — and decouples apps from the storage choice. Swap Tempo for Jaeger, or add a commercial APM as a second exporter, without touching service code.
+- **All services emit to the same collector**. That's the magic of OpenTelemetry as a standard — propagation, instrumentation, and wire format are uniform across runtimes.
+
+Click ⛶ on the diagram to view it full-screen.
+
+## OpenTelemetry, briefly
+
+Before OpenTelemetry (OTel) merged OpenCensus and OpenTracing in 2019, instrumenting a polyglot system was painful: every vendor had its own SDK, propagation format, and semantic conventions. You'd commit to a vendor at the SDK layer and pay to leave.
+
+OTel changed three things:
+
+1. **Vendor-neutral SDKs** in 12+ languages with stable APIs.
+2. **OTLP** — a single wire protocol for exporting traces, metrics, and logs.
+3. **Semantic conventions** — `http.method`, `db.system`, `messaging.destination` mean the same thing everywhere.
+
+The practical effect: instrument once, route the data anywhere. That single decision is what made the rest of the landscape coherent.
+
+## The tools landscape
+
+Roughly four layers, easy to mix and match because of OTel:
+
+**Instrumentation (inside your services)**
+- OpenTelemetry SDKs — auto-instrumentation for Java, .NET, Node, Python, Go covers most frameworks out of the box
+- eBPF-based auto-instrumentation (Beyla, Pixie) — span capture without code changes; useful for legacy services
+
+**Collection / pipeline**
+- OpenTelemetry Collector — the default. Receivers, processors (filter, batch, sample), exporters
+- Vector — log-first but extends to traces
+- Vendor agents (Datadog Agent, New Relic Infra) when you're committed to a vendor
+
+**Storage / query (open source)**
+- Grafana Tempo — object-storage-backed, cheap to retain everything
+- Jaeger — the original; ClickHouse and OpenSearch backends are common now
+- Zipkin — older, simpler, still in use
+- ClickHouse + SigNoz — increasingly popular as a single store for traces, logs, and metrics
+
+**Storage / query (commercial)**
+- Datadog APM, New Relic, Honeycomb, Lightstep, Dynatrace, Splunk Observability
+- Honeycomb's high-cardinality query model is genuinely different from the others; worth a look if you do a lot of debugging-as-querying
+
+The thing to internalize: with OTel as the SDK and OTLP as the wire format, **the storage layer is no longer a one-way decision**. You can run Tempo for retention and ship a sampled stream to a commercial backend for debugging, or migrate between vendors with a config change.
+
+## What's actually hard
+
+A short list of recurring pain points:
+
+- **Sampling.** You can't store every span — at scale, you'd pay millions for storage you'll never query. *Head sampling* (decide at the start) is cheap but may miss the interesting traces. *Tail sampling* (decide after the trace is complete, based on errors or latency) needs the collector to buffer until trace assembly. Most production systems run a mix.
+- **Context propagation gaps.** A queue, a lambda, a third-party SDK that doesn't carry headers — and your trace tree splits. Audit your async paths; they're where traces quietly die.
+- **Instrumentation drift.** Auto-instrumentation covers HTTP, DB, queue clients. Custom in-process work — feature flags, ML inference, batch jobs — needs manual spans, and they decay if no one owns them.
+- **Cardinality explosions.** Putting `user_id` or `request_id` on every span is great for debugging, expensive for storage, and often violates retention or PII policy. Decide what goes on the span vs. what stays in linked logs.
+- **Trace ≠ profile.** A trace tells you *which* span was slow. To know *why* inside the process, you need continuous profiling (Pyroscope, Parca) — which OTel is now standardizing too.
+
+## Where to start
+
+Starting from zero on a real system:
+
+1. Pick OTel SDKs for your top two languages and turn on auto-instrumentation. *(One sprint per service, less if framework-supported.)*
+2. Run an OTel collector — locally first — and point everything at it.
+3. Send to **one** backend. Tempo if you want cheap retention; a commercial one if you want a UI that pays for itself fast. Pick one — don't shop.
+4. Verify propagation works across your message bus. This is where it usually breaks.
+5. Add manual spans only where you actually debug — async jobs, fan-outs, anything auto-instrumentation can't see.
+6. *Then* think about sampling. Don't pre-optimize before you know your trace volume.
+
+The fastest way to waste a year on tracing is to bikeshed the backend before you've solved instrumentation and propagation. The hard work is upstream of the storage choice.
