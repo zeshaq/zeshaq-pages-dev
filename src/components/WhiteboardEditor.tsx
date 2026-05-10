@@ -114,6 +114,11 @@ function EditorInner() {
     );
   };
 
+  const removeNode = (id: string) => {
+    setNodes((ns) => ns.filter((n) => n.id !== id));
+    setEdges((es) => es.filter((e) => e.source !== id && e.target !== id));
+  };
+
   const buildPayload = () => ({
     title: title.trim() || "Untitled session",
     description: description.trim() || "",
@@ -269,6 +274,16 @@ function EditorInner() {
                   onChange={(e) => updateBorderColor(selectedNode.id, e.target.value)}
                   title="Border color"
                 />
+                <span className="canvas-divider" />
+                <button
+                  type="button"
+                  className="canvas-btn canvas-btn-danger"
+                  onClick={() => removeNode(selectedNode.id)}
+                  title="Delete selected (also: Delete key)"
+                  aria-label="Delete selected"
+                >
+                  ✕ delete
+                </button>
                 <span className="canvas-divider" />
                 <span className="canvas-hint">drag corners to resize</span>
               </Panel>
