@@ -1,6 +1,6 @@
 # zahid
 
-Personal blog + whiteboard sessions. Astro + React islands, deployed to Cloudflare Pages at https://zahid.pages.dev.
+Personal blog + whiteboard sessions. Astro + React islands, deployed to Cloudflare Pages at https://zeshaq.pages.dev.
 
 ## Local
 
@@ -19,4 +19,4 @@ npm run build    # → dist/
 
 ## Deploy
 
-Pushing to `main` triggers `.github/workflows/deploy.yml` → builds → uploads to Cloudflare Pages project `zahid`.
+Pushing to `main` triggers `.github/workflows/deploy.yml` → builds → uploads to Cloudflare Pages project `zeshaq`.
