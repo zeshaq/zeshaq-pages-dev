@@ -4,12 +4,27 @@ export type NavNode = {
   label: string;
   href?: string;
   children?: NavNode[];
+  /** raw sort key, used for ordering before pretty labels are computed */
+  sortKey?: string;
 };
 
 type BlogItem = CollectionEntry<"blog">;
+type DocItem = CollectionEntry<"docs">;
+type AnyItem = BlogItem | DocItem;
 
 const prettify = (s: string) =>
   s.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toLowerCase());
+
+/** Strip a leading "NN-" or "NN_" numeric prefix, used for sort-only segments. */
+const stripPrefix = (s: string) => s.replace(/^\d+[-_]/, "");
+
+/** Slug after stripping numeric prefixes from each segment of a content id. */
+export function stripIdPrefixes(id: string): string {
+  return id
+    .split("/")
+    .map((seg) => stripPrefix(seg))
+    .join("/");
+}
 
 export function buildTree(items: BlogItem[], base: string): NavNode[] {
   const root: NavNode = { label: "", children: [] };
@@ -20,20 +35,68 @@ export function buildTree(items: BlogItem[], base: string): NavNode[] {
     let cursor = root;
     for (let i = 0; i < parts.length - 1; i++) {
       const dir = parts[i];
+      const cleanDir = stripPrefix(dir);
       let child = cursor.children!.find(
-        (c) => c.label === prettify(dir) && !c.href
+        (c) => c.sortKey === dir && !c.href
       );
       if (!child) {
-        child = { label: prettify(dir), children: [] };
+        child = { label: prettify(cleanDir), children: [], sortKey: dir };
         cursor.children!.push(child);
       }
       cursor = child;
     }
     cursor.children!.push({
       label: (item.data as { title: string }).title,
-      href: `${base}/${item.id}`,
+      href: `${base}/${stripIdPrefixes(item.id)}`,
+      sortKey: parts[parts.length - 1],
     });
   }
+
+  // Sort children at every level by sortKey (so 01-foo comes before 02-bar).
+  const sortRecursive = (nodes: NavNode[] | undefined) => {
+    if (!nodes) return;
+    nodes.sort((a, b) => (a.sortKey ?? a.label).localeCompare(b.sortKey ?? b.label));
+    for (const n of nodes) sortRecursive(n.children);
+  };
+  sortRecursive(root.children);
+
+  return root.children ?? [];
+}
+
+/** Like buildTree but for the `docs` collection — accepts a per-item `sidebar_label` override. */
+export function buildDocsTree(items: DocItem[], base: string): NavNode[] {
+  const root: NavNode = { label: "", children: [] };
+  const sorted = [...items].sort((a, b) => a.id.localeCompare(b.id));
+
+  for (const item of sorted) {
+    const parts = item.id.split("/");
+    let cursor = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const dir = parts[i];
+      const cleanDir = stripPrefix(dir);
+      let child = cursor.children!.find(
+        (c) => c.sortKey === dir && !c.href
+      );
+      if (!child) {
+        child = { label: prettify(cleanDir), children: [], sortKey: dir };
+        cursor.children!.push(child);
+      }
+      cursor = child;
+    }
+    const data = item.data as { title: string; sidebar_label?: string };
+    cursor.children!.push({
+      label: data.sidebar_label ?? data.title,
+      href: `${base}/${stripIdPrefixes(item.id)}`,
+      sortKey: parts[parts.length - 1],
+    });
+  }
+
+  const sortRecursive = (nodes: NavNode[] | undefined) => {
+    if (!nodes) return;
+    nodes.sort((a, b) => (a.sortKey ?? a.label).localeCompare(b.sortKey ?? b.label));
+    for (const n of nodes) sortRecursive(n.children);
+  };
+  sortRecursive(root.children);
 
   return root.children ?? [];
 }
