@@ -1,0 +1,133 @@
+---
+title: "OpenShift AI: a comprehensive mind map"
+description: "A radial mind map of Red Hat OpenShift AI in 2026 — the eight branches that capture its scope: components, LLM stack, architecture, GPUs, MLOps lifecycle, Red Hat ecosystem integrations, deployment models, and use cases. Pan, zoom, fullscreen."
+date: 2026-05-10
+category: AI
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 16, letterSpacing: "0.05em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 180, textAlign: "center", fontWeight: 700, fontSize: 13, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 130, textAlign: "center", fontSize: 12 };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+export const polar = (deg, r, cx, cy) => ({
+  x: cx + r * Math.cos((deg * Math.PI) / 180),
+  y: cy + r * Math.sin((deg * Math.PI) / 180),
+});
+
+export const branch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+  const headerPos = polar(angleDeg, 320, cx, cy);
+  nodes.push({
+    id: headerId,
+    position: { x: headerPos.x - 90, y: headerPos.y - 25 },
+    data: { label: header },
+    style: branchHeader,
+  });
+  edges.push({
+    id: "trunk_" + headerId,
+    source: "openshift_ai",
+    target: headerId,
+    style: { stroke: "#15803d", strokeWidth: 2 },
+  });
+
+  const n = leaves.length;
+  const spreadDeg = Math.min(55, 6 * n);
+  const startAngle = angleDeg - spreadDeg / 2;
+  leaves.forEach((label, i) => {
+    const a = n === 1 ? angleDeg : startAngle + (spreadDeg / (n - 1)) * i;
+    const r = 600 + ((i % 3) * 35);
+    const pos = polar(a, r, cx, cy);
+    const id = slug(header) + "_" + slug(label);
+    nodes.push({
+      id,
+      position: { x: pos.x - 65, y: pos.y - 15 },
+      data: { label },
+      style: leaf,
+    });
+    edges.push({
+      id: "br_" + id,
+      source: headerId,
+      target: id,
+      style: { stroke: "#9ca3af", strokeWidth: 1 },
+    });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const branches = [
+  branch("Components", -90, ["Workbenches", "DS Pipelines", "Distributed Training", "KServe", "vLLM Runtime", "Model Registry", "TrustyAI", "Dashboard", "Workbench Images"], CX, CY),
+  branch("LLM Stack", -45, ["InstructLab", "LAB Method", "Granite Models", "AI Inference Server", "Multi-LoRA", "RAG Examples", "pgvector / Milvus", "NeMo Guardrails"], CX, CY),
+  branch("Architecture", 0, ["OAI Operator", "KNative Serverless", "Service Mesh", "Tekton Pipelines", "Argo Workflows", "Authorino", "Logging", "Monitoring"], CX, CY),
+  branch("GPUs & Accelerators", 45, ["NVIDIA GPU Op", "AMD ROCm Op", "Intel Gaudi Op", "Node Feature Discovery", "MIG Slicing", "Time-slicing", "H100 / B200", "L40S / A100"], CX, CY),
+  branch("MLOps Lifecycle", 90, ["Experiment Tracking", "Model Registry", "DS Pipelines", "KServe Deploy", "Drift Detection", "Bias (TrustyAI)", "Explainability", "A/B Testing"], CX, CY),
+  branch("Integrations", 135, ["OpenShift GitOps", "OpenShift Pipelines", "RHACM", "RHACS", "Service Mesh", "Serverless", "RHEL AI", "Connectivity Link"], CX, CY),
+  branch("Deployment Models", 180, ["Self-managed OCP", "ROSA (AWS)", "ARO (Azure)", "OS Dedicated", "IBM Cloud", "Disconnected", "Hosted Control Planes", "Edge / Far-edge"], CX, CY),
+  branch("Use Cases", -135, ["Predictive ML", "LLM Fine-tune", "LLM Serving", "RAG Apps", "AI Agents", "Computer Vision", "NLP / Classification", "Time Series"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "openshift_ai", position: { x: CX - 110, y: CY - 40 }, data: { label: "OpenShift AI" }, style: center },
+  ...branches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = branches.flatMap((b) => b.edges);
+
+OpenShift AI's scope isn't obvious from the marketing. It's not a single product; it's a platform of ~15 components plus a curated stack of GPU operators, integration points, and use-case-specific layers. The component list reads like a Kubeflow + OpenShift + GenAI bingo card, and figuring out what relates to what — and what you actually need — takes effort.
+
+This post is a comprehensive mind map of the platform, organized into the eight branches that I find capture the scope most cleanly. Each branch radiates from the center to its key sub-topics. Pan with drag, zoom with scroll, click **⛶ fullscreen** for the full-window view.
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={800} />
+
+The trunk edges (thick green) connect the central platform to each branch; the branch edges (thin gray) connect each branch to its sub-topics. Eight directions, eight slices of the platform.
+
+## The eight branches
+
+**Components.** The actual products inside OpenShift AI: Workbenches (Jupyter / RStudio / Code Server), Data Science Pipelines (Kubeflow Pipelines v2 on Argo Workflows), Distributed Training (Ray + Kubeflow Training Operator), KServe with vLLM as the LLM runtime, the Model Registry (added 2024), TrustyAI for fairness / bias / explainability, the OpenShift AI Dashboard as a console plugin, and the curated workbench images that ship pre-baked with CUDA, ROCm, PyTorch, and TensorFlow stacks. If you've used OpenShift AI, you've used some subset of these nine.
+
+**LLM Stack.** The GenAI-specific tooling layered on top of the base platform: InstructLab as the fine-tuning workflow, the LAB methodology (large-scale alignment for chatbots) for synthetic-data generation, Granite as Red Hat's open-source model family, the RHEL AI Inference Server for standalone serving, vLLM's multi-LoRA support for serving many adapters on one base model, reference RAG patterns with pgvector or Milvus, and NeMo Guardrails for safety layering. Center of gravity since 2023; covered in depth in [the OpenShift AI post](/blog/openshift-ai).
+
+**Architecture.** The OpenShift-level foundations that the AI platform rides on. The OpenShift AI Operator orchestrates everything; KNative Serverless gives KServe its autoscale-to-zero behavior; Service Mesh handles inference traffic routing (including canary deployments); Tekton powers OpenShift Pipelines for CI/CD; Argo Workflows backs the Data Science Pipelines runtime; Authorino handles OAuth / OIDC for the dashboard and inference endpoints. Plus the Logging and Monitoring stacks every OCP cluster gets.
+
+**GPUs & Accelerators.** Hardware enablement is operationally non-trivial; it gets its own branch. NVIDIA GPU Operator is the dominant case (H100, B200, L40S, A100, T4); AMD ROCm Operator covers MI300X / MI250; Intel Gaudi Operator handles Habana Gaudi 2/3. Node Feature Discovery labels nodes so workloads schedule correctly. MIG (Multi-Instance GPU) and time-slicing let you share an H100 across multiple smaller jobs — important for the economics of inference workloads that don't saturate a full GPU.
+
+**MLOps Lifecycle.** The end-to-end model lifecycle: experiment tracking, model registry, pipelines for training, KServe for deployment, then the *day-2* concerns — drift detection, bias detection (TrustyAI), explainability (LIME / SHAP via TrustyAI), A/B testing via Service Mesh traffic splitting. The lifecycle-as-CRs framing is what differentiates OpenShift AI from a Notebook-as-a-service product: every step is a Kubernetes object you can version, audit, and operate.
+
+**Integrations.** What OpenShift AI connects to in the broader Red Hat ecosystem. [OpenShift GitOps](/blog/openshift-gitops) deploys model serving across fleets via ApplicationSet. OpenShift Pipelines (Tekton) drives image builds for workbench images and serving containers. [RHACM](/blog/rhacm) handles multi-cluster model deployment with the pull model. [RHACS](/blog/rhacs) scans the resulting containers. Service Mesh / Serverless are the runtime substrate for inference. RHEL AI is the inference-only spinoff for non-OpenShift edge. Red Hat Connectivity Link is the API gateway story.
+
+**Deployment Models.** Where OpenShift AI actually runs. Self-managed OCP on-prem is still the largest deployment. ROSA (AWS), ARO (Azure), and OpenShift Dedicated (GCP) are the cloud-managed variants. IBM Cloud OpenShift gets specific mention given IBM ownership. Disconnected / air-gapped is supported and used in regulated industries. **Hosted Control Planes (HyperShift)** is the multi-tenant economics fix for dense fleets. Edge / far-edge is the telco-flavored scenario.
+
+**Use Cases.** What people actually build. Classical predictive ML (regression, classification, fraud, churn) is still the largest category by deployment count. LLM fine-tuning and LLM serving are the fastest-growing. RAG apps and AI agents are the application layer on top of those. Computer vision (industrial inspection, medical imaging) is a stable specialty. Traditional NLP, time series, and recommendation systems round out the catalog. The platform supports all eight, with varying levels of opinionated tooling per use case.
+
+## How to use this map
+
+The map is a *vocabulary tour and gap analysis tool*, not a recommendation:
+
+- **Orientation.** When a colleague says "we use TrustyAI for bias monitoring," the map shows you that's a Components-branch tool with MLOps-branch relevance.
+- **Gap analysis.** Look at your current OpenShift AI deployment against the map. The branches you don't have anything in are either gaps or deliberate scope reductions.
+- **Adoption planning.** New OpenShift AI adopters typically start in **Components** (Workbench + DS Pipelines + KServe), add **GPUs** for serious training, add **LLM Stack** when GenAI use cases show up, and grow outward through MLOps and Integrations as the practice matures.
+
+## What the map deliberately omits
+
+This is the 8-branch view of OpenShift AI specifically. The map doesn't show:
+
+- **The broader Kubeflow ecosystem** — Notebooks, Pipelines, Training Operator are inside OpenShift AI; other Kubeflow components (KFServing, Katib) are not, and aren't shown.
+- **Third-party tools that integrate** — Weights & Biases, MLflow, LangChain, Hugging Face Hub all work *with* OpenShift AI but aren't part of the platform. The [AI/ML landscape map](/blog/ai-ml-landscape-2026) covers those.
+- **Internal sub-architecture** — each leaf could itself be expanded into a sub-mind-map. KServe alone has 8-10 distinct sub-components.
+- **Pricing / licensing tiers** — orthogonal to the technical mind map.
+
+If you want depth on any branch, the [main OpenShift AI post](/blog/openshift-ai) walks through the lifecycle in narrative form. This mind map is the visual index.
+
+## The trap
+
+The hardest thing about a platform with this many components is the temptation to enable all of them. A team that turns on Workbench + DS Pipelines + Ray + KServe + TrustyAI + InstructLab + Multi-LoRA + Service Mesh routing + A/B testing on day one ends up operating eight things instead of shipping one model. The platform is designed so that each branch can be adopted independently — start with the **Components** branch's first three (Workbench → DS Pipeline → KServe), get one end-to-end model running, then expand outward only when the absence of a specific capability is what's blocking you.
+
+The map is comprehensive on purpose. Your initial adoption shouldn't be.
