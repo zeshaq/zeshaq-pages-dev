@@ -1,5 +1,6 @@
 import {
   Handle,
+  NodeResizer,
   Position,
   useReactFlow,
   type NodeProps,
@@ -18,6 +19,7 @@ export type Shape = "rect" | "ellipse" | "text";
 export interface ShapeData {
   label: string;
   shape: Shape;
+  borderColor?: string;
   [key: string]: unknown;
 }
 
@@ -60,28 +62,42 @@ export default function ShapeNode({ id, data, selected }: NodeProps) {
     }
   };
 
-  return (
-    <div
-      className={`shape shape-${d.shape}${selected ? " selected" : ""}`}
-      onDoubleClick={() => editable && setEditing(true)}
-    >
-      <Handle id="t" type="source" position={Position.Top} />
-      <Handle id="r" type="source" position={Position.Right} />
-      <Handle id="b" type="source" position={Position.Bottom} />
-      <Handle id="l" type="source" position={Position.Left} />
+  const inlineStyle = d.borderColor ? { borderColor: d.borderColor } : undefined;
 
-      {editing ? (
-        <input
-          ref={inputRef}
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          onBlur={commit}
-          onKeyDown={handleKey}
-          className="shape-input"
+  return (
+    <>
+      {editable && (
+        <NodeResizer
+          isVisible={!!selected}
+          minWidth={60}
+          minHeight={28}
+          lineStyle={{ borderColor: "#15803d" }}
+          handleStyle={{ background: "#15803d", width: 8, height: 8, borderRadius: 2 }}
         />
-      ) : (
-        <span>{label || (editable ? "double-click to edit" : "")}</span>
       )}
-    </div>
+      <div
+        className={`shape shape-${d.shape}${selected ? " selected" : ""}`}
+        style={inlineStyle}
+        onDoubleClick={() => editable && setEditing(true)}
+      >
+        <Handle id="t" type="source" position={Position.Top} />
+        <Handle id="r" type="source" position={Position.Right} />
+        <Handle id="b" type="source" position={Position.Bottom} />
+        <Handle id="l" type="source" position={Position.Left} />
+
+        {editing ? (
+          <input
+            ref={inputRef}
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            onBlur={commit}
+            onKeyDown={handleKey}
+            className="shape-input"
+          />
+        ) : (
+          <span>{label || (editable ? "double-click to edit" : "")}</span>
+        )}
+      </div>
+    </>
   );
 }

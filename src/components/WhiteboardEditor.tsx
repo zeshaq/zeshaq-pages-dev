@@ -4,7 +4,7 @@ import {
   ReactFlowProvider,
   Background,
   Controls,
-  MiniMap,
+  Panel,
   ConnectionMode,
   MarkerType,
   addEdge,
@@ -16,7 +16,7 @@ import {
   type Node,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import ShapeNode, { EditableContext, type Shape } from "./ShapeNode";
+import ShapeNode, { EditableContext, type Shape, type ShapeData } from "./ShapeNode";
 
 const nodeTypes = { shape: ShapeNode };
 const DRAFT_KEY = "session-draft-v1";
@@ -106,6 +106,14 @@ function EditorInner() {
     ]);
   };
 
+  const updateBorderColor = (id: string, color: string) => {
+    setNodes((ns) =>
+      ns.map((n) =>
+        n.id === id ? { ...n, data: { ...n.data, borderColor: color } } : n
+      )
+    );
+  };
+
   const buildPayload = () => ({
     title: title.trim() || "Untitled session",
     description: description.trim() || "",
@@ -153,6 +161,9 @@ function EditorInner() {
     setRestored(false);
   };
 
+  const selectedNode = nodes.find((n) => n.selected);
+  const selectedShape = selectedNode?.data as ShapeData | undefined;
+
   return (
     <EditableContext.Provider value={true}>
       <div className="editor-root">
@@ -172,16 +183,6 @@ function EditorInner() {
         </div>
 
         <div className="editor-toolbar">
-          <button type="button" className="editor-btn" onClick={() => addShape("rect")}>
-            + rectangle
-          </button>
-          <button type="button" className="editor-btn" onClick={() => addShape("ellipse")}>
-            + ellipse
-          </button>
-          <button type="button" className="editor-btn" onClick={() => addShape("text")}>
-            + text
-          </button>
-          <span className="editor-spacer" />
           <button
             type="button"
             className="editor-btn"
@@ -190,6 +191,7 @@ function EditorInner() {
           >
             ⛶ fullscreen
           </button>
+          <span className="editor-spacer" />
           <button type="button" className="editor-btn" onClick={onCopy}>
             {copied ? "copied!" : "copy json"}
           </button>
@@ -226,12 +228,56 @@ function EditorInner() {
           >
             <Background color="#d1d5db" gap={20} />
             <Controls showInteractive={false} />
-            <MiniMap pannable zoomable maskColor="rgba(243,244,246,0.6)" />
+
+            <Panel position="top-left" className="canvas-panel">
+              <button
+                type="button"
+                className="canvas-btn"
+                onClick={() => addShape("rect")}
+                title="Add rectangle"
+                aria-label="Add rectangle"
+              >
+                ▭
+              </button>
+              <button
+                type="button"
+                className="canvas-btn"
+                onClick={() => addShape("ellipse")}
+                title="Add ellipse"
+                aria-label="Add ellipse"
+              >
+                ◯
+              </button>
+              <button
+                type="button"
+                className="canvas-btn"
+                onClick={() => addShape("text")}
+                title="Add text"
+                aria-label="Add text"
+              >
+                T
+              </button>
+            </Panel>
+
+            {selectedNode && selectedShape && (
+              <Panel position="top-right" className="canvas-panel canvas-panel-props">
+                <span className="canvas-label">border</span>
+                <input
+                  type="color"
+                  className="canvas-color"
+                  value={selectedShape.borderColor ?? "#6b7280"}
+                  onChange={(e) => updateBorderColor(selectedNode.id, e.target.value)}
+                  title="Border color"
+                />
+                <span className="canvas-divider" />
+                <span className="canvas-hint">drag corners to resize</span>
+              </Panel>
+            )}
           </ReactFlow>
         </div>
 
         <p className="editor-hints">
-          drag handles to connect • double-click a shape to edit text • select &amp; press <kbd>Delete</kbd> to remove • drag to reposition • autosaved to your browser
+          drag handles to connect • double-click a shape to edit text • select &amp; press <kbd>Delete</kbd> to remove • drag corners (when selected) to resize • autosaved to your browser
         </p>
       </div>
     </EditableContext.Provider>
