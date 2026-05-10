@@ -1,13 +1,14 @@
 ---
 import "../styles/global.css";
+import Sidebar from "../components/Sidebar.astro";
 
 interface Props {
   title?: string;
   description?: string;
-  wide?: boolean;
 }
 
-const { title = "zahid", description = "personal blog and whiteboard sessions", wide = false } = Astro.props;
+const { title = "zahid", description = "personal blog and whiteboard sessions" } = Astro.props;
+const currentPath = Astro.url.pathname;
 ---
 
 <!doctype html>
@@ -20,22 +21,17 @@ const { title = "zahid", description = "personal blog and whiteboard sessions", 
     <title>{title}</title>
   </head>
   <body class="min-h-screen">
-    <header class="border-b border-[var(--color-border)] bg-[var(--color-surface)]">
-      <nav class="w-full px-6 py-4 flex items-center justify-between">
-        <a href="/" class="font-semibold tracking-tight text-[var(--color-ink)]">zahid</a>
-        <div class="flex gap-4 text-sm text-[var(--color-muted)]">
-          <a href="/" class="hover:text-[var(--color-ink)]">home</a>
-          <a href="/#blog" class="hover:text-[var(--color-ink)]">blog</a>
-          <a href="/#sessions" class="hover:text-[var(--color-ink)]">sessions</a>
+    <div class="app-shell">
+      <Sidebar currentPath={currentPath} />
+      <main class="app-main">
+        <div class="app-content">
+          <slot />
         </div>
-      </nav>
-    </header>
-    <main class={`w-full px-6 py-10 ${wide ? "" : "max-w-7xl mx-auto"}`}>
-      <slot />
-    </main>
-    <footer class="w-full max-w-7xl mx-auto px-6 py-8 text-xs text-[var(--color-muted)] border-t border-[var(--color-border)] mt-16">
-      <span>built with astro on cloudflare pages</span>
-    </footer>
+        <footer class="app-footer">
+          <span>built with astro on cloudflare pages</span>
+        </footer>
+      </main>
+    </div>
 
     <script is:inline>
       // Generic fullscreen toggler — any element with [data-fullscreen-target="<id>"]

@@ -1,0 +1,30 @@
+---
+import Self from "./NavNode.astro";
+import { containsPath, isActive, type NavNode } from "../utils/navTree";
+
+interface Props {
+  node: NavNode;
+  currentPath: string;
+  depth?: number;
+}
+
+const { node, currentPath, depth = 0 } = Astro.props;
+const hasChildren = (node.children?.length ?? 0) > 0;
+const active = isActive(node.href, currentPath);
+const expand = hasChildren && containsPath(node, currentPath);
+---
+
+{hasChildren ? (
+  <details open={expand} class="nav-group">
+    <summary class="nav-summary">{node.label}</summary>
+    <ul class="nav-children">
+      {node.children!.map((child) => (
+        <li>
+          <Self node={child} currentPath={currentPath} depth={depth + 1} />
+        </li>
+      ))}
+    </ul>
+  </details>
+) : (
+  <a href={node.href} class:list={["nav-link", { active }]}>{node.label}</a>
+)}

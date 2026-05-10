@@ -1,0 +1,42 @@
+---
+import { getCollection } from "astro:content";
+import NavNode from "./NavNode.astro";
+import { buildTree, type NavNode as NavNodeT } from "../utils/navTree";
+
+interface Props {
+  currentPath: string;
+}
+
+const { currentPath } = Astro.props;
+
+const blog = (await getCollection("blog", ({ data }) => !data.draft)).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+);
+const sessions = (await getCollection("sessions")).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+);
+
+const tree: NavNodeT[] = [
+  { label: "home", href: "/" },
+  { label: "blog", children: buildTree(blog, "/blog") },
+  { label: "sessions", children: buildTree(sessions, "/sessions") },
+];
+---
+
+<aside class="sidebar">
+  <details class="sidebar-toggle" open>
+    <summary class="sidebar-summary">
+      <span class="sidebar-brand">zahid</span>
+      <span class="sidebar-hamburger" aria-hidden="true">≡</span>
+    </summary>
+    <nav class="sidebar-nav">
+      <ul>
+        {tree.map((node) => (
+          <li>
+            <NavNode node={node} currentPath={currentPath} />
+          </li>
+        ))}
+      </ul>
+    </nav>
+  </details>
+</aside>
