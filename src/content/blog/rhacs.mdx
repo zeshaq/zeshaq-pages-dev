@@ -1,0 +1,133 @@
+---
+title: "RHACS: Kubernetes-native security for OpenShift"
+description: "What Red Hat Advanced Cluster Security gives you over a stack of generic scanners, how the Central / Sensor / Collector architecture works, and where it earns its keep."
+date: 2026-05-10
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const ctrlEdge  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const localEdge = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const acsNodes = [
+  { id: "registry",  position: { x: 700, y: 0   }, data: { label: "container registry" }, style: stage },
+  { id: "central",   position: { x: 220, y: 80  }, data: { label: "RHACS Central\n(UI, policies, DB)" }, style: ctrl },
+  { id: "scanner",   position: { x: 540, y: 80  }, data: { label: "Scanner V4" }, style: ctrl },
+  { id: "admission", position: { x: 60,  y: 250 }, data: { label: "Admission\nwebhook" }, style: agent },
+  { id: "sensor",    position: { x: 320, y: 250 }, data: { label: "Sensor\n(per cluster)" }, style: agent },
+  { id: "collector", position: { x: 580, y: 250 }, data: { label: "Collector\n(per node, eBPF)" }, style: agent },
+  { id: "workloads", position: { x: 320, y: 410 }, data: { label: "workloads\n(pods, services)" }, style: stage },
+];
+
+export const acsEdges = [
+  { id: "r1", source: "registry",  target: "scanner",   label: "image fetch", ...localEdge },
+  { id: "r2", source: "scanner",   target: "central",   label: "vuln + SBOM",  ...localEdge },
+  { id: "c1", source: "central",   target: "sensor",    label: "policies, config", ...ctrlEdge },
+  { id: "c2", source: "sensor",    target: "central",   label: "events",       ...ctrlEdge },
+  { id: "a1", source: "admission", target: "sensor",    label: "decisioning",  ...localEdge },
+  { id: "a2", source: "admission", target: "workloads", label: "gates",        ...localEdge },
+  { id: "k1", source: "workloads", target: "collector", label: "kernel events", ...localEdge },
+  { id: "k2", source: "collector", target: "sensor",    label: "telemetry",    ...localEdge },
+];
+
+Red Hat Advanced Cluster Security is what you reach for when "we'll piece together image scanning, runtime detection, network policy, and compliance from open-source tools" stops being a winning bet. It's a single platform with one UI, one policy engine, and one risk model that spans build-time, deploy-time, and runtime. Originally StackRox, acquired by Red Hat in 2021, productized into RHACS for OpenShift and RHACS Cloud Service.
+
+This post walks through what it does, how it's wired, and what's actually different about the eBPF-based collector.
+
+## The problem it solves
+
+Kubernetes security is not one job; it's six, each with its own tool culture:
+
+- **Image scanning** — find CVEs in container images before deploy
+- **Configuration scanning** — find bad K8s YAML (privileged pods, hostPath mounts, missing limits)
+- **Network policy** — minimize east-west blast radius
+- **Compliance** — produce evidence for CIS, NIST 800-53, PCI, HIPAA, etc.
+- **Runtime detection** — catch what bypassed everything upstream (cryptominers, reverse shells, lateral movement)
+- **Admission control** — actively block bad deployments at the K8s API
+
+The DIY stack — Trivy + Falco + Kyverno + a homegrown compliance dashboard — covers each of these, but the gap between them is where attackers live. A CVE in an image only matters if the container actually runs and reaches the network; a runtime alert only matters if it's correlated with which deployment, which team, which Argo CD app. **RHACS's pitch is unified context** across all six.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: acsNodes, edges: acsEdges }} height={580} />
+
+Reading the diagram:
+
+- **RHACS Central** is the control plane: UI, policy engine, vulnerability database, Postgres-backed state. One Central per RHACS deployment, can manage many clusters.
+- **Scanner V4** pulls images from registries, extracts SBOMs, matches against a curated CVE feed (Red Hat's vulnerability catalog plus public sources), and ships results to Central. Scanner V4 is the rewrite (replacing the older Clair-based scanner) — better performance, native SBOM support.
+- **Sensor** runs once per managed cluster. It's the K8s-aware integration: watches the API server for deployments, services, network policies, RBAC; receives policies and configs from Central; ships back events.
+- **Admission webhook** is a `ValidatingWebhookConfiguration` that K8s calls during pod creation. It asks Sensor whether the deployment violates active policies and either lets it through or blocks.
+- **Collector** is the runtime data plane — one DaemonSet pod per node — using **eBPF in the kernel** to capture process executions, network connections, file events, and syscalls without touching the workload. Forwards telemetry to Sensor.
+
+The green dashed edges are policy/event traffic between Central and Sensor; solid edges are local-to-cluster relationships. Central → Sensor is mostly outbound from Sensor (Sensor opens a long-running connection), so this works through firewalls and NAT — the spoke initiates, like the patterns in [the OpenShift GitOps post](/blog/openshift-gitops).
+
+## What you actually do in RHACS
+
+Roughly in order of how often each gets used:
+
+1. **Vulnerability management.** The default landing page shows CVEs across every image deployed across every cluster, scoped by namespace, deployment, severity, fixable/not, and whether it's running. Most teams use this as their primary "what should I patch this week" view.
+2. **Risk view.** RHACS scores every deployment by combining vulnerability severity, configuration violations, runtime exposure, and network reachability. The result is a flat ordered list — "fix these 20 first" — that's worth more than any single dimension on its own.
+3. **Policies.** Pre-built policies for common controls (no privileged containers, no `hostNetwork`, no images from non-approved registries, no critical-CVE images in production). You can scope them to namespaces, set them to alert vs enforce, and toggle admission-time vs runtime enforcement per policy.
+4. **Network graph.** Live east-west traffic visualization, generated from collector data. Selecting a service shows actual ingress/egress; "simulate network policy" generates a baseline `NetworkPolicy` from observed traffic, which you can review and apply.
+5. **Compliance.** One-click reports for CIS Kubernetes Benchmark, CIS OpenShift, NIST 800-53, PCI-DSS, HIPAA. Each control maps to specific cluster checks. The output is auditor-ready.
+6. **Runtime detection.** Default policies for shell-spawn-from-running-container, network-from-an-image-that-shouldn't-have-network, suspicious process execution, crypto-mining patterns. Tuneable to your environment.
+
+## The eBPF collector, briefly
+
+The collector is the hardest part of RHACS to replace with open-source equivalents and the part that genuinely differentiates the product.
+
+It uses **eBPF programs in the Linux kernel** to capture syscalls, process exec, network connect/accept, and file events. Compared to alternatives:
+
+- **vs. ptrace / userspace agents**: eBPF runs in-kernel without context-switch overhead — orders of magnitude lower CPU
+- **vs. sidecar proxies (Envoy, etc.)**: no per-pod injection, no application-layer awareness needed, captures every workload including DaemonSets and privileged pods
+- **vs. host-only auditd**: gets per-container context (collector knows which cgroup the event came from)
+
+The collector is a kernel module on RHEL/CoreOS, falling back to a pure-eBPF mode on kernels where the module isn't applicable. Either way, the workload pods see no overhead and require no modification.
+
+Falco is the closest open-source equivalent and is genuinely good. The differentiator isn't capture quality (both use kernel-level techniques); it's the integration upstream into the same UI as your CVE management and policy engine.
+
+## Risk, the honest center of the product
+
+The Risk score is RHACS's core idea. Each deployment gets a number computed from:
+
+- **Vulnerability severity** in its images (weighted by fixable / unfixable, by CVSS, by Red Hat severity)
+- **Configuration risks** — privileged, hostPath, missing limits, `imagePullPolicy: Always` to a mutable tag
+- **Runtime exposure** — does it actually run? Does it have network ingress?
+- **Reachability** — is it accessible from the internet? From other namespaces?
+
+A 9.8 CVE in an image that's deployed once, in a sandboxed namespace, with no network exposure, isn't priority one. A 7.0 in an image running on every node with `hostNetwork: true` and a public service in front of it is. Risk fuses these dimensions into the prioritization most teams need but rarely build themselves.
+
+## Limitations and pitfalls
+
+- **Heavy footprint.** Central + Postgres + Scanner is a non-trivial deployment. Smaller environments often start with RHACS Cloud Service to skip the operational overhead.
+- **Policy tuning is real work.** Out-of-the-box policies generate a *lot* of alerts on existing clusters. Plan a quarter of triage and tuning before you switch enforcement on.
+- **eBPF kernel compatibility.** Older RHEL kernels (RHEL 7) lack the eBPF features collector needs; collector falls back to a kernel module. Plan kernel updates accordingly.
+- **CVE noise.** As with any scanner, you'll see CVEs in distroless and ubi-minimal images that aren't actually exploitable in your context. RHACS's "fixable only" filter and scope-by-deployment helps, but humans still need to triage.
+- **It's not a CSPM.** RHACS focuses on what's running on Kubernetes. Cloud-account-level posture (IAM misconfig, S3 bucket exposure) is somebody else's tool — Prisma Cloud, Wiz, or Red Hat's ACS Cloud Service add-on.
+
+## Where RHACS sits in the landscape
+
+Closest competitors:
+
+- **Sysdig Secure** — also eBPF-based runtime, very strong on cloud workloads beyond K8s
+- **Aqua Security** — broad K8s + serverless + VM coverage, mature
+- **Prisma Cloud (Palo Alto)** — broader CSPM scope, Kubernetes is one slice
+- **Open source: Falco + Trivy + Kyverno** — viable, but you're integrating four products
+
+RHACS's natural lane is "OpenShift-centric organization that wants one platform for K8s security, prefers a Red Hat-supported stack, and values the depth of integration between vuln, config, network, runtime, and compliance over best-of-breed in any single dimension."
+
+## Where to start
+
+1. Install the **RHACS operator** on a hub OpenShift cluster (or sign up for RHACS Cloud Service).
+2. Deploy the **`SecuredCluster`** CR to the same cluster — that brings in Sensor, Admission, Collector.
+3. Open the dashboard. It will fill in within minutes; let it run for a day before tuning.
+4. Triage the **Risk** view, not the CVE list. Top 10 items first.
+5. Pick **two policies** to move from alert to enforce on day one — typically "no images with critical CVEs in prod" and "no privileged containers." Iterate from there.
+6. Add a second managed cluster only after policies are settled on the first. Fan-out is cheap; un-firing a noisy alert flood across a fleet is not.
+
+The trap to avoid: turning every policy on at full enforcement on day one. RHACS rewards an iterative approach — same as any security platform, more so because the collector sees more than your team is used to looking at.

@@ -1,0 +1,157 @@
+---
+title: "RHACM: managing OpenShift fleets at scale"
+description: "What Red Hat Advanced Cluster Management does, the hub-spoke pull architecture that makes it work across networks, and how it changes the operating model when one cluster turns into a hundred."
+date: 2026-05-10
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const sub   = { background: "#e5e7eb", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const acmNodes = [
+  { id: "hub",        position: { x: 360, y: 0   }, data: { label: "RHACM Hub\n(on a single OpenShift cluster)" }, style: ctrl },
+  { id: "placement",  position: { x: 100, y: 130 }, data: { label: "Placement\n+ PlacementDecision" }, style: sub },
+  { id: "manifest",   position: { x: 360, y: 130 }, data: { label: "ManifestWork\n(per spoke)" }, style: sub },
+  { id: "policy",     position: { x: 620, y: 130 }, data: { label: "Policy\n+ governance" }, style: sub },
+  { id: "spokeA",     position: { x: 80,  y: 290 }, data: { label: "spoke A\n+ klusterlet" }, style: agent },
+  { id: "spokeB",     position: { x: 360, y: 290 }, data: { label: "spoke B\n+ klusterlet" }, style: agent },
+  { id: "spokeC",     position: { x: 640, y: 290 }, data: { label: "spoke C\n+ klusterlet" }, style: agent },
+  { id: "appsA",      position: { x: 80,  y: 430 }, data: { label: "workloads + config\n(spoke A)" }, style: stage },
+  { id: "appsB",      position: { x: 360, y: 430 }, data: { label: "workloads + config\n(spoke B)" }, style: stage },
+  { id: "appsC",      position: { x: 640, y: 430 }, data: { label: "workloads + config\n(spoke C)" }, style: stage },
+];
+
+export const acmEdges = [
+  { id: "h1", source: "hub", target: "placement",  label: "selects clusters", ...muted },
+  { id: "h2", source: "hub", target: "manifest",   label: "creates",          ...muted },
+  { id: "h3", source: "hub", target: "policy",     label: "drives",           ...muted },
+  { id: "p1", source: "placement", target: "manifest", label: "decision feeds", ...muted },
+  { id: "k1", source: "spokeA", target: "hub", label: "register + pull (gRPC)", ...pullEdge },
+  { id: "k2", source: "spokeB", target: "hub", ...pullEdge },
+  { id: "k3", source: "spokeC", target: "hub", ...pullEdge },
+  { id: "ap1", source: "spokeA", target: "appsA", label: "applies", ...muted },
+  { id: "ap2", source: "spokeB", target: "appsB", ...muted },
+  { id: "ap3", source: "spokeC", target: "appsC", ...muted },
+];
+
+A single OpenShift cluster has obvious tooling: the OCP console, `oc`, GitOps. None of those answer the questions you start asking the moment a second cluster shows up. *Where is this app deployed? Which clusters drift from policy? Which clusters are still on 4.16? What changes when I roll out a new region?* RHACM is the layer that answers those questions for fleets — from "two clusters" to "two thousand."
+
+This post is what RHACM does, how the hub-spoke pull architecture works, and how it changes the operating model when fleet size is no longer one.
+
+## The four pillars
+
+RHACM bundles four largely independent capability areas under one console:
+
+| Pillar | What it does |
+| --- | --- |
+| **Cluster lifecycle** | Provision, import, upgrade, destroy clusters across cloud providers, on-prem, edge |
+| **Application lifecycle** | Deploy applications to subsets of clusters with `Subscription`, `Channel`, or — increasingly — Argo CD `ApplicationSet` |
+| **Governance, risk, compliance** | Policy authoring, distribution, evaluation, and reporting across the fleet |
+| **Observability** | Federated metrics, alerts, and search across managed clusters via Thanos |
+
+You can adopt them piece by piece. Most organizations start with cluster lifecycle (just to import the clusters they already have), then add governance, then drift toward GitOps integration for app delivery.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: acmNodes, edges: acmEdges }} height={580} />
+
+The whole architecture stands on one CR pair: **`ManagedCluster`** on the hub registers a managed cluster; **`klusterlet`** on the spoke is the agent that handles the connection back. Everything else (apps, policies, manifests, observability) rides those rails.
+
+Reading the diagram:
+
+- **RHACM Hub** runs on a single OpenShift cluster you've designated. It's where the console, the cluster registry, the placement controller, and the work dispatchers live.
+- **Placement + PlacementDecision** is the "where to deploy" mechanism. Placement is your declarative selection ("clusters with `env=prod` and `region=eu`"); PlacementDecision is the controller's evaluation result.
+- **ManifestWork** is the unit of delivered work — a wrapped bundle of K8s resources targeted at a specific spoke. It lives on the hub, in the namespace named after that spoke.
+- **Policy** is the governance pillar's primary CR, distributed via the same ManifestWork mechanism.
+- **klusterlet** runs on every managed cluster — two pods: registration agent (handshakes with the hub) and work agent (pulls and applies ManifestWork).
+
+The green dashed lines show the **defining property of the architecture**: every spoke initiates its own outbound connection to the hub. The hub never opens a connection into a spoke. This is what makes RHACM work across NAT, firewalls, air-gaps, and the unstable WANs of edge sites.
+
+## The pull model, in one diagram's worth of detail
+
+When you express "deploy app X to all clusters with `env=prod`":
+
+1. You write a **Placement** CR. The placement controller evaluates it against current `ManagedCluster` metadata and produces a **PlacementDecision** listing the matching cluster names.
+2. RHACM creates a **ManifestWork** in each matching spoke's hub-side namespace, containing the resources to apply.
+3. The **klusterlet work agent** on the spoke pulls its `ManifestWork` over its existing outbound connection.
+4. The work agent applies the resources to the spoke's local API server.
+5. Status flows back the same way the work flowed in — through the long-running connection, spoke to hub.
+
+There is no time at which the hub initiates a new connection toward the spoke. Spoke clusters can be behind any kind of NAT, can be air-gapped between sync windows, can disappear for a week and come back with `klusterlet` resuming the conversation. This is the operational difference vs. anything that requires the hub to hold spoke kubeconfigs.
+
+## Cluster lifecycle
+
+Three flavors of "manage a cluster" inside RHACM:
+
+- **Hive provisioning** — RHACM's classic cluster creator for OpenShift on AWS, Azure, GCP, vSphere, OpenStack. You write a `ClusterDeployment` CR; Hive provisions the cluster end-to-end.
+- **Cluster API (CAPI) provisioning** — newer, increasingly the recommended path. Aligns RHACM with the upstream Kubernetes Cluster API ecosystem; better for non-OpenShift clusters.
+- **Import** — point RHACM at an existing cluster, scan a kubeconfig in or run a join command on the spoke. The spoke installs `klusterlet` and joins. This is how most fleets actually onboard.
+
+Hosted Control Planes (HyperShift) sits adjacent: RHACM can provision and manage a hosted-control-plane cluster, where the OpenShift control plane runs as pods on the hub. The data plane runs elsewhere. This collapses the "300 clusters means 300 control planes" problem into "300 data planes managed by one hub." For dense fleets, HCP changes the economics.
+
+## Application lifecycle
+
+RHACM has its own application model (`Subscription` + `Channel`), but the modern recommendation is to use **Argo CD `ApplicationSet`** with the `clusterDecisionResource` generator that reads `PlacementDecision` directly. This gives you GitOps as the primitive and RHACM as the placement engine — the same pattern covered in the [OpenShift GitOps post](/blog/openshift-gitops).
+
+The progression most teams walk:
+
+1. Start with RHACM `Subscription` because it ships in the box.
+2. Within a quarter, replace it with OpenShift GitOps + ApplicationSet driven by RHACM Placement.
+3. Eventually adopt the **Argo CD pull model** in RHACM 2.10+, where ApplicationSet creates ManifestWork and the spoke's local Argo CD reconciles. Best of both worlds for large fleets.
+
+## Governance and policy
+
+RHACM's policy framework is one of its underappreciated strengths. You write **Policy** CRs declaring required state — "all namespaces must have a NetworkPolicy," "all images must come from approved registries," "etcd encryption at rest must be enabled" — and RHACM distributes them via ManifestWork to every cluster matching the Placement attached to the policy.
+
+A policy controller on each spoke evaluates the policy against the local cluster and reports compliance back to the hub. The aggregated view shows which clusters are compliant, which are violating, and (with `remediationAction: enforce`) RHACM will actively converge the spoke to the policy.
+
+Three things this gets right:
+
+- **Native to the K8s API.** Policies are CRs; they version, diff, and review like everything else.
+- **Distributed evaluation.** Spoke does the work, not the hub. Doesn't bottleneck.
+- **Maps to compliance frameworks.** PolicySets group policies into bundles ("CIS Benchmark v1.7," "PCI-DSS," "your own internal control set") and report against the framework directly.
+
+## Observability
+
+The observability pillar deploys a Thanos-backed federated metrics layer: each managed cluster runs a `metrics-collector` that ships a curated subset of Prometheus metrics back to a hub-side Thanos receiver. Hub-side Grafana dashboards ride on Thanos's deduplicated query API, giving you fleet-wide views.
+
+What it's good at: cluster-health metrics across the fleet, OCP-version distribution, capacity at a glance, drilling from "this fleet's CPU is hot" into per-cluster panels.
+
+What it's not: an APM. Ship application traces and logs to your own observability backend; RHACM's observability is the *fleet operator's* dashboard, not a debugging tool for application owners.
+
+## Limitations and pitfalls
+
+- **The hub is a single point of administration.** Lose the hub, and you keep the fleet running but lose central control. Plan hub HA + backups (RHACM has a backup-and-restore operator).
+- **Policy enforcement at scale is fast but cardinality is real.** Thousands of clusters × hundreds of policies generates a lot of compliance status records. Governance schedules and `evaluationInterval` tuning matter.
+- **Subscription apps were never Argo CD.** If you started a fleet on RHACM Subscriptions, the migration to GitOps is non-trivial. Worth doing, but plan it.
+- **Hub upgrade discipline.** Spokes generally tolerate hub being one minor version ahead, but upgrade discipline matters. Don't let the hub drift forward of all spokes.
+- **Default observability is limited.** The metrics-collector subset is small by design (cost). If you need full Prom federation, configure custom rules carefully.
+
+## Where RHACM sits in the landscape
+
+Closest comparators:
+
+- **Rancher (SUSE)** — broad multi-cluster manager with a strong GUI, more vendor-agnostic by design
+- **GitLab Multi-cluster + Flux** — GitOps-first multi-cluster, less of a unified console
+- **Anthos / EKS Anywhere / AKS Arc** — cloud-vendor multi-cluster offerings, tied to that vendor's ecosystem
+- **Open Cluster Management (OCM, CNCF sandbox)** — RHACM's upstream; if you want the rails without Red Hat support, OCM is RHACM minus the productization, console polish, and lifecycle integrations
+
+RHACM's natural lane: organizations standardizing on OpenShift, with hybrid (on-prem + multi-cloud) or edge footprints, who want the four pillars in one supported product rather than assembling from upstream.
+
+## Where to start
+
+1. Install the **RHACM operator** on one OpenShift cluster — that becomes your hub.
+2. Import your existing clusters using the join command. This step is unreasonably satisfying — `klusterlet` joins in under a minute and the fleet view fills in.
+3. Apply one **Policy** that you're sure will pass everywhere ("`namespace must exist: openshift-monitoring`"). Watch the compliance dashboard light up. This validates the rails.
+4. Apply one Policy that you *expect* to violate. See the violation appear with the offending cluster and remediation guidance. This validates the value.
+5. Wire **OpenShift GitOps** into the same hub. Convert your application deployments to ApplicationSet + `clusterDecisionResource`.
+6. Add observability last. It's the most operationally heavy pillar; don't lead with it.
+
+The mistake to avoid: building cluster lifecycle automations *outside* RHACM (Terraform-only fleets, scripted joins) once RHACM is in play. Either commit to RHACM as the system of record for cluster state, or don't deploy it. The half-and-half configuration where some clusters are RHACM-managed and some aren't is a permanent confusion tax.
