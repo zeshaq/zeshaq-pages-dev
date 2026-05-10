@@ -1,0 +1,232 @@
+---
+title: "Shift left, shift right, shift everywhere: the modern AppSec spectrum"
+description: "Where SAST, DAST, IAST, SCA, RASP, CSPM, WAF, and bug bounty actually live across the SDLC; why 'shift left' was never enough on its own; and the 'shift everywhere' answer that defines modern AppSec in 2026."
+date: 2026-05-10
+category: SECURITY
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 8, padding: 10, color: "#ffffff", width: 130, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const leftTone  = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 6, padding: 6, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const rightTone = { background: "#fafafa", border: "1.5px solid #b91c1c", borderRadius: 6, padding: 6, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+
+export const stageEdge = { style: { stroke: "#15803d", strokeWidth: 1.5 } };
+export const toolEdge  = { style: { stroke: "#9ca3af", strokeWidth: 1 } };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const lifecycleStages = [
+  { name: "Plan",       x: 100,  tools: [{ label: "Threat Modeling", tone: leftTone }] },
+  { name: "Code",       x: 280,  tools: [{ label: "IDE SAST", tone: leftTone }, { label: "Secret Scan", tone: leftTone }, { label: "Pre-commit Hooks", tone: leftTone }] },
+  { name: "Build",      x: 470,  tools: [{ label: "SAST", tone: leftTone }, { label: "SCA / Deps", tone: leftTone }, { label: "IaC Scan", tone: leftTone }, { label: "Container Scan", tone: leftTone }, { label: "SBOM + Sign", tone: leftTone }] },
+  { name: "Test",       x: 670,  tools: [{ label: "DAST (CI)", tone: stage }, { label: "IAST", tone: stage }, { label: "Fuzzing", tone: stage }] },
+  { name: "Pre-prod",   x: 860,  tools: [{ label: "DAST (stage)", tone: stage }, { label: "Pen Test", tone: stage }] },
+  { name: "Production", x: 1060, tools: [{ label: "RASP", tone: rightTone }, { label: "Runtime Detection", tone: rightTone }, { label: "WAF / API Sec", tone: rightTone }, { label: "CSPM / KSPM", tone: rightTone }] },
+  { name: "Continuous", x: 1260, tools: [{ label: "Bug Bounty", tone: rightTone }, { label: "SIEM + DFIR", tone: rightTone }, { label: "Threat Intel", tone: rightTone }] },
+];
+
+export const spectrumNodes = [
+  // Header bar
+  { id: "shift_left",  position: { x: 80,   y: 0 },  data: { label: "SHIFT LEFT" },  style: { ...ctrl, background: "#15803d", borderColor: "#15803d", color: "#ffffff", width: 200 } },
+  { id: "shift_right", position: { x: 1200, y: 0 },  data: { label: "SHIFT RIGHT" }, style: { ...ctrl, background: "#b91c1c", borderColor: "#b91c1c", color: "#ffffff", width: 200 } },
+  // Stage row
+  ...lifecycleStages.map((s) => ({
+    id: slug(s.name),
+    position: { x: s.x - 65, y: 90 },
+    data: { label: s.name },
+    style: ctrl,
+  })),
+  // Tools
+  ...lifecycleStages.flatMap((s) =>
+    s.tools.map((t, i) => ({
+      id: slug(s.name) + "_" + slug(t.label),
+      position: { x: s.x - 70, y: 200 + i * 60 },
+      data: { label: t.label },
+      style: t.tone,
+    }))
+  ),
+];
+
+export const spectrumEdges = [
+  // Lifecycle progression (top row)
+  ...lifecycleStages.slice(0, -1).map((s, i) => ({
+    id: "prog_" + i,
+    source: slug(s.name),
+    target: slug(lifecycleStages[i + 1].name),
+    ...stageEdge,
+    type: "smoothstep",
+  })),
+  // Stage → tool
+  ...lifecycleStages.flatMap((s) =>
+    s.tools.map((t) => ({
+      id: "tool_" + slug(s.name) + "_" + slug(t.label),
+      source: slug(s.name),
+      target: slug(s.name) + "_" + slug(t.label),
+      ...toolEdge,
+    }))
+  ),
+];
+
+"Shift left security" was the rallying cry of the 2018-2022 era — move scanning, testing, and policy enforcement earlier in the SDLC so vulnerabilities get caught closer to where they're written. It worked, mostly. By 2024 every serious engineering org had IDE plugins, pre-commit hooks, SAST in CI, SCA on every PR, container scans, IaC scans, and an SBOM pipeline somewhere.
+
+Then everyone realized two things at once. First: catching everything pre-deploy is impossible — supply chain attacks, business logic bugs, configuration drift, and unknown-unknowns slip through *every* static check. Second: shifting only left meant production was a security blind spot exactly when production attack surface kept growing (API explosion, LLM applications, cloud sprawl). The pendulum swung back. **Shift right** — runtime detection, RASP, CSPM, WAF, observability — became the second half of the answer. The 2026 consensus is **"shift everywhere"**: layered controls from threat-model to runtime, each catching what the previous layer missed.
+
+This post is what the spectrum actually looks like in 2026 — which tools live where, what SAST/DAST/IAST/SCA actually do, the shift-right tools that complete the picture, and how to pick the smallest stack that gets you real coverage.
+
+## The spectrum
+
+<Whiteboard client:load data={{ nodes: spectrumNodes, edges: spectrumEdges }} height={620} />
+
+Reading the diagram: green-bordered tools live early in the lifecycle (shift left); plain-bordered tools span the middle (build, test, pre-prod); red-bordered tools live in production and beyond (shift right). The lifecycle bar at the top connects the seven stages — every stage has its security work, and **no stage is sufficient on its own**.
+
+## Why "shift left" alone was never enough
+
+The original shift-left thesis was correct but partial: catching vulnerabilities at code-time is **100× cheaper** than catching them in production. That math is real. The flaws emerged at scale:
+
+- **Static analysis misses runtime context.** A SAST scanner can flag every database call as "potential SQL injection." It can't tell you which ones are reachable from an authenticated endpoint with attacker-controlled input. False positives drown signal.
+- **Supply chain attacks bypass code review.** The XZ Utils backdoor in early 2024 was committed by a maintainer who'd built trust over two years. No SAST tool would have flagged the malicious code as malicious — it was syntactically clean and intentionally subtle.
+- **Configuration drift happens after deploy.** IaC scanning catches what's in your Terraform repo; it doesn't catch what someone clicked in the AWS console at 2am during an incident.
+- **Business logic bugs are invisible to scanners.** "User A can read User B's data because the authorization check uses the wrong field" — every shift-left tool will pass that code. Manual testing or runtime monitoring catches it.
+- **LLM applications introduced new categories.** Prompt injection, training-data poisoning, jailbreaks — these aren't in any SAST rule library.
+
+The lesson by 2024: **shift-left maximizes coverage of known patterns**; it doesn't catch novel, contextual, or post-deploy issues. Shift-right exists because those exist.
+
+## The tool categories, with examples
+
+The terminology is its own learning curve. Quick reference:
+
+| Acronym | What it does | Where it lives | Examples |
+| --- | --- | --- | --- |
+| **SAST** | Static analysis of source code or bytecode | Build / Code | Semgrep, SonarQube, Checkmarx, Veracode, Snyk Code, GitHub CodeQL |
+| **SCA** | Software Composition Analysis — known CVEs in dependencies | Build | Snyk, Dependabot, Renovate, OWASP Dependency-Check, Trivy, Black Duck, JFrog Xray |
+| **DAST** | Dynamic testing against a running app | Test / Pre-prod | OWASP ZAP, Burp Suite Pro, [Acunetix](/blog/acunetix), [Invicti](/blog/invicti), Nuclei |
+| **IAST** | Agent inside running app correlates DAST inputs with code paths | Test / Pre-prod | Contrast Security, Synopsys Seeker, AcuSensor, Invicti's IAST sensors |
+| **IaC scan** | Static analysis of Terraform / Pulumi / K8s manifests | Build | Checkov, tfsec, KICS, Terrascan, Snyk IaC |
+| **Container scan** | CVE scanning of container images | Build / Registry | Trivy, Grype, Clair, Snyk Container, [RHACS Scanner V4](/blog/rhacs) |
+| **Secret scan** | Detect committed credentials / API keys | Code / Build | TruffleHog, GitLeaks, GitGuardian, GitHub Secret Scanning |
+| **SBOM** | Software Bill of Materials — what's actually in your artifact | Build / Release | Syft, Anchore, CycloneDX, SPDX |
+| **Signing / Provenance** | Attest who built what | Release | Sigstore (cosign), in-toto, SLSA framework |
+| **Policy as Code** | Admission control on Kubernetes / cloud | Deploy | OPA / Gatekeeper, Kyverno, Conftest |
+| **RASP** | Runtime Application Self-Protection — block exploits inline | Production | Contrast Protect, Imperva RASP, Signal Sciences (Fastly), Datadog ASM |
+| **Runtime Detection** | Kernel / process / network anomaly detection | Production | Falco, Tracee, [RHACS Collector](/blog/rhacs), Sysdig Secure, Aqua |
+| **WAF / API Security** | Edge protection for HTTP traffic | Production | Cloudflare WAF, AWS WAF, Imperva, Akamai, Wallarm, Salt Security |
+| **CSPM / KSPM** | Cloud / Kubernetes Security Posture Management | Production | Wiz, Prisma Cloud, Lacework, Orca, [RHACS](/blog/rhacs), AWS Security Hub |
+| **DSPM** | Data Security Posture Management | Production | Cyera, Dig Security, BigID, Sentra |
+| **Bug Bounty** | Crowdsourced exploitation | Continuous | HackerOne, Bugcrowd, Synack, Intigriti |
+| **ASPM** | Application Security Posture Management — orchestrate the above | Cross-cutting | ArmorCode, Apiiro, Dazz (Wiz), Cycode, OX Security |
+
+If you're new to AppSec, the table looks like alphabet soup. The simpler model: **scan code → scan dependencies → scan infra-as-code → scan built artifacts → test running app → protect production → respond to incidents → invite outside testers**. The acronyms are tools for each step.
+
+## SAST, in depth
+
+Static Application Security Testing. The most-mature category, and the one with the most legacy baggage.
+
+**How it works:** Parses source code (or sometimes compiled bytecode) into an abstract syntax tree, runs queries against it looking for vulnerable patterns. "User input flows into a SQL string concatenation" = SQL injection. "User input renders to a template without escaping" = XSS. Modern SAST also does **data-flow analysis** (taint tracking) — follows untrusted input from source to sink across function boundaries.
+
+**Strengths:**
+- Full code coverage (sees every code path, including ones DAST never hits).
+- Runs without infrastructure — just source code.
+- Cheap per-scan; runs in CI on every PR.
+- Catches patterns that are easy to express as rules (injection, weak crypto, hardcoded secrets, unsafe deserialization).
+
+**Weaknesses:**
+- **High false positives.** Many flagged "vulnerabilities" aren't reachable in practice, or the input is sanitized elsewhere. Triage cost can dominate scan cost.
+- **Misses business logic bugs.** "User A can access User B's data" doesn't match any SAST rule.
+- **Language-specific.** Each language needs its own analyzer. Polyglot codebases need multiple tools.
+- **Doesn't see infrastructure context.** A SQL query in a script that never runs is treated identically to one in the request path.
+
+**Modern leaders by language:**
+- **All-language / open source:** Semgrep (the rule engine that ate the open-source SAST world), GitHub CodeQL (powerful but complex)
+- **Enterprise:** Checkmarx, Veracode, Fortify (HCL), Coverity (Synopsys)
+- **Developer-friendly SaaS:** Snyk Code, SonarQube Cloud
+- **Specific languages:** Bandit (Python), gosec (Go), Brakeman (Ruby), ESLint with security plugins (JS/TS)
+
+The trend since 2023: **Semgrep** has won the open-source race. Custom rules are simple YAML; the rule library is huge; the false-positive rate is lower than legacy SAST. Most new programs start there.
+
+## DAST, in depth
+
+Dynamic Application Security Testing. Tests the *running* application.
+
+**How it works:** Spider / crawl the app, then send payloads (SQL injection strings, XSS vectors, command injection chains, etc.) against discovered endpoints and parameters. Watch the responses for evidence of exploitation.
+
+**The shift-left ambition of DAST:** Traditionally DAST ran against staging environments — slow, occasional, after-the-fact. Modern DAST tools (Acunetix, Invicti, ZAP) run in CI/CD against ephemeral preview environments, and even against local dev servers. **DAST in CI** is the shift-left move for a fundamentally runtime tool.
+
+**Strengths:**
+- Validates *exploitability*, not just patterns. A finding means the attack worked.
+- Language-agnostic.
+- Sees the app the way an attacker does.
+- Catches misconfigurations that SAST can't see (CORS, security headers, SSL).
+
+**Weaknesses:**
+- **Only finds reachable code.** Endpoints the crawler doesn't discover aren't tested.
+- **Authentication is annoying.** Multi-step logins, MFA, CSRF tokens — all require configuration.
+- **Slow** compared to SAST. Full scans take hours.
+- **No code context.** "There's a SQL injection at `/products`" doesn't tell developers which file / line.
+- **Categorically can't find business logic bugs** any better than SAST.
+
+Covered in depth in [the Acunetix post](/blog/acunetix) (mid-market DAST) and [the Invicti post](/blog/invicti) (enterprise DAST with Proof-Based Scanning).
+
+## IAST: the hybrid
+
+Interactive Application Security Testing.
+
+**How it works:** Runs an agent *inside* the application that watches code execution. When external testing (DAST or normal traffic) sends a payload, the IAST agent sees the payload arrive, watches it flow through the code, and reports both "this is exploitable" *and* "here's the file:line where it lands."
+
+**Why it matters:** IAST combines DAST's runtime confirmation with SAST's code-level detail. Findings come with stack traces, much lower false positives, and reproducibility. It's the *correct* answer for in-CI scanning of microservices — but it requires deploying agents, which is the operational catch.
+
+**Leaders:** Contrast Security (purest IAST), Synopsys Seeker, Invicti's IAST sensors, Acunetix AcuSensor. Adoption has been slower than expected — the agent footprint and language coverage gaps (great for .NET/Java, weaker for Node/Python/Go) keep many teams on SAST + DAST instead.
+
+## The shift-right tools, in depth
+
+These are the production-side controls that catch what shifted-left missed.
+
+**RASP (Runtime Application Self-Protection).** Inline agent that intercepts attacks at execution time and blocks them. SQL injection attempt? The RASP agent sees the malicious query, recognizes the pattern, blocks the call. The trade-off is performance overhead and the operational risk of an agent crashing or false-positively blocking legitimate traffic.
+
+**Runtime Detection (eBPF-based).** Falco, Tracee, [RHACS Collector](/blog/rhacs), Sysdig Secure. These use kernel-level instrumentation to watch process execution, network connections, file access. They detect post-exploitation behavior (a shell spawning inside a container, unexpected network egress, cryptominer signatures) rather than the initial exploit.
+
+**WAF (Web Application Firewall) and API Security.** Edge filtering for HTTP traffic. Modern WAFs (Cloudflare, AWS WAF, Imperva, Akamai) have moved well beyond the old "regex-match-bad-strings" approach — ML-driven, with custom rule engines, bot management, and API-aware features. Dedicated API security tools (Salt, Wallarm, Noname / Akamai) cover the rest.
+
+**CSPM / KSPM.** Continuous scanning of cloud / Kubernetes configurations against benchmarks. "Is this S3 bucket public?" "Is this IAM role too permissive?" "Are there any pods running as root?" Wiz dominates the commercial CSPM space; Prisma Cloud, Lacework, and Orca are strong; RHACS handles the Kubernetes slice.
+
+**SIEM + DFIR.** Centralized log analysis, alert correlation, and incident response. Splunk, Microsoft Sentinel, Datadog Cloud SIEM, Elastic Security, Panther. Every security finding ultimately flows through here for triage.
+
+**Bug Bounty.** The most-effective shift-right control is paying outside hackers to find what your scanners missed. HackerOne, Bugcrowd, Synack, Intigriti run the programs. The ROI is high but the operational discipline (triage capacity, payouts, communication) is real.
+
+## ASPM: the orchestration layer
+
+By 2024 most security teams had 8-12 of the above tools running and producing thousands of findings per week across different dashboards. **Application Security Posture Management** (ArmorCode, Apiiro, Dazz, Cycode) emerged as the orchestration layer: ingest findings from every tool, deduplicate, correlate (this SAST finding + this SCA CVE + this runtime alert = one ticket), prioritize by business context, and route to the right developer team.
+
+Not every org needs ASPM. Small teams can wrangle their tools manually. Large enterprises with 100+ apps and a dozen scanners get genuine value from ASPM — but only after they've reached scanner sprawl, which itself is an indicator of sufficient AppSec maturity.
+
+## Where to start, by maturity
+
+For an organization starting from zero:
+
+1. **Secret scanning + pre-commit hooks.** One day. Highest ROI.
+2. **SCA on every PR.** One week. Snyk, Dependabot, or Trivy. Cuts known-vuln deps.
+3. **SAST on every PR.** Semgrep is the easiest start. Tune ruleset down to high-confidence first.
+4. **Container scan.** Plug into your registry. Trivy in CI for free.
+5. **IaC scan.** Checkov on every Terraform PR.
+6. **SBOM + artifact signing.** Sigstore cosign. Makes you respond-able to the next supply chain incident.
+7. **DAST in CI** (or pre-prod). [Acunetix or OWASP ZAP](/blog/acunetix). Validate the runtime side.
+8. **Runtime detection.** Falco or RHACS Collector. The first shift-right tool.
+9. **CSPM.** Wiz or open-source equivalent. Cloud config drift will bite you.
+10. **WAF.** Cloudflare WAF or AWS WAF. Edge protection.
+11. **Bug bounty.** Start with a private program on HackerOne after you've fixed the obvious.
+12. **ASPM.** Only after you have 6+ scanners producing findings the org can't keep up with.
+
+You don't need all 12 on day one. You need to know which one would catch the next breach.
+
+## The traps
+
+A few common mistakes:
+
+- **Shifting left without ownership.** Throwing SAST findings over the wall to developers without context, prioritization, or remediation guidance generates noise and resentment. The findings need to land in the developer's queue *with* the fix path.
+- **Buying tools that don't talk to each other.** A SAST tool, a SCA tool, a DAST tool, a runtime tool, and a CSPM tool — each with its own dashboard — produces 10× the cognitive load of one consolidated view. ASPM exists precisely for this.
+- **Treating WAF as a substitute for fixing bugs.** A WAF rule that blocks SQL injection at the edge is great until an attacker finds an encoding the rule didn't anticipate. Defense in depth means *layers*, not "we have a WAF so we don't need to fix the app."
+- **Running every tool at maximum sensitivity.** Default settings on most scanners produce noise at production scale. Tune for high-confidence findings first; expand only when triage capacity allows.
+- **Forgetting business logic.** Every category above catches *technical* vulnerabilities. None of them catch "this feature allows fraud if used by a determined adversary." Manual pentest and bug bounty remain irreplaceable.
+
+The deeper trap: treating shift-left as the *whole* AppSec program. It's the part that scales — but it's also the part with the most diminishing returns past a certain point. Once you're catching the high-confidence patterns reliably, the next vulnerability is the one your scanners *cannot* see, and that one will surface in production. Plan for both halves of the spectrum from day one, and you'll be ahead of most organizations that found out the hard way.
