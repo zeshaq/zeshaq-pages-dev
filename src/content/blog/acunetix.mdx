@@ -1,0 +1,145 @@
+---
+title: "Acunetix: the fast-UI DAST scanner"
+description: "What Acunetix is — DAST web vulnerability scanning, DeepScan crawler for SPAs, AcuSensor IAST hybrid, network scanning — its place in the Invicti Security product family, and where it sits next to Burp Pro, OWASP ZAP, and Invicti."
+date: 2026-05-10
+category: SECURITY
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge  = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const sensorEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const acuNodes = [
+  { id: "user",     position: { x: 80,  y: 80  }, data: { label: "security engineer" }, style: stage },
+  { id: "console",  position: { x: 80,  y: 230 }, data: { label: "Acunetix Console\n(Web UI)" }, style: ctrl },
+  { id: "scanner",  position: { x: 320, y: 230 }, data: { label: "Scanner Engine\n+ Vulnerability Tests" }, style: ctrl },
+  { id: "crawler",  position: { x: 320, y: 80  }, data: { label: "DeepScan Crawler\n(JS / SPA aware)" }, style: ctrl },
+  { id: "netscan",  position: { x: 320, y: 380 }, data: { label: "Network Scanner\n(OpenVAS-based)" }, style: ctrl },
+  { id: "app",      position: { x: 580, y: 230 }, data: { label: "target web app\n+ APIs" }, style: ext },
+  { id: "acusensor", position: { x: 580, y: 80  }, data: { label: "AcuSensor\n(in-app IAST agent)" }, style: agent },
+  { id: "tracker",  position: { x: 80,  y: 380 }, data: { label: "issue trackers\n(Jira, GitHub, …)" }, style: ext },
+];
+
+export const acuEdges = [
+  { id: "u1", source: "user",     target: "console", label: "configure / triage", ...reqEdge },
+  { id: "c1", source: "console",  target: "scanner", label: "launch scan", ...dataEdge },
+  { id: "s1", source: "scanner",  target: "crawler", label: "uses", ...dataEdge },
+  { id: "s2", source: "crawler",  target: "app",     label: "discover URLs", ...reqEdge },
+  { id: "s3", source: "scanner",  target: "app",     label: "vuln tests (XSS, SQLi, …)", ...reqEdge },
+  { id: "s4", source: "scanner",  target: "netscan", label: "uses", ...dataEdge },
+  { id: "se1", source: "acusensor", target: "scanner", label: "code-path + stack trace", ...sensorEdge },
+  { id: "t1", source: "console",  target: "tracker", label: "create ticket", ...reqEdge },
+];
+
+Acunetix is the **Dynamic Application Security Testing** (DAST) scanner with a reputation for fast scans, clean UI, and approachable pricing — the one that often ends up in the hands of mid-market security teams and developers who want vulnerability scanning without an enterprise procurement cycle. It's been around since 2005, predating most of its competitors, and is now owned by **Invicti Security** alongside its enterprise sibling, **Invicti** (formerly Netsparker). The two products share substantial scanner-engine technology under the hood; the differentiation is in positioning, scale, and feature gating.
+
+This post is what Acunetix actually is in 2026, the relationship to Invicti, and where it sits against Burp Suite Pro, OWASP ZAP, and the rest of the DAST landscape.
+
+## The position
+
+Acunetix's value proposition: **point a scanner at a web application, get a list of vulnerabilities, integrate it into your CI/CD pipeline — without an enterprise platform's learning curve.**
+
+Three properties define it:
+
+1. **Fast scan engine.** Acunetix has historically led DAST benchmarks for raw scan speed and coverage on common vulnerabilities (OWASP Top 10, especially SQLi, XSS, CSRF, file inclusion).
+2. **Mid-market positioning.** Pricing per-target (per-website / per-app) lands between Burp Suite Pro's per-user model and Invicti's enterprise-wide pricing. Practical for security teams of 5-50 people with 10-200 apps to scan.
+3. **Three editions, one engine.** Acunetix Standard (on-prem), Acunetix Premium (on-prem with more concurrent scans), and **Acunetix 360** (the SaaS variant, which is essentially Invicti Enterprise's smaller-team SKU). Same underlying scanner.
+
+## The Invicti Security relationship, briefly
+
+Acunetix was acquired by what's now Invicti Security around 2018, when Spectrum Equity rolled Acunetix and Netsparker into the same portfolio. Netsparker rebranded as Invicti in 2022. The result, in 2026:
+
+- **Acunetix** — the brand for self-service / mid-market customers
+- **Invicti** — the brand for enterprise customers, with additional IAST and Proof-Based Scanning features (covered in [the Invicti post](/blog/invicti))
+- **Acunetix 360** — sometimes branded as Invicti Standard or similar; the SaaS variant shares architecture with Invicti Enterprise
+
+For most evaluations: **start with Acunetix Standard or 360** unless you have enterprise-scale requirements (>200 apps, complex RBAC, formal Proof-Based Scanning needs). Then upgrade to Invicti.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: acuNodes, edges: acuEdges }} height={510} />
+
+Reading the diagram:
+
+- **Acunetix Console** — the web UI. Where you configure targets, schedule scans, review findings, manage users, and triage results. Same UI across all editions.
+- **DeepScan Crawler** — Acunetix's JavaScript-aware crawler. Renders single-page applications (React, Angular, Vue), discovers routes that aren't linked in static HTML, handles authentication flows. The crawler quality is half of any DAST scanner's value; DeepScan is one of Acunetix's strongest pieces.
+- **Scanner Engine** — runs the actual vulnerability tests against discovered URLs and parameters. Tests for SQL injection, XSS, server-side request forgery, file inclusion, command injection, weak authentication, exposed config files, vulnerable JS libraries, and the rest of the OWASP Top 10 / Top 25 catalog.
+- **AcuSensor** — Acunetix's in-app IAST agent. Optional. Available for .NET, PHP, Java, Node.js. Sits inside the application being scanned and feeds the scanner code-path information when a vulnerability is hit (which file, which line, which stack trace). The green dashed edge shows this is in-target instrumentation.
+- **Network Scanner** — bundled OpenVAS-based scanning for host-level vulnerabilities (open ports, weak SSL, outdated services). Less differentiated than the web scanner.
+- **Issue tracker integrations** — Jira, GitHub, GitLab, Azure DevOps, Bugzilla, ServiceNow. The whole point: findings flow into your developers' existing queue, not just the security team's dashboard.
+
+## What you actually do in Acunetix
+
+The day-to-day:
+
+1. **Add a target.** Web app URL, an OpenAPI spec for an API, a SOAP WSDL, or a Postman collection. Acunetix supports all four as scope definitions.
+2. **Configure authentication.** Either record a login sequence (point-and-click in the recorder browser), provide cookies, or use OAuth credentials. Apps behind auth need this; the default scan otherwise hits only the login page.
+3. **Launch a scan.** Pick a profile (Full Scan, OWASP Top 10, Critical/High, Weak Authentication, etc.). The scanner runs, reports a stream of findings.
+4. **Triage findings.** False positives, suppressed false positives, confirmed vulnerabilities by severity. Acunetix's UI surfaces "Confirmed" / "Likely" / "Possible" tiers — many engines just say "vulnerability."
+5. **Fix and re-scan.** Hit "Re-scan" on a target and Acunetix retests only the previously-found issues, validating fixes without re-scanning the whole app.
+6. **Integrate with CI/CD.** A scan can be triggered from a build pipeline (GitHub Actions / Jenkins / GitLab CI) and gate the build on the presence of high-severity findings.
+
+## The vulnerability scope
+
+Roughly what Acunetix catches well, and what it misses:
+
+| Category | Coverage |
+| --- | --- |
+| SQL injection | Strong — including blind, time-based, second-order |
+| Cross-site scripting (XSS) | Strong — reflected, stored, DOM-based |
+| Command injection / SSTI | Strong |
+| File inclusion (LFI / RFI) | Strong |
+| Server-Side Request Forgery (SSRF) | Good |
+| XML External Entity (XXE) | Good |
+| Cross-Site Request Forgery (CSRF) | Detection only; remediation guidance varies |
+| Authentication / session flaws | Decent but business-logic-aware tests are limited |
+| Authorization (broken access control) | Weakest area — DAST can't reliably detect missing authZ without explicit test cases |
+| Business logic flaws | Out of scope for DAST in general; needs manual testing or Burp Pro |
+| Third-party library CVEs | Coverage via JS library fingerprinting; not as deep as SCA tools |
+
+DAST's strength is unauthenticated and partially-authenticated injection vulnerabilities; its weakness is anything requiring application-specific understanding (business logic, authorization rules). Acunetix doesn't transcend those category limits — but inside the DAST envelope, it's competent.
+
+## Where Acunetix sits in the landscape
+
+| Tool | Where it differs |
+| --- | --- |
+| **Burp Suite Pro** | Manual-testing focused, single-user, lower automated-scan throughput. Burp Suite Enterprise competes more directly. Acunetix is more scan-and-report; Burp is more interactive testing. |
+| **OWASP ZAP** (open source) | Free, very capable, but more developer-effort to set up and tune. Coverage similar; UX behind. |
+| **Invicti** (formerly Netsparker) | Same parent company. Enterprise scale, Proof-Based Scanning, more IAST features. Covered in [the Invicti post](/blog/invicti). |
+| **Veracode DAST** | Part of a broader AppSec platform (SAST + SCA + DAST). Heavier procurement, broader scope. |
+| **Checkmarx** | SAST-first vendor with DAST added. Acunetix is DAST-native. |
+| **Rapid7 InsightAppSec** | Mid-market DAST competitor; similar positioning. |
+| **HCL AppScan** | Mature DAST (heritage from IBM Rational). Enterprise-focused; more configurable, less polished UX. |
+| **Probely** | Newer SaaS-only DAST; lighter, integrates well with developer workflows. |
+| **Snyk** | SCA-first, with DAST added more recently. Different center of gravity. |
+
+Acunetix's natural lane: **security teams at mid-market organizations who want a competent DAST scanner with minimal setup overhead, who don't yet need enterprise-grade Proof-Based Scanning or thousands-of-apps scale.** Often the first DAST tool a security team buys after outgrowing OWASP ZAP.
+
+## Limitations and pitfalls
+
+- **False positives are real.** Like any DAST, Acunetix flags things that turn out not to be exploitable. The "Confirmed" / "Likely" tiering helps but isn't perfect. Plan for triage time.
+- **AcuSensor coverage is uneven.** Excellent for .NET / PHP / Java. Newer for Node; less mature for Python (limited). If your stack is Python / Go / Rust, you get less IAST benefit.
+- **JS-heavy SPAs still trip the crawler sometimes.** DeepScan is good but not perfect. Complex client-side state machines, infinite scroll, WebSocket-driven UIs — all corner cases. Verify scan coverage explicitly.
+- **No real business-logic testing.** This is a DAST limitation, not Acunetix-specific. For "user A shouldn't be able to access user B's data," DAST is the wrong tool. Use Burp Pro + manual testing or dedicated authZ testing tools.
+- **Network scanner is a side feature.** Don't pick Acunetix for network vulnerability scanning — buy Tenable / Qualys / Rapid7 if that's the primary need.
+- **Per-target pricing model.** Each "target" (typically a web app) is a license unit. Counting targets correctly matters for procurement; don't blow your budget by configuring one app as 12 targets.
+- **Acunetix 360 cost can jump.** The SaaS tier scales with usage; small teams sometimes underestimate annual cost.
+
+## Where to start
+
+1. Sign up for an **Acunetix Standard trial** or Acunetix 360 trial. Most evaluations need a few weeks; ask for the longest available.
+2. Pick **one well-understood internal web app** as the first target. Configure login. Run a Full Scan. Triage everything that comes back.
+3. Compare the findings to what you'd find manually — the false-positive rate and missed vulns determine whether the tool earns its place.
+4. **Wire up CI/CD** before fanning out to more targets. A scanner that's not automated is a scanner that runs quarterly and produces stale reports.
+5. Deploy **AcuSensor** on the apps where you can — that improves accuracy substantially for the supported stacks.
+6. Add the **issue tracker integration** so findings land in the developers' queue, not just security's.
+7. Scale to more targets incrementally. Don't try to scan everything on day one; the triage volume will overwhelm.
+
+The mistake to avoid: treating DAST as the complete AppSec program. DAST is one layer. You also need **SAST** (static code analysis for source-code bugs), **SCA** (dependency vulnerability scanning), and meaningful manual testing for business logic and authorization. Acunetix is good at its layer; don't ask it to do the other layers' jobs.

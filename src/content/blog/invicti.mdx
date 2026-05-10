@@ -1,0 +1,161 @@
+---
+title: "Invicti: enterprise DAST with Proof-Based Scanning"
+description: "What Invicti (formerly Netsparker) is, the Proof-Based Scanning model that defines it, DAST+IAST hybrid coverage, the relationship to its Acunetix sibling, and where it sits in the enterprise AppSec landscape."
+date: 2026-05-10
+category: SECURITY
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge  = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const iastEdge  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const inviNodes = [
+  { id: "user",      position: { x: 80,  y: 100 }, data: { label: "AppSec team\n+ developers" }, style: stage },
+  { id: "platform",  position: { x: 80,  y: 270 }, data: { label: "Invicti Enterprise\n(Console, RBAC, SSO)" }, style: ctrl },
+  { id: "scanners",  position: { x: 330, y: 270 }, data: { label: "Scanner Cluster\n(distributed agents)" }, style: ctrl },
+  { id: "pbs",       position: { x: 330, y: 100 }, data: { label: "Proof-Based Scanning\n(safe exploitation)" }, style: ctrl },
+  { id: "apps",      position: { x: 600, y: 270 }, data: { label: "web apps + APIs\n(REST / GraphQL / SOAP)" }, style: ext },
+  { id: "iast",      position: { x: 600, y: 100 }, data: { label: "IAST sensors\n(.NET / Java / Node / PHP)" }, style: agent },
+  { id: "cicd",      position: { x: 80,  y: 430 }, data: { label: "CI/CD pipelines\n(GitHub / GitLab / Jenkins)" }, style: ext },
+  { id: "tracker",   position: { x: 330, y: 430 }, data: { label: "issue trackers\n+ ticketing" }, style: ext },
+  { id: "sast",      position: { x: 600, y: 430 }, data: { label: "SAST / SCA\n(via integrations)" }, style: ext },
+];
+
+export const inviEdges = [
+  { id: "u1", source: "user",     target: "platform", label: "manage", ...reqEdge },
+  { id: "p1", source: "platform", target: "scanners", label: "schedule", ...dataEdge },
+  { id: "s1", source: "scanners", target: "apps",     label: "DAST tests", ...reqEdge },
+  { id: "s2", source: "scanners", target: "pbs",      label: "candidate findings", ...dataEdge },
+  { id: "p2", source: "pbs",      target: "apps",     label: "verify exploit", ...reqEdge },
+  { id: "i1", source: "iast",     target: "scanners", label: "code-path + telemetry", ...iastEdge },
+  { id: "c1", source: "cicd",     target: "platform", label: "scan triggers", ...reqEdge },
+  { id: "t1", source: "platform", target: "tracker",  label: "auto-file confirmed", ...reqEdge },
+  { id: "x1", source: "platform", target: "sast",     label: "correlate findings", ...dataEdge },
+];
+
+Invicti is the enterprise-tier DAST platform sold by **Invicti Security** — the same company that owns [Acunetix](/blog/acunetix). Until 2022 the product was called **Netsparker**; the rebrand signaled both the parent-company consolidation and a positioning shift toward enterprise AppSec. The single feature that distinguishes Invicti from generic DAST products is **Proof-Based Scanning**: when the scanner finds a vulnerability, it automatically constructs and executes a safe, controlled exploit to verify the finding is real. Confirmed findings ship to developers as "this is exploitable, here is the evidence" — eliminating the false-positive triage tax that consumes most security teams' DAST budget in human hours.
+
+This post is what Invicti is in 2026, how Proof-Based Scanning works, the IAST/DAST hybrid story, and where it sits against the rest of the enterprise AppSec landscape.
+
+## The position
+
+Invicti's pitch is direct: **for an enterprise with hundreds or thousands of web apps and APIs, the operational cost of triaging DAST false positives is larger than the license cost.** Proof-Based Scanning is the technical answer to that problem.
+
+Three properties that define the platform:
+
+1. **Proof-Based Scanning (PBS).** When a vulnerability is detected, Invicti attempts a non-destructive exploitation step that extracts proof (e.g., for SQL injection, reads a specific known value from a benign table; for XSS, executes a benign JavaScript to demonstrate context). If the proof succeeds, the finding ships as "Confirmed" with the exploit evidence attached. Developers don't have to argue with the security team about whether a vuln is real.
+2. **DAST + IAST hybrid.** Invicti runs as DAST (outside the app) by default. With IAST sensors deployed inside applications (.NET, Java, Node.js, PHP), it correlates DAST findings with code-path, file/line, and stack-trace information.
+3. **Enterprise platform.** SSO, granular RBAC, asset management for thousands of targets, distributed scanner clusters, advanced reporting for executives and auditors. The kind of product feature set that procurement departments check off, not the kind a developer evaluates.
+
+The trade-off versus Acunetix: more capability, higher cost, more enterprise process required to deploy well. Most organizations don't need Invicti until they have at least 100+ apps in scope or specific compliance requirements that demand the proof-evidence model.
+
+## The Acunetix relationship
+
+Both products are now owned by Invicti Security; the scanner engines share substantial DNA. The practical distinction in 2026:
+
+- **Acunetix Standard / Premium** — on-prem, fewer concurrent scans, smaller target counts, lower price. Mid-market.
+- **Acunetix 360 / Invicti Enterprise** — these are effectively the same SaaS platform underneath, with feature tiering and target-count licensing distinguishing them. Enterprise.
+- **Invicti Standard** — the on-prem version with full enterprise features.
+
+If you're already on Acunetix 360 and need more scale or Proof-Based Scanning, the migration to Invicti is a license / SKU change, not a product migration.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: inviNodes, edges: inviEdges }} height={540} />
+
+Reading the diagram:
+
+- **Invicti Enterprise platform** — the central console: target management, user / role / team configuration, SSO, reporting, scheduling. Where security engineers and AppSec leads spend their time.
+- **Scanner Cluster** — distributed scanner agents. For enterprise scale, you run many concurrent scanners; the platform dispatches scans to available capacity. Each scanner is the actual DAST engine.
+- **Proof-Based Scanning module** — when scanners find candidate vulnerabilities, the PBS subsystem runs verification exploits. The green-dashed `verify exploit` edge back to the target app is what produces "Confirmed" status.
+- **IAST sensors** — agents inside target applications. They observe the running code as DAST tests are sent, correlating "this DAST input triggered this code path." The green dashed edge `code-path + telemetry` shows the IAST feedback channel.
+- **CI/CD integration** — Invicti scans triggered from Jenkins, GitHub Actions, GitLab CI, Azure DevOps. Builds can fail on confirmed high-severity findings.
+- **Issue tracker integration** — confirmed findings auto-file as tickets (Jira, GitHub Issues, Azure Boards, ServiceNow). Developers receive a ticket with exploit evidence already attached.
+- **SAST / SCA integrations** — Invicti correlates with third-party SAST (Checkmarx, Veracode) and SCA tools to deduplicate findings and prioritize by what's actually reachable in running code.
+
+The platform's design assumption: at enterprise scale, **the bottleneck is humans, not the scanner**. Every feature optimizes for reducing the human work between a vulnerability existing and a developer fixing it.
+
+## Proof-Based Scanning, in detail
+
+This is the feature most worth understanding because it changes how the platform integrates into your workflow.
+
+For a typical DAST tool, the output is: "Possible SQL injection at `/products?id=`. CVSS 8.6. Please verify." A human security engineer then has to:
+
+1. Reproduce the vuln manually.
+2. Confirm it's not a false positive (the parameter doesn't actually reach a query, or the query is parameterized, or the data isn't sensitive).
+3. Argue with the developer about whether the finding is real.
+
+For Invicti with PBS, the output is: "SQL injection at `/products?id=`. **Confirmed.** Executed `SELECT @@version`, response contained `MySQL 8.0.32`. Evidence: [HTTP request/response captured]." There's no debate; the database returned a version string from a query the attacker controlled.
+
+PBS is calibrated to be safe — it executes proof queries that read benign data (the database version, the user table's schema, a hash of system time), never write or destructive operations. The vendor claims a near-zero false-positive rate on PBS-confirmed findings. In practice this isn't exactly zero but is meaningfully lower than DAST scanners that don't verify.
+
+What PBS doesn't help with:
+
+- Vulnerabilities where benign-exploit demonstration is hard (some SSRF, second-order injection, some race conditions). PBS reports these as "Likely" or "Possible," not Confirmed.
+- Business-logic bugs and authorization flaws — DAST in general can't see those.
+- Vulnerabilities only triggered with specific application state that the scanner didn't reproduce.
+
+So PBS isn't magic — it's a substantial reduction in the false-positive rate on the *subset* of vulnerabilities where automated verification is feasible. For confirmed findings, the cycle time from "scan finds bug" to "developer fixes bug" measurably shortens.
+
+## Where Invicti sits in the landscape
+
+| Competitor | Where it differs |
+| --- | --- |
+| **Acunetix** | Same parent. Acunetix is mid-market; Invicti is enterprise. Cross-link: [the Acunetix post](/blog/acunetix). |
+| **Burp Suite Enterprise** | PortSwigger's enterprise DAST. Strong scanner pedigree, lighter on workflow / triage automation. |
+| **Veracode** | Full AppSec platform (SAST + SCA + DAST + manual pentest add-on). Broader scope, less DAST-deep than Invicti. |
+| **Checkmarx** | SAST-first; DAST added. Checkmarx's strength is source-code analysis, where Invicti is runtime. |
+| **HCL AppScan** | Mature enterprise DAST (heritage from IBM). More configurable, less polished. |
+| **Rapid7 InsightAppSec** | Mid-market DAST, simpler product. |
+| **Probely** | SaaS-only, developer-friendly, lighter footprint. Smaller scale than Invicti. |
+| **Synopsys Seeker** | Strong IAST-only product; less DAST. Different center of gravity. |
+| **Contrast Security** | IAST + runtime protection (RASP). Different architecture; agent-only model. |
+| **Snyk** | SCA-first; DAST and SAST added more recently. Different audience (developer-led AppSec). |
+| **Tenable Web App Scanning** | Bundled with Tenable's broader vulnerability management; less standalone DAST depth. |
+
+Invicti's natural lane: **enterprises with hundreds of web apps and APIs, where the false-positive triage cost across the security and development teams justifies the license premium.** Financial services, large healthcare systems, government agencies, telcos. Organizations where the AppSec team has to convince developers to fix findings, and "the scanner already proved it's exploitable" is the convincing argument.
+
+## What's actually in the box
+
+| Capability | Notes |
+| --- | --- |
+| **DAST scanning** | Web apps + REST / GraphQL / SOAP APIs |
+| **Proof-Based Scanning** | The differentiator. Confirmed findings with exploit evidence. |
+| **IAST sensors** | .NET, Java, Node.js, PHP. Correlate DAST findings with code-path. |
+| **Authentication recorder** | Login sequences for protected apps; supports multi-factor auth flows |
+| **API discovery** | Imports OpenAPI / Postman; can also discover endpoints via traffic analysis |
+| **Asset management** | Group targets, assign owners, track scan status across the inventory |
+| **RBAC + SSO** | Per-team permissions, SAML / OIDC SSO, audit logs |
+| **CI/CD integration** | Pipelines trigger scans; gate builds on confirmed findings |
+| **Issue tracker integration** | Auto-file to Jira / GitHub / Azure Boards / ServiceNow with proof attached |
+| **Compliance reporting** | PCI-DSS, OWASP Top 10, ASVS, HIPAA, SOC 2 templates |
+| **API for everything** | The platform has REST APIs for all operations; useful for ops-as-code |
+| **Distributed scanner agents** | Scale horizontally for large app inventories |
+
+## Limitations and pitfalls
+
+- **Cost.** Invicti is one of the most expensive DAST platforms. Justifying the spend requires demonstrating the FP-reduction-in-human-hours math against your specific environment.
+- **PBS isn't universal.** Confirmed findings are confirmed; Likely and Possible findings still need human triage. Don't budget zero triage time.
+- **IAST sensor coverage gaps.** Python, Go, Rust, Kotlin — no native IAST sensors. For those stacks you get DAST-only depth.
+- **Heavy enterprise process.** Onboarding Invicti involves asset inventory, RBAC design, SSO integration, CI/CD plumbing, issue tracker mapping. Plan a quarter, not a week.
+- **Scan tuning is real work.** Default scan profiles cover OWASP Top 10 well; tuning for your specific framework, custom auth flows, anti-CSRF tokens — that takes engineering time.
+- **It's not SAST or SCA.** Invicti scans running applications. Source-code analysis and dependency CVE scanning are separate tool categories.
+- **The platform consolidates findings, but reality is more layered.** Confirmed DAST findings, SAST findings, SCA CVEs, manual pentest findings, runtime detection alerts — keeping them all in Invicti is possible but isn't always the right shape. Some organizations prefer dedicated AppSec orchestration / ASPM products (ArmorCode, Apiiro, Dazz) on top.
+
+## Where to start
+
+1. Get a **proof-of-value (PoV) deployment** running against 5-10 of your most representative apps. Don't try to inventory everything in PoV.
+2. **Compare PBS-confirmed findings with what your existing DAST or manual testing produces.** The FP-reduction number is the buying argument.
+3. **Wire up SSO and RBAC** before going wider. Once 50 people have access, retroactively organizing permissions is painful.
+4. **Pilot CI/CD integration** on one team. The friction of CI-blocking on confirmed high-severity findings tests both the developer relationship and your incident-response posture.
+5. **Deploy IAST sensors** in the languages they're available for (.NET, Java first; Node, PHP if applicable). The accuracy lift is significant for those stacks.
+6. **Plan triage workflow** — who owns Confirmed findings, who owns Likely/Possible, what SLA, what auto-file destinations. The platform reduces work but doesn't eliminate it.
+
+The mistake to avoid: buying Invicti without committing to the operational change PBS enables. The platform's value compounds only when developers trust Confirmed findings enough to skip the "is this real?" debate and go straight to fixing. That trust takes a quarter or two to build. Teams that buy Invicti and keep the same back-and-forth triage process spend enterprise money on an Acunetix-shaped outcome.
