@@ -22,13 +22,27 @@ const tree: NavNodeT[] = buildTree(blog, "/blog");
       <a href="/" class="sidebar-brand" onclick="event.stopPropagation()">Zahid's Blog</a>
       <span class="sidebar-hamburger" aria-hidden="true">≡</span>
     </summary>
+
+    <div class="sidebar-filter-wrap">
+      <input
+        type="search"
+        class="sidebar-filter"
+        placeholder="filter posts…"
+        autocomplete="off"
+        spellcheck="false"
+        data-filter
+      />
+    </div>
+
     <nav class="sidebar-nav">
-      <ul>
+      <ul data-filter-list>
         {tree.map((node) => (
           <li>
             <NavNode node={node} currentPath={currentPath} />
           </li>
         ))}
+      </ul>
+      <ul class="sidebar-extra">
         <li>
           <a class="nav-link nav-link-cta" href="/whiteboard" target="_blank" rel="noopener">
             whiteboard ↗
@@ -38,3 +52,46 @@ const tree: NavNodeT[] = buildTree(blog, "/blog");
     </nav>
   </details>
 </aside>
+
+<script is:inline>
+  (() => {
+    const input = document.querySelector("[data-filter]");
+    const root = document.querySelector("[data-filter-list]");
+    if (!input || !root) return;
+
+    const filter = (li, q) => {
+      const link = li.querySelector(":scope > a.nav-link");
+      if (link) {
+        const match = !q || link.textContent.toLowerCase().includes(q);
+        li.style.display = match ? "" : "none";
+        return match;
+      }
+      const details = li.querySelector(":scope > details");
+      if (details) {
+        const summary = details.querySelector(":scope > summary");
+        const summaryMatch = !q || (summary?.textContent.toLowerCase().includes(q) ?? false);
+        const childUl = details.querySelector(":scope > ul");
+        let anyChild = false;
+        if (childUl) {
+          for (const child of childUl.children) {
+            if (child.tagName === "LI" && filter(child, q)) anyChild = true;
+          }
+        }
+        const visible = summaryMatch || anyChild;
+        li.style.display = visible ? "" : "none";
+        if (q && anyChild) details.open = true;
+        return visible;
+      }
+      return true;
+    };
+
+    const apply = () => {
+      const q = input.value.trim().toLowerCase();
+      for (const li of root.children) {
+        if (li.tagName === "LI") filter(li, q);
+      }
+    };
+
+    input.addEventListener("input", apply);
+  })();
+</script>
