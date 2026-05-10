@@ -1,53 +1,40 @@
 ---
 import DocsLayout from "../../layouts/DocsLayout.astro";
+import DocsTocNode from "../../components/DocsTocNode.astro";
 import { getCollection } from "astro:content";
-import { buildDocsTree } from "../../utils/navTree";
+import { buildDocsTree, type NavNode } from "../../utils/navTree";
 
 const docs = await getCollection("docs", ({ data }) => !data.draft);
 const tree = buildDocsTree(docs, "/docs");
+
+function countLeaves(n: NavNode): number {
+  if (n.href) return 1;
+  return (n.children ?? []).reduce((acc, c) => acc + countLeaves(c), 0);
+}
+
+const totalLeaves = tree.reduce((acc, n) => acc + countLeaves(n), 0);
 ---
 
 <DocsLayout title="Full Platform Docs">
-  <section class="mb-12">
+  <section class="mb-10">
     <h1 class="text-2xl font-semibold mb-2">Full Platform Documentation</h1>
-    <p class="text-[var(--color-muted)]">
+    <p class="text-[var(--color-muted)] mb-3">
       Architecture, operating model, and runbooks for the CompTech full-platform OpenShift rebuild.
       Covers cluster topology, GitOps, disconnected image supply, operators, Vault + ESO, RHACS,
       OADP backup, compliance, and admin handoff.
     </p>
+    <p class="text-[var(--color-muted)] text-sm">
+      <strong>{totalLeaves}</strong> pages across <strong>{tree.length}</strong> sections.
+      Authoring is tracked under
+      <a class="underline" href="https://github.com/zeshaq/codex-opp-agent/milestone/33">Public Blog Documentation</a>.
+    </p>
   </section>
 
-  <section>
-    <h2 class="text-lg font-semibold mb-4 text-[var(--color-ink)]">Sections</h2>
-    {tree.length === 0 ? (
-      <p class="text-[var(--color-muted)] text-sm">
-        Pages are being authored — see the sidebar (or the milestone <a class="underline" href="https://github.com/zeshaq/codex-opp-agent/milestone/33">Public Blog Documentation</a>).
-      </p>
-    ) : (
-      <ul class="space-y-3">
-        {tree.map((node) => (
-          <li>
-            {node.href ? (
-              <a href={node.href} class="text-[var(--color-ink)] hover:underline">{node.label}</a>
-            ) : (
-              <details>
-                <summary class="font-semibold cursor-pointer">{node.label}</summary>
-                <ul class="mt-2 space-y-1 ml-5">
-                  {(node.children ?? []).map((child) => (
-                    <li>
-                      {child.href ? (
-                        <a href={child.href} class="text-[var(--color-ink)] hover:underline">{child.label}</a>
-                      ) : (
-                        <span>{child.label}</span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            )}
-          </li>
-        ))}
-      </ul>
-    )}
+  <section class="toc">
+    {tree.map((node) => (
+      <div class="toc-section">
+        <DocsTocNode node={node} depth={0} />
+      </div>
+    ))}
   </section>
 </DocsLayout>

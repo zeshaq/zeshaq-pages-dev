@@ -1,0 +1,37 @@
+---
+import Self from "./DocsTocNode.astro";
+import type { NavNode } from "../utils/navTree";
+
+interface Props {
+  node: NavNode;
+  depth?: number;
+}
+
+const { node, depth = 0 } = Astro.props;
+const hasChildren = (node.children?.length ?? 0) > 0;
+
+function countLeaves(n: NavNode): number {
+  if (n.href) return 1;
+  return (n.children ?? []).reduce((acc, c) => acc + countLeaves(c), 0);
+}
+
+const leafCount = hasChildren ? countLeaves(node) : 0;
+---
+
+{hasChildren ? (
+  <details open={depth === 0} class="toc-group" style={`--toc-depth: ${depth}`}>
+    <summary class="toc-summary">
+      <span class="toc-summary-label">{node.label}</span>
+      <span class="toc-summary-count">{leafCount} page{leafCount === 1 ? "" : "s"}</span>
+    </summary>
+    <ul class="toc-children">
+      {node.children!.map((child) => (
+        <li>
+          <Self node={child} depth={depth + 1} />
+        </li>
+      ))}
+    </ul>
+  </details>
+) : (
+  <a href={node.href} class="toc-leaf">{node.label}</a>
+)}
