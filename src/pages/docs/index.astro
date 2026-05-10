@@ -1,0 +1,53 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import { getCollection } from "astro:content";
+import { buildDocsTree } from "../../utils/navTree";
+
+const docs = await getCollection("docs", ({ data }) => !data.draft);
+const tree = buildDocsTree(docs, "/docs");
+---
+
+<DocsLayout title="Full Platform Docs">
+  <section class="mb-12">
+    <h1 class="text-2xl font-semibold mb-2">Full Platform Documentation</h1>
+    <p class="text-[var(--color-muted)]">
+      Architecture, operating model, and runbooks for the CompTech full-platform OpenShift rebuild.
+      Covers cluster topology, GitOps, disconnected image supply, operators, Vault + ESO, RHACS,
+      OADP backup, compliance, and admin handoff.
+    </p>
+  </section>
+
+  <section>
+    <h2 class="text-lg font-semibold mb-4 text-[var(--color-ink)]">Sections</h2>
+    {tree.length === 0 ? (
+      <p class="text-[var(--color-muted)] text-sm">
+        Pages are being authored — see the sidebar (or the milestone <a class="underline" href="https://github.com/zeshaq/codex-opp-agent/milestone/33">Public Blog Documentation</a>).
+      </p>
+    ) : (
+      <ul class="space-y-3">
+        {tree.map((node) => (
+          <li>
+            {node.href ? (
+              <a href={node.href} class="text-[var(--color-ink)] hover:underline">{node.label}</a>
+            ) : (
+              <details>
+                <summary class="font-semibold cursor-pointer">{node.label}</summary>
+                <ul class="mt-2 space-y-1 ml-5">
+                  {(node.children ?? []).map((child) => (
+                    <li>
+                      {child.href ? (
+                        <a href={child.href} class="text-[var(--color-ink)] hover:underline">{child.label}</a>
+                      ) : (
+                        <span>{child.label}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </li>
+        ))}
+      </ul>
+    )}
+  </section>
+</DocsLayout>
