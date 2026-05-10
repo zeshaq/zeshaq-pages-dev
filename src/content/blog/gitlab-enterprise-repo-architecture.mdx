@@ -1,0 +1,362 @@
+---
+title: "Git repository architecture for the large enterprise: a GitLab field guide"
+description: "Why repo architecture is a load-bearing decision, the trade-offs between monorepo / polyrepo / federation patterns, GitLab's hierarchical group model, the full capability surface (issues / epics / iterations / CI / scanning / registries / Duo), and how to implement it to actually take advantage."
+date: 2026-05-10
+category: WORKFLOWS
+---
+
+import Whiteboard from "../../components/Whiteboard";
+import Mermaid from "../../components/Mermaid";
+
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const branch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+
+  const R_HEADER = 380;
+  const headerCenter = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
+  nodes.push({
+    id: headerId,
+    position: { x: headerCenter.x - 100, y: headerCenter.y - 25 },
+    data: { label: header },
+    style: branchHeader,
+  });
+  edges.push({
+    id: "trunk_" + headerId,
+    source: "gitlab",
+    target: headerId,
+    style: { stroke: "#15803d", strokeWidth: 2 },
+  });
+
+  const FORWARD_START = 150;
+  const FORWARD_STEP = 170;
+  const PERP_OFFSET = 95;
+
+  leaves.forEach((label, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+
+    const x = headerCenter.x + forwardDist * dx + perpDist * px;
+    const y = headerCenter.y + forwardDist * dy + perpDist * py;
+
+    const id = headerId + "_" + slug(label);
+    nodes.push({
+      id,
+      position: { x: x - 75, y: y - 15 },
+      data: { label },
+      style: leaf,
+    });
+    edges.push({
+      id: "br_" + id,
+      source: headerId,
+      target: id,
+      style: { stroke: "#9ca3af", strokeWidth: 1 },
+    });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const branches = [
+  branch("Source Control", -90, ["Branches + tags", "Merge Requests", "Protected branches", "CODEOWNERS", "Approval rules", "Reviewer roulette", "Push rules", "Mirror + sync"], CX, CY),
+  branch("Planning & Tracking", -45, ["Issues + templates", "Epics (multi-issue)", "Milestones", "Iterations + sprints", "Boards + swimlanes", "Roadmaps", "Service Desk", "Time tracking"], CX, CY),
+  branch("CI/CD", 0, [".gitlab-ci.yml", "Runners (K8s / Docker)", "Parent-child pipelines", "Multi-project pipelines", "Environments", "Deployments + rollback", "Schedules", "Auto DevOps"], CX, CY),
+  branch("Security Scanning", 45, ["SAST (built-in)", "DAST + API testing", "Dependency scanning", "Secret detection", "Container scanning", "License compliance", "Fuzz testing", "Vulnerability dashboard"], CX, CY),
+  branch("Registries", 90, ["Container Registry", "Package Registry", "Dependency Proxy", "Terraform modules", "Helm + Maven + npm", "PyPI + NuGet + Go", "Generic packages", "Artifact retention"], CX, CY),
+  branch("Compliance & Governance", 135, ["Audit events", "Compliance pipelines", "Compliance frameworks", "License scanning", "SBOM export", "Push rules + signing", "Group access tokens", "Read-only mode"], CX, CY),
+  branch("DevOps Tools", 180, ["Feature flags", "Error tracking", "Value Stream Analytics", "Code quality reports", "Test coverage", "Insights dashboards", "Pages (static hosting)", "Wiki + Snippets"], CX, CY),
+  branch("AI & Productivity", -135, ["Duo Code Suggestions", "Duo Chat", "Vuln explanation", "MR summaries", "Refactor suggestions", "Test generation", "Issue summarization", "Root cause analysis"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "gitlab", position: { x: CX - 110, y: CY - 40 }, data: { label: "GitLab" }, style: center },
+  ...branches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = branches.flatMap((b) => b.edges);
+
+The repository architecture decision is the most load-bearing engineering choice most enterprises don't realize they're making. Teams that pick a structure early — even a sub-optimal one — and commit, run circles around teams that re-organize their Git topology every 18 months. The compounding effects of consistent CI patterns, predictable code locations, and shared tooling outweigh the marginal benefit of "the right" structure for most decisions.
+
+This post is the wide introduction: the three patterns that exist (monorepo, polyrepo, federation), GitLab's hierarchical model that makes federation practical, GitLab's full capability surface (most teams use ~30% of it), and an opinionated implementation playbook for actually getting value from the platform.
+
+## The three repository patterns
+
+<Mermaid client:load chart={`flowchart TD
+  subgraph Monorepo
+    M[Single repository]
+    M --> MA[apps/]
+    M --> MB[libs/]
+    M --> MC[infra/]
+    M --> MD[docs/]
+  end
+
+  subgraph Polyrepo
+    PA[repo: auth-service]
+    PB[repo: api-gateway]
+    PC[repo: web-app]
+    PD[repo: data-pipeline]
+    PE[repo: shared-libs]
+  end
+
+  subgraph Federation
+    FA[group: platform]
+    FB[group: product-a]
+    FC[group: product-b]
+    FA --> FA1[platform repos]
+    FB --> FB1[product-a repos]
+    FC --> FC1[product-b repos]
+    FA1 -.shared modules.-> FB1
+    FA1 -.shared modules.-> FC1
+  end
+
+  classDef monorepo fill:#e5e7eb,stroke:#15803d,color:#1f2937
+  classDef polyrepo fill:#fafafa,stroke:#6b7280,color:#1f2937
+  classDef federation fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  class M,MA,MB,MC,MD monorepo
+  class PA,PB,PC,PD,PE polyrepo
+  class FA,FB,FC,FA1,FB1,FC1 federation`} />
+
+**Monorepo.** Everything in one repository. Apps, libraries, infrastructure, docs all share a tree. Adopted by Google, Meta, Microsoft (Windows partially), Uber's Go codebase, Twitter (X) historically. Strengths: atomic cross-project changes, code reuse, consistent tooling, instant grep across the entire codebase. Weaknesses: build complexity, longer CI times, fine-grained access control is hard, scale (a 10-year monorepo can be hundreds of GBs and require specialized Git extensions like Sparse Checkout or VFS).
+
+**Polyrepo.** Many small repositories, one per service or library. Adopted by Amazon (one repo per microservice), Netflix, most early-stage startups. Strengths: team autonomy, smaller blast radius per change, simpler per-repo CI, easier access control. Weaknesses: dependency-version hell, harder cross-project refactors, tooling drift between repos, "where does this code live?" friction.
+
+**Federation.** The honest hybrid. A small number of *shared* / *platform* monorepos (terraform modules, shared CI templates, design system) plus many *team-owned* polyrepos for services. Most modern enterprises end up here regardless of their initial position. Strengths: best of both. Weaknesses: requires deliberate boundary design — what goes in shared, what stays in team repos.
+
+The trap in this decision: **picking one pattern globally**. Different parts of an enterprise have different optimal patterns. Platform code (used by everyone) benefits from monorepo discipline. Independent product code benefits from polyrepo isolation. Federation explicitly accepts that there's no single answer.
+
+## GitLab's hierarchical model
+
+GitLab's structural primitives map naturally to federation:
+
+- **Top-level group** (e.g., `acme-corp`) — the organization
+- **Sub-groups** (nested arbitrarily deep) — divisions, products, teams
+- **Projects** — individual repositories
+- **Members** — users assigned at any group or project level, with role inheritance flowing down
+
+A typical large-enterprise layout:
+
+```
+acme-corp/
+├── platform/                       (group)
+│   ├── infrastructure/             (subgroup)
+│   │   ├── terraform-modules/      (project — shared monorepo)
+│   │   ├── k8s-platform/           (project — shared monorepo)
+│   │   └── ci-templates/           (project — shared CI library)
+│   ├── shared-libs/                (subgroup)
+│   │   ├── design-system/          (project)
+│   │   └── auth-sdk/               (project)
+│   └── developer-portal/           (project)
+├── product-banking/                (group)
+│   ├── services/                   (subgroup)
+│   │   ├── accounts-service/       (project)
+│   │   ├── payments-service/       (project)
+│   │   └── fraud-detection/        (project)
+│   └── apps/                       (subgroup)
+│       ├── mobile-app/             (project)
+│       └── web-banking/            (project)
+├── product-insurance/              (group)
+│   └── ...
+└── shared/                         (group)
+    ├── docs/                       (project)
+    └── runbooks/                   (project)
+```
+
+Critical mechanics this gives you:
+
+- **Permissions cascade**. Grant a user `Maintainer` on `platform/` and they get it on every project underneath. Adjust at the leaf project to override.
+- **Group-level resources**. CI/CD variables, runners, container registry credentials, milestones — defined at the group level and inherited by all projects.
+- **Group epics and roadmaps**. Cross-project planning lives in the group, not in any one project.
+- **Audit events** roll up to the group level for compliance reporting.
+- **Compliance frameworks** apply to all projects in a group.
+
+This hierarchy is the *enabler* of federation in GitLab. It's also the place most enterprises mis-design — flat group layouts force re-organization in year 2.
+
+## The GitLab capability surface
+
+What you're actually buying when you adopt GitLab — far more than "Git hosting":
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={1000} />
+
+Eight branches; ~64 capabilities. Most teams use 15-20 of these at any point in time. The flywheel comes from compounding adoption across the surface.
+
+## Source control and code review
+
+The Git-hosting basics plus the *workflow* primitives that make code review work at enterprise scale:
+
+- **Branches and tags.** Standard Git. Protected branches enforce who can push (typically: nobody directly; all changes via Merge Request) and protect tags from being moved or deleted.
+- **Merge Requests (MRs).** GitLab's PR equivalent. Discussion threads, suggested changes, file-level comments, resolved discussion tracking. MR templates for consistent review.
+- **CODEOWNERS file.** Per-path ownership; specified reviewers required for changes in their paths. Enables true codebase-wide review enforcement without manual reviewer assignment.
+- **Approval rules.** Configurable per project or per branch. "2 approvals from backend team + 1 from security + 1 from product owner" is expressible declaratively.
+- **Push rules** (Premium+). Server-side enforcement of commit message format, signed commits, file name patterns, prohibited filenames, branch name conventions. Catches at push, not at MR time.
+- **Mirroring + sync.** Bi-directional mirroring with GitHub, Bitbucket, or another GitLab. Useful for open-sourcing internal projects or vendoring external code with controlled sync.
+- **Reviewer roulette.** Auto-assigns reviewers based on CODEOWNERS or load-balancing rules.
+
+## Planning and tracking entities
+
+GitLab is also a project management tool. Most teams under-use this. The hierarchy:
+
+| Entity | Scope | What it's for |
+| --- | --- | --- |
+| **Issue** | Project (or group) | Atomic unit of work — a bug, a feature, a chore. Templates per project. |
+| **Epic** | Group level (Premium+) | Multi-issue initiative. Links to many issues across many projects. |
+| **Milestone** | Project or group | Time-boxed delivery target (e.g., "Q3 2026 release"). Issues tagged with milestone. |
+| **Iteration** (Premium+) | Group | Sprint primitive. Auto-rotates. Issues assigned to iterations. |
+| **Board** | Project or group | Kanban view of issues with configurable columns, swimlanes, weight aggregation. |
+| **Roadmap** (Premium+) | Group | Timeline visualization of epics. Strategic view across products. |
+| **Service Desk** | Project | Email-to-issue gateway. Customer emails create issues; replies threaded in. |
+| **To-Do list** | User | Personal queue of mentions, assigned items, requested reviews. |
+
+A few patterns that work:
+
+- **Epic per feature, milestone per release.** Epics group all the work for a feature regardless of how many projects touch it; milestones track delivery to a release date. They're orthogonal.
+- **Issue templates per project.** `bug.md`, `feature-request.md`, `incident.md` in `.gitlab/issue_templates/`. Forces consistent fields.
+- **Weighted issues for sprint capacity.** Each issue gets a `Weight: 1/2/3/5/8` (Fibonacci-ish). Iteration boards aggregate weight. Teams calibrate their per-iteration capacity over 3-5 iterations.
+- **Boards per workflow stage.** One project might have multiple boards: "Backlog refinement," "Active sprint," "Bugs," "Security." Same issues, different views.
+- **Service Desk for external interfaces.** Customer support tickets become issues. Engineering and support work the same queue.
+- **Cross-project epics** are how product management actually works at scale. An epic in the `product-banking/` group can have child issues in `accounts-service`, `mobile-app`, `web-banking`, and `payments-service` — and a single roadmap view shows progress across all of them.
+
+## CI/CD in GitLab
+
+The capability that distinguishes GitLab from being "just Git hosting" was always its CI/CD. The mechanics:
+
+- **`.gitlab-ci.yml`** at the root of any repo defines the pipeline. Jobs in stages run in parallel within a stage, sequentially across stages.
+- **Runners** execute jobs. Three flavors: **shared** (GitLab-managed on SaaS, or shared across the GitLab self-managed instance), **group** (registered to a group, available to all projects within), **project-specific**. Executor types: Docker (most common), Kubernetes (best for autoscaling), shell, SSH.
+- **Parent-child pipelines.** A pipeline can trigger another pipeline within the same project (e.g., one parent pipeline that fans out to children based on what changed).
+- **Multi-project pipelines.** A pipeline in project A can trigger a pipeline in project B, waiting on its completion. Cross-project release orchestration.
+- **Environments.** Declare deployment targets (`staging`, `production`, `feature-XYZ`). Track deployment history per environment. Rollback by re-running an older job.
+- **Dynamic environments.** A per-MR preview environment created on push, destroyed on merge. The preview URL appears in the MR.
+- **Schedules.** Pipeline schedules (cron-syntax) for nightly builds, security scans, data refreshes.
+- **Auto DevOps.** Template-driven full CI/CD with sensible defaults for many languages. Less popular at large enterprises (every team wants their own variations) but excellent for prototypes.
+- **Components / Includes.** Pull shared CI logic from a central project (`include: project: 'platform/ci-templates'`). The DRY mechanism for federation-style CI.
+
+## Security scanning (Ultimate)
+
+GitLab Ultimate's distinctive value. Built-in:
+
+- **SAST.** ~30 languages, including Go, Java, Python, C#, JavaScript/TypeScript, PHP, Ruby. Based on Semgrep-derived rules plus other engines per-language.
+- **DAST.** Browser-based scanner against deployed applications. Also includes API security testing (REST, GraphQL, SOAP).
+- **Dependency Scanning.** CVE detection in transitive dependencies. Supports npm, Maven, pip, Go, etc.
+- **Secret Detection.** Pre-receive hook + pipeline scan for committed API keys, tokens, certs.
+- **Container Scanning.** CVE scanning of built container images. Uses Trivy under the hood.
+- **License Compliance.** Detects OSS licenses in dependencies. Allow / deny list per group.
+- **Fuzz Testing** (Ultimate). Coverage-guided fuzzing for Go, C/C++, Java, Python.
+- **Infrastructure-as-Code Scanning.** Terraform, CloudFormation, Kubernetes manifests checked against policy rules.
+- **Vulnerability Dashboard.** Cross-project aggregation. Filter by severity, tool, status, project. Triage workflow with approver paths.
+
+For the broader security context, see [the shift-left/shift-right post](/blog/shift-left-shift-right).
+
+## Container and package registries
+
+Often-underused capability that eliminates separate Artifactory / Nexus deployments for many enterprises:
+
+- **Container Registry.** Per-project Docker image registry. Tied to GitLab's auth (any user with project access can pull; tokens are short-lived). Image expiration policies.
+- **Package Registry.** Supports npm, Maven, PyPI, Composer, NuGet, Go modules, Conan, Helm, Debian, RubyGems, and a generic package format. Each project gets its own.
+- **Dependency Proxy.** Caches DockerHub / npm / PyPI public packages within GitLab. Reduces external dependency on registry availability. Saves bandwidth.
+- **Terraform Module Registry.** Per-group module registry. Teams reference modules via `source = "https://gitlab.com/api/v4/projects/.../terraform/modules/..."`.
+- **Artifact retention.** Configurable per project / group. Critical at scale — without retention policies, artifact storage grows unboundedly.
+
+Replacing JFrog Artifactory or Sonatype Nexus with GitLab's registries is a meaningful cost reduction for many organizations.
+
+## Compliance and governance
+
+- **Audit Events.** Every action (login, push, MR creation, merge, project setting change) recorded. Group-level audit log streaming to external SIEM.
+- **Compliance Frameworks.** Define a framework (e.g., "PCI-DSS," "SOC 2") and apply to projects. Compliance projects get mandatory CI/CD configurations they can't bypass.
+- **Compliance Pipelines.** A compliance framework can inject required pipeline jobs into every CI run on affected projects — guaranteeing security scans, license checks, signing.
+- **License Scanning.** GPL-3.0 in your dependency tree? Compliance policy blocks merge.
+- **SBOM Export.** CycloneDX and SPDX formats supported. Generates on every build.
+- **Push Rules.** Server-side enforcement of commit signing, branch name patterns, file size limits, prohibited filenames.
+- **Group Access Tokens.** Short-lived API tokens scoped to a group. Better than long-lived personal access tokens.
+- **Read-only mode** for archived projects. Preserves history while preventing changes.
+
+## DevOps tools
+
+- **Feature Flags.** Built-in feature flag UI (Unleash-based). Define flags per environment; toggle without redeploying.
+- **Error Tracking.** Sentry-compatible integration. Errors aggregated in the GitLab UI.
+- **Value Stream Analytics.** Cycle time from issue created → MR merged → deployed. Identifies bottlenecks.
+- **Code Quality reports.** Pluggable code quality tools (e.g., RuboCop, ESLint) report into MRs.
+- **Test Coverage.** Coverage badges and per-MR coverage diff.
+- **Insights Dashboards** (Premium+). Customizable charts on issues, MRs, deployments. Engineering metrics without a separate tool.
+- **GitLab Pages.** Static site hosting per project. Useful for project docs, design systems, marketing micro-sites.
+- **Wiki and Snippets.** Markdown wikis per project / group. Snippets for sharing code without creating projects.
+
+## AI capabilities (Duo)
+
+GitLab's AI add-on, available across tiers in 2026:
+
+- **Duo Code Suggestions.** Inline code completion in supported IDEs (VS Code, JetBrains). Comparable to Copilot.
+- **Duo Chat.** Conversational assistant. Answers questions about your code, explains vulnerabilities, suggests fixes.
+- **Vulnerability Explanation.** For each security finding, an LLM-generated explanation of the vulnerability and remediation.
+- **MR Summaries.** Auto-generated summary of what a merge request changes. Useful for reviewers and audit.
+- **Refactor Suggestions.** Recommend code restructuring within a file or across files.
+- **Test Generation.** Generate unit tests from existing code.
+- **Issue Summarization.** Summarize long issue threads.
+- **Root Cause Analysis.** For failed pipelines, suggest the likely failure cause.
+
+The pattern: AI augmenting *existing* workflows rather than replacing them. The features feel similar to GitHub Copilot Enterprise's offering, with GitLab Duo's competitive differentiator being deeper integration with planning, security findings, and CI/CD context.
+
+## Implementation: how to actually get value
+
+Adopting GitLab is easy. Getting *value* out of GitLab takes deliberate work. The 12-step playbook for enterprises:
+
+1. **Pick the deployment model.** SaaS (gitlab.com) vs Self-Managed vs Dedicated. SaaS for most; Self-Managed if regulatory or air-gapped requirements; Dedicated for "we need single-tenant SaaS."
+2. **SSO + SCIM from day one.** SAML/OIDC to your enterprise IdP. SCIM for automated user provisioning. Manual user management does not scale past 200 people.
+3. **Design the group hierarchy.** This is the load-bearing decision. Plan for 3+ years. Reorganization is painful — issue references break, permissions reset, CI variable inheritance shifts.
+4. **Establish shared CI templates** in a `platform/ci-templates` project. Every team includes from there. Updates propagate organically.
+5. **Configure runners properly.** Group-level Kubernetes runners scale better than shared SaaS runners for most enterprises. Plan capacity per team.
+6. **Enable security scanning** at the group level. Compliance frameworks make it mandatory for production projects.
+7. **Set up Container Registry + Package Registry.** Deprecate parallel Artifactory / Nexus where possible. Massive cost saving.
+8. **Implement protected branches and approval rules** universally. CODEOWNERS files in every repo.
+9. **Define compliance frameworks** for regulated projects. Tie them to compliance pipelines that enforce the controls.
+10. **Roll out Duo** to a pilot team. Measure productivity impact before broader rollout.
+11. **Establish a platform team** that owns shared CI templates, runner capacity, group hierarchy, and the developer portal. Without ownership, drift compounds.
+12. **Measure adoption.** Insights dashboards, Value Stream Analytics. The capabilities exist; the discipline of using them is the differentiator.
+
+## Common anti-patterns
+
+- **Flat group hierarchy.** Everyone is in one top-level group with hundreds of projects. Permissions become unmanageable. Refactoring is expensive.
+- **Per-project CI templates copy-pasted.** When the security policy changes, you touch 80 repos. Use group-level includes.
+- **Long-lived personal access tokens** for service accounts. Use Project / Group Access Tokens with explicit expiration.
+- **No protected branches.** Direct pushes to main happen. Audit trail breaks down.
+- **Ignoring the planning capabilities.** Teams keep using Jira "because we've always used Jira" while paying for GitLab Premium. The integration is one-way fine, but the in-platform experience is meaningfully better.
+- **Treating Auto DevOps as production-ready.** Auto DevOps is a great prototype; most enterprises customize it heavily before production use.
+- **Underestimating storage.** Container images + packages + artifacts + LFS objects accumulate. Set retention policies early or pay the migration tax later.
+- **Letting compliance pipelines be optional.** Compliance Frameworks exist for a reason — apply them so they can't be bypassed.
+
+## Beyond GitLab: when to look elsewhere
+
+GitLab is excellent. It is not the only choice:
+
+- **GitHub Enterprise** — larger community, better Copilot integration, weaker built-in CI/CD compared to GitLab's. Default for open-source-heavy organizations and ML/AI startups.
+- **Bitbucket Cloud / Data Center** — strongest if you're already deep in the Atlassian (Jira) ecosystem.
+- **Azure DevOps** — Microsoft shops, strong Azure integration. The Repos product is shrinking; Microsoft mostly directs users to GitHub.
+- **Gitea / Forgejo** — self-hosted lightweight alternatives. Good for small teams or air-gapped labs.
+- **AWS CodeCommit** — being sunset. Don't start new projects here.
+
+The decision is rarely "which is best" and almost always "which fits our existing ecosystem and team skills." GitLab's natural lane: organizations that want **one platform** for source, CI/CD, security, and registries with strong self-managed options and a clear enterprise tier.
+
+## The closing pattern
+
+The teams that get the most from GitLab share three habits:
+
+1. **Treat the platform as a product.** A platform team owns the CI templates, the runner fleet, the group hierarchy, and the developer experience. Drift is everyone's problem; the platform team is paid to prevent it.
+2. **Lean into the capability surface.** Every quarter, pick one underused capability (Compliance Pipelines, Iterations, Feature Flags) and roll it out properly. Compounding returns.
+3. **Standardize aggressively at the platform level, vary at the team level.** Shared CI templates, shared security scanning, shared registry strategy. Team-specific application code, team-specific test choices, team-specific feature flags. Federation in practice.
+
+The mistake to avoid: buying GitLab for the Git hosting and never adopting the rest. The competitive value of GitLab in 2026 vs GitHub or Bitbucket isn't Git — it's the *integration* of source, planning, CI/CD, security, and registries under one roof. Teams that use 30% of the platform get 30% of the value. Teams that use 70% — same license, vastly different leverage.
