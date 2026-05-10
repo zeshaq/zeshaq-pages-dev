@@ -59,7 +59,7 @@ export function buildCategoryTree(items: BlogItem[], base: string): NavNode[] {
       .get(cat)!
       .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
     result.push({
-      label: prettify(cat),
+      label: cat.replace(/[-_]+/g, " "),
       children: posts.map((p) => ({
         label: (p.data as { title: string }).title,
         href: `${base}/${p.id}`,
