@@ -1,0 +1,124 @@
+---
+title: "WSO2 API Gateway: the open-source API management stack"
+description: "What WSO2 API Manager actually is — Publisher, Developer Portal, Gateway, Key Manager — how the components fit together, where it earns its place against Apigee and Kong, and the Choreo SaaS migration path."
+date: 2026-05-10
+category: INTEGRATION
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const wso2Nodes = [
+  { id: "client",  position: { x: 80,  y: 240 }, data: { label: "API consumer" }, style: stage },
+  { id: "gateway", position: { x: 330, y: 240 }, data: { label: "Gateway\n(runtime, OAuth, throttle)" }, style: ctrl },
+  { id: "km",      position: { x: 330, y: 80  }, data: { label: "Key Manager\n(OAuth / tokens)" }, style: ctrl },
+  { id: "pub",     position: { x: 80,  y: 80  }, data: { label: "Publisher\n(API definition)" }, style: ctrl },
+  { id: "dev",     position: { x: 80,  y: 400 }, data: { label: "Developer Portal\n(discover + subscribe)" }, style: ctrl },
+  { id: "tm",      position: { x: 580, y: 80  }, data: { label: "Traffic Manager\n(rate limiting)" }, style: ctrl },
+  { id: "an",      position: { x: 580, y: 400 }, data: { label: "Analytics" }, style: ctrl },
+  { id: "backend", position: { x: 780, y: 240 }, data: { label: "backend services" }, style: stage },
+];
+
+export const wso2Edges = [
+  { id: "c1", source: "client",  target: "gateway", label: "API call + token", ...reqEdge },
+  { id: "g1", source: "gateway", target: "km",      label: "validate token",   ...dataEdge },
+  { id: "g2", source: "gateway", target: "tm",      label: "rate check",       ...dataEdge },
+  { id: "g3", source: "gateway", target: "backend", label: "proxied",          ...reqEdge },
+  { id: "g4", source: "gateway", target: "an",      label: "events",           ...dataEdge },
+  { id: "p1", source: "pub",     target: "gateway", label: "deploy API",       ...dataEdge },
+  { id: "d1", source: "dev",     target: "km",      label: "subscribe / get key", ...dataEdge },
+];
+
+WSO2 API Manager is the open-source API management platform from WSO2 (Sri Lankan-American company founded 2005). It's been around long enough to be in the "boring and respected" category of integration tooling — used heavily in regulated industries (government, finance, healthcare) where on-prem deployment and source-code access matter, less marketed than Apigee or Kong, but quietly running large API estates at organizations who picked it years ago.
+
+This post walks through what it actually is, how the components fit together, the licensing and SaaS story (Choreo), and where it sits next to its better-marketed competitors.
+
+## The position
+
+WSO2 API Manager is an **integrated, open-source, on-prem-first API management platform**. Three properties:
+
+1. **Apache 2.0 licensed.** The full product, including the gateway, publisher, dev portal, and key manager, is open source. WSO2 sells commercial support, not gated features.
+2. **All four core API-management capabilities in one product.** Publisher (API authoring), Developer Portal (consumer discovery), Gateway (runtime enforcement), Key Manager (auth). You install one stack, not four.
+3. **OAuth / OIDC native via WSO2 Identity Server integration.** The Key Manager is an Identity Server under the hood. Auth isn't bolted on; it's part of the platform.
+
+The natural alternative for the "open source, self-host" lane is **Kong** (also open source, more focused on the gateway alone), and the alternative for the "managed SaaS" lane is **Apigee** or AWS / Azure API Management. WSO2 occupies a middle position: full lifecycle management as the open-source default, with a SaaS variant (Choreo) for those who want to skip the operations.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: wso2Nodes, edges: wso2Edges }} height={560} />
+
+Reading the diagram:
+
+- **Publisher** — where API designers and developers define APIs. Import OpenAPI or AsyncAPI specs, configure auth, rate limits, transformations, and lifecycle state (created → published → deprecated → retired).
+- **Developer Portal** — the consumer-facing storefront. App developers register applications, subscribe to APIs, get tokens, view docs, try APIs in a built-in console.
+- **Gateway** — the runtime. Receives client requests, validates tokens against the Key Manager, checks throttling against Traffic Manager, applies any mediation (transformation, scopes, custom policies), proxies to the backend.
+- **Key Manager** — the OAuth 2.0 / OIDC server. Issues access tokens, validates them, manages clients and scopes. Defaults to the embedded WSO2 IS Key Manager; can federate to external IdPs (Okta, Keycloak, Auth0).
+- **Traffic Manager** — separate component (or co-located) that handles rate limiting at high volume. Uses distributed counter state for accurate cluster-wide throttling.
+- **Analytics** — captures every request as an event, feeds dashboards (Grafana, ELK, or WSO2's own analytics).
+
+The green dashed edges show out-of-band control and metadata flow. The solid edges are user-facing request paths. In real deployments, Publisher / DevPortal / Key Manager / Traffic Manager are typically co-located on a few "control plane" nodes; Gateways are scaled horizontally and placed close to where API consumers live.
+
+## What you actually do in WSO2 APIM
+
+The day-to-day:
+
+1. **Author an API.** Import an OpenAPI spec or write one in Publisher. Configure auth (OAuth scopes), rate limits (per-tier or per-app), backend endpoints (multiple, with failover).
+2. **Deploy.** Publisher pushes the API definition to Gateways. A "create version → deploy → publish" lifecycle keeps prod traffic stable while new versions are validated.
+3. **Onboard consumers.** Developers visit the portal, sign up, create an application, subscribe to APIs at a tier (Bronze / Silver / Gold by default), generate keys.
+4. **Operate.** Watch Analytics — RPS, error rates, p99 latency, top APIs, top consumers. Alert on threshold breaches.
+5. **Govern.** Lifecycle moves: deprecate v1, retire v0. Token revocation. Scope changes.
+
+The features that make this faster than a DIY Kong + Keycloak + Grafana stack: the lifecycle / governance / dev portal UI is *integrated*, not assembled. The dev portal alone — branded, theme-able, with built-in app + subscription management — is a significant time savings over building one.
+
+## Choreo: the SaaS pivot
+
+Since 2021, WSO2 has pivoted hard toward **Choreo**, their SaaS platform. Choreo is conceptually a layer above API Manager — full internal developer platform (IDP) covering API management, integration runtime (MI under the hood), CI/CD, deployment, observability, AI integrations.
+
+Two trajectories:
+
+- **WSO2 API Manager** (on-prem) — still actively maintained, open source. The Apache 2.0 version isn't going away; it's used by regulated customers who can't or won't go SaaS.
+- **Choreo** — the new sales motion. Hosted SaaS or BYOC (bring-your-own-cluster) where Choreo's control plane manages your data plane in your AWS / Azure / GCP / on-prem cluster.
+
+WSO2's pricing model has shifted accordingly: open source for self-host, Choreo for managed. Both still rest on the same underlying APIM / IS / MI components.
+
+## Where it sits in the API management landscape
+
+| Tool | Differentiator |
+| --- | --- |
+| **WSO2 API Manager** | Open source, all-in-one (publisher + portal + gateway + KM), on-prem-first |
+| **Kong** | Open source gateway-only by default; Enterprise version adds dev portal + analytics; better K8s-native experience |
+| **Apigee (Google)** | Mature SaaS API management; full lifecycle; expensive at scale; very strong analytics |
+| **MuleSoft Anypoint** | API management + integration in one (covered in [the MuleSoft post](/blog/mulesoft)); Salesforce-owned |
+| **AWS API Gateway / Azure APIM / GCP API Gateway** | Cloud-native managed; tight integration with the cloud's IAM; less full-lifecycle than WSO2 / Apigee |
+| **Tyk** | Open-source gateway, smaller team, K8s-native |
+| **Gravitee** | Open-source full-lifecycle, similar shape to WSO2, smaller community |
+| **3scale (Red Hat)** | Now part of OpenShift Service on AWS; smaller scope than WSO2 |
+| **Solo.io Gloo** | Envoy-based gateway, strong on service mesh integration |
+
+WSO2's natural lane: **regulated and government customers who require source-code access and on-prem deployment, plus organizations that want the full lifecycle (not just a gateway) without paying Apigee prices.** The Asia-Pacific and Middle East market has particularly strong WSO2 adoption for these reasons.
+
+## Limitations and pitfalls
+
+- **Operational footprint.** WSO2 APIM is a Java application; HA deployment requires multiple processes per component, a shared database (RDBMS), and careful clustering. Lighter than 5 years ago, still not trivial.
+- **The default Publisher / Portal UIs are functional but dated.** Many customers theme them or front them with their own. Worth knowing before you commit to the out-of-box experience.
+- **K8s deployment is supported, not idiomatic.** Helm charts exist; the deployment doesn't feel as cloud-native as Kong on Kubernetes or KServe-style operator-driven products.
+- **Documentation versions are a maze.** Major versions (3.x, 4.x, 5.x) have non-trivially different deployment models. Make sure tutorials match your installed version.
+- **Choreo overlap.** The product narrative emphasizes Choreo; on-prem APIM remains supported but receives less marketing energy. Plan for either path and don't assume the on-prem version will get the same feature velocity as Choreo.
+- **Database is the scaling concern.** Multiple components share a database for configuration and runtime data; sizing and tuning that database (Postgres or MySQL) is what most production troubles trace back to.
+
+## Where to start
+
+1. Download the **WSO2 API Manager all-in-one distribution** or use the official Docker images. Run on a single VM for evaluation.
+2. Walk the **first-API tutorial**: import an OpenAPI spec into Publisher, publish, then go to Portal as a consumer, register an app, subscribe, get a token, call the API. Validates the full lifecycle in 30 minutes.
+3. Stand up **separate runtime profiles** (gateway, control plane, traffic manager) only when going to production. The all-in-one is fine for dev.
+4. Integrate with your **existing IdP** (Okta, Azure AD, Keycloak) as a federated Key Manager rather than running WSO2 IS separately. Less to operate.
+5. Plan **database sizing and HA** early. Postgres replication or a managed Postgres service. This is the hot spot for outages.
+6. Consider **Choreo** if your team is small and you don't want to operate the platform. The on-prem trade-off only pays off at scale or with regulatory needs.
+
+The mistake to avoid: treating WSO2 APIM as a drop-in gateway. It's a full API lifecycle platform — Publisher, Portal, Key Manager, Analytics. Teams that adopt it for the gateway only and ignore the rest end up paying the deployment cost without realizing the integration benefit. Either commit to the full lifecycle or pick a gateway-only product like Kong or Tyk.

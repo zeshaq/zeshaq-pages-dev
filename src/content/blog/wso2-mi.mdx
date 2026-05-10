@@ -1,0 +1,151 @@
+---
+title: "WSO2 Micro Integrator: the lightweight ESB"
+description: "What WSO2 Micro Integrator (MI) is, how the Synapse mediation engine processes messages, the EIP patterns it implements, and where it sits next to Apache Camel and MuleSoft for service integration."
+date: 2026-05-10
+category: INTEGRATION
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 130, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const flowEdge = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const miNodes = [
+  { id: "client",  position: { x: 80,  y: 230 }, data: { label: "client / event" }, style: stage },
+  { id: "inbound", position: { x: 280, y: 230 }, data: { label: "Inbound Endpoint\n(HTTP / JMS / Kafka / File)" }, style: ctrl },
+  { id: "proxy",   position: { x: 280, y: 80  }, data: { label: "Proxy Service\n(SOAP / REST API)" }, style: ctrl },
+  { id: "seq",     position: { x: 500, y: 230 }, data: { label: "Sequence\n(mediation flow)" }, style: ctrl },
+  { id: "mediate", position: { x: 500, y: 80  }, data: { label: "mediators:\nlog, transform, filter,\nenrich, iterate, switch" }, style: ctrl },
+  { id: "ep",      position: { x: 720, y: 230 }, data: { label: "Endpoint\n(backend address)" }, style: ctrl },
+  { id: "backend", position: { x: 920, y: 230 }, data: { label: "backend service" }, style: ext },
+];
+
+export const miEdges = [
+  { id: "c1", source: "client",  target: "inbound", label: "request", ...reqEdge },
+  { id: "i1", source: "inbound", target: "seq",     label: "dispatch", ...flowEdge },
+  { id: "p1", source: "proxy",   target: "seq",     label: "uses", ...flowEdge },
+  { id: "m1", source: "seq",     target: "mediate", label: "applies", ...flowEdge },
+  { id: "m2", source: "mediate", target: "seq",     ...flowEdge },
+  { id: "s1", source: "seq",     target: "ep",      label: "send", ...flowEdge },
+  { id: "e1", source: "ep",      target: "backend", label: "proxied call", ...reqEdge },
+];
+
+WSO2 Micro Integrator (MI) is the lightweight integration runtime from WSO2 — the third leg of their open-source platform alongside API Manager and Identity Server. It's an ESB / integration engine that runs as a small footprint, fast-startup container suitable for cloud-native deployment. The engine is **Apache Synapse**, originally created by WSO2 and donated to the ASF.
+
+If you've worked with enterprise integration in the 2010s, you know the shape: receive messages from somewhere (HTTP, JMS, Kafka, files, databases), transform them, route them, enrich them, and send them somewhere else. MI is the modern, container-friendly form of that pattern, descended from WSO2 ESB and WSO2 Enterprise Integrator.
+
+This post is what MI does, the EIP patterns it implements, and where it competes against Apache Camel, MuleSoft, and the modern API-gateway-plus-Lambda pattern.
+
+## The position
+
+WSO2 MI is a **lightweight, configuration-driven integration runtime**. Three properties:
+
+1. **Small footprint.** Starts in seconds, runs in a few hundred MB of RAM. Designed to be packaged in containers and deployed per-integration rather than as a monolithic ESB.
+2. **Synapse-based mediation.** The mediation engine is Apache Synapse — battle-tested, message-based, XML-configured. Synapse's mediator catalog covers the standard Enterprise Integration Patterns: content-based routing, message transformation, splitting, aggregating, enriching, etc.
+3. **Open source, Apache 2.0.** Same licensing as API Manager and IS. Optional commercial support from WSO2.
+
+The successor framing: **WSO2 Enterprise Integrator** (WSO2 EI) was the monolithic ESB that bundled mediation, MQ, business processes, and analytics. MI is the streamlined, container-first runtime that dropped what didn't fit — keeping the mediation engine.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: miNodes, edges: miEdges }} height={500} />
+
+Reading the diagram:
+
+- **Inbound Endpoint** — listener for non-HTTP transports (JMS / Kafka / file polling / database polling / custom). The way messages get into MI from event-driven sources.
+- **Proxy Service** — service definition that exposes a SOAP or REST API endpoint. The way HTTP clients invoke MI as a service.
+- **Sequence** — an ordered list of mediators. The pipeline that processes a message. Reusable across multiple proxies or endpoints.
+- **Mediators** — the unit of work: log a message, transform XML to JSON, filter on a content predicate, call a database, enrich from another service, iterate over an array, switch on a value. Synapse ships with dozens; you can write custom ones in Java.
+- **Endpoint** — the address of a backend service (URL, queue, etc.) along with policies like timeout, retry, load balancing, failover.
+- **Backend** — the actual downstream system MI talks to.
+
+A typical integration: a JMS message arrives → an Inbound Endpoint dispatches it to a Sequence → the Sequence transforms the payload (XML→JSON), enriches with a database lookup, filters out invalid messages, then sends to an HTTP endpoint or another queue.
+
+## EIP patterns: the things MI actually does well
+
+WSO2 MI / Synapse implements the canonical Enterprise Integration Patterns from Hohpe & Woolf's book — same patterns you'd implement in Apache Camel or MuleSoft:
+
+| EIP pattern | Synapse mediator |
+| --- | --- |
+| **Content-Based Router** | `switch` / `filter` |
+| **Message Translator** | `payloadFactory`, `xslt`, `dataMapper`, `script` |
+| **Splitter** | `iterate` |
+| **Aggregator** | `aggregate` |
+| **Content Enricher** | `enrich` |
+| **Recipient List** | `clone` |
+| **Throttler** | `throttle` |
+| **Dead Letter Channel** | `store`, `error sequence` |
+| **Polling Consumer** | Inbound Endpoint (file / DB / queue) |
+| **Wire Tap** | `clone` + `log` |
+| **Correlation Identifier** | sequences with property mediators |
+| **Scatter-Gather** | `clone` + `aggregate` |
+
+If you've done enterprise integration before, the mediator catalog is recognizable. Synapse is one of the most complete open-source implementations of these patterns.
+
+## Authoring: WSO2 Integration Studio
+
+You don't write Synapse XML by hand (well, you can; you typically don't). **WSO2 Integration Studio** is the Eclipse-based authoring tool: graphical sequence editor, drag-mediators-into-flow, properties panel, debugger, simulator, test runner. The XML is the underlying serialization; the UI is the production workflow.
+
+The Integration Studio approach is the trade-off WSO2 makes vs. the Apache Camel "write DSL in Java/Kotlin/YAML" model. If you have a team that lives in IDEs and prefers code-first integration, Camel feels more natural. If you have a team that prefers a visual mediation flow and reviews integration logic at design time, MI's tooling fits better.
+
+## CAR files: the deployment artifact
+
+Integration projects are packaged into **CAR (Composite Application aRchive)** files — basically a JAR with sequences, proxies, endpoints, registry artifacts. CAR files are the deployable unit: build once, deploy to multiple MI runtimes (dev, test, prod).
+
+The CI/CD shape: code in Git → Maven build produces CAR → CD pipeline deploys CAR to MI runtimes. Modern WSO2 deployments wrap MI in a Docker container with the CAR file baked in; Kubernetes manages the rest.
+
+## Comparison: WSO2 MI vs other integration platforms
+
+| Tool | Differentiator |
+| --- | --- |
+| **WSO2 MI** | Lightweight, Synapse engine, graphical authoring, Apache 2.0 open source |
+| **Apache Camel** | Code-first (Java / Kotlin / YAML / XML), Spring Boot or Quarkus runtime. The Java integration mainstream. |
+| **MuleSoft Anypoint** | Salesforce-owned, full lifecycle (covered in [the MuleSoft post](/blog/mulesoft)), strong DataWeave transformation language. Commercial. |
+| **Spring Integration** | Java-native, in-process integration. Lighter but less feature-rich. |
+| **Boomi (Dell)** | Cloud-native SaaS iPaaS, drag-and-drop, no on-prem |
+| **IBM App Connect** | IBM's iPaaS / integration server. Mature, expensive. |
+| **Microsoft Power Automate / Logic Apps** | Cloud-native low-code integration. Strong inside Microsoft 365 / Azure. |
+| **Apache NiFi** | Data flow / ETL focused (file-based, large-payload), less request-response. |
+| **n8n / Zapier** | Different audience — business automation. Covered in [the n8n post](/blog/n8n). |
+
+WSO2 MI's natural lane: **organizations that want graphical, Apache 2.0-licensed mediation, with a tool catalog they don't have to assemble from scratch.** Telecommunications, banking, and government — sectors where ESB-style integration has been the model for 15 years — are heavy users.
+
+## When you'd pick MI specifically
+
+- You want **open source** with full mediation features (no enterprise-version gates).
+- You have **Synapse XML or legacy WSO2 ESB** to migrate; MI is the supported path forward.
+- You need **on-prem deployment** with full source-code access.
+- You have an **integration team that uses Integration Studio productively** — graphical authoring beats code for some teams' workflow.
+- You're already on **WSO2 API Manager** and want a consistent integration story underneath the gateway.
+
+When you'd pick something else:
+
+- **Apache Camel** if your team prefers code-first integration in Java/Kotlin/Spring Boot.
+- **MuleSoft** if you need the full lifecycle (design center, exchange, API manager) integrated as a single product and budget isn't a concern.
+- **Boomi / Workato / Tray.io** for low-code iPaaS where the audience is business analysts.
+- **AWS Step Functions / Azure Logic Apps** for cloud-native managed integration in a single-cloud world.
+- **Custom microservices** if the integration is a small number of well-defined transformations and adding an ESB is overkill.
+
+## Limitations and pitfalls
+
+- **XML configuration heritage.** Underneath the Integration Studio UI is XML. When things go wrong, you debug at the XML level. Modern, but not as clean as Camel's fluent DSL or DataWeave.
+- **JVM tuning.** MI is Java; heap, GC, and threading tuning matter for high-throughput integrations. Plan for some JVM ops work.
+- **Stateful integrations are harder.** MI is fundamentally request-response / message-flow. Long-running stateful integrations (sagas, business processes) need something else — either WSO2 EI's BPS component (which is being phased out) or an external workflow engine like Temporal.
+- **Custom mediators in Java.** Beyond the built-in mediators, custom logic means writing Java. Some teams find this heavy compared to inline Groovy / JavaScript in some competitors.
+- **Documentation drift.** Older WSO2 ESB / EI tutorials don't always apply cleanly to MI. Make sure docs are MI-specific.
+- **DataWeave doesn't exist here.** MuleSoft's DataWeave is genuinely a nice transformation language. WSO2's equivalents (`payloadFactory`, `xslt`, `script`) are functional but less ergonomic.
+
+## Where to start
+
+1. Install **WSO2 Integration Studio** locally. Walk the **first proxy service** tutorial — HTTP proxy that transforms XML to JSON.
+2. Package it as a **CAR file**. Deploy to a local MI runtime via Docker. Validate end-to-end with `curl`.
+3. Build one **real integration** at work — replace a fragile point-to-point integration with an MI sequence. Pick something small first.
+4. Wire MI into your **CI/CD**: Maven build → CAR file → container image → deploy to K8s. The integration is code, not click-ops.
+5. Add **Inbound Endpoints** for non-HTTP sources when you have a queue or file-based integration to handle.
+6. Plan **error handling** explicitly. Default behavior is "fail and log"; production needs retry policies, dead-letter queues, and observability into mediation failures.
+
+The mistake to avoid: treating MI as a generic API gateway. It is *not* an API gateway — that's WSO2 API Manager's job. MI's value is in *mediation*: transforming, routing, enriching messages between systems. Use API Manager in front for external consumer-facing APIs; use MI for internal service-to-service integration with substantive transformation logic.

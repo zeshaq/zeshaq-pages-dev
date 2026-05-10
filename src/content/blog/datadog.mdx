@@ -1,0 +1,150 @@
+---
+title: "Datadog: the observability platform tour"
+description: "What Datadog actually is once you strip the marketing, how the agent-and-SaaS architecture works, what each of the 20+ products gives you, where it earns the cost, and where it doesn't."
+date: 2026-05-10
+category: OBSERVABILITY
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const ddNodes = [
+  { id: "host",    position: { x: 80,  y: 80  }, data: { label: "host / VM\n+ Agent" }, style: agent },
+  { id: "k8s",     position: { x: 280, y: 80  }, data: { label: "K8s cluster\n+ Agent + Cluster Agent" }, style: agent },
+  { id: "app",     position: { x: 480, y: 80  }, data: { label: "app instrumented\n(APM tracer)" }, style: agent },
+  { id: "browser", position: { x: 680, y: 80  }, data: { label: "browser RUM\n+ Synthetics" }, style: agent },
+  { id: "intake",  position: { x: 380, y: 250 }, data: { label: "Datadog intake\n(SaaS regions)" }, style: ctrl },
+  { id: "metrics", position: { x: 100, y: 410 }, data: { label: "Metrics + Dashboards" }, style: ctrl },
+  { id: "logs",    position: { x: 290, y: 410 }, data: { label: "Logs\n(indexed / archived)" }, style: ctrl },
+  { id: "apm",     position: { x: 480, y: 410 }, data: { label: "APM + Profiling" }, style: ctrl },
+  { id: "sec",     position: { x: 680, y: 410 }, data: { label: "Cloud SIEM + CSPM + CWPP" }, style: ctrl },
+  { id: "user",    position: { x: 380, y: 540 }, data: { label: "operator / on-call" }, style: stage },
+];
+
+export const ddEdges = [
+  { id: "h1", source: "host",    target: "intake", label: "metrics / logs", ...dataEdge },
+  { id: "h2", source: "k8s",     target: "intake", ...dataEdge },
+  { id: "h3", source: "app",     target: "intake", label: "traces / profiles", ...dataEdge },
+  { id: "h4", source: "browser", target: "intake", label: "RUM events", ...dataEdge },
+  { id: "i1", source: "intake",  target: "metrics", ...reqEdge },
+  { id: "i2", source: "intake",  target: "logs",    ...reqEdge },
+  { id: "i3", source: "intake",  target: "apm",     ...reqEdge },
+  { id: "i4", source: "intake",  target: "sec",     ...reqEdge },
+  { id: "u1", source: "metrics", target: "user",    ...reqEdge },
+  { id: "u2", source: "logs",    target: "user",    ...reqEdge },
+  { id: "u3", source: "apm",     target: "user",    ...reqEdge },
+];
+
+Datadog is the SaaS observability platform that started in 2010 as infrastructure monitoring for cloud workloads and is now 20-something products competing across every category of observability and security. It's the default answer for "give me a unified UI for everything happening across our cloud environment, and don't make me think about scaling the backend." It's also the platform whose monthly bill is *the* recurring conversation in every engineering all-hands once a company scales past a few hundred hosts.
+
+This post is what Datadog actually contains in 2026, how the architecture works, where the value compounds, and the cost dynamics worth understanding before you commit.
+
+## The position
+
+Datadog's value proposition has two parts:
+
+1. **Unification.** Metrics, logs, traces, RUM, security findings, infrastructure inventory — all in one UI, all correlated automatically (the same `host` tag links a metric, a log line, a trace, and a security alert). The alternative is stitching together Prometheus + Loki + Tempo + Falco + a SIEM, and *being responsible for that integration yourself*.
+2. **Managed.** No clusters to scale, no retention quotas to operate, no per-team SREs maintaining the observability stack. The Datadog org has done that work; you pay them to keep doing it.
+
+The trade-off is paid in dollars and lock-in. Datadog's pricing scales with usage in a way that surprises every customer at least once. And while data going *in* is easy (open standards, OpenTelemetry support), the value of the *correlation* between products is what's hard to migrate away from.
+
+## The architecture
+
+<Whiteboard client:load data={{ nodes: ddNodes, edges: ddEdges }} height={620} />
+
+Reading the diagram:
+
+- **Datadog Agent** runs on every host you want to monitor. It's an open-source Go process that ships metrics, logs, traces, and process info to the Datadog SaaS intake. Configured via YAML; supports 800+ integrations (one per common piece of software it knows how to scrape).
+- **Cluster Agent** on Kubernetes — a separate process that talks to the K8s API and provides cluster-level metadata, leader election for cluster checks, and admission webhooks for auto-instrumentation.
+- **APM tracer** is library code inside your application, in whatever language you're using (Python, Go, Java, Node, Ruby, .NET, etc.). It generates distributed traces, profiles, and live debugger snapshots, and ships them to the local Agent over UDP / unix socket.
+- **Browser RUM and Synthetics** are different — the RUM SDK runs in users' browsers; Synthetics tests are scheduled HTTP checks from Datadog's edge network.
+- **Datadog intake** — Datadog's SaaS regions (US1, US3, US5, EU1, AP1, GovCloud). One of these is your "site" and all your data flows there.
+- **The products** — Metrics, Logs, APM, Security — sit on top of Datadog's internal storage. Same backend, different query and visualization layers per product.
+
+The green dashed edges show all data flowing **outbound from your infrastructure to Datadog's intake**. You don't expose anything inbound; the Agent initiates all connections. (You can also run Agents in a "private link" mode for VPC-internal egress.)
+
+## The product catalog
+
+Datadog has a *lot* of products. The major lines:
+
+| Product | What it does |
+| --- | --- |
+| **Infrastructure Monitoring** | Host metrics, integration metrics, dashboards, monitors. The original product. |
+| **APM** | Distributed tracing in your application code. Service maps, trace search, exception tracking. |
+| **Logs** | Log ingestion, indexing, archival to S3. Live tail. Sensitive data scanner. |
+| **Continuous Profiler** | Always-on production profiling (CPU, memory, lock contention). |
+| **RUM (Real User Monitoring)** | Frontend performance — page loads, route changes, errors, user sessions. |
+| **Synthetics** | Scheduled API and browser-based checks from Datadog's edge. |
+| **Network Performance Monitoring** | Flow data, DNS, TCP retransmits, host-to-host throughput. |
+| **Database Monitoring** | Query-level analysis for Postgres, MySQL, SQL Server, MongoDB. |
+| **Serverless** | Specific instrumentation for Lambda, GCF, Azure Functions. |
+| **Cloud SIEM** | Security signal correlation over logs. |
+| **Cloud Security Posture Management (CSPM)** | Cloud account / Kubernetes misconfiguration scanning. |
+| **Cloud Workload Security (CWPP)** | Runtime workload security; competes with Falco/Sysdig in the K8s slot. |
+| **Application Security Management (ASM)** | In-app threat detection via the APM tracer (RASP-style). |
+| **Cloud Cost Management** | Cost analytics tied to your observability data. |
+| **CI Visibility** | CI pipeline performance and flaky test detection. |
+| **Test Visibility** | Per-test execution time, flakiness, ownership. |
+| **LLM Observability** | New in 2024 — token usage, latency, prompt/completion tracking per LLM call. |
+| **Workflow Automation (Datadog Workflows)** | No-code response automation triggered by signals. |
+
+Roughly **the first six** are the core observability stack; the rest are adjacent products that share the Agent and the data model. The pricing comes in modules — you pay per product you turn on.
+
+## What makes the platform feel different in practice
+
+Three things explain why teams pick it despite the cost:
+
+- **Tag-based unification.** Every metric, log, trace, profile, and security event gets the same tags (`env`, `service`, `version`, `host`, `kube_namespace`, etc.). One click on a tag in any product filters every other product to the same scope. This is what "unification" actually means — and it's the part you'd spend a quarter building yourself with OpenTelemetry + Grafana.
+- **Watchdog (anomaly detection).** Datadog runs ML over your metrics to surface "this is anomalous" without you defining a threshold. Sometimes it's noise. Often enough, it surfaces a real degradation 20 minutes before any monitor would have fired.
+- **Live debugger and Continuous Profiler.** Production profiling, always on, attributable to a specific request via trace correlation, with near-zero overhead. You can answer "why is *this* request slow?" in seconds.
+
+## Cost dynamics worth understanding upfront
+
+Datadog's pricing model is the source of most customer-Datadog friction. Three patterns to internalize:
+
+- **Hosts are billed continuously.** A spot fleet that auto-scales to 200 hosts every weekday hour will bill for *roughly* the average host count. Containers are billed differently — by container density or by host depending on the SKU.
+- **Custom metrics are the runaway cost.** Datadog bills per **unique tag combination** per metric. A metric with `user_id` as a tag and 10 million users is 10 million custom metrics. **Avoid high-cardinality tags on metrics.** Use logs or traces for high-cardinality data.
+- **Indexed log volume bills by GB, not by event count.** Verbose JSON logs with stack traces are expensive. Use the **Logs Pipelines** to drop noisy fields, sample high-volume ones, and archive everything to S3 instead of indexing.
+
+The structural advice: **set up Datadog with cost discipline from day one.** A team that adds Datadog without limits will see a 5-10× bigger bill than one that's deliberate about cardinality, log volume, and APM trace sampling.
+
+## Where it sits in the landscape
+
+| Competitor | What it does well | What Datadog does better |
+| --- | --- | --- |
+| **New Relic** | APM heritage, pricing model now per-user | Datadog has wider product breadth and tag unification |
+| **Dynatrace** | OneAgent auto-instrumentation, AI-driven RCA | Datadog has cleaner UX and faster iteration |
+| **Splunk Observability** | Strong APM (Signal-FX heritage), fits Splunk shops | Datadog is more integrated cloud-native |
+| **Grafana Cloud / LGTM** | Open-source-compatible (Prometheus, Loki, Tempo, Mimir) | Datadog handles correlation automatically; LGTM gives you the building blocks to assemble |
+| **Honeycomb** | High-cardinality observability, very different query model | Honeycomb is the right answer for debugging-as-querying; Datadog for everything else |
+| **Elastic Observability** | Open data formats, self-hostable | Elastic is more flexible but more operational work |
+| **AWS CloudWatch / GCP Operations / Azure Monitor** | Built in, cheap baseline | Native is fine for baseline; Datadog is what you turn to when you outgrow it |
+
+The natural lane: **cloud-native organizations of 50–5000 engineers that want unified observability without owning the observability platform.** Below 50 engineers, you can usually get by with the cloud provider's native tools plus Sentry. Above 5000, the bill becomes large enough that Grafana LGTM with dedicated platform engineering may be cheaper.
+
+## Limitations and pitfalls
+
+- **Lock-in via correlation.** Migrating away from Datadog is straightforward for any single product (metrics, logs, traces — all open standards). Migrating away from the *correlation* across products is the hard part. Plan for this if vendor independence is a long-term goal.
+- **Tag explosion.** Custom metrics billed by tag combination + a slack-message thread asking "can we add `customer_id` as a tag?" = bill shock at month-end. Establish tag governance early.
+- **Logs indexed without retention discipline.** Default index retention is 15 days; default behavior is "index everything." A noisy service can index TB-per-month. Use exclusion filters and archive-only routing for logs you don't actively query.
+- **APM trace sampling defaults.** The default samples 100% of traces, which sounds great until your bill arrives. Set service-level trace sampling rates intentionally.
+- **Agent CPU / memory.** Agents are generally lightweight, but Cluster Agent in large K8s clusters and Continuous Profiler can be non-trivial. Monitor the monitor.
+- **Status page reliability.** Datadog has had multi-region outages. Your monitoring should not be your only signal of an incident, especially when the incident is Datadog itself.
+
+## Where to start
+
+1. Sign up for a Datadog account (free tier covers a few hosts, 5 users, 1-day retention). Pick a region (US1 / EU1 / etc.) — you can't migrate regions later.
+2. Install the Agent on one host. Watch the **Infrastructure** view fill in. This validates the rails.
+3. Add the Agent to your **biggest server fleet or your Kubernetes cluster.** Don't add APM yet; metrics and logs alone give you most of the immediate value.
+4. Turn on **APM** for *one* service. Wire up the tracer in code, deploy, watch the service map populate. Validate before fanning out.
+5. Set **cardinality discipline** early. Establish your standard tags (env, service, version, team, region). Document what's not allowed as a tag on metrics.
+6. Configure **log exclusion filters** and **trace sampling rates** before going production-wide. These are the cost knobs.
+7. Add additional products (RUM, Synthetics, Cloud Security) when you have a specific use case. Don't turn them all on at once.
+
+The mistake to avoid: enabling every product without cost discipline because "we're already paying for Datadog." Every product is a separate billing line; turning on Logs + APM + Continuous Profiler + RUM + Security on day one without sampling and retention discipline is how Datadog bills become a quarterly board topic. Adopt deliberately.

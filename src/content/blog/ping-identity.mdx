@@ -1,0 +1,144 @@
+---
+title: "Ping Identity: enterprise IAM after the ForgeRock merge"
+description: "What Ping Identity is in 2026 — PingFederate, PingAccess, PingOne, PingDirectory, PingID — how the ForgeRock acquisition reshaped the product line, and where it sits against Okta, Microsoft Entra, and the open-source IAM stack."
+date: 2026-05-10
+category: IDENTITY
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 130, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const pingNodes = [
+  { id: "client",    position: { x: 80,  y: 220 }, data: { label: "user / browser" }, style: stage },
+  { id: "app",       position: { x: 80,  y: 80  }, data: { label: "application" }, style: stage },
+  { id: "fed",       position: { x: 320, y: 220 }, data: { label: "PingFederate\n(SSO / federation)" }, style: ctrl },
+  { id: "access",    position: { x: 320, y: 80  }, data: { label: "PingAccess\n(authZ / web gateway)" }, style: ctrl },
+  { id: "directory", position: { x: 580, y: 80  }, data: { label: "PingDirectory\n(LDAPv3 store)" }, style: ctrl },
+  { id: "id",        position: { x: 580, y: 220 }, data: { label: "PingID\n(MFA)" }, style: ctrl },
+  { id: "one",       position: { x: 320, y: 380 }, data: { label: "PingOne\n(SaaS control plane)" }, style: ctrl },
+  { id: "external",  position: { x: 580, y: 380 }, data: { label: "external IdPs\n+ social / partner" }, style: ext },
+];
+
+export const pingEdges = [
+  { id: "c1", source: "client", target: "app",       label: "uses",      ...reqEdge },
+  { id: "a1", source: "app",    target: "access",    label: "front-channel", ...reqEdge },
+  { id: "a2", source: "access", target: "fed",       label: "delegates AuthN", ...dataEdge },
+  { id: "f1", source: "fed",    target: "directory", label: "verifies",  ...dataEdge },
+  { id: "f2", source: "fed",    target: "id",        label: "step-up MFA", ...dataEdge },
+  { id: "f3", source: "fed",    target: "external",  label: "federate",  ...dataEdge },
+  { id: "o1", source: "one",    target: "fed",       label: "policy + admin", ...dataEdge },
+  { id: "o2", source: "one",    target: "access",    ...dataEdge },
+];
+
+Ping Identity is the enterprise IAM vendor that, after acquiring ForgeRock in 2023, became the second-largest pure-play identity company behind Okta. The combination merged two large product lines — Ping's federation/access products and ForgeRock's full identity platform (AM, IDM, DS, IG) — into one company. The product roadmap is now consolidating both lines, but in 2026 you'll still see active deployments of both Ping-branded and ForgeRock-branded products in production.
+
+This post is what Ping Identity is in 2026, how the major products fit together, what changed with the ForgeRock merge, and where Ping competes against Okta, Microsoft Entra, and the open-source IAM stack.
+
+## The position
+
+Ping Identity is the **enterprise-grade IAM platform of choice in regulated industries** — financial services, healthcare, government, large insurance, telcos. Three properties define the offering:
+
+1. **Workforce + customer identity in one vendor.** Both internal employee identity (workforce) and customer-facing identity (CIAM) are supported by the same product family. Not all competitors handle both well.
+2. **Hybrid deployment model.** Most Ping customers run a mix — on-prem PingFederate / PingAccess + SaaS PingOne. Few large enterprises are pure-SaaS or pure-on-prem.
+3. **Standards-grade federation.** SAML, OIDC, OAuth, WS-Federation, FAPI, SCIM — all production-quality, all heavily used in deep enterprise integrations.
+
+It's the IDP you find at Fortune 500 banks, insurance carriers, telcos, and major hospital systems. Less hip than Okta, less developer-friendly than Auth0, more flexible and on-prem-capable than Microsoft Entra.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: pingNodes, edges: pingEdges }} height={500} />
+
+Reading the diagram:
+
+- **PingFederate** — the federation server. OAuth 2.0, OIDC, SAML, WS-Federation. Issues tokens to applications, federates to external IdPs (social, customer IdPs, partner IdPs), enforces authentication policies.
+- **PingAccess** — the web access management gateway. Sits in front of internal applications, enforces session-based authentication (cookies, headers), proxies requests, applies authorization policy. The modern replacement for legacy SiteMinder / OAM-style WAM.
+- **PingDirectory** — a high-performance LDAPv3 directory server. Often the user store for the rest of the stack; ForgeRock had a competing product (DS / OpenDJ) that's converging.
+- **PingID** — multi-factor authentication. TOTP, push notifications, FIDO2 / WebAuthn, biometric, SMS / voice. Used as a step-up by PingFederate.
+- **PingOne** — the SaaS control plane. Acts as a tenant-aware orchestration / configuration layer over on-prem components; can also be the IdP standalone (PingOne SSO).
+- **External IdPs** — social providers, partner organizations' IdPs. PingFederate brokers identity between these and your applications.
+
+The dashed green edges are out-of-band control flows (federation, policy, MFA validation). Solid edges are user-facing request flows. A typical user authentication: user hits app → PingAccess intercepts → delegates to PingFederate → PingFed validates against PingDirectory and requests step-up via PingID → token issued → PingAccess injects credentials → request reaches the app.
+
+## The major products in detail
+
+The Ping family in 2026:
+
+| Product | What it does |
+| --- | --- |
+| **PingFederate** | Federation, SSO, OAuth/OIDC/SAML, the primary IdP component |
+| **PingAccess** | Web access management gateway, session-based auth in front of legacy apps |
+| **PingDirectory** | High-performance LDAPv3 user store |
+| **PingID** | MFA (TOTP, push, FIDO2, biometric) |
+| **PingOne SSO** | Cloud-hosted SSO; lighter alternative to running PingFed yourself |
+| **PingOne Risk** | Risk scoring engine for adaptive auth (location, device, behavior signals) |
+| **PingOne DaVinci** | No-code orchestration of authentication flows |
+| **PingOne Advanced Identity Cloud** (ForgeRock IDC) | The ForgeRock product line as cloud — IAM, identity governance, directory |
+| **PingOne Authorize** | Fine-grained authorization (PDP / PEP, attribute-based) |
+| **PingOne Verify** | Identity proofing (document scanning + selfie matching for KYC) |
+| **PingOne Neo** | Decentralized identity / verifiable credentials (newer, evolving) |
+| **PingCentral** | DevOps console for managing PingFed / PingAccess configurations |
+
+The "Ping" prefix is consistent; the suffixes name the function. The merged ForgeRock products are gradually being rebranded into PingOne suffixes (e.g., ForgeRock's Identity Cloud → PingOne Advanced Identity Cloud).
+
+## The ForgeRock acquisition: what changed
+
+In August 2023, Ping completed the acquisition of ForgeRock for ~$2.3B. The strategic logic: ForgeRock had a stronger identity governance and lifecycle management story; Ping had stronger federation and access management. Combined, the merged company has end-to-end IAM in one portfolio.
+
+What this means practically in 2026:
+
+- **Existing ForgeRock customers** can continue running ForgeRock Identity Platform (AM, IDM, DS, IG). It's supported, will continue receiving security patches and incremental updates.
+- **New customers** will be directed toward the converged PingOne Advanced Identity Cloud SaaS offering, which is essentially ForgeRock Identity Cloud under the new brand.
+- **Product overlap is being resolved**: the on-prem PingDirectory and ForgeRock DS are converging; PingFederate and ForgeRock AM serve overlapping use cases with PingFed taking the federation lead.
+
+If you're choosing today: PingOne Advanced Identity Cloud for SaaS, PingFederate for on-prem federation, PingAccess for legacy app protection. Don't start new projects on ForgeRock-branded products as the long-term plan.
+
+## What you actually use Ping for
+
+Real-world deployments cluster around three patterns:
+
+1. **Workforce SSO.** Employees authenticate to internal apps via PingFederate; PingAccess gates legacy web apps that can't speak OIDC; PingID handles MFA. The classic large-enterprise pattern, still very common.
+2. **B2C / CIAM.** Customer-facing login for a bank, retailer, healthcare portal. PingFederate as IdP, PingOne Risk for fraud signals, PingID for MFA, PingOne Verify for identity proofing at onboarding.
+3. **B2B federation.** Partner organizations federate their users into your apps. PingFederate as the broker; each partner's IdP federated in.
+
+The bank-and-large-enterprise stronghold is the federation and the directory: PingDirectory handles millions of users with sub-millisecond reads, PingFederate handles tens of thousands of TPS of token issuance. Performance and stability at that scale is what the brand stands for.
+
+## Comparison: where Ping sits
+
+| Competitor | Where it differs |
+| --- | --- |
+| **Okta** | More SaaS-only, more polished UX, dominant in tech-company workforce identity. Less strong on hybrid / on-prem. Owns Auth0 for developer identity. |
+| **Microsoft Entra ID** | The default in any Microsoft 365 / Azure shop. Workforce-strong, weaker outside the Microsoft ecosystem, less flexible for unusual federation needs. |
+| **WSO2 Identity Server** | Open source, on-prem-first, smaller integration catalog. Covered in [the WSO2 IS post](/blog/wso2-identity-server). |
+| **Keycloak** | Open source, Red Hat / community-driven, K8s-native. Strong technically; less polished SaaS option. |
+| **Auth0** | Developer-friendly SaaS, owned by Okta. Strong CIAM and B2B Organizations model. |
+| **CyberArk** (formerly IDaaS via Idaptive) | Stronger PAM focus, smaller IAM footprint |
+| **SailPoint** | Identity governance leader, less of an IdP/SSO competitor — often deployed alongside Ping |
+| **Saviynt** | Cloud-native identity governance and access |
+
+Ping's natural lane: **large enterprises in regulated industries with hybrid deployment needs and standards-grade requirements (FAPI, OIDC, SAML), where the conversation isn't "should we use IAM" but "we already have legacy WAM and need to modernize."** ForgeRock's identity governance heritage now also positions Ping as a competitor to SailPoint in that segment.
+
+## Limitations and pitfalls
+
+- **Pricing is opaque.** Quote-based, account-team-driven. Plan for procurement work; the public pricing pages are starting points, not commitments.
+- **The product matrix is large.** Distinguishing PingOne (SSO product) from PingOne (the platform) from PingFederate (the federation server) is harder than the marketing makes it sound. Get clear on which thing you're buying.
+- **Configuration sprawl.** PingFederate authentication policies, PingAccess application policies, PingDirectory ACIs — all stored as XML / JSON / LDAP entries. Without `PingCentral` or DevOps practices, change management is fragile.
+- **Two ForgeRock product lines.** Until the consolidation completes, Ping has two of some things — PingDirectory and ForgeRock DS, PingFederate and ForgeRock AM. Pick one and don't mix in new projects.
+- **MFA fatigue is a real risk.** Push-MFA is convenient and exploitable (attackers spam push prompts hoping the user accepts). PingID supports number-matching prompts that mitigate this; turn them on.
+- **PingAccess + modern apps is awkward.** PingAccess was designed for legacy session-based apps. For OIDC-native apps, you usually skip PingAccess and integrate directly with PingFederate.
+
+## Where to start
+
+1. If you're new to Ping, start with **PingOne SSO** (the SaaS) — quick onboarding, no on-prem operational burden, full SSO and MFA via PingID.
+2. Walk the **first-app onboarding**: configure a SAML or OIDC app, validate SSO from a few test users.
+3. Add **MFA** via PingID. Try push-with-number-matching; that's the modern default.
+4. Federate to **an external IdP** (Google / Microsoft / a partner's SAML IdP) and validate inbound federation works.
+5. Plan **hybrid deployment** only if you have legacy on-prem apps. Adding PingFederate / PingAccess on-prem is a significant project; do it deliberately.
+6. Talk to your account team about **the ForgeRock product convergence** before committing to a multi-year roadmap. The current SKUs will change name and pricing as consolidation continues.
+
+The mistake to avoid: deploying Ping (or any enterprise IdP) without a clear product owner who understands both identity and the application portfolio. Identity infrastructure spans every application, every team, every authentication failure incident. Without someone whose job is to own the IdP and curate the policies, configuration entropy compounds and the platform becomes the cause of the outages it was meant to prevent.

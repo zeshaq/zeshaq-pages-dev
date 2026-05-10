@@ -1,0 +1,135 @@
+---
+title: "Apache Spark: the distributed compute lingua franca"
+description: "What Spark actually is, the driver/executor model that defines every job, the four library layers (SQL / Streaming / MLlib / GraphX), Spark on Kubernetes, and where it sits in the modern data landscape."
+date: 2026-05-10
+category: DATA
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 140, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const sparkNodes = [
+  { id: "user",    position: { x: 380, y: 0   }, data: { label: "user code\n(PySpark, Scala, SQL)" }, style: stage },
+  { id: "driver",  position: { x: 380, y: 110 }, data: { label: "Driver\n(SparkSession)" }, style: ctrl },
+  { id: "cm",      position: { x: 380, y: 230 }, data: { label: "Cluster Manager\n(YARN / K8s / standalone)" }, style: ctrl },
+  { id: "exec1",   position: { x: 100, y: 360 }, data: { label: "Executor\n(JVM + tasks)" }, style: agent },
+  { id: "exec2",   position: { x: 300, y: 360 }, data: { label: "Executor" }, style: agent },
+  { id: "exec3",   position: { x: 500, y: 360 }, data: { label: "Executor" }, style: agent },
+  { id: "exec4",   position: { x: 700, y: 360 }, data: { label: "Executor" }, style: agent },
+  { id: "storage", position: { x: 380, y: 490 }, data: { label: "object store / HDFS / Iceberg / Delta" }, style: stage },
+];
+
+export const sparkEdges = [
+  { id: "u1", source: "user",   target: "driver", label: "submits job", ...reqEdge },
+  { id: "d1", source: "driver", target: "cm",     label: "requests executors", ...reqEdge },
+  { id: "c1", source: "cm",     target: "exec1",  label: "schedule", ...dataEdge },
+  { id: "c2", source: "cm",     target: "exec2",  ...dataEdge },
+  { id: "c3", source: "cm",     target: "exec3",  ...dataEdge },
+  { id: "c4", source: "cm",     target: "exec4",  ...dataEdge },
+  { id: "e1", source: "exec1",  target: "storage", label: "read/write partition", ...reqEdge },
+  { id: "e2", source: "exec2",  target: "storage", ...reqEdge },
+  { id: "e3", source: "exec3",  target: "storage", ...reqEdge },
+  { id: "e4", source: "exec4",  target: "storage", ...reqEdge },
+];
+
+Apache Spark is the distributed compute engine that turned out to be the right abstraction. Started at UC Berkeley's AMPLab in 2009, donated to Apache in 2013, and somewhere around 2016 it became the *default* substrate for anything that involves more data than one machine can hold. Hadoop MapReduce died, Hive moved on top of it, Pandas got jealous (and produced PySpark), and a generation of data engineers learned `df.groupBy("col").agg(...)` before they learned SQL.
+
+This post walks through what Spark actually is in 2026, the architecture every job rides on, the four library layers, and the operational shifts (Spark on Kubernetes, modern table formats) that changed how it's deployed.
+
+## The position
+
+Spark is a **unified analytics engine for large-scale data**. Three claims in that:
+
+- *Unified*: SQL, dataframes, streaming, ML, and graph all run on the same execution engine.
+- *Analytics*: batch and stream processing; not an OLTP store, not a serving system.
+- *Large-scale*: scales from a laptop to thousands of executors against petabytes of data.
+
+In 2026 its center of gravity has shifted toward **PySpark on object storage with open table formats (Iceberg, Delta, Hudi)** and **Spark on Kubernetes** for cluster orchestration. The classic Hadoop-and-YARN deployment still exists; it isn't where new projects are landing.
+
+## The architecture every job rides
+
+<Whiteboard client:load data={{ nodes: sparkNodes, edges: sparkEdges }} height={600} />
+
+Reading the diagram:
+
+- **Driver** — runs your code. Creates a `SparkSession`, builds a logical plan from your dataframe / SQL operations, optimizes it (Catalyst optimizer), and schedules tasks. One driver per application.
+- **Cluster Manager** — the resource broker. Spark itself doesn't manage compute; it asks something else (YARN, Kubernetes, standalone, or Mesos in the legacy world) for executor slots.
+- **Executors** — JVM processes running on worker nodes that actually execute tasks. Each task processes one partition of data. Executors hold partitions in memory between tasks of the same job.
+- **Storage** — object store (S3, GCS, Azure Blob), HDFS, or a table format on top of object storage (Iceberg, Delta Lake, Apache Hudi). Spark doesn't store data; it reads and writes.
+
+The green dashed edges are the schedule-and-launch flow: cluster manager hands executor slots to Spark, executors register with the driver. Solid edges are the actual data path: user code → driver → storage via executors. **Once a job is running, executors talk to storage directly, not through the driver.** That's the property that lets Spark scale.
+
+## The four library layers
+
+All four sit on the same core engine (RDD / DataFrame APIs + the Catalyst optimizer + Tungsten execution).
+
+| Layer | What it does | When to use it |
+| --- | --- | --- |
+| **Spark SQL / DataFrames** | Declarative queries over structured data. Same engine, accessible from SQL, Python, Scala. | 80% of Spark workloads. The "spreadsheet at scale" layer. |
+| **Structured Streaming** | Treats a stream as an unbounded dataframe; same API as batch. Watermarks, windowing, exactly-once via checkpointing. | Real-time ETL, near-real-time aggregations. |
+| **MLlib** | Distributed ML algorithms (linear models, trees, ALS, k-means, etc.) + Pipelines API. | Classical ML on data too big for sklearn. For deep learning, hand off to PyTorch / Ray. |
+| **GraphX (or GraphFrames)** | Distributed graph algorithms — PageRank, connected components, triangle counting. | Niche but useful — recommendation systems, fraud detection. |
+
+The under-appreciated insight: SQL, dataframes, and streaming **share the same optimizer and execution engine**. A team writing PySpark and another writing Spark SQL produce identical physical plans for equivalent operations. This is why "we use Spark" works across data engineering / data science / analytics teams that wouldn't otherwise agree on a tool.
+
+## Spark on Kubernetes
+
+The current operational preference. Two flavors:
+
+- **Spark Operator (Kubeflow project)** — declarative `SparkApplication` CR. You submit a CR, the operator creates driver/executor pods, watches them, exposes status. The path most teams take.
+- **`spark-submit` with the built-in K8s scheduler** — Spark can talk directly to the K8s API to request pods. No operator needed. Simpler for one-shot jobs.
+
+Why Kubernetes won over YARN:
+
+- Same orchestrator as the rest of the stack (your applications, your databases, your inference services already run on K8s).
+- Object-store-first model maps cleanly to K8s + S3 / GCS / Azure Blob; YARN assumed HDFS colocation.
+- Autoscaling, dynamic resource allocation, spot instance support — all easier on K8s.
+- Multi-tenant resource quotas via namespaces.
+
+The trade-off: shuffle. Spark's shuffle (intermediate data redistribution between stages) historically benefited from HDFS-style colocation. On K8s with object storage, shuffle data either uses local PVs or **remote shuffle services** (Apache Celeborn, Uniffle). Plan this if your jobs shuffle a lot of data.
+
+## Modern table formats: the real shift since 2020
+
+A `parquet` file in S3 doesn't make a *table*. It makes a file. Tables need atomic operations, schema evolution, time travel, and concurrent writers. Three formats provide those on top of object storage:
+
+- **Apache Iceberg** — most vendor-neutral, strong schema evolution, hidden partitioning. Backed by Netflix, Apple, AWS (S3 Tables), Snowflake, Databricks (now also supports Iceberg).
+- **Delta Lake** — Databricks-originated, now CNCF (Delta Lake 4.0 / Delta-rs). Very tight Databricks integration; works fine outside.
+- **Apache Hudi** — strong on streaming updates (CDC, upserts), record-level indexing. Niche but real adoption at scale.
+
+Spark + Iceberg or Spark + Delta is the **2026 default stack** for new data platforms. They turn an object store into something with the operational semantics of a database — without giving up the cost and scalability of object storage. Schema evolution, MERGE INTO, time travel, atomic appends: all work.
+
+## Where Spark sits in the landscape
+
+| Tool | Where it overlaps with Spark | Where it differs |
+| --- | --- | --- |
+| **Hadoop MapReduce** | Distributed batch processing | Spark's in-memory model is 10–100× faster; MapReduce is essentially dead for new work |
+| **Apache Flink** | Distributed streaming + batch | Flink leads on true streaming semantics, lower-latency state management; Spark leads on ecosystem and batch maturity |
+| **Dask** | Python-native distributed dataframes | Dask is lighter and more Pythonic; Spark is more mature and handles much larger data sets in production |
+| **Ray** | Distributed Python compute | Ray is more general (ML training, RL, serving); Spark wins on SQL and ETL |
+| **Trino / Presto** | Distributed SQL query | Trino is a query engine, not a compute engine — no MLlib, no Streaming. Often *complements* Spark (Spark builds tables, Trino queries them) |
+| **DuckDB** | Analytics on smaller datasets | Single-node, in-process. The right answer for ~1TB and under |
+
+## Limitations and pitfalls
+
+- **Driver as a bottleneck.** Every action collects status back through the driver. Operations that pull large results to the driver (`.collect()`) crash on large datasets.
+- **Skew is the eternal enemy.** A `groupBy` on a key with 95% of records concentrated in one value will have one task running for an hour while the other 199 finished in two minutes. Salt your keys.
+- **JVM tuning still matters.** Memory configuration (`spark.executor.memory`, off-heap allocation, JVM GC tuning) directly affects whether jobs succeed or OOM at scale.
+- **Streaming watermarks are subtle.** Late data, exactly-once across complex stateful operators — possible but takes care.
+- **DataFrames hide cost.** A chained `.filter().join().groupBy()` looks the same regardless of how big the inputs are. Knowing what the physical plan does (`.explain()`) is non-optional past toy scale.
+- **PySpark UDF overhead.** Python UDFs serialize rows across the JVM boundary. Use vectorized (Pandas) UDFs or stick to native dataframe ops when possible.
+
+## Where to start
+
+1. Run Spark locally on a laptop. `pip install pyspark`, write a notebook, work with a few-GB CSV / Parquet file. You can develop everything against the same API you'll later run on a cluster.
+2. Move to a managed cluster (Databricks, AWS EMR, GCP Dataproc, Azure Synapse) or self-host on Kubernetes via the Spark Operator. Don't stand up a YARN cluster in 2026 unless you're inheriting one.
+3. Add an **open table format** early. Iceberg or Delta, pick one, commit. Your future self will not want to refactor flat-parquet ETL pipelines into a table-format-aware ones.
+4. Learn `.explain()` and the Spark UI. The DAG view, the stage timing, the shuffle stats — these are your debugging tools.
+5. Add Structured Streaming only when you have a confirmed streaming use case. Batch is simpler and almost always good enough.
+
+The mistake to avoid: treating Spark as a black box. It scales because the abstractions are leaky in the *right* direction — once you understand the driver-executor split, partitioning, and shuffle, performance becomes legible. Until you do, every job either works for opaque reasons or fails for opaque reasons.

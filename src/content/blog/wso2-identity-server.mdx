@@ -1,0 +1,153 @@
+---
+title: "WSO2 Identity Server: open-source IAM"
+description: "What WSO2 Identity Server gives you — OAuth 2.0, OIDC, SAML, federation, B2B, adaptive authentication — the architecture, the Asgardeo SaaS migration, and where it actually competes with Keycloak, Okta, and Ping."
+date: 2026-05-10
+category: IDENTITY
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const isNodes = [
+  { id: "user",     position: { x: 80,  y: 240 }, data: { label: "user / browser" }, style: stage },
+  { id: "app",      position: { x: 80,  y: 80  }, data: { label: "client application" }, style: stage },
+  { id: "is",       position: { x: 350, y: 240 }, data: { label: "WSO2 Identity Server\n(AuthN + AuthZ + Federation)" }, style: ctrl },
+  { id: "social",   position: { x: 620, y: 60  }, data: { label: "social IdPs\n(Google, GitHub, …)" }, style: ext },
+  { id: "saml",     position: { x: 620, y: 180 }, data: { label: "enterprise IdPs\n(SAML / OIDC)" }, style: ext },
+  { id: "ad",       position: { x: 620, y: 300 }, data: { label: "Active Directory\n/ LDAP" }, style: ext },
+  { id: "db",       position: { x: 620, y: 420 }, data: { label: "JDBC userstore\n(Postgres / MySQL)" }, style: ext },
+  { id: "mfa",      position: { x: 350, y: 80  }, data: { label: "MFA: TOTP, FIDO2,\nSMS, biometric" }, style: ctrl },
+  { id: "scim",     position: { x: 350, y: 420 }, data: { label: "SCIM 2.0\nuser provisioning" }, style: ctrl },
+];
+
+export const isEdges = [
+  { id: "u1", source: "user", target: "app",  label: "uses",            ...reqEdge },
+  { id: "a1", source: "app",  target: "is",   label: "OAuth / OIDC / SAML", ...reqEdge },
+  { id: "u2", source: "user", target: "is",   label: "credentials",     ...reqEdge },
+  { id: "f1", source: "is",   target: "social", label: "federate",      ...dataEdge },
+  { id: "f2", source: "is",   target: "saml",   label: "federate",      ...dataEdge },
+  { id: "u3", source: "is",   target: "ad",     label: "primary store", ...dataEdge },
+  { id: "u4", source: "is",   target: "db",     label: "secondary",     ...dataEdge },
+  { id: "m1", source: "is",   target: "mfa",    label: "step-up",       ...dataEdge },
+  { id: "s1", source: "is",   target: "scim",   label: "provisioning",  ...dataEdge },
+];
+
+WSO2 Identity Server is the open-source IAM platform from the same WSO2 stable that produces API Manager (covered in [the WSO2 API Gateway post](/blog/wso2-api-gateway)) and Micro Integrator. It's the IdP underneath their API gateway's Key Manager and a standalone product in its own right. Apache 2.0, on-prem-first, with a SaaS sibling (Asgardeo) for organizations that want managed.
+
+This post is what WSO2 IS actually does, how it sits architecturally, and where it competes with Keycloak (the obvious open-source comparator), Okta, and Ping Identity.
+
+## The position
+
+WSO2 IS is a **full-featured open-source IAM platform**. Three properties:
+
+1. **Open source, Apache 2.0.** No locked features behind enterprise editions. WSO2 sells support; the software is yours.
+2. **Multi-protocol native.** OAuth 2.0, OIDC, SAML 2.0, WS-Federation, SCIM 2.0, OpenID Connect FAPI for finance. The protocols aren't tacked on; they're first-class.
+3. **Federation as a first principle.** WSO2 IS isn't just a user store — it's an identity broker. Users sign in via Google, Microsoft Entra, your existing enterprise IdP, a customer's IdP, social providers, all funneled through one consistent OAuth/OIDC interface to your applications.
+
+The closest open-source comparator is **Keycloak**. The closest commercial comparators are **Okta**, **Auth0**, **Ping Identity**, and **Microsoft Entra ID** (formerly Azure AD).
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: isNodes, edges: isEdges }} height={580} />
+
+Reading the diagram:
+
+- **Client application** — your web app, API, mobile app, native app. Talks to WSO2 IS over OAuth / OIDC / SAML for authentication.
+- **User / browser** — the end user, redirected to IS for login.
+- **WSO2 Identity Server** — the IdP. Handles AuthN (login), AuthZ (token issuance, scope, claims), federation, MFA, session management.
+- **Social IdPs, enterprise IdPs (SAML / OIDC), AD/LDAP, JDBC user stores** — the sources of identity. IS federates outbound to any of these. A single user can be authenticated via multiple providers via WSO2's identity federation.
+- **MFA** — TOTP, SMS OTP, FIDO2 / WebAuthn, biometric (via mobile SDKs), email OTP. Configurable per application or per user-segment with adaptive rules.
+- **SCIM 2.0** — provisioning. Other systems push users into IS or pull provisioning events from IS. Standard inbound and outbound flow.
+
+The green dashed edges are out-of-band: federation, MFA validation, provisioning. The solid edges are the front-channel user authentication flow. Federation lets a single application accept logins from many identity sources without each application needing to integrate each source directly.
+
+## What's actually in the box
+
+The capabilities:
+
+| Capability | What it does |
+| --- | --- |
+| **OAuth 2.0 / OIDC** | Standard authorization code flow, PKCE, client credentials, device code, refresh tokens. JWT and reference token support. |
+| **SAML 2.0** | SP-initiated, IdP-initiated, federation, attribute mapping. Still mandatory for enterprise integrations even in 2026. |
+| **Multi-factor authentication** | TOTP, SMS, email, FIDO2 / passkeys, push notifications via mobile SDK |
+| **Federated identity** | Inbound and outbound. WSO2 IS can both be an IdP for downstream apps and an SP federating to external IdPs |
+| **Adaptive authentication** | Conditional MFA based on rules ("require step-up if IP is unusual, if it's a new device, if the resource is sensitive"). Scripted in JavaScript. |
+| **B2B / Organization management** | Sub-organization tenant model where each customer org can manage its own identity (users, branding, federation to their IdP). The "Auth0 Organizations" equivalent. |
+| **SCIM 2.0 provisioning** | Inbound (HR system pushes users) and outbound (push users to downstream apps) |
+| **OAuth-based fine-grained authorization** | XACML 3.0 and PDP/PEP architecture for policy-based authZ |
+| **API and admin REST APIs** | Everything configurable via API — useful for IaC-driven IAM |
+| **Self-service portal** | Users manage their own profile, password, MFA devices, consent, security settings |
+| **Audit and analytics** | Login events, MFA events, federation events, exported to your SIEM |
+
+The protocols are the *table stakes*; the differentiator is the federation model and the adaptive authentication scripting.
+
+## Adaptive authentication scripting
+
+The feature WSO2 IS leans on hardest in marketing — and the one that genuinely differentiates it from simpler IdPs.
+
+You can attach **JavaScript code** to the login flow. The script has access to the user, the application, the device, the IP, the time. It decides which authentication steps to require:
+
+```javascript
+var onLoginRequest = function(context) {
+  executeStep(1); // username + password
+  var user = context.steps[1].subject;
+  if (user.localClaims['http://wso2.org/claims/role'].indexOf('admin') >= 0) {
+    executeStep(2, { authenticator: 'fido' }); // require FIDO2 for admins
+  } else if (isUnusualLocation(user, context)) {
+    executeStep(2, { authenticator: 'totp' }); // step-up TOTP for new locations
+  }
+};
+```
+
+This composes step-up auth, geo-aware MFA, role-based requirements, and risk scoring into the login flow without requiring a separate fraud product. Auth0 and Okta have equivalent features (Actions / Workflows) but WSO2 IS makes it a first-class part of the open-source offering.
+
+## Asgardeo: the SaaS variant
+
+Asgardeo is WSO2's hosted IAM SaaS. Conceptually it's WSO2 IS as a service, with a more modern UX, simpler onboarding, and B2B-first ergonomics. Pricing per-MAU (monthly active user), with free tier.
+
+When to use which:
+
+- **Asgardeo** if you don't want to operate the platform and you don't have on-prem-only requirements
+- **WSO2 IS** if you need on-prem, multi-cloud, BYOC, or specific compliance certifications
+
+Asgardeo and WSO2 IS share the underlying engine; APIs are largely compatible. Migration paths exist but aren't fully bidirectional.
+
+## Comparison: WSO2 IS vs the competition
+
+| Competitor | Where it differs |
+| --- | --- |
+| **Keycloak** | Other major open-source IAM. Red Hat / community-led. Strong K8s-native deployment, simpler admin UI, smaller protocol surface in some areas (less full SAML / WS-Fed). The default open-source IAM in many enterprises. |
+| **Okta** | SaaS-first, most polished admin UX, large integration catalog (workforce + customer identity). Expensive at scale. Closed source. |
+| **Auth0** | Developer-friendly SaaS (acquired by Okta 2021). Strong B2C and B2B Organizations model. |
+| **Microsoft Entra ID** | The default IdP for any organization on Microsoft 365 / Azure. Limited federation outside the Microsoft ecosystem; strong inside it. |
+| **Ping Identity** | Enterprise-focused, especially financial services. Full lifecycle (federation, access, directory, MFA). Commercial. Covered in [the Ping Identity post](/blog/ping-identity). |
+| **ForgeRock** | Acquired by Ping in 2023; the two product lines are merging |
+| **Cognito (AWS)** | Cheap cloud-native IAM if you're already on AWS. Less feature-rich, less polished. |
+
+WSO2 IS's natural lane: **on-prem and BYOC deployments where the customer needs full-feature IAM (SAML + OAuth + adaptive + B2B), wants open source, and is comfortable operating a Java application stack.** Regulated industries (finance, healthcare, government), Asia-Pacific market, and existing WSO2 customers form most of the user base.
+
+## Limitations and pitfalls
+
+- **Java application footprint.** WSO2 IS is a Carbon-framework-based Java app. HA requires multiple nodes + a database. Less cloud-native feeling than Keycloak Quarkus distribution or pure-SaaS alternatives.
+- **The admin UI has improved but is still a learning curve.** Older Console (Carbon-era) vs newer Console — make sure tutorials match what's in your version.
+- **Documentation versions.** Like API Manager, the 5.x vs 6.x vs 7.x version differences are significant. Match docs to your installed version.
+- **Federated IdP setup is metadata-heavy.** SAML federation in particular requires importing SP/IdP metadata, mapping attributes, configuring signature/encryption certificates. Real work even for "standard" integrations.
+- **B2B Organizations model is newer.** It's good but evolving — earlier major versions handled multi-tenancy via separate "tenants" with their own admin domains. New patterns use Organizations. Pick one model and commit.
+- **Marketing pivots to Asgardeo.** On-prem WSO2 IS is supported but Asgardeo gets more roadmap energy. Plan accordingly.
+
+## Where to start
+
+1. Run **WSO2 IS** via Docker for evaluation — single container, default H2 database (don't use for production).
+2. Walk the **first-app integration**: configure a service provider, integrate a sample OIDC app, validate login.
+3. Add a **federated IdP** (Google or your enterprise IdP) and validate federation works.
+4. Configure **adaptive authentication** for one rule (e.g., require MFA for users with `admin` role) using the script editor.
+5. Move to a **production-ready deployment**: Postgres database, multiple nodes, load balancer, certificates, exported logs.
+6. Decide between **Asgardeo and on-prem** before committing engineering effort. The two share concepts but operational profiles differ.
+
+The mistake to avoid: under-investing in user-store strategy on day one. WSO2 IS supports multiple user stores (LDAP, AD, JDBC, custom) but the primary store choice locks in how users sync, how federation works, and how SCIM provisioning behaves. Decide early and stick with it.

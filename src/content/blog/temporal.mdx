@@ -1,0 +1,148 @@
+---
+title: "Temporal: durable execution for business workflows"
+description: "What Temporal is, the event-sourced 'workflow as code' model that lets functions resume from where they crashed, and where it actually replaces hand-rolled state machines and saga frameworks."
+date: 2026-05-10
+category: WORKFLOWS
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pollEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const tempNodes = [
+  { id: "client",   position: { x: 380, y: 0   }, data: { label: "client app\n(starts workflow)" }, style: stage },
+  { id: "server",   position: { x: 380, y: 110 }, data: { label: "Temporal Server\n(history, queues, matching)" }, style: ctrl },
+  { id: "db",       position: { x: 100, y: 240 }, data: { label: "persistence\n(Postgres / MySQL / Cassandra)" }, style: stage },
+  { id: "wfworker", position: { x: 380, y: 270 }, data: { label: "Workflow Worker\n(your code, replay-safe)" }, style: agent },
+  { id: "actworker", position: { x: 660, y: 270 }, data: { label: "Activity Worker\n(your code, side effects)" }, style: agent },
+  { id: "external", position: { x: 660, y: 410 }, data: { label: "external systems\n(DBs, APIs, queues)" }, style: stage },
+];
+
+export const tempEdges = [
+  { id: "c1", source: "client",   target: "server", label: "start workflow", ...reqEdge },
+  { id: "s1", source: "server",   target: "db",     label: "events", ...reqEdge },
+  { id: "p1", source: "wfworker", target: "server", label: "poll task queue", ...pollEdge },
+  { id: "p2", source: "actworker", target: "server", label: "poll task queue", ...pollEdge },
+  { id: "a1", source: "actworker", target: "external", label: "side effects", ...reqEdge },
+];
+
+Temporal is a **durable execution engine**. You write workflows as plain code — a function in Go, Java, Python, TypeScript, .NET, PHP, or Ruby — and Temporal records every step as an event. If the process running your code crashes, dies, or is killed mid-workflow, a fresh worker replays the event history and continues from exactly where the previous one left off. The workflow function can sleep for six months, wait for a webhook, retry on failure, run compensating logic on cancellation, and survive every reschedule of the worker fleet underneath it.
+
+The pitch: the durability properties of a workflow engine, with the developer ergonomics of writing a function. If you've ever built a state machine with a database table called `order_state` and a cron job that picks up rows in `pending_payment`, this is the abstraction you actually wanted.
+
+## The position
+
+Temporal's natural lane is **long-running stateful business workflows**: order processing, payment sagas, user onboarding flows, document review pipelines, anything where the *business process* takes hours to months and the application crashing partway through should not lose state.
+
+Three properties that define it:
+
+1. **Workflow as code.** Your workflow is a function. Loops, conditionals, error handling, retries — all native code, in your favorite language, with your IDE and debugger.
+2. **Durable execution.** Every workflow event (activity called, signal received, timer fired) is recorded in a history. Workers are stateless; if one dies, another picks up the history and replays it.
+3. **Activities are the side-effect interface.** Workflow code is *deterministic* (must replay identically); anything non-deterministic — API calls, database writes, random numbers, current time — must go through an Activity. Activities have their own retry, timeout, and heartbeat semantics.
+
+Temporal is *not* a batch pipeline tool. If your goal is "run this image, then this image, then this image" — Argo Workflows or Airflow fits better. If your goal is "implement my business process correctly so it survives infrastructure failures" — Temporal is the right shape.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: tempNodes, edges: tempEdges }} height={520} />
+
+Reading the diagram:
+
+- **Client app** — anywhere your code lives that starts workflows (an API server, a Kafka consumer, a CLI). Calls the Temporal SDK to start a workflow by name.
+- **Temporal Server** — the durable backend. Stores workflow event histories, manages task queues, dispatches tasks to workers. Stateless service tier; persistence layer below it.
+- **Persistence** — Postgres, MySQL, or Cassandra. Stores event histories, visibility records, schedules. Configured per namespace.
+- **Workflow workers** — your processes running your workflow code. They poll task queues for **workflow tasks** — events that move the workflow forward. Workflow code must be deterministic.
+- **Activity workers** — your processes running your activity code. They poll task queues for **activity tasks** — units of side-effect work. Activities can do anything; they don't need to be deterministic.
+
+The green dashed edges show the **defining property of the architecture**: workers *poll* the server. The server doesn't push work to workers. This is what lets workers scale to zero, survive network partitions, and run anywhere the worker process can reach the server.
+
+## The "workflow as code" model
+
+What makes Temporal feel different from other workflow tools is that you write a function. In Python:
+
+```python
+@workflow.defn
+class OnboardCustomer:
+    @workflow.run
+    async def run(self, customer_id: str) -> None:
+        await workflow.execute_activity(
+            send_welcome_email, customer_id,
+            start_to_close_timeout=timedelta(minutes=5),
+        )
+        await workflow.sleep(timedelta(days=7))
+        if not await workflow.execute_activity(has_completed_profile, customer_id, ...):
+            await workflow.execute_activity(send_nudge_email, customer_id, ...)
+        await workflow.sleep(timedelta(days=23))
+        if not await workflow.execute_activity(is_active, customer_id, ...):
+            await workflow.execute_activity(send_winback_offer, customer_id, ...)
+```
+
+That function describes a 30-day customer onboarding sequence. **The `await workflow.sleep(timedelta(days=7))` is real — the workflow waits seven actual days.** During that time, no worker process holds any state about this workflow. When the sleep timer fires, the server schedules the next workflow task; a worker picks it up, replays the history (the events up to the sleep), and proceeds.
+
+You can write the same workflow in any of the supported languages. The model is the same.
+
+## Activities, signals, and the rest of the API surface
+
+Beyond workflow-as-function, the API surface is small but expressive:
+
+| Concept | Purpose |
+| --- | --- |
+| **Activity** | A unit of side-effect work. Has its own retry policy, timeout, heartbeat. Runs on activity workers. |
+| **Signal** | An asynchronous external input. Send a signal to a running workflow ("payment received") and it wakes up at `await workflow.wait_condition(...)`. |
+| **Query** | A synchronous read into a running workflow's state. No side effects. Used for "what is this order's status?" without exposing internal data. |
+| **Update** | A synchronous *write* into a workflow with a return value. Newer than signals/queries; useful when you want a request/response interaction with a long-running workflow. |
+| **Child workflow** | A workflow started from another workflow. Independent lifecycle; can run in parallel. |
+| **Timer** | Schedule a fire-once event in the future. Used for sleep, deadlines, scheduled retries. |
+| **Schedule** | First-class recurring workflow trigger (cron and beyond). |
+
+These primitives compose into surprisingly complex behavior with very small amounts of code. A saga (compensating transactions across multiple services) is a workflow that catches an activity exception and runs an inverse activity. Retry-with-backoff is built into the activity options. Long-running approval flows are signals against a sleeping workflow.
+
+## Comparison: Temporal vs Argo Workflows
+
+The two tools share the word "workflow" and nothing else. The split:
+
+| Dimension | Argo Workflows | Temporal |
+| --- | --- | --- |
+| Programming model | YAML CRDs | Code in your language |
+| Step granularity | One step = one pod | One step = one function call |
+| State | Outputs / artifacts | Variables in workflow code (durable) |
+| Where it runs | Kubernetes CRDs | Temporal server + your workers (anywhere) |
+| Duration | Minutes to hours | Hours to years |
+| Failure model | Retry step or fail | Durable retry + compensation |
+| Best for | Batch / CI / ML pipelines | Long-running stateful business workflows |
+
+If you're already writing complex retry logic and storing state in a database between steps of an "Argo Workflows" pipeline, you're approaching Temporal's job. If you're compiling and shipping a container image with Temporal, you've overshot.
+
+## Operational model
+
+Temporal can run two ways:
+
+- **Self-hosted.** Apache 2.0 open source. Run the server (Go binary, Kubernetes manifests available), connect a database, run workers. Some operational complexity — schemas, sharding, history backups.
+- **Temporal Cloud.** Managed service from Temporal Technologies (the company founded by the Cadence creators). You run only your workers; they run everything else.
+
+Most production adopters start with Temporal Cloud unless they have a specific reason to self-host. The operational engineering required for the server tier at scale (Cassandra cluster, sharding, multi-cluster replication) is non-trivial.
+
+## Limitations and pitfalls
+
+- **Determinism is real.** Workflow code that uses `random.random()`, `time.now()`, or makes HTTP calls directly will replay incorrectly. Every non-deterministic operation must be inside an Activity (or use `workflow.now()`, `workflow.random()` helpers).
+- **Replay performance.** Workflows with very long histories (>10,000 events) become slow to replay. Use `continue-as-new` to start a fresh workflow with the same name when histories get long.
+- **Activity timeouts are mandatory.** Forgetting to set `start_to_close_timeout` means a stuck activity blocks the workflow forever. Default to short timeouts; explicit retry policies for long activities.
+- **Versioning workflow code is a real concern.** Once a workflow is running, its code can't change in incompatible ways without breaking replay. Use `workflow.patched()` or version markers for evolving logic.
+- **Worker resource model is yours.** Temporal Cloud doesn't run your workers. Workers need to be deployed, scaled, monitored like any other service. Most users underscale workers initially.
+- **The learning curve is concept-heavy.** "Workflow as code" sounds simple. The implications — replay, determinism, activities vs workflows, signals vs updates — take weeks to internalize. Plan for it.
+
+## Where to start
+
+1. Run `temporal server start-dev` locally — it spins up a single-process Temporal in seconds for development. (Or sign up for Temporal Cloud's free tier.)
+2. Write the **money transfer** workflow from the Temporal docs — debit one account, credit another, with a saga that reverses the debit if the credit fails. The canonical example for a reason.
+3. Open the Temporal Web UI. Watch the event history as the workflow runs. Trigger a failure and observe the retry-and-replay behavior.
+4. Convert **one** real business process at work — order processing, signup flow, document approval — to a Temporal workflow. The first conversion teaches you everything.
+5. Add signals and queries when you've outgrown "start the workflow and let it run." The async-by-default model becomes natural after one workflow that needs to wait for external input.
+6. Plan worker scaling and monitoring (worker poll rates, task queue lag, replay metrics) before going to production. These are the operational metrics that matter, and they're not the obvious ones.
+
+The mistake to avoid: building a "Temporal-shaped" thing with a database table and a cron job because the team isn't familiar with Temporal. The ad-hoc state machine looks simpler on day one, becomes impossible to reason about by month six, and grows a partial reimplementation of Temporal that's worse than the real one. If the use case fits — durable, long-running, business-process — use Temporal from the start.

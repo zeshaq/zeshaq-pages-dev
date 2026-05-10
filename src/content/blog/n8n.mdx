@@ -1,0 +1,133 @@
+---
+title: "n8n: the self-hostable workflow automation platform"
+description: "What n8n is, the node-based visual model that makes it Zapier-shaped without the SaaS lock-in, where it sits next to the no-code automation landscape, and what it can and can't do."
+date: 2026-05-10
+category: WORKFLOWS
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600 };
+export const trig  = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 130, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const trigEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const n8nNodes = [
+  { id: "extEvt",  position: { x: 80,  y: 0   }, data: { label: "external event\n(webhook, schedule)" }, style: trig },
+  { id: "trigger", position: { x: 80,  y: 130 }, data: { label: "Trigger node" }, style: ctrl },
+  { id: "n2",      position: { x: 280, y: 130 }, data: { label: "Set / Code node\n(transform)" }, style: ctrl },
+  { id: "n3",      position: { x: 480, y: 130 }, data: { label: "IF node\n(branch)" }, style: ctrl },
+  { id: "n4a",     position: { x: 680, y: 50  }, data: { label: "Slack node\n(notify)" }, style: ctrl },
+  { id: "n4b",     position: { x: 680, y: 210 }, data: { label: "Postgres node\n(write)" }, style: ctrl },
+  { id: "n8n",     position: { x: 380, y: 340 }, data: { label: "n8n core\n(workflow engine + DB)" }, style: ctrl },
+];
+
+export const n8nEdges = [
+  { id: "ev", source: "extEvt", target: "trigger", label: "fires", ...trigEdge },
+  { id: "f1", source: "trigger", target: "n2", ...reqEdge },
+  { id: "f2", source: "n2",      target: "n3", ...reqEdge },
+  { id: "f3", source: "n3",      target: "n4a", label: "true", ...reqEdge },
+  { id: "f4", source: "n3",      target: "n4b", label: "false", ...reqEdge },
+  { id: "rt", source: "trigger", target: "n8n", label: "execution", ...trigEdge },
+  { id: "rt2", source: "n4a",    target: "n8n", ...trigEdge },
+  { id: "rt3", source: "n4b",    target: "n8n", ...trigEdge },
+];
+
+n8n is the "Zapier you can self-host" — a workflow automation platform with a visual node-based editor, 400+ pre-built integrations, and the unusual property of being open-source-ish (fair-code license, source-available, free for self-hosting). Originally built in 2019 in Berlin by Jan Oberhauser, it's grown into the default answer for "I want Zapier's UX but I need data to stay in my infrastructure" and "I want to build internal automations without paying per-task to a SaaS."
+
+This post is what n8n is, where it fits, and the trade-offs versus the SaaS automation competitors and the developer-facing workflow tools.
+
+## The position
+
+n8n sits in a specific spot: **between Zapier (managed, no-code, SaaS-only) and Temporal / Argo Workflows (developer-facing, code-first, infrastructure-heavy).**
+
+Three properties define it:
+
+1. **Visual node-based editor.** Drag nodes onto a canvas, draw lines between them. Each node has a UI form for its parameters. Non-engineers can build and modify workflows; engineers can drop into JavaScript code nodes when needed.
+2. **Self-hostable.** Docker container, Postgres/MySQL/SQLite backend, runs anywhere. Your data stays in your network. No per-execution pricing.
+3. **400+ integrations.** Slack, Notion, Google Workspace, Salesforce, Postgres, MongoDB, HTTP, queues, AI providers (OpenAI, Anthropic, Hugging Face), and so on. Each is a node with form fields for credentials and parameters.
+
+It's not a developer SDK. It's not a CI/CD engine. It's not built for high-throughput stream processing. It's built for **business automations and integrations** — the kind of work that previously happened in Zapier, a homegrown Lambda, or a spreadsheet macro.
+
+## Architecture and execution model
+
+<Whiteboard client:load data={{ nodes: n8nNodes, edges: n8nEdges }} height={520} />
+
+Reading the diagram:
+
+- **External event** — webhook, schedule, queue message, file change, or any other trigger configured on a node.
+- **Trigger node** — special node that starts a workflow. Each workflow has one (or more) triggers.
+- **Processing nodes** — Set (transform data), Code (run JavaScript or Python), IF (branch), Merge (combine), HTTP Request (call any API), and so on.
+- **Integration nodes** — Slack, Postgres, Notion, etc. Each one is a wrapped API client with credentials configured once and reused.
+- **n8n core** — the runtime executing the workflow. Connects to a database for credential storage, execution history, and queueing. Available as a single binary or split into "main" (UI/API), "worker," and "webhook" processes for scale.
+
+The green dashed edges are the eventing path (trigger and execution metadata flowing back to core). Solid edges are the data flow between nodes — each node produces a JSON array of items, the next node iterates over them.
+
+## What you actually do in n8n
+
+A few patterns covering 80% of real use:
+
+1. **Webhook → Transform → Notify.** A webhook from a third-party tool (Stripe, GitHub, Typeform) triggers the workflow; a Set or Code node reshapes the data; a Slack or email node notifies the right channel.
+2. **Schedule → Query → Aggregate → Report.** Hourly cron triggers a Postgres query, n8n aggregates the rows, sends a daily summary to email or a dashboard.
+3. **Form / chatbot → AI completion → Action.** A form submission or chatbot message triggers an OpenAI or Anthropic node for processing; the result drives an action — file a ticket, update a CRM, generate a report.
+4. **Sync between systems.** Notion to Postgres, Salesforce to HubSpot, Google Drive to S3. Bidirectional sync workflows using the change-detection patterns each integration supports.
+5. **Internal "data robot."** Automate the recurring data movement that used to be a human checking a spreadsheet every Tuesday.
+
+## The AI angle
+
+Since late 2023, n8n has invested heavily in AI / LLM nodes. The current set includes:
+
+- **LLM nodes** — OpenAI, Anthropic, Google Gemini, local models via Ollama or HuggingFace.
+- **Vector store nodes** — Pinecone, Qdrant, Postgres + pgvector, Supabase.
+- **AI Agent node** — gives an LLM a set of tool nodes it can call; effectively building a no-code agent.
+- **LangChain integration** — n8n is a LangChain client; you can compose chains visually instead of in Python.
+
+This makes n8n a reasonable "internal AI tool" platform — a place to build a chatbot that hits your knowledge base, an email triage agent, a report generator, without writing a full Python application.
+
+## License: fair-code, not pure open source
+
+n8n is licensed under the **Sustainable Use License** — n8n's own variant of fair-code. Practically:
+
+- Free for internal company use, including in production.
+- Free to modify and self-host.
+- *Not* permitted to host as a competing SaaS that charges third parties for n8n access.
+
+This matters if you're doing something unusual, but for the typical "we use this for internal automation" or "we ship it embedded in our product without exposing it directly" cases, it's effectively free. Worth reading the actual license text before committing to a model that depends on it being treated as MIT or Apache.
+
+## Comparison: where n8n sits
+
+| Tool | Model | Best at |
+| --- | --- | --- |
+| **Zapier** | SaaS, no-code | The largest integration catalog, easiest for non-technical users, expensive at scale, no self-host |
+| **Make.com** (Integromat) | SaaS, no-code | Visual flowchart-style editor, strong for data transformations, SaaS-only |
+| **Pipedream** | SaaS + open-source components | Developer-friendly, code-first within a SaaS shell |
+| **IFTTT** | SaaS, consumer-grade | Simple trigger/action, not for serious business automation |
+| **n8n** | Self-hostable, fair-code | "Zapier in our infrastructure" — strong for orgs with privacy / cost concerns |
+| **Activepieces** | Open-source (MIT) | The closer pure-OSS alternative to n8n; smaller integration catalog |
+| **Apache Airflow** | Self-hosted, Python | Data engineering pipelines, not business integration |
+| **Temporal** | Self-hosted / managed, code | Durable business workflows in code; different audience |
+
+n8n's natural lane: **internal automation at small-to-medium organizations, or enterprises that need data to stay on-premise.** If your automation talks to internal databases, sensitive customer data, or industry-regulated systems, the "your data never leaves your network" property is the selling point.
+
+## Limitations and pitfalls
+
+- **Not a developer-team tool.** n8n versions workflows in its own database, not Git. You can export workflows as JSON and version those in Git, but the dev loop isn't as clean as code-first tools. Workflows-as-code is improving (the **CLI** and the **workflow JSON API**) but not yet first-class.
+- **Scale ceiling.** A single n8n instance can comfortably handle thousands of executions per day. Tens of thousands per minute is when you should be using something else (Kafka + workers, Temporal, Lambda).
+- **Long-running steps.** A node that takes 5 minutes to complete blocks the workflow. n8n is fine with workflows that take seconds; it's not built for hour-long activities the way Temporal is.
+- **Credential sprawl.** Hundreds of integrations × many credentials per integration. Use n8n's credential management thoughtfully; audit who has access to what.
+- **The Code node escape hatch is dangerous.** Anyone with workflow edit permissions can write JavaScript that runs in the n8n process. Treat workflow authors like trusted internal developers.
+- **Webhook reliability.** Workflows triggered by webhooks lose events if the n8n instance is down at the moment the webhook fires. Use a queue node in front if reliability matters.
+- **The visual editor scales to about 30 nodes.** Past that, workflows become unreadable. Decompose into sub-workflows via the Execute Workflow node.
+
+## Where to start
+
+1. Run n8n via Docker: `docker run -p 5678:5678 -v ~/.n8n:/home/node/.n8n n8nio/n8n`. Open `http://localhost:5678`.
+2. Build the **Hello, World** workflow — Manual Trigger → Set node → return. Validates the basic flow.
+3. Build something useful: a webhook from your form provider → Slack notification, or a daily Postgres query → email report. Real value in an hour.
+4. Add the **AI Agent** node when you have a use case (internal chatbot over a knowledge base, email triage). Validate value before committing to it as architecture.
+5. Move to a **managed PostgreSQL backend** and split n8n into main + worker + webhook processes when you exceed maybe 50 workflows or 10,000 executions per day.
+6. Adopt the **Workflows API** and Git-export-import discipline before n8n becomes a critical system. Otherwise you'll have important automations whose only copy lives in a UI.
+
+The mistake to avoid: building production-critical pipelines in n8n that have no source-of-truth in Git. n8n is excellent at letting non-developers build useful automations. It's not excellent at letting you treat those automations as code with reviews, environments, and rollbacks unless you actively enforce the discipline.

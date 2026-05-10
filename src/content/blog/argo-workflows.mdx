@@ -1,0 +1,155 @@
+---
+title: "Argo Workflows: Kubernetes-native pipelines"
+description: "What Argo Workflows is, the DAG-and-pod-per-step execution model, where it fits next to Tekton and Airflow, and the patterns that actually scale on real fleets."
+date: 2026-05-10
+category: WORKFLOWS
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 130, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const argoNodes = [
+  { id: "user",     position: { x: 380, y: 0   }, data: { label: "user / event" }, style: stage },
+  { id: "wf",       position: { x: 380, y: 100 }, data: { label: "Workflow CR\n(or WorkflowTemplate)" }, style: ctrl },
+  { id: "ctl",      position: { x: 380, y: 220 }, data: { label: "argo-server +\nworkflow-controller" }, style: ctrl },
+  { id: "step1",    position: { x: 80,  y: 360 }, data: { label: "step 1\n(pod)" }, style: agent },
+  { id: "step2",    position: { x: 280, y: 360 }, data: { label: "step 2\n(pod)" }, style: agent },
+  { id: "step3",    position: { x: 480, y: 360 }, data: { label: "step 3\n(pod)" }, style: agent },
+  { id: "step4",    position: { x: 680, y: 360 }, data: { label: "step 4\n(pod)" }, style: agent },
+  { id: "artifacts", position: { x: 380, y: 500 }, data: { label: "artifact store\n(S3 / GCS / MinIO)" }, style: stage },
+];
+
+export const argoEdges = [
+  { id: "u1", source: "user",  target: "wf",    label: "create / event", ...reqEdge },
+  { id: "w1", source: "wf",    target: "ctl",   label: "watched", ...reqEdge },
+  { id: "c1", source: "ctl",   target: "step1", label: "schedule", ...dataEdge },
+  { id: "c2", source: "ctl",   target: "step2", ...dataEdge },
+  { id: "c3", source: "ctl",   target: "step3", ...dataEdge },
+  { id: "c4", source: "ctl",   target: "step4", ...dataEdge },
+  { id: "a1", source: "step1", target: "artifacts", label: "outputs", ...reqEdge },
+  { id: "a2", source: "step2", target: "artifacts", ...reqEdge },
+  { id: "a3", source: "step3", target: "artifacts", ...reqEdge },
+  { id: "a4", source: "step4", target: "artifacts", ...reqEdge },
+];
+
+Argo Workflows is a Kubernetes-native workflow engine. You describe a pipeline as a `Workflow` CR — a directed acyclic graph of steps — and the controller schedules each step as a pod. Outputs flow through artifacts in an object store. Common uses: CI/CD pipelines, ML training, data processing, batch jobs, anything you'd previously have done with Jenkins, Airflow, or a hand-rolled shell script over `kubectl`.
+
+It's a CNCF graduated project, part of the Argo family (CD for GitOps, Workflows for pipelines, Events for triggering, Rollouts for progressive delivery). This post focuses on Workflows specifically, with comparisons to its peers at the end.
+
+## The position
+
+Argo Workflows occupies a specific niche: **container-per-step pipelines on Kubernetes**. Three properties define it:
+
+1. **Each step is a pod.** Not a "stage in a JVM," not "a function in a daemon" — an actual Kubernetes pod, with its own container image, resources, lifecycle. Want a step that runs `python train.py`? Use a Python image. Want a step that runs `terraform apply`? Use HashiCorp's image. No plugin ecosystem to glue together.
+2. **The pipeline is a CRD.** The `Workflow` is just a Kubernetes object. Versioned in Git, applied with `kubectl`, viewable in the cluster, scoped by namespace, secured by RBAC.
+3. **DAG and step semantics, declared in YAML.** Steps can run sequentially, in parallel, conditionally, with retries, with template reuse via `WorkflowTemplate` CRs.
+
+If your pipeline can be described as "run this image, then this image, then this image, passing files between them," Argo Workflows is the cleanest expression of that in Kubernetes.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: argoNodes, edges: argoEdges }} height={600} />
+
+Reading the diagram:
+
+- **Workflow CR** — your pipeline definition. Either created on demand or stamped from a `WorkflowTemplate`. Triggered by users (`argo submit`) or events (via Argo Events).
+- **argo-server + workflow-controller** — the two components that make up the Argo Workflows deployment. The server provides the API and UI; the controller watches `Workflow` CRs and schedules step pods.
+- **Step pods** — one per step that's currently running. Each pod has a `main` container (your code) and a sidecar that handles artifact upload/download, log capture, and signaling.
+- **Artifact store** — S3, GCS, MinIO, Azure Blob. Workflow steps declare artifact outputs (`/output/model.pkl`) and inputs; the sidecar uploads/downloads them automatically. This is how data flows between pods that may run on different nodes.
+
+The green dashed edges are the controller scheduling step pods. Solid edges are user input and artifact data. **No persistent process holds workflow state in memory** — everything is in the `Workflow` CR's status field, so the controller can crash and resume.
+
+## Workflow templates and reuse
+
+The thing that makes Argo Workflows usable at scale is template composition.
+
+A `WorkflowTemplate` is a reusable, parameterized workflow definition. A team writes templates once ("the standard model training pipeline," "the standard release pipeline") and downstream users instantiate them by name with parameters. Combined with `ClusterWorkflowTemplate` (cluster-scoped), this gives you something like a function library — but for pipelines.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+spec:
+  workflowTemplateRef:
+    name: train-and-register-model
+  arguments:
+    parameters:
+      - name: dataset
+        value: s3://bucket/datasets/2026-q2/
+      - name: epochs
+        value: "20"
+```
+
+This pattern — central platform team owns templates, application teams instantiate them — is what differentiates "we use Argo Workflows" from "we use Argo Workflows *well*."
+
+## The execution model in detail
+
+Each step's pod is created on demand, runs to completion, and is reaped. The controller polls pod status and updates the `Workflow` CR's status with which steps have completed.
+
+Steps interact via three mechanisms:
+
+- **Parameters** — small string values passed in command-line args or environment variables.
+- **Artifacts** — files uploaded to / downloaded from object storage by the wait sidecar. The unit of data interchange.
+- **Result outputs** — small string outputs read from a file in the pod, used to drive DAG conditionals.
+
+Three execution constructs cover most real pipelines:
+
+| Construct | What it gives you |
+| --- | --- |
+| `steps:` | Sequential pipeline with parallel sub-steps within each stage |
+| `dag:` | Explicit dependency graph; step B runs when step A completes |
+| `withItems:` / `withParam:` | Fan-out — run the same step against a list of items, in parallel |
+
+The combination is what makes complex pipelines expressible: a DAG of stages, each with parallel fan-out for grid search or batch processing, with conditional next-steps based on result outputs.
+
+## Where it sits in the workflow landscape
+
+Workflow engines overlap in unhelpful ways. The clearest framing:
+
+| Tool | Programming model | Best at |
+| --- | --- | --- |
+| **Argo Workflows** | YAML DAG, pod-per-step | Container-native batch and ML pipelines on K8s |
+| **Tekton (OpenShift Pipelines)** | YAML, pod-per-step | CI/CD specifically; similar shape, more CI-focused features |
+| **Apache Airflow** | Python DAGs | Data engineering pipelines; mature operator ecosystem, scheduler-centric |
+| **Kubeflow Pipelines** | Python SDK → Argo Workflows YAML | ML pipelines specifically; uses Argo under the hood |
+| **Flyte** | Python decorators → K8s | Type-safe ML pipelines with strong lineage / caching |
+| **Temporal** | Code-first durable workflows | Long-running business processes (months / years), not batch jobs |
+| **Prefect / Dagster** | Python | Data engineering with developer ergonomics |
+| **Step Functions / Durable Functions** | JSON state machines / code | Managed serverless workflows on AWS / Azure |
+
+Argo's natural lane: **container-native pipelines on Kubernetes, where each step is heterogeneous (different images, different languages, different teams).** If everything in your pipeline is Python and the data fits in memory between steps, Prefect or Dagster will give you better dev ergonomics. If everything is one team's CI pipeline, Tekton fits the use case more directly.
+
+## Argo Events: the missing trigger story
+
+Argo Workflows by itself starts workflows on user submission or cron schedule. **Argo Events** is the separate Argo project that fills the rest:
+
+- `EventSource` — listens to external events (GitHub webhooks, Kafka topics, S3 bucket changes, calendar schedules, AWS SNS, etc.)
+- `Sensor` — defines a trigger that fires when conditions on the event bus match
+- The trigger can create a `Workflow`, post to Slack, call a webhook, etc.
+
+The Workflows + Events pair turns Argo into a full event-driven automation platform. Most production deployments use both.
+
+## Limitations and pitfalls
+
+- **YAML at scale.** Workflows past ~20 steps in pure YAML become unmaintainable. Lean on `WorkflowTemplate` decomposition or use the **Hera** Python SDK (or Argo's own Python SDK) to generate workflows programmatically.
+- **Artifact size.** Pushing large artifacts (GBs) through the wait sidecar is slow and uses a lot of pod-local disk. For very large data, mount a shared volume or write directly to your store from `main`, bypassing the artifact mechanism.
+- **Pod startup latency.** Each step is a pod cold-start — typically 5–15 seconds before your code runs. For very fast steps, this dominates. Combine fast steps into single steps.
+- **Quota explosions.** A fan-out with `withItems` against a 10,000-item list creates 10,000 pods. Set `parallelism:` to cap concurrent step pods or you'll exhaust the cluster.
+- **State outside the cluster.** Workflows in long-term archive accumulate. The archive (`workflow-archive`) stores completed workflows in a database; configure retention or your DB grows without bound.
+- **Sensitive parameters.** Step parameters are visible in the `Workflow` CR — visible to anyone with RBAC read on the resource. Use Kubernetes secrets via env vars / volumeMounts for anything sensitive.
+
+## Where to start
+
+1. Install Argo Workflows in a namespace via the official manifests or the Helm chart. Configure an artifact store (MinIO or your existing S3 bucket).
+2. Submit the **hello-world** workflow from the docs. `argo watch` it. Open the UI. Validate the rails.
+3. Move your simplest existing pipeline — a build, a daily report, a model training run — to Argo Workflows. Don't pick the hardest one first.
+4. Introduce **`WorkflowTemplate`** the second time you find yourself copying a pipeline. Owning a template is cheaper than owning two near-duplicate pipelines.
+5. Add **Argo Events** when "we manually re-run this pipeline" stops being acceptable. Hook it to your Git provider, your queue, or whatever produces the trigger event.
+6. Adopt **Hera** (the Python SDK) when YAML becomes the bottleneck. Hera generates Argo Workflows YAML from Python; you keep all the Argo execution semantics with much better authoring ergonomics.
+
+The mistake to avoid: writing every workflow inline as standalone YAML. Argo's value compounds with reuse. Templates are the unit of return-on-investment; pipelines without templates feel like Bash scripts in disguise. Pipelines built from templates feel like a real platform.
