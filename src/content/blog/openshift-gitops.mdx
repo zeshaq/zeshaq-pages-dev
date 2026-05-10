@@ -1,0 +1,191 @@
+---
+title: "OpenShift GitOps: from app-of-apps to argocd-agent"
+description: "OpenShift GitOps, the App of Apps pattern, ApplicationSet, RHACM's pull model, and the newer argocd-agent architecture — with Red Hat's current guidance on which to pick when."
+date: 2026-05-10
+---
+
+import Whiteboard from "../../components/Whiteboard";
+import Mermaid from "../../components/Mermaid";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const grpcEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const localEdge = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" } };
+
+export const agentNodes = [
+  { id: "git",       position: { x: 420, y: 0   }, data: { label: "Git repo" },                        style: stage },
+  { id: "principal", position: { x: 420, y: 110 }, data: { label: "Argo CD Principal\n(hub cluster)" }, style: ctrl  },
+  { id: "agentA",    position: { x: 100, y: 270 }, data: { label: "argocd-agent\nspoke A" },           style: agent },
+  { id: "agentB",    position: { x: 420, y: 270 }, data: { label: "argocd-agent\nspoke B" },           style: agent },
+  { id: "agentC",    position: { x: 740, y: 270 }, data: { label: "argocd-agent\nspoke C" },           style: agent },
+  { id: "appsA",     position: { x: 100, y: 410 }, data: { label: "workloads\n(spoke A)" },            style: stage },
+  { id: "appsB",     position: { x: 420, y: 410 }, data: { label: "workloads\n(spoke B)" },            style: stage },
+  { id: "appsC",     position: { x: 740, y: 410 }, data: { label: "workloads\n(spoke C)" },            style: stage },
+];
+
+export const agentEdges = [
+  { id: "g1", source: "git",       target: "principal", label: "manifests",            ...reqEdge,  labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "a1", source: "agentA",    target: "principal", label: "gRPC (spoke-initiated)", ...grpcEdge },
+  { id: "a2", source: "agentB",    target: "principal", ...grpcEdge },
+  { id: "a3", source: "agentC",    target: "principal", ...grpcEdge },
+  { id: "l1", source: "agentA",    target: "appsA",     label: "applies", ...localEdge, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "l2", source: "agentB",    target: "appsB",     ...localEdge },
+  { id: "l3", source: "agentC",    target: "appsC",     ...localEdge },
+];
+
+GitOps on OpenShift has changed shape three times in five years. What started as one Argo CD running App-of-Apps is now a layered story: **OpenShift GitOps** for the single-cluster case, **ApplicationSet** for templated multi-tenant fleets, **RHACM with the pull model** for hundreds of managed clusters, and **`argocd-agent`** for the where-this-is-going scenarios — disconnected edge, far-flung fleets, or anywhere the hub can't open a tunnel into the spoke.
+
+This post walks through the layers and lands on Red Hat's current guidance on which to pick when.
+
+## OpenShift GitOps
+
+OpenShift GitOps is Red Hat's productized, supported distribution of Argo CD, packaged as an Operator. You install it from OperatorHub and it gives you:
+
+- A standard Argo CD deployment in `openshift-gitops` namespace
+- OAuth integration with the OpenShift identity providers (no separate Argo CD users)
+- Built-in OpenShift Console plugin (Argo CD apps appear in the OCP console)
+- A default `cluster` Argo CD instance that's already wired to the local API
+- Tekton + Argo CD integration patterns (Pipelines drives image builds; Argo CD drives the resulting deployment)
+- Long-term support and CVE backports on a Red Hat release cadence
+
+For a single OpenShift cluster, OpenShift GitOps + a Git repo is the entire GitOps stack. Everything below this section is what you reach for when one cluster isn't the whole picture.
+
+## App of Apps
+
+The original Argo CD multi-app pattern. A single root `Application` points at a directory in Git that contains a bunch of other `Application` YAMLs:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-app
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/zeshaq/platform-config
+    path: applications/
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: {}
+```
+
+Sync `root-app`, get every `Application` it generates, get every workload those Applications generate. Bootstrap done.
+
+It still has a place — specifically as a **cluster bootstrap** mechanism (one root app that brings up your platform-level Argo CD apps: monitoring, ingress, cert-manager, etc.). For *application* deployment to a fleet, it's been outgrown by ApplicationSet.
+
+## ApplicationSet
+
+ApplicationSet is a controller in Argo CD that generates `Application` resources from templates and **generators**. The generator is the input — a list, a set of registered clusters, files in a Git directory, pull requests on a repo, etc. The template stamps out one Application per generated value.
+
+The generators that matter:
+
+| Generator | What it does | When you use it |
+| --- | --- | --- |
+| `list` | Hardcoded list of values | Static fleets, demos |
+| `cluster` | All clusters registered in Argo CD | Hub-spoke push model |
+| `git` (file/dir) | Files or subdirectories in Git | Per-tenant, per-environment |
+| `matrix` | Cartesian product of two generators | "These apps × these clusters" |
+| `merge` | Overlay one generator over another | Override defaults per cluster |
+| `pullRequest` | Open PRs against a repo | Preview environments |
+| `clusterDecisionResource` | Reads a `PlacementDecision` CR | **The bridge to RHACM** |
+
+The `clusterDecisionResource` generator is the integration point between Argo CD ApplicationSet and RHACM Placements. It's the seam that lets you keep "where to deploy" decisions in RHACM (which knows about cluster labels, taints, capacity, network zones) and "what to deploy" in Argo CD.
+
+## The push problem
+
+Classic multi-cluster Argo CD is **push**: a central Argo CD instance holds kubeconfigs for every managed cluster and reaches *out* to apply manifests. This works fine up to a point and falls over predictably:
+
+- **Network.** Hub → spoke connectivity assumes flat networking. Edge sites behind NAT, telco far-edge, air-gapped clusters, customer-premises clusters — none of these reliably let an external system into their API server.
+- **Credentials.** The hub holds privileged kubeconfigs for every cluster. The blast radius of a compromised hub scales with fleet size.
+- **Scale.** A single Argo CD reconciling 5,000 apps across 200 clusters runs out of headroom. You can shard, but sharding multi-tenant Argo CD is its own project.
+- **Latency and reliability.** A WAN hiccup between hub and spoke shows up as failed syncs.
+
+Pull model addresses all four.
+
+## RHACM + Pull Model
+
+In the RHACM pull model, **the spoke pulls its own desired state from the hub**, instead of the hub pushing into the spoke. The mechanism is RHACM's existing `ManifestWork` resource — already used for cluster lifecycle — repurposed as the delivery channel for Argo CD `Application` objects.
+
+The wiring:
+
+<Mermaid client:load chart={`flowchart LR
+  Git[Git repo] --> AS[ApplicationSet<br/>on hub]
+  P[RHACM Placement] --> PD[PlacementDecision]
+  PD --> AS
+  AS --> MW[ManifestWork CRs<br/>on hub]
+  MW -. pulled by .-> K1[klusterlet<br/>spoke A]
+  MW -. pulled by .-> K2[klusterlet<br/>spoke B]
+  K1 --> A1[Application<br/>+ workloads on A]
+  K2 --> A2[Application<br/>+ workloads on B]
+
+  classDef hub fill:#e5e7eb,stroke:#6b7280,color:#1f2937
+  classDef spoke fill:#fafafa,stroke:#9ca3af,color:#1f2937
+  class Git,AS,P,PD,MW hub
+  class K1,K2,A1,A2 spoke`} />
+
+Reading it:
+
+1. You write **Placement** CRs in RHACM expressing "deploy to clusters that have label `env=prod` and region `us`." RHACM evaluates and produces a `PlacementDecision`.
+2. The ApplicationSet on the hub uses the `clusterDecisionResource` generator to read that decision.
+3. Instead of generating Applications that target spokes by API URL (push), it generates `ManifestWork` CRs on the hub.
+4. Each spoke's klusterlet (the RHACM agent on every managed cluster) pulls its `ManifestWork` and applies the contained `Application` locally — where a small Argo CD instance on the spoke reconciles the actual workloads.
+
+What this buys you:
+
+- **No hub → spoke API access required.** All connections are spoke-initiated outbound to the hub.
+- **No central credential store.** The hub doesn't hold spoke kubeconfigs anymore.
+- **Resilience.** Spokes can keep reconciling against their last-known `ManifestWork` even during hub outages.
+- **Scale.** The hub Argo CD doesn't run reconciliation for spoke workloads — only the local Argo CD on each spoke does.
+
+This has been the GA recommendation in RHACM 2.10+ for any fleet bigger than a handful of clusters.
+
+## argocd-agent
+
+The newer architecture, primarily driven by Red Hat (via `argoproj-labs/argocd-agent`), goes one step further: it removes the dependency on RHACM as the delivery substrate, and bakes the pull model into Argo CD itself.
+
+<Whiteboard client:load data={{ nodes: agentNodes, edges: agentEdges }} height={580} />
+
+Reading it:
+
+- One **Principal Argo CD** on the hub holds the application definitions, the UI, and the user-facing control plane. It is the Argo CD operators and developers interact with.
+- Each managed cluster runs a lightweight **`argocd-agent`** process. The agent opens a single outbound **gRPC connection** to the principal — that's the green dashed line; the spoke initiates it, so firewalls and NAT stop being a problem.
+- The principal sends desired state across that gRPC channel; the agent applies it locally to the spoke's API server.
+- Workloads live entirely on the spoke; no traffic flows from the principal directly to a spoke API.
+
+The agent runs in one of two modes:
+
+- **Managed mode.** The principal's application controller computes the diff; the agent is essentially a remote applier.
+- **Autonomous mode.** The agent has its own application controller and reconciles locally; the principal is a viewer/orchestrator. Survives long hub outages.
+
+This is **technology preview** as of early 2026, but it's the strategic direction Red Hat is pushing — including for telco far-edge ZTP scenarios where ManifestWork-based pull is more orchestration than is needed.
+
+## Red Hat's current guidance
+
+Roughly the decision tree Red Hat field engineers walk through with customers:
+
+| Scenario | Recommended approach |
+| --- | --- |
+| One OpenShift cluster | OpenShift GitOps + Git. App of Apps for cluster bootstrap. |
+| 2–10 clusters, flat network | OpenShift GitOps with ApplicationSet `cluster` generator (push). |
+| 10–100+ clusters, especially across networks | **RHACM + ApplicationSet pull model.** Placement drives "where," ApplicationSet drives "what." |
+| Disconnected, edge, low-bandwidth, NAT'd, ZTP | **`argocd-agent`** (TP). Principal at the hub, agent at the edge, gRPC initiated from spoke. |
+| Cluster lifecycle (provisioning the cluster itself) | RHACM + Hive / Cluster API, separate from app delivery. |
+
+The pattern: **App of Apps** is for bootstrap, not fleet rollout; **ApplicationSet** is the right primitive for any multi-app deployment; the choice between **push**, **RHACM pull**, and **agent** is a network and scale decision more than a feature decision.
+
+## Where to start
+
+If you're new to GitOps on OpenShift:
+
+1. Install OpenShift GitOps Operator on one cluster. Point its default Argo CD at a Git repo containing one `kustomization.yaml`. Sync.
+2. Move your platform components (cert-manager, monitoring, your operators) under an App-of-Apps root.
+3. When you hit the second cluster, switch to ApplicationSet with a `git` generator before adding cluster credentials.
+4. Before the fleet hits ten clusters, install RHACM. Convert your "where" decisions to Placement CRs and your ApplicationSet generator to `clusterDecisionResource`.
+5. Watch `argocd-agent` — when it reaches GA, it's likely going to be Red Hat's default recommendation for the multi-cluster case, displacing the push model entirely.
+
+The mistake to avoid: standing up a central push-mode Argo CD for a fleet you know will exceed ten clusters. The migration path from push to pull is straightforward (the `Application` YAML barely changes), but every team that postpones it spends a quarter rebuilding pipelines that grew up around the old assumption that the hub could reach in.
