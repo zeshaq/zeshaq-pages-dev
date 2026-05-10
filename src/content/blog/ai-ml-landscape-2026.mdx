@@ -1,0 +1,140 @@
+---
+title: "The AI/ML landscape in 2026: an interactive map"
+description: "A pan-and-zoom map of the 75+ tools that define the modern AI/ML stack — foundation models, inference engines, agent frameworks, vector databases, MLOps, evaluation, enterprise platforms, cloud compute, and developer assistants. Click ⛶ to go fullscreen."
+date: 2026-05-10
+category: AI
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 130, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 8, padding: 10, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 13, letterSpacing: "0.04em", textTransform: "uppercase" };
+
+export const linkEdge = { style: { stroke: "#15803d", strokeWidth: 1.5, strokeDasharray: "5,5" }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const cluster = (header, baseX, baseY, tools) => {
+  const out = [
+    { id: slug(header), position: { x: baseX, y: baseY }, data: { label: header }, style: ctrl },
+  ];
+  tools.forEach((t, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    out.push({
+      id: slug(t),
+      position: { x: baseX + (col === 0 ? -95 : 95), y: baseY + 70 + row * 50 },
+      data: { label: t },
+      style: stage,
+    });
+  });
+  return out;
+};
+
+export const landscapeNodes = [
+  ...cluster("Classic ML",       110, 0,    ["scikit-learn", "XGBoost", "LightGBM", "CatBoost"]),
+  ...cluster("Foundation Models", 620, 0,    ["OpenAI GPT", "Anthropic Claude", "Google Gemini", "Meta Llama", "Mistral", "DeepSeek", "Qwen", "IBM Granite"]),
+  ...cluster("Multimodal",       1130, 0,    ["Stable Diffusion", "Midjourney", "DALL·E", "Sora", "ElevenLabs", "Whisper"]),
+
+  ...cluster("DL Frameworks",     110, 420,  ["PyTorch", "TensorFlow", "JAX", "ONNX"]),
+  ...cluster("Inference",         620, 420,  ["vLLM", "Triton", "TGI", "Ollama", "llama.cpp", "NVIDIA NIM"]),
+  ...cluster("Fine-tuning",      1130, 420,  ["Axolotl", "Unsloth", "HF PEFT", "HF TRL", "InstructLab"]),
+
+  ...cluster("Vector DBs",        110, 840,  ["Pinecone", "Weaviate", "Milvus", "Qdrant", "Chroma", "pgvector"]),
+  ...cluster("Agent Frameworks",  620, 840,  ["LangChain", "LlamaIndex", "LangGraph", "CrewAI", "AutoGen", "Pydantic AI"]),
+  ...cluster("MLOps",            1130, 840,  ["MLflow", "Weights & Biases", "ZenML", "DVC", "Kubeflow"]),
+
+  ...cluster("Eval & Observability", 110, 1260, ["LangSmith", "LangFuse", "RAGAS", "Arize", "Helicone"]),
+  ...cluster("Enterprise Platforms", 620, 1260, ["Databricks Mosaic", "Snowflake Cortex", "OpenShift AI", "NVIDIA AI Ent.", "H2O.ai", "Vertex AI", "SageMaker", "Azure AI Foundry"]),
+  ...cluster("Code Assistants",     1130, 1260, ["GitHub Copilot", "Cursor", "Claude Code", "Aider", "Continue"]),
+
+  ...cluster("Cloud Compute",     620, 1680, ["AWS GPUs / Trainium", "GCP TPUs / GPUs", "Azure GPUs", "CoreWeave", "Lambda Labs", "RunPod"]),
+];
+
+export const landscapeEdges = [
+  { id: "e1", source: "cloud_compute",       target: "dl_frameworks",     ...linkEdge, label: "compute" },
+  { id: "e2", source: "cloud_compute",       target: "inference",         ...linkEdge },
+  { id: "e3", source: "dl_frameworks",       target: "foundation_models", ...linkEdge, label: "trained with" },
+  { id: "e4", source: "foundation_models",   target: "inference",         ...linkEdge, label: "served by" },
+  { id: "e5", source: "foundation_models",   target: "fine_tuning",       ...linkEdge, label: "adapted by" },
+  { id: "e6", source: "inference",           target: "agent_frameworks",  ...linkEdge, label: "called by" },
+  { id: "e7", source: "vector_dbs",          target: "agent_frameworks",  ...linkEdge, label: "RAG" },
+  { id: "e8", source: "agent_frameworks",    target: "eval_observability", ...linkEdge, label: "monitored by" },
+  { id: "e9", source: "mlops",               target: "foundation_models", ...linkEdge, label: "tracks" },
+  { id: "e10", source: "enterprise_platforms", target: "foundation_models", ...linkEdge },
+];
+
+The AI/ML landscape in 2026 is a sprawl. Five years ago you could point at "the modern ML stack" and reasonably mean *PyTorch + Jupyter + a Kaggle notebook*. Today every layer has a dozen serious products, every category has been re-shaped by LLMs, and every conference talk seems to reference five tools you've never heard of.
+
+This post is a map. I've put the 75 most-used tools across 13 categories onto a single ReactFlow canvas so you can see what relates to what. Pan with drag, zoom with scroll, click **⛶ fullscreen** for the full-window view.
+
+<Whiteboard client:load data={{ nodes: landscapeNodes, edges: landscapeEdges }} height={760} />
+
+The green dashed edges between cluster headers show the dominant data flow: **cloud compute** underpins everything; **DL frameworks** train **foundation models**; **inference engines** serve them; **agent frameworks** call them; **vector DBs** feed RAG into agents; **MLOps** tracks the lifecycle; **eval & observability** measures the running system. Inside each cluster, the tools are alternatives or complements within that layer.
+
+## The clusters, briefly
+
+**Classic ML.** scikit-learn, XGBoost, LightGBM, CatBoost. The boring-but-load-bearing layer. Most production ML is still tabular. These four cover roughly 95% of tabular use cases — and remain the right answer when the LLM-shaped hammer doesn't match the nail.
+
+**Foundation Models.** OpenAI's GPT family, Anthropic's Claude, Google Gemini, Meta's Llama (open weights), Mistral, DeepSeek, Alibaba Qwen, IBM Granite. The dominant frontier and open-weights players. The choice between closed-API and open-weights models is now the biggest architectural decision in most AI projects.
+
+**Multimodal.** Stable Diffusion (and its derivatives like Flux), Midjourney, OpenAI's DALL·E and Sora, ElevenLabs (voice), Whisper (speech-to-text). The non-text generation half of the landscape. Image generation, voice, and video are now first-class production capabilities.
+
+**DL Frameworks.** PyTorch, TensorFlow, JAX, ONNX. PyTorch won. TensorFlow has retreated to legacy. JAX has a strong research / Google niche. ONNX is the interchange format. If you're starting today, learn PyTorch.
+
+**Inference.** vLLM, NVIDIA Triton, Hugging Face TGI, Ollama, llama.cpp, NVIDIA NIM. How you actually *serve* a model — paged attention, continuous batching, quantization, GPU scheduling. The space where 10× cost differences live.
+
+**Fine-tuning.** Axolotl, Unsloth, HuggingFace PEFT and TRL, Red Hat's InstructLab. The libraries that make fine-tuning an open-weights model on your own data tractable. LoRA, QLoRA, DPO, GRPO — all here.
+
+**Vector DBs.** Pinecone (managed), Weaviate, Milvus, Qdrant, Chroma (developer-friendly), pgvector (it's just Postgres). The RAG retrieval layer. The right answer is often "pgvector unless you have a specific reason to leave Postgres."
+
+**Agent Frameworks.** LangChain, LlamaIndex, LangGraph, CrewAI, Microsoft AutoGen, Pydantic AI. The orchestration layer for multi-step LLM applications. The framework wars are still active; LangGraph and Pydantic AI are the 2026 ascendants.
+
+**MLOps.** MLflow, Weights & Biases, ZenML, DVC, Kubeflow. Experiment tracking, model registry, pipeline orchestration. MLflow remains the open-source default; W&B is the commercial-experience champion.
+
+**Eval & Observability.** LangSmith, LangFuse, RAGAS, Arize, Helicone. How you measure LLM application quality (RAGAS, LangSmith) and observe production behavior (LangFuse, Helicone). The fastest-growing category — everyone realized in 2024 they had no idea what their LLM application was actually doing.
+
+**Enterprise Platforms.** Databricks Mosaic AI, Snowflake Cortex, [Red Hat OpenShift AI](/blog/openshift-ai), [NVIDIA AI Enterprise](/blog/nvidia-ai-enterprise), [H2O.ai](/blog/h2o-ai), Vertex AI, SageMaker, Azure AI Foundry. The bundled "do all of the above" platforms. The right choice depends mostly on which cloud / data warehouse you're already in.
+
+**Code Assistants.** GitHub Copilot, Cursor, Claude Code, Aider, Continue. AI inside the IDE. Cursor and Claude Code have been the breakout developer tools of the last 18 months.
+
+**Cloud Compute.** AWS (GPUs + Trainium / Inferentia), GCP (TPUs + GPUs), Azure GPUs, CoreWeave, Lambda Labs, RunPod. The substrate everyone runs on. CoreWeave and the GPU-cloud specialists have eaten meaningful share from the hyperscalers for training-heavy workloads.
+
+## The 80/20: what most teams actually use
+
+If you're building a typical AI feature in 2026, your stack is probably something like:
+
+- **OpenAI or Anthropic** for closed-API calls, **Llama 3.x or Mistral** if you go open-weights
+- **vLLM** if you self-host inference
+- **pgvector** for retrieval (or **Pinecone** / **Qdrant** if you outgrow it)
+- **LangChain** or **LlamaIndex** (or, increasingly, just raw SDK + structured outputs)
+- **LangSmith** or **LangFuse** for observability
+- **AWS / GCP / Azure** for compute, or **Modal** / **RunPod** for ad-hoc GPU
+- **GitHub Copilot** or **Cursor** while writing the code
+
+Three to seven of these tools, not all 75. The reason the landscape is sprawling isn't that everyone uses everything — it's that different companies optimized different layers and the categories aren't yet consolidated.
+
+## Trends worth watching
+
+A few directions the map will be different in 12 months:
+
+- **Open-weights catching up.** Llama 4, DeepSeek's reasoning models, and Mistral's frontier work have closed enough of the gap that "default to open weights" is now a defensible position for most use cases.
+- **Agents getting structured.** LangGraph and Pydantic AI represent a move toward explicit state machines and typed I/O. The "string-soup chains" era is ending.
+- **Inference cost compression.** vLLM, TGI, and TensorRT-LLM are commoditizing fast model serving. Margins for proprietary inference APIs are getting squeezed by self-hosting.
+- **Evals finally treated seriously.** RAGAS, DeepEval, and product-specific eval frameworks went from "nobody bothered" to "table stakes" between 2023 and 2026.
+- **Vector DB consolidation.** Pure-play vector DBs (Pinecone, Weaviate) face pressure from "Postgres can do this" (pgvector) and full-text + hybrid retrieval. Some won't survive.
+- **Code assistants as agents.** Copilot, Cursor, and Claude Code have moved from "autocomplete++" to genuine multi-step agents that can run, test, and iterate. This is changing what "writing code" means for many teams.
+
+## How to use this map
+
+The map is a *vocabulary tour*, not a recommendation. Three uses:
+
+1. **Orientation.** When someone says "we use Weaviate," you know what cluster that's in and what alternatives it competes with.
+2. **Gap identification.** Look at your current stack on the map. The clusters you don't have anything in are the layers you're missing — sometimes that's correct, sometimes that's a problem.
+3. **Starting points for deeper dives.** The cross-linked posts on [OpenShift AI](/blog/openshift-ai), [NVIDIA AI Enterprise](/blog/nvidia-ai-enterprise), [H2O.ai](/blog/h2o-ai), and the [data scientist path post](/blog/become-data-scientist-2026) go deeper on specific clusters.
+
+## The trap
+
+Reading a landscape map and concluding "we need a tool from every cluster" is the wrong takeaway. Most successful AI products in 2026 use 5-8 tools across 4-5 clusters. The teams that try to adopt one of everything spend more time on integration than on the actual problem. **Pick the smallest stack that solves your problem; add layers only when you hit their absence as a real constraint.**
+
+The map is the menu, not the meal.
