@@ -1,0 +1,201 @@
+---
+title: "Camunda 8: BPMN as a runtime, not just a diagram"
+description: "What Camunda is, why BPMN matters as an executable runtime and not just a notation, the Camunda 7 → Camunda 8 (Zeebe) rewrite, the external-task / job-worker model that defines C8, and where it sits next to Temporal and traditional BPM."
+date: 2026-05-10
+category: WORKFLOWS
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge  = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pollEdge  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const camNodes = [
+  { id: "modeler",  position: { x: 400, y: 0   }, data: { label: "Web Modeler\n(BPMN + DMN design)" }, style: ctrl },
+  { id: "zeebe",    position: { x: 400, y: 130 }, data: { label: "Zeebe Engine\n(gRPC gateway + brokers)" }, style: ctrl },
+  { id: "operate",  position: { x: 700, y: 130 }, data: { label: "Operate\n(ops dashboard)" }, style: ctrl },
+  { id: "workers",  position: { x: 100, y: 280 }, data: { label: "Job Workers\n(Java / Node / Python / …)" }, style: agent },
+  { id: "tasklist", position: { x: 400, y: 280 }, data: { label: "Tasklist\n(human task UI)" }, style: ctrl },
+  { id: "optimize", position: { x: 700, y: 280 }, data: { label: "Optimize\n(analytics)" }, style: ctrl },
+  { id: "humans",   position: { x: 400, y: 410 }, data: { label: "human users" }, style: stage },
+  { id: "elastic",  position: { x: 700, y: 410 }, data: { label: "Elasticsearch\n(exporter target)" }, style: ext },
+];
+
+export const camEdges = [
+  { id: "d1", source: "modeler",  target: "zeebe",    label: "deploy BPMN",  ...dataEdge },
+  { id: "w1", source: "workers",  target: "zeebe",    label: "poll + complete jobs (gRPC)", ...pollEdge },
+  { id: "u1", source: "zeebe",    target: "tasklist", label: "user task jobs", ...dataEdge },
+  { id: "u2", source: "tasklist", target: "humans",   label: "claim + complete", ...reqEdge },
+  { id: "u3", source: "humans",   target: "tasklist", ...reqEdge },
+  { id: "e1", source: "zeebe",    target: "elastic",  label: "events", ...dataEdge },
+  { id: "o1", source: "elastic",  target: "operate",  label: "reads", ...dataEdge },
+  { id: "o2", source: "elastic",  target: "optimize", label: "reads", ...dataEdge },
+];
+
+Camunda is the workflow / business-process orchestration platform that treats **BPMN 2.0** as an executable runtime — not just a notation. You draw a process diagram, deploy it to the engine, and the engine *runs the diagram*. Tokens flow through the BPMN shapes, service tasks become jobs that external workers complete, user tasks appear in a human-task UI, gateways route based on data, timers fire on schedule. The diagram is the program.
+
+This sounds simple. The implication is significant: business analysts and engineers look at the *same artifact*. When something breaks in production, the operations dashboard highlights the exact shape in the diagram where the token is stuck. BPMN-as-runtime is what differentiates Camunda from "we have a workflow library" — and from Temporal's code-first model, which is for a different audience.
+
+This post is what Camunda is in 2026, the Camunda 7 → 8 split, how the Zeebe-based engine works, and where it fits next to Temporal and traditional BPM products.
+
+## The position
+
+Camunda's value proposition has three legs:
+
+1. **BPMN 2.0 as executable.** The same diagram is the documentation, the implementation, and the runtime monitoring view. Business stakeholders read it; developers implement it; operators debug it. One artifact, three audiences.
+2. **Long-running, stateful processes with human + system steps.** Loan origination, claims processing, employee onboarding, telco order provisioning, regulatory workflows. Days-to-months durations, human approvals interleaved with automated calls, the whole shape of "enterprise business process."
+3. **Vendor-neutral, multi-language execution.** With Camunda 8's job-worker pattern, the *process logic* lives in BPMN (engine-side) and the *implementation code* lives in any language (worker-side). The engine doesn't care if your service task is implemented in Java, Node, Python, Go, or Rust.
+
+It's *not* a data pipeline tool (use Argo Workflows or Airflow). It's *not* a CI/CD engine (use Tekton). It's *not* a stateful application framework (use Temporal). It's a **business process orchestrator** — and that scope is its strength.
+
+## Camunda 7 vs Camunda 8
+
+The single most important piece of context for anyone evaluating Camunda in 2026 is the **two-platform split**:
+
+| | Camunda 7 (BPM Platform) | Camunda 8 (Camunda Platform 8) |
+| --- | --- | --- |
+| Engine | JVM-embedded, synchronous, RDBMS-backed | Zeebe — distributed, event-sourced, cloud-native |
+| State store | Relational DB (Postgres / MySQL / Oracle) | RocksDB + Elasticsearch (event log + projections) |
+| Service task model | Java delegate (in-process) or external task | Job worker only (external, multi-language) |
+| Deployment | JVM application (Spring Boot / Tomcat / WildFly) | Kubernetes / SaaS |
+| License | Source-available, Camunda Community Edition + commercial Enterprise | Commercial (SaaS or Self-Managed); open SDKs and connectors |
+| Released | 2013 | 2022 |
+| Status in 2026 | Still maintained (EOL announced for 2027 community / 2030 enterprise) | Strategic platform; all new development here |
+
+**Camunda 7** is the classic — battle-tested, embedded in Spring Boot apps across banking and insurance, with a relational database as its system of record. It's not going away tomorrow; it's still in production at thousands of enterprises.
+
+**Camunda 8** is the cloud-native rewrite, built on the **Zeebe** engine that the Camunda team developed from scratch. The architectural choices are different enough that "Camunda 7" and "Camunda 8" are best treated as distinct products that share BPMN as a modeling language.
+
+New projects in 2026 should start on Camunda 8. The migration path from 7 to 8 exists but it's not a drop-in.
+
+## Architecture (Camunda 8)
+
+<Whiteboard client:load data={{ nodes: camNodes, edges: camEdges }} height={520} />
+
+Reading the diagram:
+
+- **Web Modeler** — the BPMN / DMN design tool. Browser-based; deploys diagrams directly to the engine. There's also a desktop modeler for offline / Git-driven workflows.
+- **Zeebe Engine** — the heart of Camunda 8. Distributed cluster of brokers, gRPC gateway in front. Stores process state as an event log (RocksDB), partitioned for horizontal scale.
+- **Job Workers** — your code, in any language, that does the actual work for service tasks. Workers poll the gateway for jobs of a type they handle, execute, and complete (or fail with a reason). The green dashed edges show this is **spoke-initiated** — workers reach into the engine, not the other way around.
+- **Tasklist** — the human task UI. When a BPMN process hits a user task, the engine publishes a job that lands here; users see their assigned tasks, fill in forms, complete.
+- **Operate** — the ops dashboard. Running process instances, incidents (stuck tokens with reasons), retries, variable inspection. The "where in the diagram is each token right now" view.
+- **Optimize** — the analytics product. Historical process performance — bottlenecks, cycle time, where instances spend their time, where they fail.
+- **Elasticsearch** — Zeebe exports its event stream here. Operate and Optimize read from Elasticsearch, not directly from Zeebe. This separation is what lets Zeebe stay fast.
+
+The dashed green edges are spoke-initiated polling (workers); solid edges are server-to-server flow and human interaction.
+
+## The job-worker pattern, in detail
+
+This is the architectural choice that defines Camunda 8 and the part most worth understanding.
+
+In Camunda 7's classic mode, a service task in BPMN is bound to a **Java class** (a `JavaDelegate`). The engine, running in your JVM, instantiates and calls that class synchronously. Fast and simple — and tightly coupled to the JVM.
+
+In Camunda 8 (and Camunda 7's external task mode), a service task has a **task type** string. The engine doesn't know how to do the work. Instead:
+
+1. A process instance reaches the service task.
+2. The engine creates a **job** of the corresponding type ("send-welcome-email", "credit-check", "generate-pdf").
+3. **Workers** running anywhere — Java, Node, Python, Go, your own service — poll the gateway for jobs of that type.
+4. A worker claims a job, does the work (calls an API, runs business logic, talks to a database), and either completes the job (with output variables) or fails it (with an error reason and retry policy).
+5. The engine receives the completion, advances the token to the next BPMN element.
+
+Three things this gives you:
+
+- **Language freedom.** Process logic in BPMN (engine), implementation in whatever language fits the work.
+- **Scaling decoupling.** Want to scale just one task type? Scale only its workers. The engine doesn't change.
+- **Operational isolation.** A buggy worker crashing doesn't take the engine down. Failed jobs retry; persistent failures create *incidents* visible in Operate that humans can investigate.
+
+The trade-off is latency. A polling worker has poll-interval overhead before it starts work. Modern Zeebe workers use long-polling and gRPC streaming, so the overhead is small (single-digit ms), but it's not zero.
+
+## BPMN concepts that matter
+
+A short list of BPMN constructs you'll actually use:
+
+| BPMN element | What it does |
+| --- | --- |
+| **Start event** | Where a process begins — none / message / timer / signal |
+| **Service task** | Automated work; engine creates a job for an external worker |
+| **User task** | Human work; appears in Tasklist for assigned user / group |
+| **Exclusive gateway** (XOR) | Routes a single token down one of several paths based on a condition |
+| **Parallel gateway** (AND) | Splits one token into multiple, or joins them back together |
+| **Inclusive gateway** | Routes down one *or more* paths based on conditions |
+| **Event-based gateway** | Waits for whichever event arrives first |
+| **Intermediate timer event** | Pauses the token for a duration or until a date |
+| **Intermediate message event** | Pauses the token until a correlated message arrives |
+| **Error / escalation event** | Throws or catches business errors |
+| **Subprocess** | A bounded scope, useful for transactions and error boundaries |
+| **Call activity** | Calls a separately deployed sub-process |
+| **End event** | Where the process (or a path) finishes |
+
+If you've used a flowchart, half of this is intuitive. The non-obvious primitives — event-based gateway, message correlation, compensation events — are the parts that handle "real" business processes where things don't go in order.
+
+**DMN** (Decision Model and Notation) is the sibling spec: decision tables and decision logic, expressed visually. Used for "given input fields, decide an outcome" — credit scoring, eligibility rules, routing decisions. Engines can call DMN from inside BPMN.
+
+**FEEL** (Friendly Enough Expression Language) is the small expression language for BPMN/DMN conditions and DMN tables. Slightly Java-flavored, slightly SQL-flavored — written so business analysts can read it.
+
+## The Camunda 8 product family
+
+| Product | What it does |
+| --- | --- |
+| **Zeebe** | Workflow engine |
+| **Operate** | Operations dashboard for running instances |
+| **Tasklist** | Human-task UI |
+| **Optimize** | Process analytics and reporting |
+| **Web Modeler** | Browser-based BPMN / DMN editor |
+| **Desktop Modeler** | Local Electron-based modeler |
+| **Connectors** | Pre-built integrations (HTTP, AWS, Slack, OpenAI, Kafka, REST APIs, etc.) — first-class job workers for common services |
+| **Connector Runtime** | Where connector workers run, either in Camunda's infra or self-managed |
+| **Identity** | OAuth / OIDC, built on Keycloak (Self-Managed) |
+| **Console** | Admin UI for Self-Managed clusters |
+| **IDP** (Intelligent Document Processing) | Newer (2024) — LLM-backed document extraction for human-task automation |
+| **AI agents and chat tasks** | Newer — agent-like tasks that delegate to LLMs (Camunda's GenAI direction) |
+| **Marketplace** | Catalog of connectors and process templates from Camunda + community |
+
+Deployment options:
+
+- **Camunda 8 SaaS** — fully managed, multi-region, fastest to start.
+- **Self-Managed** — Helm chart on Kubernetes (Camunda 8 includes Zeebe + Operate + Tasklist + Optimize + Identity + Connectors). Requires Elasticsearch / OpenSearch operationally.
+
+## Where Camunda sits in the landscape
+
+| Tool | Where it differs |
+| --- | --- |
+| **Temporal** | Code-first durable execution. Different audience (developers); see [the Temporal post](/blog/temporal) for the full comparison. Camunda is for business-process workflows where the diagram is the artifact; Temporal is for code-driven workflows where the function is the artifact. |
+| **Apache Airflow** | Data engineering DAGs — different domain. Airflow doesn't do user tasks, doesn't do long-running waits over weeks/months, doesn't render BPMN. Not really a competitor. |
+| **Argo Workflows** | K8s-native batch pipelines; see [the Argo Workflows post](/blog/argo-workflows). Pod-per-step container pipelines, not business processes. |
+| **n8n / Zapier / Make** | Lower-code business automation. Overlapping at the simplest end; Camunda is the right answer when a process has 10+ steps, gateways, human tasks, and SLA / audit requirements. See [the n8n post](/blog/n8n). |
+| **IBM BAW / IBM Cloud Pak for Business Automation** | Traditional BPM stack. Heavier, slower release cadence, more integrated with the broader IBM ecosystem. |
+| **Pega** | Enterprise BPM + CRM with a heavy low-code surface. Bigger consulting partner ecosystem; very different operating model. |
+| **Appian** | Low-code BPM with strong rapid-development story. Faster delivery, less developer-flexible. |
+| **Activiti / Flowable** | Both forked from Camunda 7 heritage. Activiti's energy has waned; Flowable is the active fork. Smaller community than Camunda. |
+| **jBPM / Kogito** (Red Hat) | Red Hat's BPM stack — jBPM is the classic engine, Kogito is the cloud-native rewrite. Similar shape to Camunda's 7 → 8 trajectory, smaller commercial traction. |
+| **ServiceNow Workflow Studio** | Workflow inside the ServiceNow platform. Strong if you live in ServiceNow already; not a standalone BPM choice. |
+| **AWS Step Functions / Azure Durable Functions** | Managed serverless orchestration. Limited visual modeling (Step Functions has a Workflow Studio that's not BPMN), tied to one cloud. |
+
+Camunda's natural lane: **enterprise organizations modernizing long-running business processes — banks, insurers, telcos, government, healthcare — that need BPMN as the system of record for processes, with strong audit, human-task UI, and operations tooling out of the box.**
+
+## Limitations and pitfalls
+
+- **Camunda 8 SaaS or Self-Managed isn't cheap.** Pricing is per-process-instance or per-resource-tier and adds up. Self-Managed needs an Elasticsearch / OpenSearch operations skill set you may not have.
+- **The 7 → 8 migration is non-trivial.** Java delegates have to become job workers; DB-backed state semantics are different; some features (CMMN, the Java-embedded engine model) didn't carry forward. Plan it as a project, not a flag flip.
+- **BPMN as a programming language has limits.** Beyond a certain complexity, BPMN diagrams become unreadable. The mitigation is rigorous use of subprocesses and call activities to keep each diagram below ~25 elements.
+- **Business analysts will draw diagrams that don't run.** BPMN-as-runtime requires implementation-aware modeling. Pure "this is how the process works conceptually" diagrams skip the engine-relevant details (correlation keys, error handling, retry policies). Expect close collaboration between analysts and engineers.
+- **Versioning processes in flight is tricky.** Old instances continue running on their original BPMN version. Migration plans to move them onto a new version exist but are not free.
+- **Audit logging requires Elasticsearch tuning.** The event log is comprehensive; retention and indexing cost real money at scale.
+- **The default UIs (Tasklist, Operate) are functional, not branded.** Many customers wrap their own UI on top of the Tasklist API for end-user-facing experiences.
+
+## Where to start
+
+1. **Camunda 8 SaaS free tier** — sign up, deploy the included "loan request" example. Walk through it: modeler → engine → operate → tasklist. Validates the platform shape in 30 minutes.
+2. Write **one job worker** in your team's primary language. The Camunda 8 SDKs are small; spawning a worker that handles a single task type is ~30 lines.
+3. Model a **real, small process** at work — a 5-step process with one user task and two service tasks. Resist the urge to start with the most complex process. Migrate it once it works.
+4. Add a **DMN decision table** for any "if these inputs, route this way" logic. Pulling rules out of code into a decision table is one of the highest-leverage moves Camunda enables.
+5. Wire up **Operate** with real eyes — incidents are how you'll find the "I forgot to handle this case" gaps. The dashboard is part of the platform's value, not an afterthought.
+6. Plan **Self-Managed** only if regulatory / data residency requires it. SaaS is operationally lighter unless you specifically need on-prem.
+
+The mistake to avoid: treating BPMN as documentation and writing your "real" workflow in code that *also* lives in your services. The point of Camunda is that the diagram is the program; the code-side artifacts are job workers that do single tasks, not orchestration logic. Teams that maintain two parallel views of the process — one in BPMN, one in service code — get the worst of both. Commit to BPMN-as-runtime or use Temporal instead.
