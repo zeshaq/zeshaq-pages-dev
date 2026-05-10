@@ -5,10 +5,24 @@ import Sidebar from "../components/Sidebar.astro";
 interface Props {
   title?: string;
   description?: string;
+  image?: string;
+  type?: "website" | "article";
+  published?: Date;
+  category?: string;
 }
 
-const { title = "zahid", description = "personal blog and whiteboard sessions" } = Astro.props;
+const {
+  title = "Zahid's Blog",
+  description = "Notes on OpenShift, observability, identity, integration, security, AI, and the infrastructure underneath modern platforms.",
+  image = "/og-default.svg",
+  type = "website",
+  published,
+  category,
+} = Astro.props;
+
 const currentPath = Astro.url.pathname;
+const canonicalURL = new URL(currentPath, Astro.site).toString();
+const ogImage = new URL(image, Astro.site).toString();
 ---
 
 <!doctype html>
@@ -17,8 +31,30 @@ const currentPath = Astro.url.pathname;
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalURL} />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate" type="application/rss+xml" title="Zahid's Blog" href="/rss.xml" />
+    <link rel="sitemap" type="application/xml" href="/sitemap-index.xml" />
+
     <title>{title}</title>
+
+    <meta property="og:type" content={type} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:site_name" content="Zahid's Blog" />
+    {published && <meta property="article:published_time" content={published.toISOString()} />}
+    {category && <meta property="article:section" content={category} />}
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <slot name="head" />
   </head>
   <body class="min-h-screen">
     <div class="app-shell">
@@ -28,14 +64,12 @@ const currentPath = Astro.url.pathname;
           <slot />
         </div>
         <footer class="app-footer">
-          <span>built with astro on cloudflare pages</span>
+          <span>built with astro on cloudflare pages · <a href="/rss.xml">RSS</a></span>
         </footer>
       </main>
     </div>
 
     <script is:inline>
-      // Generic fullscreen toggler — any element with [data-fullscreen-target="<id>"]
-      // will toggle fullscreen on the element with that id when clicked.
       document.addEventListener("click", (e) => {
         const btn = e.target.closest("[data-fullscreen-target]");
         if (!btn) return;
