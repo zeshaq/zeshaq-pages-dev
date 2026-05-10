@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -34,6 +34,7 @@ function EditorInner() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const { screenToFlowPosition } = useReactFlow();
   const hydrated = useRef(false);
+  const canvasId = `wb_canvas_${useId().replace(/:/g, "_")}`;
 
   // Restore draft on first mount
   useEffect(() => {
@@ -154,79 +155,84 @@ function EditorInner() {
 
   return (
     <EditableContext.Provider value={true}>
-      <div className="editor-meta">
-        <input
-          type="text"
-          placeholder="Session title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <textarea
-          placeholder="Description (optional)"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          rows={2}
-        />
-      </div>
+      <div className="editor-root">
+        <div className="editor-meta">
+          <input
+            type="text"
+            placeholder="Session title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+          <textarea
+            placeholder="Description (optional)"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            rows={2}
+          />
+        </div>
 
-      <div className="editor-toolbar">
-        <button type="button" className="editor-btn" onClick={() => addShape("rect")}>
-          + rectangle
-        </button>
-        <button type="button" className="editor-btn" onClick={() => addShape("ellipse")}>
-          + ellipse
-        </button>
-        <button type="button" className="editor-btn" onClick={() => addShape("text")}>
-          + text
-        </button>
-        <span className="editor-spacer" />
-        <button type="button" className="editor-btn" onClick={onCopy}>
-          {copied ? "copied!" : "copy json"}
-        </button>
-        <button
-          type="button"
-          className="editor-btn editor-btn-primary"
-          onClick={onExport}
-        >
-          export json
-        </button>
-        <button type="button" className="editor-btn" onClick={onClear}>
-          clear
-        </button>
-        {restored && (
-          <button type="button" className="editor-btn editor-btn-warn" onClick={onDiscardDraft}>
-            discard draft
+        <div className="editor-toolbar">
+          <button type="button" className="editor-btn" onClick={() => addShape("rect")}>
+            + rectangle
           </button>
-        )}
-      </div>
+          <button type="button" className="editor-btn" onClick={() => addShape("ellipse")}>
+            + ellipse
+          </button>
+          <button type="button" className="editor-btn" onClick={() => addShape("text")}>
+            + text
+          </button>
+          <span className="editor-spacer" />
+          <button
+            type="button"
+            className="editor-btn"
+            data-fullscreen-target={canvasId}
+            title="Fullscreen"
+          >
+            ⛶ fullscreen
+          </button>
+          <button type="button" className="editor-btn" onClick={onCopy}>
+            {copied ? "copied!" : "copy json"}
+          </button>
+          <button
+            type="button"
+            className="editor-btn editor-btn-primary"
+            onClick={onExport}
+          >
+            export json
+          </button>
+          <button type="button" className="editor-btn" onClick={onClear}>
+            clear
+          </button>
+          {restored && (
+            <button type="button" className="editor-btn editor-btn-warn" onClick={onDiscardDraft}>
+              discard draft
+            </button>
+          )}
+        </div>
 
-      <div ref={wrapperRef} className="diagram editor-canvas" style={{ height: "70vh" }}>
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          connectionMode={ConnectionMode.Loose}
-          deleteKeyCode={["Delete"]}
-          fitView
-          fitViewOptions={{ padding: 0.2 }}
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background color="#d1d5db" gap={20} />
-          <Controls showInteractive={false} />
-          <MiniMap pannable zoomable maskColor="rgba(243,244,246,0.6)" />
-        </ReactFlow>
-      </div>
+        <div id={canvasId} ref={wrapperRef} className="diagram editor-canvas">
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            connectionMode={ConnectionMode.Loose}
+            deleteKeyCode={["Delete"]}
+            fitView
+            fitViewOptions={{ padding: 0.2 }}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background color="#d1d5db" gap={20} />
+            <Controls showInteractive={false} />
+            <MiniMap pannable zoomable maskColor="rgba(243,244,246,0.6)" />
+          </ReactFlow>
+        </div>
 
-      <p className="editor-hints">
-        drag handles to connect • double-click a shape to edit text • select &amp; press <kbd>Delete</kbd> to remove • drag to reposition • autosaved to your browser
-      </p>
-
-      <div className="editor-howto">
-        <strong>To publish:</strong> click <em>export json</em>, save the file as
-        {" "}<code>src/content/sessions/&lt;slug&gt;.json</code>, then commit and push. The session shows up in the sidebar after deploy.
+        <p className="editor-hints">
+          drag handles to connect • double-click a shape to edit text • select &amp; press <kbd>Delete</kbd> to remove • drag to reposition • autosaved to your browser
+        </p>
       </div>
     </EditableContext.Provider>
   );

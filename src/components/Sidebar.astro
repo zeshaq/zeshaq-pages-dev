@@ -12,19 +12,10 @@ const { currentPath } = Astro.props;
 const blog = (await getCollection("blog", ({ data }) => !data.draft)).sort(
   (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
 );
-const sessions = (await getCollection("sessions")).sort(
-  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
-);
-
-const sessionChildren: NavNodeT[] = [
-  { label: "+ new session", href: "/sessions/new" },
-  ...buildTree(sessions, "/sessions"),
-];
 
 const tree: NavNodeT[] = [
   { label: "home", href: "/" },
   { label: "blog", children: buildTree(blog, "/blog") },
-  { label: "sessions", children: sessionChildren },
 ];
 ---
 
@@ -41,6 +32,11 @@ const tree: NavNodeT[] = [
             <NavNode node={node} currentPath={currentPath} />
           </li>
         ))}
+        <li>
+          <a class="nav-link nav-link-cta" href="/whiteboard" target="_blank" rel="noopener">
+            whiteboard ↗
+          </a>
+        </li>
       </ul>
     </nav>
   </details>

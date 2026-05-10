@@ -6,7 +6,7 @@ export type NavNode = {
   children?: NavNode[];
 };
 
-type CollectionItem = CollectionEntry<"blog"> | CollectionEntry<"sessions">;
+type CollectionItem = CollectionEntry<"blog">;
 
 const prettify = (s: string) =>
   s.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toLowerCase());

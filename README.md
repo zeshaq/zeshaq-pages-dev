@@ -15,7 +15,11 @@ npm run build    # → dist/
 - **Blog post**: drop a `.mdx` file in `src/content/blog/` with frontmatter (`title`, `date`, optional `description`, `draft`).
   - Mermaid: `import Mermaid from "../../components/Mermaid"` then `<Mermaid client:load chart={`graph TD; A-->B`} />`.
   - draw.io: `import DrawioEmbed from "../../components/DrawioEmbed.astro"` then `<DrawioEmbed src="https://viewer.diagrams.net/?...#R..." />`.
-- **Whiteboard session**: drop a `.json` file in `src/content/sessions/` with `{ title, date, description?, nodes, edges }`. Export from any ReactFlow editor and paste in.
+  - Inline ReactFlow: `import Whiteboard from "../../components/Whiteboard"` then declare `export const nodes = [...]; export const edges = [...]` and render `<Whiteboard client:load data={{ nodes, edges }} />`.
+
+## Whiteboard
+
+Open the whiteboard tool from the sidebar (or directly at `/whiteboard`). It opens in a new tab as a full-window editor with rectangle / ellipse / text shapes, drag-to-connect, double-click-to-edit, autosave-to-localStorage, and a `⛶ fullscreen` toolbar button.
 
 ## Deploy
 
