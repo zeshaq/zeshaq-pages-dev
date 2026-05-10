@@ -1,0 +1,148 @@
+---
+title: "Red Hat OpenShift AI: from Jupyter to vLLM"
+description: "What Red Hat OpenShift AI (formerly RHODS) gives you over a DIY ML stack on Kubernetes, the lifecycle components that matter, and how the LLM tooling — InstructLab, vLLM, model registry — changed the platform's center of gravity."
+date: 2026-05-10
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const accel = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge  = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const gpuEdge   = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const aiNodes = [
+  { id: "ds",         position: { x: 380, y: 0   }, data: { label: "data scientist" },         style: stage },
+  { id: "dashboard",  position: { x: 380, y: 90  }, data: { label: "OpenShift AI Dashboard" }, style: ctrl },
+  { id: "workbench",  position: { x: 80,  y: 220 }, data: { label: "Workbench\n(Jupyter)" },   style: ctrl },
+  { id: "pipelines",  position: { x: 290, y: 220 }, data: { label: "Data Science\nPipelines" }, style: ctrl },
+  { id: "training",   position: { x: 500, y: 220 }, data: { label: "Distributed Training\n(Ray / Kubeflow)" }, style: ctrl },
+  { id: "serving",    position: { x: 720, y: 220 }, data: { label: "Model Serving\n(KServe + vLLM)" }, style: ctrl },
+  { id: "registry",   position: { x: 400, y: 380 }, data: { label: "Model Registry" }, style: ctrl },
+  { id: "gpus",       position: { x: 720, y: 380 }, data: { label: "GPU nodes\n(NVIDIA / AMD / Gaudi)" }, style: accel },
+  { id: "s3",         position: { x: 80,  y: 380 }, data: { label: "S3 / object store\n(data + weights)" }, style: ext },
+  { id: "clients",    position: { x: 720, y: 510 }, data: { label: "inference clients" }, style: stage },
+];
+
+export const aiEdges = [
+  { id: "u1",  source: "ds",         target: "dashboard", ...reqEdge },
+  { id: "d1",  source: "dashboard",  target: "workbench", label: "open", ...dataEdge },
+  { id: "d2",  source: "dashboard",  target: "pipelines", label: "run",  ...dataEdge },
+  { id: "d3",  source: "dashboard",  target: "serving",   label: "deploy", ...dataEdge },
+  { id: "wb1", source: "workbench",  target: "s3",        label: "read data", ...dataEdge },
+  { id: "wb2", source: "workbench",  target: "pipelines", label: "kick off", ...dataEdge },
+  { id: "p1",  source: "pipelines",  target: "training",  label: "scale-out", ...dataEdge },
+  { id: "p2",  source: "pipelines",  target: "registry",  label: "register",  ...dataEdge },
+  { id: "t1",  source: "training",   target: "gpus",      label: "uses",      ...gpuEdge },
+  { id: "t2",  source: "training",   target: "s3",        label: "checkpoints", ...dataEdge },
+  { id: "r1",  source: "registry",   target: "serving",   label: "deploy version", ...dataEdge },
+  { id: "s1",  source: "serving",    target: "gpus",      label: "uses",      ...gpuEdge },
+  { id: "s2",  source: "serving",    target: "clients",   label: "inference API", ...reqEdge },
+];
+
+Red Hat OpenShift AI is the new name for what was, until 2024, Red Hat OpenShift Data Science (RHODS) — and before that, the upstream Open Data Hub. The renaming wasn't just marketing: it tracked a center-of-gravity shift in the product itself, from "Jupyter notebooks for data scientists on OpenShift" to "the platform you build, train, fine-tune, and serve models on, *including* large language models." The notebook is still in the box. It's no longer the product's main job.
+
+This post walks through what the platform actually is in 2026.
+
+## Position
+
+OpenShift AI is **the MLOps platform shipped on OpenShift**. Its closest competitors are:
+
+- **AWS SageMaker** — most feature-complete, deeply tied to AWS
+- **Databricks** — strong on data + ML lifecycle, lakehouse-centric
+- **GCP Vertex AI** — tight Google Cloud integration
+- **DIY Kubeflow + KServe + Ray + Jupyter** — viable, but you're integrating five products
+
+OpenShift AI's natural lane is "OpenShift-centric organization that wants the MLOps stack as a Red Hat-supported, on-cluster product — same support contract, same operator model, same console — without committing to a hyperscaler's managed AI service."
+
+## What it actually contains
+
+The platform is delivered by the **OpenShift AI Operator** and a handful of dependent operators (Authorino for auth, Service Mesh for inference traffic, Pipelines for orchestration, Serverless for KServe, NVIDIA / AMD / Gaudi GPU operators). The CRDs and components are independent — you adopt the slices you need.
+
+| Component | What it does |
+| --- | --- |
+| **Workbenches** | On-demand Jupyter notebook servers per user, with curated images (PyTorch, TensorFlow, CUDA, ROCm, R-Studio) |
+| **Data Science Pipelines** | Argo / Tekton-backed orchestration of training jobs (built on Kubeflow Pipelines v2) |
+| **Distributed Training** | Ray clusters and Kubeflow Training Operator for multi-node, multi-GPU jobs |
+| **Model Registry** | First-class CR-based registry of trained models with versioning and lineage |
+| **Model Serving** | KServe (Serverless mode) for real-time inference; ModelMesh for many-models-per-pod density; **vLLM** as the runtime for LLMs |
+| **InstructLab** | Red Hat's tooling for fine-tuning open-source LLMs (Granite, Mistral, Llama) using a synthetic-data-generation method (LAB) |
+| **OpenShift Service Mesh integration** | mTLS, traffic shifting, canary deployment for model endpoints |
+| **GPU operators** | NVIDIA GPU Operator, AMD ROCm, Intel Gaudi — node enablement and scheduling |
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: aiNodes, edges: aiEdges }} height={620} />
+
+Reading the diagram:
+
+- The **OpenShift AI Dashboard** is the user's entry point — a console plugin into OCP, surfacing only the AI/ML capabilities.
+- A **Workbench** is a Jupyter (or RStudio) server with persistent storage, running as a pod with whatever curated image the user selected. Most teams keep notebooks in Git and data in S3.
+- **Data Science Pipelines** is where notebook work gets promoted into reproducible training jobs. Pipelines compile from Python (KFP SDK) into Argo workflows; each step runs as a pod.
+- **Distributed Training** is the scale-out layer: Ray for general distributed compute, Kubeflow Training Operator for framework-native (PyTorch / TensorFlow) distributed jobs.
+- **GPU nodes** are the green-dashed boxes — accelerators, scheduled via the GPU operator that handles drivers, runtime, and resource exposure (`nvidia.com/gpu` etc.). Both training and serving pull from the same node pool.
+- **Model Registry** sits between training and serving as the system of record. Trained models register here; serving deploys from here. This was a 2024 addition and it noticeably tightened the lifecycle.
+- **Model Serving** is KServe (real-time, autoscale-to-zero) with vLLM as the LLM runtime. Inference clients hit the Service Mesh-managed endpoint; the underlying pods run on GPU nodes.
+
+## The lifecycle
+
+What an actual project tends to look like:
+
+1. **Develop.** Data scientist opens a Workbench from the dashboard, pulls data from S3, develops a notebook against a small sample. Notebook gets committed to Git.
+2. **Promote to a pipeline.** The notebook gets split into pipeline steps via the KFP SDK (or kubeflow's notebook-to-pipeline tooling). The pipeline now runs as a reproducible job — same code, same containers, parameterized inputs.
+3. **Train at scale.** When the model needs more compute than a single node, the pipeline launches a Ray or Kubeflow Training Operator job. Multi-GPU, multi-node, gradient sharding for big models.
+4. **Register.** The trained model and its metrics land in the **Model Registry** with a version, lineage to the pipeline run, and a link to the artifact in S3.
+5. **Serve.** A `ServingRuntime` + `InferenceService` deploys the registered model. KServe brings up a pod (with the right GPU resources), exposes a v2 inference endpoint via OpenShift Service Mesh, and scales based on request rate.
+6. **Iterate.** Canary the new version to a percentage of traffic via Service Mesh. Promote on success.
+
+The platform's value isn't any single step — it's that all six are first-class CRs, scoped to a project, observable, GitOps-able, and supported.
+
+## LLMs, specifically
+
+The platform's center of gravity moved toward LLMs from late 2023 onward. The relevant additions:
+
+- **vLLM as the default LLM runtime.** Continuous batching, paged-attention KV cache, speculative decoding — all the things that make a 70B-parameter model serveable at reasonable cost. Out of the box.
+- **Multi-LoRA serving.** One base model + many adapters in a single pod; route per-tenant or per-task LoRAs without spinning up separate inference services.
+- **InstructLab.** Red Hat's fine-tuning approach using **LAB** (Large-scale Alignment for chatBots): a synthetic-data-generation method that lets you teach a model new skills/knowledge from a small amount of seed data. Targeted at the Granite family but works on Mistral / Llama / Phi. Available as a CLI for local prototyping and as a pipeline for production runs on the platform.
+- **Granite models.** Red Hat's open-source LLM family (Apache 2.0, including weights), shipped with the platform's example pipelines. Good baseline if you want a model whose license isn't going to surprise legal.
+- **Inference Server (RHEL AI).** The same vLLM-based serving stack also ships as **Red Hat AI Inference Server**, a standalone container for non-OpenShift environments. Lets you train on OpenShift AI and serve on a bare RHEL node if that's what your environment requires.
+- **GuardRails / safety.** Pluggable input/output filters in the inference path for prompt-injection detection, PII redaction, toxicity classification.
+- **RAG patterns.** First-class examples for Retrieval-Augmented Generation using vector DBs (Milvus, pgvector via OpenShift Data Foundation) and Granite/Llama embedding models. Less a feature and more a documented reference architecture, but treated as a first-tier use case.
+
+The framing: traditional ML is still well supported (sklearn, XGBoost, classical PyTorch CV/NLP), but if your team is building LLM applications, OpenShift AI's recent feature direction is overwhelmingly aimed at you.
+
+## Integration story
+
+OpenShift AI ties into the rest of the Red Hat stack in ways that matter:
+
+- **OpenShift GitOps.** All of OpenShift AI's CRs (workbenches, pipelines, inference services, model versions) are first-class Kubernetes objects. ApplicationSet + ClusterDecisionResource means you can deploy model serving across an RHACM-managed fleet — see [the OpenShift GitOps post](/blog/openshift-gitops).
+- **RHACM.** Multi-cluster training with one hub plus many spokes (e.g., per-region GPU pools) is operable through Placement.
+- **RHACS.** Inference services are containers; RHACS scans them, applies the same admission and runtime policies as any other workload — see [the RHACS post](/blog/rhacs).
+- **OpenShift Service Mesh.** Traffic shifting, mTLS, observability for inference endpoints, including for canary rollouts of model versions.
+- **OpenShift Pipelines (Tekton).** Continuous integration for the *code* side of model development — image builds, lint, test — running alongside Data Science Pipelines for the *training* side.
+
+The platform doesn't reinvent any of these; it extends them with AI-specific CRs and curated images.
+
+## Limitations and pitfalls
+
+- **GPU economics.** GPU nodes are the dominant cost. Autoscale-to-zero on KServe inference helps; the harder problem is training jobs that hold GPUs idle between steps. Watch GPU utilization, not just allocation.
+- **Image curation overhead.** Curated workbench images are convenient but can lag the framework versions data scientists want. Plan for custom workbench images per team — it's straightforward but it's work.
+- **Operator stack is heavy.** OpenShift AI pulls in Service Mesh, Serverless, Pipelines, Authorino, GPU Operator, and its own operator. Each is fine; the aggregate is significant. A cluster running OpenShift AI is not a small cluster.
+- **vLLM versioning.** The vLLM runtime updates frequently and supports new model architectures on each release. The version shipped with OpenShift AI lags upstream by a few weeks. For bleeding-edge models, you may need to build a custom serving runtime image.
+- **Fine-tuning ≠ training-from-scratch.** OpenShift AI is excellent for fine-tuning and inference. Training a foundation model from scratch is a different scale and a different conversation; the platform supports it, but it's rarely the right choice unless you have a very specific reason.
+- **Don't run notebooks in prod.** The Workbench is a development environment. Production training runs should be Pipelines; production inference should be KServe `InferenceService`. The platform makes the distinction easy to ignore — don't.
+
+## Where to start
+
+1. Install the **OpenShift AI Operator** on a cluster with at least one GPU node available (NVIDIA GPU Operator if you're on NVIDIA hardware).
+2. Open the dashboard. Create a **Project**. Spin up a **Workbench** with a CUDA-enabled image.
+3. Walk the bookinfo-equivalent: pull a public dataset, train a small classifier, save to S3 — entirely from the notebook. Validates the platform without involving pipelines yet.
+4. Convert that notebook into a **Data Science Pipeline**. Validate that the same code runs end-to-end without you in front of it.
+5. Register the resulting model in the **Model Registry**, then deploy via **KServe**. Hit the inference endpoint with `curl`. This is the "I have an end-to-end model lifecycle" milestone.
+6. *Then* introduce distributed training, vLLM-based LLM serving, or InstructLab — whichever maps to your actual workload. Don't add scale or LLM tooling before the lifecycle works on a small classical model.
+
+The mistake to avoid: treating OpenShift AI as a Jupyter-hosting service. The dashboard makes that easy because spinning up a Workbench is the path of least resistance. The platform's value is in everything *after* the notebook — pipelines, registry, serving — and teams that don't progress past Workbench-as-dev-environment never realize it.
