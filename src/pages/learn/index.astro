@@ -1,0 +1,38 @@
+---
+import LearnLayout from "../../layouts/LearnLayout.astro";
+import DocsTocNode from "../../components/DocsTocNode.astro";
+import { getCollection } from "astro:content";
+import { buildLearnTree, type NavNode } from "../../utils/navTree";
+
+const learn = await getCollection("learn", ({ data }) => !data.draft);
+const tree = buildLearnTree(learn, "/learn");
+
+function countLeaves(n: NavNode): number {
+  if (n.href) return 1;
+  return (n.children ?? []).reduce((acc, c) => acc + countLeaves(c), 0);
+}
+
+const totalLeaves = tree.reduce((acc, n) => acc + countLeaves(n), 0);
+---
+
+<LearnLayout title="Learning — Zahid's Blog">
+  <section class="mb-10">
+    <h1 class="text-2xl font-semibold mb-2">Learning</h1>
+    <p class="text-[var(--color-muted)] mb-3">
+      Self-paced tracks for hands-on engineers. Each track is a sequence of numbered modules with
+      diagrams, code, and exercises. Start at module 00 and walk through, or skip to the modules
+      that match what you're trying to ship.
+    </p>
+    <p class="text-[var(--color-muted)] text-sm">
+      <strong>{totalLeaves}</strong> modules across <strong>{tree.length}</strong> track{tree.length === 1 ? "" : "s"}.
+    </p>
+  </section>
+
+  <section class="toc">
+    {tree.map((node) => (
+      <div class="toc-section">
+        <DocsTocNode node={node} depth={0} />
+      </div>
+    ))}
+  </section>
+</LearnLayout>

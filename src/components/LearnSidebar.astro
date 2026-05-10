@@ -1,7 +1,7 @@
 ---
 import { getCollection } from "astro:content";
 import NavNode from "./NavNode.astro";
-import { buildCategoryTree, type NavNode as NavNodeT } from "../utils/navTree";
+import { buildLearnTree, type NavNode as NavNodeT } from "../utils/navTree";
 
 interface Props {
   currentPath: string;
@@ -9,17 +9,15 @@ interface Props {
 
 const { currentPath } = Astro.props;
 
-const blog = (await getCollection("blog", ({ data }) => !data.draft)).sort(
-  (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
-);
+const learn = await getCollection("learn", ({ data }) => !data.draft);
 
-const tree: NavNodeT[] = buildCategoryTree(blog, "/blog");
+const tree: NavNodeT[] = buildLearnTree(learn, "/learn");
 ---
 
 <aside class="sidebar">
   <details class="sidebar-toggle" open>
     <summary class="sidebar-summary">
-      <a href="/" class="sidebar-brand" onclick="event.stopPropagation()">Zahid's Blog</a>
+      <a href="/learn" class="sidebar-brand" onclick="event.stopPropagation()">Learning</a>
       <span class="sidebar-hamburger" aria-hidden="true">≡</span>
     </summary>
 
@@ -27,7 +25,7 @@ const tree: NavNodeT[] = buildCategoryTree(blog, "/blog");
       <input
         type="search"
         class="sidebar-filter"
-        placeholder="filter posts…"
+        placeholder="filter modules…"
         autocomplete="off"
         spellcheck="false"
         data-filter
@@ -36,27 +34,19 @@ const tree: NavNodeT[] = buildCategoryTree(blog, "/blog");
 
     <nav class="sidebar-nav">
       <ul data-filter-list>
-        {tree.map((node) => (
-          <li>
-            <NavNode node={node} currentPath={currentPath} />
-          </li>
-        ))}
+        {tree.length === 0 ? (
+          <li class="docs-empty">No tracks yet — check back soon.</li>
+        ) : (
+          tree.map((node) => (
+            <li>
+              <NavNode node={node} currentPath={currentPath} />
+            </li>
+          ))
+        )}
       </ul>
       <ul class="sidebar-extra">
         <li>
-          <a class="nav-link nav-link-cta" href="/learn">
-            learn ↗
-          </a>
-        </li>
-        <li>
-          <a class="nav-link nav-link-cta" href="/docs">
-            docs ↗
-          </a>
-        </li>
-        <li>
-          <a class="nav-link nav-link-cta" href="/whiteboard" target="_blank" rel="noopener">
-            whiteboard ↗
-          </a>
+          <a class="nav-link" href="/">← Back to Blog</a>
         </li>
       </ul>
     </nav>

@@ -1,0 +1,225 @@
+---
+title: "MCP — the Model Context Protocol"
+sidebar_label: "03 — MCP"
+description: "The open standard that consolidated how LLMs talk to tools — what it is, how it works, building your first MCP server, and the ecosystem of hundreds of pre-built servers."
+estimated_minutes: 70
+last_updated: 2026-05-10
+---
+
+Before late 2024, every agent framework had its own way of defining and exposing tools to LLMs. LangChain's `Tool` class. LlamaIndex's `BaseTool`. The vendor SDKs each had their own. Sharing tools between agents — or between teams using different frameworks — meant rewriting wrappers.
+
+**MCP (Model Context Protocol)** is Anthropic's answer to this fragmentation, released open-source in November 2024. It's the **USB-C for AI** — a single protocol for LLM-to-tool communication that every major framework now supports. Once a tool is written as an MCP server, *any* MCP-capable agent runtime can use it.
+
+This module is what MCP is, how it works, and how to build your own server.
+
+## The 30-second mental model
+
+- **MCP Server** — a process that exposes tools, data resources, and prompt templates. Runs anywhere — local script, Docker container, remote service.
+- **MCP Client** — embedded in your agent runtime. Connects to one or more MCP servers, discovers what they expose, and routes the LLM's tool calls to the right server.
+- **Three primitives** an MCP server can offer: **Tools** (callable functions), **Resources** (readable data), **Prompts** (reusable templates).
+- **Two transports** — `stdio` (local subprocess) and HTTP/SSE (remote).
+
+If you wrote a tool in module 02, you can re-wrap it as an MCP server in 50 lines of code. The tool definition itself doesn't change — what changes is how it's exposed.
+
+## Why it spread so fast
+
+Several things aligned in 2024-2025:
+
+- **The protocol is small.** ~5 message types. A complete server in any language fits in a single file.
+- **Open spec from day one.** Anthropic published the spec + reference SDKs for TypeScript and Python before locking the design. Community contributions followed.
+- **The pain was real.** Engineers were tired of writing the GitHub tool wrapper, the filesystem tool wrapper, the Postgres tool wrapper — over and over.
+- **Major-vendor adoption.** Claude Desktop shipped MCP support first; OpenAI's Agents SDK adopted it in 2025; Microsoft Copilot Studio adopted it; every major IDE (Cursor, Cline, Zed, Continue, Windsurf) embedded MCP clients.
+- **The ecosystem became a flywheel.** By mid-2025 there were thousands of MCP servers — filesystem, GitHub, Postgres, Slack, Notion, Linear, Sentry, Stripe, Brave Search, and many more. Each new agent runtime got those tools for free.
+
+## The protocol
+
+The full MCP spec is at `https://modelcontextprotocol.io/`. The minimum to understand:
+
+- **JSON-RPC 2.0** is the wire format. Requests and responses are JSON messages.
+- **`initialize`** — the client says hello, declares its supported protocol version, gets the server's capabilities back.
+- **`tools/list`** — the client asks what tools the server offers; the server returns names + JSON Schema descriptions.
+- **`tools/call`** — the client invokes a tool; the server returns the result.
+- **`resources/list`**, **`resources/read`** — similar for read-only data.
+- **`prompts/list`**, **`prompts/get`** — similar for prompt templates.
+
+That's most of the protocol. There are a few other messages (logging, sampling, notifications) but you can build useful MCP servers without them.
+
+## Building your first MCP server
+
+Here's a complete MCP server in Python that exposes a single tool — `get_weather` from module 01 — using the official SDK:
+
+```python
+# weather_server.py
+import asyncio
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+import mcp.types as types
+
+# Create the server.
+app = Server("weather-server")
+
+@app.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="get_weather",
+            description="Get the current weather for a location.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name"
+                    }
+                },
+                "required": ["location"]
+            }
+        )
+    ]
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    if name == "get_weather":
+        # In real life: hit a weather API.
+        location = arguments["location"]
+        return [types.TextContent(
+            type="text",
+            text=f"In {location}, it's 22°C and partly cloudy."
+        )]
+    raise ValueError(f"Unknown tool: {name}")
+
+async def main():
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Install the SDK: `pip install mcp`. Run it: `python weather_server.py`. It now communicates over stdin/stdout using JSON-RPC; an MCP client can spawn it as a subprocess and call its tools.
+
+A TypeScript version is similar — `npm install @modelcontextprotocol/sdk`, write the equivalent setup with `Server` from `@modelcontextprotocol/sdk/server`. The shape is identical.
+
+## Connecting to an MCP server
+
+The Anthropic SDK now supports MCP natively. Here's how to use the weather server:
+
+```python
+import anthropic
+from anthropic.lib.mcp import MCPClientStdio
+
+# Spawn the MCP server as a child process.
+mcp_client = MCPClientStdio(
+    command="python",
+    args=["weather_server.py"]
+)
+
+# Connect, then list tools.
+await mcp_client.connect()
+tools = await mcp_client.list_tools()
+
+# Use them in an agent loop — Claude knows how to call MCP tools.
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model="claude-sonnet-4-7",
+    max_tokens=1024,
+    mcp_servers=[mcp_client],  # MCP-aware client
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+)
+print(response)
+```
+
+The framework details vary by SDK; the conceptual shape is the same everywhere:
+
+1. **Discover** — connect, list available tools and resources.
+2. **Expose** — pass the tools to the LLM as part of the prompt.
+3. **Dispatch** — when the LLM calls a tool, route the call to the right MCP server.
+4. **Return** — feed the server's result back to the LLM.
+
+## stdio vs HTTP/SSE
+
+The two transports cover different scenarios:
+
+**stdio (local subprocess):**
+- The MCP client spawns the server as a child process and talks to it via stdin/stdout.
+- Best for: development tools, local-only servers (filesystem, Git, local databases).
+- No network exposure; one-to-one client-server.
+- Used by: Claude Desktop, Cursor, Cline, Zed for local tools.
+
+**HTTP / SSE (remote):**
+- The MCP server runs as a long-lived web service.
+- Best for: production servers shared across many clients, multi-tenant systems, hosted MCP services.
+- Authentication via standard HTTP auth (bearer tokens, OAuth).
+- Used by: enterprise MCP deployments, hosted MCP services (Cloudflare AI Gateway, etc.).
+
+For learning and local development, stdio is what you'll use 90% of the time.
+
+## The ecosystem
+
+A non-exhaustive sample of MCP servers you can use today (without writing any code):
+
+| Category | Servers |
+| --- | --- |
+| **Filesystem & dev** | filesystem, git, github, gitlab, terraform |
+| **Communication** | slack, gmail, outlook, discord |
+| **Productivity** | notion, linear, jira, asana, google-drive, dropbox |
+| **Data** | postgres, mysql, mongodb, sqlite, snowflake, bigquery |
+| **Web** | brave-search, google-search, puppeteer, fetch |
+| **CRM / commerce** | hubspot, salesforce, stripe, shopify |
+| **Observability** | sentry, datadog, pagerduty, grafana |
+| **Internal** | (companies write their own for their bespoke systems) |
+
+The canonical list is at the `modelcontextprotocol/servers` GitHub repo. Most can be installed in two commands and configured via a simple config file.
+
+## Configuration: the `mcp.json` pattern
+
+Most MCP-capable applications (Claude Desktop, Cursor, etc.) accept an `mcp.json` config file. Example:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..."
+      }
+    },
+    "weather": {
+      "command": "python",
+      "args": ["/Users/me/dev/weather_server.py"]
+    }
+  }
+}
+```
+
+The application reads this, spawns each server as a subprocess at startup, and exposes their tools to the LLM throughout the session.
+
+## Resources and prompts (briefly)
+
+This module focused on **tools** because they're the dominant primitive. Briefly:
+
+- **Resources** are URIs the server exposes for the LLM to *read*. Examples: file contents, query results, screenshots. The model decides when to request them.
+- **Prompts** are reusable templates the server provides — *"give me the 'commit-message-from-diff' prompt with this diff"* and the server returns a fully-instantiated prompt.
+
+Most real-world MCP servers expose just tools. Resources are useful for static catalogs; prompts are useful for re-using high-quality prompts across many clients.
+
+## Exercise
+
+1. Install the official MCP Python SDK: `pip install mcp`.
+2. Save the `weather_server.py` example above. Run it from one terminal.
+3. Install the **MCP Inspector** — a web UI for poking at any MCP server: `npx @modelcontextprotocol/inspector python weather_server.py`. Browse to the Inspector URL. Click around: list tools, call `get_weather` with `{"location": "Tokyo"}`. Watch the JSON-RPC traffic.
+4. Add a second tool — `get_forecast(location, days)` — that returns a multi-day forecast string. Restart the server, refresh the Inspector, see it appear.
+5. **Bonus**: install the filesystem MCP server (`npx @modelcontextprotocol/server-filesystem ~/some-dir`) and connect Claude Desktop to it. Ask Claude to list files in that directory and read one. You're now using a production-grade MCP server you didn't write.
+
+## Key idea to take forward
+
+MCP turns tool-building from a per-framework chore into a portable artifact. **Once you write your tools as an MCP server, they work with every agent runtime that speaks MCP** — Claude Desktop, Cursor, Cline, Anthropic and OpenAI SDKs, Google ADK, Microsoft Copilot Studio, and every framework that's joined the ecosystem.
+
+The strategic implication: **tools are no longer the moat for agent frameworks**. The frameworks that thrive in 2026 differentiate on runtime quality — planning, error recovery, observability, multi-agent orchestration — not "how many tools we ship with."
+
+**Next:** [Module 04 — Memory](/learn/agentic-ai/memory) covers what to do when the in-loop message history isn't enough — long-term memory, vector stores, episodic memory, and the trade-offs that shape every production agent's design.

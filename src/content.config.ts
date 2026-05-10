@@ -23,4 +23,18 @@ const docs = defineCollection({
   }),
 });
 
-export const collections = { blog, docs };
+const learn = defineCollection({
+  loader: glob({ pattern: "**/*.{md,mdx}", base: "./src/content/learn" }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string().optional(),
+    sidebar_label: z.string().optional(),
+    track: z.string().optional(),
+    estimated_minutes: z.number().optional(),
+    prereqs: z.array(z.string()).optional(),
+    last_updated: z.coerce.date().optional(),
+    draft: z.boolean().default(false),
+  }),
+});
+
+export const collections = { blog, docs, learn };

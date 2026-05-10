@@ -1,0 +1,139 @@
+---
+title: "Tools and function calling"
+sidebar_label: "02 — Tools"
+description: "How function calling / tool use actually works underneath, JSON Schema for tool definitions, parallel tool calls, structured outputs, and the failure modes that aren't obvious until you ship."
+estimated_minutes: 60
+last_updated: 2026-05-10
+---
+
+The agent loop from module 01 ends with: *"if it's a tool call, execute and feed back."* This module unpacks that single sentence. **Tool use** (Anthropic's term) and **function calling** (OpenAI's term) are the same idea: the model emits a structured response saying *"call function X with arguments `{...}`"* and the runtime executes it.
+
+Understanding what's actually happening under the covers is the difference between an agent that mostly works and an agent that ships.
+
+## What "tool use" actually is
+
+LLMs are trained on a corpus that includes many examples of structured-call output, plus fine-tuning on examples of tool-use behavior. When you provide a tool definition in your prompt — under whatever the provider calls it (`tools` for both OpenAI and Anthropic) — the model is being shown: *"these are functions you may call by emitting a specific structured response format."*
+
+When the model decides to use a tool, its response payload contains a **tool call block** with the function name and arguments. The runtime parses this, dispatches to the function, and includes the result in the next turn's message history. The model then continues, often deciding what to do based on the result.
+
+It's not magic. It's a structured-output trick combined with training that taught the model when to use it.
+
+## Tool definitions are JSON Schema
+
+Every modern tool-use API accepts tool definitions in **JSON Schema** form. The schema serves three purposes:
+
+1. **Documentation for the model.** The model reads the schema to understand what arguments the tool takes.
+2. **Validation by the runtime.** When the model emits a tool call, the runtime can validate it against the schema before execution.
+3. **A contract.** The tool's behavior is constrained by what the schema allows.
+
+Example — a function that lists files in a directory:
+
+```python
+TOOL_LIST_FILES = {
+    "name": "list_files",
+    "description": "List files in a directory. Returns up to 100 entries; deeper paths are not recursed.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute path to a directory. Must exist and be readable."
+            },
+            "show_hidden": {
+                "type": "boolean",
+                "description": "Include dotfiles. Defaults to false.",
+                "default": False
+            }
+        },
+        "required": ["path"]
+    }
+}
+```
+
+**The `description` fields are not cosmetic.** They are part of the prompt the model sees. A vague description leads to wrong arguments. *"Must exist and be readable"* tells the model not to pass a guess. *"Defaults to false"* lets the model omit the parameter when it's the right call.
+
+Write tool descriptions like you're writing for a junior developer who reads only the spec, not the code. Every gotcha goes in the description.
+
+## Parallel tool calls
+
+A 2024-era feature now considered table stakes: the model can request **multiple tools in a single response**, and the runtime executes them concurrently. Used for:
+
+- Fan-out reads: "fetch the README from these 5 repos."
+- Independent data lookups: "what's the weather in Tokyo, London, and NYC?"
+- Speculative exploration: "list these three directories so I can pick which to look in next."
+
+In Anthropic's API, parallel tool calls appear as multiple `tool_use` blocks in a single assistant message. The runtime executes all of them, and the next user message contains a list of `tool_result` blocks with matching `tool_use_id`s.
+
+```python
+# After the model's response with N tool_use blocks:
+tool_results = []
+for block in response.content:
+    if block.type == "tool_use":
+        # In production: dispatch to a thread pool or asyncio.gather
+        result = TOOL_HANDLERS[block.name](**block.input)
+        tool_results.append({
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": result,
+        })
+messages.append({"role": "user", "content": tool_results})
+```
+
+The sequential version (one at a time) is correct but slow. For any agent that needs to be responsive, parallelize the tool execution.
+
+## Structured outputs
+
+Sibling concept: JSON Schema applied to the **final answer**, not just tool inputs. You declare: *"the model's final response must match this schema."* The runtime guarantees the output parses as valid JSON conforming to the schema.
+
+Used when the agent's output needs to be consumed by another program — a downstream service expects `{"answer": str, "confidence": float, "sources": [str]}` and you don't want to depend on the model freeform-generating valid JSON.
+
+In Anthropic's API, this is enabled via `tool_choice` and a "synthetic tool" representing the output structure. In OpenAI's API, there's a dedicated `response_format` parameter. Both providers improved their JSON adherence dramatically in 2024-2025 — the days of "the model returned almost-JSON" are mostly over for structured outputs.
+
+## The failure modes you'll hit
+
+Things the textbook doesn't tell you:
+
+**Tool description ambiguity.** If your description is "search for products" the model will pass any string it thinks is a product. Tighten to "search by exact SKU or product name; do not pass natural-language descriptions" and the agent's behavior sharpens. Description engineering is real.
+
+**Argument hallucination.** The model invents an argument the schema doesn't allow, or passes a string where you require an enum value. Mitigations:
+- Tighter JSON Schema (`enum: [...]`, `pattern: "..."`).
+- Validate the call before dispatch; if invalid, return an error as the tool result. The model will re-try with corrected arguments.
+
+**Tool overload.** Past ~20-30 tools, model performance on selecting the right tool degrades. Mitigations:
+- Tool grouping with progressive disclosure (a "list tools in category X" meta-tool).
+- Multiple specialized agents (covered in module 07).
+
+**Slow tools blocking the loop.** A tool that takes 30 seconds blocks every subsequent turn. Mitigations:
+- Per-tool timeouts.
+- Async tools that return a job ID immediately, with a separate "check job status" tool.
+
+**Tools that succeed but return useless results.** "Found 0 results" technically succeeded but tells the model nothing. Tools should be honest about what happened, including error states, so the model can plan around them.
+
+**Side-effecting tools the model calls too eagerly.** "Send email" is not the same as "search emails." The model may call destructive tools on speculative reasoning. Mitigations:
+- Mark tools as `requires_human_confirmation: True` and have the runtime prompt for approval before executing.
+- Run side-effecting tools in dry-run mode first and present the plan.
+
+## Tool result formatting
+
+The result you return to the model is also a prompt. A few patterns that work:
+
+- **Structured when it helps.** Return JSON for data-heavy results: `{"status": "ok", "results": [...], "next_page_token": "..."}`. The model can reason about structure better than a wall of text.
+- **Truncate long outputs.** A 100K-token file's contents are not what you want in the context window. Return a summary or first/last N lines.
+- **Include error metadata.** If a tool failed, the result should explain *why* — the model will adapt better to "permission denied" than to "tool returned an error."
+- **Don't echo huge payloads.** A successful database query returning 10,000 rows shouldn't return all 10,000 rows to the model. Return the rows the model actually needs, ideally with a pagination cursor.
+
+## Exercise
+
+Extend the agent from module 01:
+
+1. **Add a `list_files` tool** that takes a `path` and returns the directory contents. Use the JSON Schema example above.
+2. **Add a `read_file` tool** that takes a path and returns the file contents (truncated to 2000 chars).
+3. **Ask the agent**: *"List the files in `/etc`, then read `/etc/hosts` and tell me what entries it has."* Watch it use both tools.
+4. **Force parallel execution**: ask *"Show me the contents of `/etc/hosts`, `/etc/resolv.conf`, and `/etc/hostname` in one go."* Modern Claude / GPT-5 will issue three parallel `tool_use` blocks. Execute them with `asyncio.gather` or a thread pool. Time both sequential and parallel runs; observe the latency difference.
+5. **Inject an error**: make `read_file` raise on a specific filename. Return the error as a tool result and see how the agent recovers.
+
+## Key idea to take forward
+
+Tool definitions are part of the prompt, even though they look like an API parameter. Their quality determines your agent's behavior more than almost anything else you'll tune. **Writing good tool descriptions is the highest-leverage skill in agent engineering** — beats prompt tweaking, beats model selection, beats most planning frameworks.
+
+**Next:** [Module 03 — MCP](/learn/agentic-ai/mcp) takes the patterns we just used to define tools and standardizes them across runtimes via the Model Context Protocol. Once you have MCP-shaped tools, any agent runtime can use them — and the ecosystem of pre-built MCP servers becomes available to your agent for free.

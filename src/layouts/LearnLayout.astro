@@ -1,0 +1,85 @@
+---
+import "../styles/global.css";
+import LearnSidebar from "../components/LearnSidebar.astro";
+
+interface Props {
+  title?: string;
+  description?: string;
+  image?: string;
+  estimatedMinutes?: number;
+  lastUpdated?: Date;
+}
+
+const {
+  title = "Learning — Zahid's Blog",
+  description = "Self-paced learning tracks on agentic AI, MCP, agent frameworks, and the modern AI engineering stack.",
+  image = "/og-default.svg",
+  estimatedMinutes,
+  lastUpdated,
+} = Astro.props;
+
+const currentPath = Astro.url.pathname;
+const canonicalURL = new URL(currentPath, Astro.site).toString();
+const ogImage = new URL(image, Astro.site).toString();
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalURL} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <title>{title}</title>
+
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:site_name" content="Zahid's Blog" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <slot name="head" />
+  </head>
+  <body class="min-h-screen">
+    <div class="app-shell">
+      <LearnSidebar currentPath={currentPath} />
+      <main class="app-main">
+        <div class="app-content">
+          {(estimatedMinutes || lastUpdated) && (
+            <p class="learn-meta">
+              {estimatedMinutes && <span>~{estimatedMinutes} min read</span>}
+              {estimatedMinutes && lastUpdated && <span> · </span>}
+              {lastUpdated && <span>updated {lastUpdated.toISOString().slice(0, 10)}</span>}
+            </p>
+          )}
+          <slot />
+        </div>
+        <footer class="app-footer">
+          <span>built with astro on cloudflare pages · <a href="/">blog</a> · <a href="/docs">docs</a> · <a href="/rss.xml">RSS</a></span>
+        </footer>
+      </main>
+    </div>
+
+    <script is:inline>
+      document.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-fullscreen-target]");
+        if (!btn) return;
+        const target = document.getElementById(btn.dataset.fullscreenTarget);
+        if (!target) return;
+        if (document.fullscreenElement) {
+          document.exitFullscreen();
+        } else {
+          target.requestFullscreen?.();
+        }
+      });
+    </script>
+  </body>
+</html>

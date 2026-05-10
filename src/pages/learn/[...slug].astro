@@ -1,0 +1,31 @@
+---
+import LearnLayout from "../../layouts/LearnLayout.astro";
+import { getCollection, render } from "astro:content";
+import { stripIdPrefixes } from "../../utils/navTree";
+
+export async function getStaticPaths() {
+  const learn = await getCollection("learn", ({ data }) => !data.draft);
+  return learn.map((module) => ({
+    params: { slug: stripIdPrefixes(module.id) },
+    props: { module },
+  }));
+}
+
+const { module } = Astro.props;
+const { Content } = await render(module);
+---
+
+<LearnLayout
+  title={`${module.data.title} — Learning · Zahid's Blog`}
+  description={module.data.description}
+  estimatedMinutes={module.data.estimated_minutes}
+  lastUpdated={module.data.last_updated}
+>
+  <article class="learn-article prose">
+    <h1>{module.data.title}</h1>
+    {module.data.description && (
+      <p class="learn-description text-[var(--color-muted)]">{module.data.description}</p>
+    )}
+    <Content />
+  </article>
+</LearnLayout>

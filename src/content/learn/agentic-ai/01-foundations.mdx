@@ -1,0 +1,169 @@
+---
+title: "Foundations: the agent loop"
+sidebar_label: "01 — Foundations"
+description: "Loop, tools, state — the three properties that turn a chat completion into an agent. The minimal agent written from scratch in ~60 lines."
+estimated_minutes: 45
+last_updated: 2026-05-10
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const accent = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const phaseEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const loopEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const loopNodes = [
+  { id: "task",   position: { x: 60,  y: 220 }, data: { label: "user task" },                  style: stage },
+  { id: "prompt", position: { x: 250, y: 220 }, data: { label: "build prompt\n(task + history)" }, style: ctrl },
+  { id: "llm",    position: { x: 460, y: 220 }, data: { label: "call LLM" },                    style: ctrl },
+  { id: "parse",  position: { x: 670, y: 220 }, data: { label: "parse response" },              style: ctrl },
+  { id: "tool",   position: { x: 670, y: 80 },  data: { label: "is tool call?\nexecute tool" }, style: accent },
+  { id: "done",   position: { x: 880, y: 220 }, data: { label: "final answer\n→ return" },      style: stage },
+];
+
+export const loopEdges = [
+  { id: "l1", source: "task",   target: "prompt", ...phaseEdge },
+  { id: "l2", source: "prompt", target: "llm",    ...phaseEdge },
+  { id: "l3", source: "llm",    target: "parse",  ...phaseEdge },
+  { id: "l4", source: "parse",  target: "tool",   label: "tool call",  ...phaseEdge },
+  { id: "l5", source: "tool",   target: "prompt", label: "tool result", ...loopEdge },
+  { id: "l6", source: "parse",  target: "done",   label: "final answer", ...phaseEdge },
+];
+
+## The three-property definition
+
+An **agent** is an LLM application that:
+
+1. **Operates in a loop.** Each iteration, it decides what to do next based on the result of the previous one. *Not* one prompt-one response.
+2. **Has tools.** It can affect the world beyond returning text — read files, call APIs, run code, query a database.
+3. **Holds state.** Between iterations, it remembers the original task, prior actions, and observed results.
+
+Everything that follows in this track — MCP, memory, planning, multi-agent — is built on those three. If you can write the loop from scratch, you understand what every agent framework is doing under the covers.
+
+## The loop, visually
+
+<Whiteboard client:load data={{ nodes: loopNodes, edges: loopEdges }} height={400} />
+
+The dashed green edge is the loop: when the LLM emits a tool call, the runtime executes the tool, then *re-prompts* the LLM with the tool's result appended to the conversation. The LLM either calls another tool (loop again) or emits a final answer (exit).
+
+## The minimal agent, in code
+
+Here is the entire agent runtime in Python. The LLM client is `anthropic` (Claude); the pattern is identical for OpenAI with one or two API differences.
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+# A tiny "tool" the agent can call. Production tools are richer; the shape is the same.
+def get_weather(location: str) -> str:
+    # In real life: hit a weather API. Here we mock.
+    return f"In {location}, it's 22°C and partly cloudy."
+
+# The tool exposed to the model, as JSON Schema.
+TOOLS = [
+    {
+        "name": "get_weather",
+        "description": "Get the current weather for a location.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"}
+            },
+            "required": ["location"],
+        },
+    }
+]
+
+# A registry mapping tool names to Python functions.
+TOOL_HANDLERS = {
+    "get_weather": get_weather,
+}
+
+def run_agent(user_task: str, max_iterations: int = 10) -> str:
+    messages = [{"role": "user", "content": user_task}]
+
+    for iteration in range(max_iterations):
+        response = client.messages.create(
+            model="claude-sonnet-4-7",
+            max_tokens=1024,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        # Append the assistant's response to the conversation history.
+        messages.append({"role": "assistant", "content": response.content})
+
+        # If the model says "stop", we're done.
+        if response.stop_reason == "end_turn":
+            return _extract_text(response.content)
+
+        # If it called a tool, execute and feed back.
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    handler = TOOL_HANDLERS[block.name]
+                    result = handler(**block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        # Any other stop_reason — bail.
+        return _extract_text(response.content)
+
+    raise RuntimeError(f"Agent hit max iterations ({max_iterations}) without a final answer")
+
+def _extract_text(content) -> str:
+    return "".join(block.text for block in content if hasattr(block, "text"))
+
+# Usage:
+print(run_agent("What's the weather in Tokyo, and should I bring an umbrella?"))
+```
+
+That's it. Sixty lines, a full working agent. It:
+
+- Builds a message history that includes the original task and all prior turns.
+- Calls the LLM with a tool definition.
+- Parses the response: if it's a tool call, execute and append the result; if it's a final answer, return it.
+- Loops with a hard cap so a runaway agent can't burn your wallet.
+
+Every production agent runtime — LangGraph, Pydantic AI, Claude Agent SDK, OpenAI Agents SDK — is this same loop with more features bolted on: streaming, structured outputs, parallel tool calls, error handling, observability, retries, memory, multi-agent orchestration. Knowing the core is essential because those extras can hide what's actually happening.
+
+## What the loop adds in production
+
+The hand-rolled version is fine for learning. Production introduces:
+
+- **Streaming.** Don't wait for the full LLM response; stream tokens as they're generated for UX.
+- **Parallel tool calls.** Modern models can request multiple tools in one response; execute them concurrently.
+- **Retries with backoff.** API errors, rate limits, malformed JSON. Per-tool retry policy.
+- **Per-tool timeouts.** A slow tool can hang the loop. Wrap each call.
+- **Observability.** Trace every step (input, output, latency, cost) to a system like LangSmith or LangFuse.
+- **Cost ceilings.** Per-task and per-user maximums; circuit-break before runaway loops.
+- **Memory.** Beyond the in-loop message history — long-term context, vector store retrieval.
+- **Human-in-the-loop.** Some tool calls require approval before execution.
+- **Guardrails.** Input/output filters, prompt-injection detection on tool results.
+
+Every later module in this track adds one or more of these.
+
+## Exercise
+
+1. Install `anthropic` (or `openai`) and copy the agent code above into a `.py` file. Set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`) in your environment.
+2. Run it with the prompt: `"What's the weather in Tokyo, and should I bring an umbrella?"`. Read the conversation history that gets built — print `messages` at the end and trace the steps.
+3. Add a second tool: `get_current_time(timezone: str) -> str`. Wire it through `TOOLS` and `TOOL_HANDLERS`. Ask the agent: *"Is it morning or evening in Tokyo right now?"*. The agent should call your new tool.
+4. Make the agent fail: ask it to do something it can't do with its current tools. Watch what happens — observe whether it (a) hallucinates a tool call, (b) admits it can't, or (c) gives a wrong answer. Each is a real failure mode you'll see in production.
+
+## Key idea to take into the next module
+
+The agent loop is dumb. **The intelligence lives in the LLM, not the runtime.** The runtime's job is to faithfully execute the loop — call tools when asked, feed back results, respect limits. Most agent failures trace back to *the runtime* doing something wrong (not parsing tool calls, not handling errors, not respecting limits) — not the model being insufficient.
+
+Keep this in mind as we add complexity: every new feature is something the runtime does to make the loop more reliable, not something that makes the model smarter.
+
+**Next:** [Module 02 — Tools and function calling](/learn/agentic-ai/tools-and-function-calling) goes deep on how tool definitions work, parallel tool calls, structured outputs, and the things that trip up the loop in practice.
