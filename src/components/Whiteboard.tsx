@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useId, useMemo } from "react";
 import {
   ReactFlow,
   Background,
@@ -16,18 +16,26 @@ interface SessionData {
 
 interface Props {
   data: SessionData;
-  height?: number;
+  height?: number | string;
 }
 
-export default function Whiteboard({ data, height = 520 }: Props) {
+export default function Whiteboard({ data, height = 560 }: Props) {
+  const id = `wb_${useId().replace(/:/g, "_")}`;
   const nodes = useMemo(() => data.nodes ?? [], [data]);
   const edges = useMemo(() => data.edges ?? [], [data]);
+  const heightStyle = typeof height === "number" ? `${height}px` : height;
 
   return (
-    <div
-      style={{ height }}
-      className="border border-[var(--color-border)] rounded-lg overflow-hidden bg-[var(--color-surface)]"
-    >
+    <div id={id} className="diagram" style={{ height: heightStyle }}>
+      <button
+        type="button"
+        className="fs-btn"
+        data-fullscreen-target={id}
+        title="Toggle fullscreen"
+        aria-label="Toggle fullscreen"
+      >
+        ⛶ fullscreen
+      </button>
       <ReactFlow
         nodes={nodes}
         edges={edges}

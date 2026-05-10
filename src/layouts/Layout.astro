@@ -4,9 +4,10 @@ import "../styles/global.css";
 interface Props {
   title?: string;
   description?: string;
+  wide?: boolean;
 }
 
-const { title = "zahid", description = "personal blog and whiteboard sessions" } = Astro.props;
+const { title = "zahid", description = "personal blog and whiteboard sessions", wide = false } = Astro.props;
 ---
 
 <!doctype html>
@@ -20,7 +21,7 @@ const { title = "zahid", description = "personal blog and whiteboard sessions" }
   </head>
   <body class="min-h-screen">
     <header class="border-b border-[var(--color-border)] bg-[var(--color-surface)]">
-      <nav class="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between">
+      <nav class="w-full px-6 py-4 flex items-center justify-between">
         <a href="/" class="font-semibold tracking-tight text-[var(--color-ink)]">zahid</a>
         <div class="flex gap-4 text-sm text-[var(--color-muted)]">
           <a href="/" class="hover:text-[var(--color-ink)]">home</a>
@@ -29,11 +30,27 @@ const { title = "zahid", description = "personal blog and whiteboard sessions" }
         </div>
       </nav>
     </header>
-    <main class="max-w-3xl mx-auto px-4 py-10">
+    <main class={`w-full px-6 py-10 ${wide ? "" : "max-w-7xl mx-auto"}`}>
       <slot />
     </main>
-    <footer class="max-w-3xl mx-auto px-4 py-8 text-xs text-[var(--color-muted)] border-t border-[var(--color-border)] mt-16">
+    <footer class="w-full max-w-7xl mx-auto px-6 py-8 text-xs text-[var(--color-muted)] border-t border-[var(--color-border)] mt-16">
       <span>built with astro on cloudflare pages</span>
     </footer>
+
+    <script is:inline>
+      // Generic fullscreen toggler — any element with [data-fullscreen-target="<id>"]
+      // will toggle fullscreen on the element with that id when clicked.
+      document.addEventListener("click", (e) => {
+        const btn = e.target.closest("[data-fullscreen-target]");
+        if (!btn) return;
+        const target = document.getElementById(btn.dataset.fullscreenTarget);
+        if (!target) return;
+        if (document.fullscreenElement) {
+          document.exitFullscreen();
+        } else {
+          target.requestFullscreen?.();
+        }
+      });
+    </script>
   </body>
 </html>

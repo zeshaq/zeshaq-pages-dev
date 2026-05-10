@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import mermaid from "mermaid";
 
 interface Props {
@@ -8,8 +8,8 @@ interface Props {
 let initialized = false;
 
 export default function Mermaid({ chart }: Props) {
-  const id = useId().replace(/:/g, "_");
-  const ref = useRef<HTMLDivElement>(null);
+  const rid = useId().replace(/:/g, "_");
+  const wrapId = `mmd_wrap_${rid}`;
   const [svg, setSvg] = useState<string>("");
 
   useEffect(() => {
@@ -30,7 +30,7 @@ export default function Mermaid({ chart }: Props) {
     }
     let cancelled = false;
     mermaid
-      .render(`mmd_${id}`, chart)
+      .render(`mmd_${rid}`, chart)
       .then(({ svg }) => {
         if (!cancelled) setSvg(svg);
       })
@@ -40,13 +40,23 @@ export default function Mermaid({ chart }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [chart, id]);
+  }, [chart, rid]);
 
   return (
-    <div
-      ref={ref}
-      className="my-4 p-4 border border-[var(--color-border)] rounded-lg bg-[var(--color-surface)] overflow-x-auto"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div id={wrapId} className="diagram my-4 p-4">
+      <button
+        type="button"
+        className="fs-btn"
+        data-fullscreen-target={wrapId}
+        title="Toggle fullscreen"
+        aria-label="Toggle fullscreen"
+      >
+        ⛶ fullscreen
+      </button>
+      <div
+        className="mermaid-svg-wrap overflow-x-auto"
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+    </div>
   );
 }
