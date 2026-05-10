@@ -1,0 +1,84 @@
+---
+title: "Blog ADR 0005 — SEO baseline (sitemap, RSS, OG, JSON-LD)"
+sidebar_label: "ADR 0005 — SEO baseline"
+description: "What's wired up to make the blog findable and shareable: @astrojs/sitemap, @astrojs/rss, Open Graph + Twitter Card meta, JSON-LD BlogPosting schema, canonical URLs."
+last_reviewed: 2026-05-10
+---
+
+## Status
+
+**Accepted** — 2026-05-10. Introduced when the blog grew past ~10 posts and the question of "how will people find this" became real.
+
+## Context
+
+The blog runs at `https://zeshaq.pages.dev` — a `pages.dev` subdomain. Three constraints converge:
+
+1. **No inbound links.** A brand-new domain with no SEO history is invisible to organic search for months.
+2. **`pages.dev` is treated as low-trust.** Search engines down-weight pages.dev domains relative to first-party domains. A custom domain would help but isn't yet acquired.
+3. **Sharing requires good previews.** When a reader pastes a blog link into LinkedIn, Slack, X, or Discord, the rendered preview is what determines whether anyone clicks. Without OG meta, the preview falls back to URL-only — low click-through.
+
+The cheap, high-leverage interventions:
+
+- **Sitemap** — tells search engines what pages exist.
+- **RSS feed** — gives the real RSS-reading audience (a small but devoted technical crowd) a subscription option.
+- **Open Graph + Twitter Card meta** — produces rich previews on every social platform.
+- **JSON-LD structured data** — gives search engines the structured signals they need to surface rich snippets.
+- **Canonical URLs** — prevents duplicate-content penalties when cross-posting to dev.to / Medium / corporate blogs.
+
+The decision is *which* of these to wire up, *how*, and at what level of polish.
+
+## Decision
+
+**Wire up all five.** No half-measure.
+
+Implementation:
+
+| Concern | Implementation |
+| --- | --- |
+| **Sitemap** | `@astrojs/sitemap` integration in `astro.config.mjs`. Generates `sitemap-index.xml` + `sitemap-0.xml` at build. References from `public/robots.txt`. |
+| **RSS** | `@astrojs/rss` at `src/pages/rss.xml.js`. Renders all non-draft blog posts, sorted newest-first, with category. Footer of every layout has a visible RSS link. |
+| **OG / Twitter** | Meta tags in every layout's `<head>` (Layout / DocsLayout / LearnLayout / BareLayout). Per-page `og:type` / `og:title` / `og:description` / `og:url` / `og:image`. Defaults to `/og-default.svg` for the OG image unless a page provides its own. |
+| **JSON-LD** | Per-blog-post `BlogPosting` schema injected into the post page's `<head>` via a slot. Fields: headline, description, datePublished, author, publisher, url, image, articleSection. |
+| **Canonical URLs** | `<link rel="canonical" href={canonicalURL}>` on every layout. Computed from `Astro.site` + path. |
+| **robots.txt** | `public/robots.txt` allows all + references sitemap. |
+| **OG image** | `public/og-default.svg` — dark green background, "Zahid's Blog" branding, 1200x630 dimensions. SVG; not perfect cross-platform (X may not render SVG OG) but acceptable for LinkedIn / Slack / Discord which dominate sharing. |
+
+The OG / Twitter meta layer accepts per-page overrides — blog post pages provide their own title/description/published date; the OpenGraph image stays default (no per-post hero image).
+
+## Consequences
+
+**What this enables:**
+
+- **Indexability.** Submitting `sitemap-index.xml` to Google Search Console + Bing Webmaster Tools establishes the site for crawl. Indexing latency is now bounded by Google's crawl cycle (days), not by lack of structure.
+- **Rich social previews.** A blog post link pasted into LinkedIn shows the post title, description, and OG image. Click-through dramatically higher than URL-only.
+- **RSS-reader subscribers.** Niche but real. RSS readers do still exist, especially in technical audiences.
+- **Cross-posting safety.** Canonical URLs let posts be syndicated to dev.to / Medium / corporate blogs without SEO duplicate-content penalties.
+
+**What this costs:**
+
+- **Per-layout `<head>` boilerplate.** Each layout (Layout / DocsLayout / LearnLayout / BareLayout) duplicates the OG/Twitter meta. A `BaseHead.astro` component could reduce this; deferred.
+- **No per-post OG images.** Currently every page uses the same `og-default.svg`. A per-post generated OG image (with the post title rendered into a PNG) would be more engaging. Deferred — generating OG images at build time requires either a headless-browser step (Playwright) or a server runtime; neither is in place yet.
+- **SVG OG image limitation.** X (Twitter) prefers PNG; the SVG works on LinkedIn / Slack / Discord but X may show a fallback. Acceptable trade-off; not yet a blocker.
+
+**What's deferred:**
+
+- **Custom domain** (e.g., `zeshaq.com`) — would significantly help SEO + trust signal. Requires registration; not in scope of this ADR.
+- **Google Search Console + Bing Webmaster verification + sitemap submission** — requires user action (auth into the consoles, verify DNS, submit). Documented elsewhere.
+- **Per-post OG image generation** — Playwright-based build step. Eventually worth doing.
+- **Schema.org BreadcrumbList** — would help search snippets show breadcrumbs. Easy to add when the URL hierarchy stabilizes.
+- **Comments / Giscus** — orthogonal to SEO; deferred.
+
+## Alternatives considered
+
+- **No SEO at all** — rejected. The cost of the baseline is ~1 hour of work; the upside is meaningful even if organic search is slow.
+- **A CMS-managed SEO plugin** — rejected as overkill. The Astro integrations are tiny and cover what's needed.
+- **Hand-rolled sitemap + RSS** — rejected. The official integrations are well-maintained, free, and one config line each.
+
+## Related
+
+- `astro.config.mjs` — sitemap integration registration.
+- `src/pages/rss.xml.js` — RSS feed implementation.
+- `src/layouts/Layout.astro` (and siblings: DocsLayout, LearnLayout, BareLayout) — OG / Twitter / canonical meta.
+- `src/pages/blog/[...slug].astro` — JSON-LD `BlogPosting` schema injection for blog posts.
+- `public/robots.txt` — crawl allowance + sitemap reference.
+- `public/og-default.svg` — fallback OG image.

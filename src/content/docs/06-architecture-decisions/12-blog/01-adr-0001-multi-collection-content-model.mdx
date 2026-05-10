@@ -1,0 +1,78 @@
+---
+title: "Blog ADR 0001 — Multi-collection content model"
+sidebar_label: "ADR 0001 — Multi-collection"
+description: "Three Astro content collections (blog, docs, learn) with separate schemas, sidebars, and URL prefixes, rather than one collection with categories."
+last_reviewed: 2026-05-10
+---
+
+## Status
+
+**Accepted** — 2026-05-10. Supersedes the initial single-collection setup that existed at site launch.
+
+## Context
+
+The site began life with one Astro content collection: `blog`. Posts were MDX files in `src/content/blog/` with a flat structure and a `category` frontmatter field. That was the right shape for the first 20 posts.
+
+Over the course of 2026 we accumulated three distinct content audiences:
+
+1. **Blog posts** — opinionated technical writing for the public. Each post stands alone, has a date, and is published for SEO + sharing. ~30+ posts.
+2. **Platform documentation** — internal-style reference for the OpenShift comptech platform. Hundreds of pages, ordered into sections, with `last_reviewed` metadata for currency tracking. Different audience (operators, on-call), different lifecycle (continuously revised, not dated like posts).
+3. **Learning tracks** — curriculum-style ordered modules (the "Agentic AI" track, with room for more tracks). Different lifecycle again (revised, not "dated"), different schema needs (estimated reading time, prerequisites).
+
+Each had **distinct schema requirements**, **distinct navigation patterns** (flat-with-categories vs hierarchical sections vs ordered modules), and **distinct URL prefixes** (`/blog/`, `/docs/`, `/learn/`).
+
+The choice: shoehorn everything into the `blog` collection with a `kind` discriminator, or split into separate collections.
+
+## Decision
+
+**Three separate Astro content collections**, each with its own schema, sidebar, layout, and URL prefix.
+
+```
+src/content/
+├── blog/        → /blog/*   — posts (with category)
+├── docs/        → /docs/*   — platform docs (hierarchical sections)
+└── learn/       → /learn/*  — curriculum (ordered modules per track)
+```
+
+Each collection has:
+
+- A unique schema in `src/content.config.ts` (matching its data needs)
+- A dedicated layout (`Layout.astro`, `DocsLayout.astro`, `LearnLayout.astro`)
+- A dedicated sidebar (`Sidebar.astro`, `DocsSidebar.astro`, `LearnSidebar.astro`)
+- A dedicated tree-builder in `src/utils/navTree.ts` (`buildCategoryTree`, `buildDocsTree`, `buildLearnTree`)
+- A dynamic route page (`src/pages/<collection>/[...slug].astro`) plus an index page
+
+The blog's main sidebar exposes **CTA links** (`learn ↗`, `docs ↗`, `whiteboard ↗`) at the bottom so all sections are reachable from the blog without forcing the user to know the URLs.
+
+## Consequences
+
+**What this enables:**
+
+- Each collection grows independently. Adding a new section (e.g., a `tutorials/` collection) is a matter of duplicating the pattern — same scaffolding, different data.
+- Schemas can be specific. `docs` has `last_reviewed`; `learn` has `estimated_minutes` and `prereqs`; `blog` has `date` and `category`. No optional-everywhere fields.
+- Sidebars match the content shape. The blog sidebar groups by category and shows newest-first; the docs sidebar shows the section hierarchy; the learn sidebar shows ordered modules per track.
+- URLs are stable. A post is `/blog/x`; a doc page is `/docs/foundations/overview`; a module is `/learn/agentic-ai/foundations`.
+
+**What this costs:**
+
+- Three sidebar components, three layouts, three tree-builders — small duplication. The CSS is shared via `global.css` which keeps the visual identity consistent.
+- The tree-builders (`buildDocsTree`, `buildLearnTree`) are near-duplicates. Worth keeping separate for type-safety on the underlying `CollectionEntry<T>` types; could be generalized later if a fourth collection appears.
+- Cross-collection search isn't free — would need a separate Pagefind / Algolia / search-index step at build time. Not yet implemented.
+
+**What this rules out:**
+
+- A single global "all content" filter / search. Would require generalization.
+- Cross-collection references at build time (e.g., a blog post that links to a doc page) — they work, but only via raw URL strings, not via Astro's `getEntry` references across collections.
+
+## Alternatives considered
+
+- **One collection with a `kind` discriminator field** — rejected. The schema would be the union of all needs (every field optional), the sidebars would still need conditional logic, and the URL routing would still need to fork on `kind`.
+- **Two collections: `posts` + `pages`** — rejected. Conflates curriculum modules (ordered, sequential) with one-shot pages.
+- **Docusaurus / Starlight / VitePress instead of Astro Collections** — rejected because Astro's collection model is already in place and the third-party doc generators add their own opinions we'd then need to override.
+
+## Related
+
+- The `learn` collection was added in [Blog ADR 0004 — Learning section structure](./adr-0004-learn-section-structure/).
+- Sidebar grouping for the blog is covered in [Blog ADR 0003 — Category-based sidebar](./adr-0003-category-based-sidebar/).
+- `src/content.config.ts` is the schema source of truth.
+- `src/utils/navTree.ts` contains the three tree-builders.

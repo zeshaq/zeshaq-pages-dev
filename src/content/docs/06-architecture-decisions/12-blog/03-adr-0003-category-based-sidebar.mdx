@@ -1,0 +1,78 @@
+---
+title: "Blog ADR 0003 — Category-based sidebar with frontmatter metadata"
+sidebar_label: "ADR 0003 — Category sidebar"
+description: "Blog posts are grouped in the sidebar by a `category` frontmatter field (ALL CAPS), rather than by folder structure or flat date-ordered list."
+last_reviewed: 2026-05-10
+---
+
+## Status
+
+**Accepted** — 2026-05-10. Supersedes both the original flat date-ordered sidebar and the brief intermediate folder-based hierarchical sidebar.
+
+## Context
+
+The blog sidebar's job is to make ~30+ posts navigable without scrolling fatigue. Three approaches were tried:
+
+1. **Flat, date-ordered list.** Initial design. Worked for the first 10 posts. By post 20+ the list was a wall of text where readers couldn't find what they were looking for unless they remembered the title.
+2. **Folder-based hierarchical groups.** Posts moved to subdirectories (`blog/openshift/`, `blog/observability/`, `blog/ai/`). The sidebar grouped automatically. **Drawback:** URLs changed (`/blog/x` → `/blog/openshift/x`), breaking external links every time a post was reclassified.
+3. **Category-based via frontmatter.** Each post declares `category: OPENSHIFT` (or similar) in its frontmatter. The sidebar groups by this field. URLs stay flat (`/blog/x` regardless of category).
+
+We picked option 3.
+
+A secondary decision: **what case for category names?** The default `prettify()` helper lowercases first letters, producing `openshift`, `ai`, `observability`. Visually low-emphasis. After a round of experimentation we standardized on **ALL CAPS** for category names. This gives the sidebar a clearer hierarchical feel — uppercase section pills with mixed-case post titles underneath.
+
+## Decision
+
+**Group blog posts in the sidebar by a `category` frontmatter field, written in ALL CAPS.**
+
+Implementation in `src/utils/navTree.ts`:
+
+```ts
+export function buildCategoryTree(items: BlogItem[], base: string): NavNode[] {
+  // Bucket by category; sort categories alphabetically; sort posts within
+  // each category by date descending. Uncategorized falls to a flat list
+  // at the bottom.
+}
+```
+
+Conventions:
+
+- Category names are **strings**, not enums. Any new category just appears once it's used in a post.
+- Categories are written **uppercase** in frontmatter (`category: OPENSHIFT`). The sidebar displays them as-is — no lowercasing by `prettify()`.
+- The `category` field is **optional**. Uncategorized posts fall to a flat list at the bottom of the sidebar.
+- Posts can only have **one** category. Multi-categorization would require a different tree-builder and a different sidebar design.
+
+Current canonical category set (as of writing):
+
+```
+AI · DATA · IDENTITY · INTEGRATION · OBSERVABILITY · OPENSHIFT · SECURITY · WORKFLOWS
+```
+
+## Consequences
+
+**What this enables:**
+
+- **URL stability.** A post never changes URL when reclassified. Edit one frontmatter line.
+- **Easy reclassification.** Moving a post between categories is one line.
+- **Discoverability.** The sidebar's category pills visually anchor the post universe — readers see at a glance that the blog covers eight broad domains.
+- **Filter works across groups.** The sidebar's search filter recurses through groups and auto-expands matches, so search works whether a reader knows the category or not.
+- **Extensibility.** New categories appear in the sidebar automatically. No code change needed.
+
+**What this costs:**
+
+- **Single-category constraint.** A post about RHACS could plausibly be SECURITY or OPENSHIFT; it gets one. Multi-categorization would require additional design.
+- **Category sprawl risk.** Without governance, every post could introduce a new category. Mitigated by keeping the canonical set small and curating it.
+- **Lower discoverability of related posts within a category.** The sidebar shows category groups in alphabetical order; the *post order within a category* is date-desc. Cross-category "see also" recommendations aren't first-class.
+- **Manual category assignment per post.** No auto-classification. For 30 posts this is fine; for 300 we'd want some assist tooling.
+
+## Alternatives considered
+
+- **Tags instead of a single category** — rejected. Tags would have been more flexible but harder to display compactly in a sidebar. A tag cloud is fine on a landing page; it's a poor primary navigation primitive.
+- **Folder-based hierarchy** (option 2 above) — rejected because of URL instability.
+- **Auto-categorization via embedding similarity** — rejected as over-engineering. With ~30 posts, manual classification is cheaper than building and tuning a classifier.
+
+## Related
+
+- `src/utils/navTree.ts` — `buildCategoryTree` function.
+- `src/components/Sidebar.astro` — consumer of the tree, plus the filter input.
+- The category casing decision is enforced by passing category strings through verbatim, *not* through `prettify()`.

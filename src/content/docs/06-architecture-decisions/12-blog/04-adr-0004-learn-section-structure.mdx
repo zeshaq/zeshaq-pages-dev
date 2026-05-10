@@ -1,0 +1,109 @@
+---
+title: "Blog ADR 0004 — Learning section as parallel collection to docs"
+sidebar_label: "ADR 0004 — Learn section"
+description: "The /learn section is a new Astro content collection mirroring the /docs pattern, not a category within /blog. Curriculum has different lifecycle and navigation needs than dated blog posts."
+last_reviewed: 2026-05-10
+---
+
+## Status
+
+**Accepted** — 2026-05-10. Introduced when the first learning track (Agentic AI) was added.
+
+## Context
+
+A user request to *"make a dedicated section for learning agentic ai"* prompted the question: **where should curriculum content live?** Three reasonable options:
+
+1. **As blog posts with a category** — e.g., `category: LEARN`. Zero new infrastructure.
+2. **As a sub-folder of `/docs/`** — e.g., `/docs/learn-agentic-ai/`. Reuses the existing docs layout/sidebar.
+3. **As a brand-new collection** — `/learn/` with its own layout, sidebar, schema. Mirrors the existing `/docs/` pattern but separately.
+
+Each option has different friction. The relevant differences across the three:
+
+| Concern | Blog category | Docs sub-folder | Separate collection |
+| --- | --- | --- | --- |
+| Lifecycle | Posts have a `date`; curriculum has `last_updated` instead | Docs already use `last_reviewed` | Custom; can be `last_updated` or `revised_on` |
+| Ordering | Date-desc (wrong for curriculum) | Numeric prefix (right) | Numeric prefix (right) |
+| Reading-time hint | Not in schema | Not in schema | Easy to add (`estimated_minutes`) |
+| Prerequisite chain | Not modeled | Not modeled | Easy to add (`prereqs`) |
+| Sidebar shape | Category groups | Hierarchical sections | Same as docs |
+| URL prefix | `/blog/x` (mixes with posts) | `/docs/learn-agentic-ai/x` | `/learn/agentic-ai/x` |
+| Mental model for readers | "a blog post" | "platform documentation" | "a learning track" |
+
+The blog-category option overloads the `/blog/` URL space with content that isn't blog-shaped. The docs sub-folder mixes platform documentation (audience: operators, on-call) with curriculum (audience: engineers learning a new domain). Each is suboptimal.
+
+## Decision
+
+**Add `learn` as a third Astro content collection, mirroring the docs collection's structure but with its own layout, sidebar, and schema.**
+
+The collection's path structure:
+
+```
+src/content/learn/
+└── agentic-ai/                    ← a "track"
+    ├── 00-overview.mdx            ← module
+    ├── 01-foundations.mdx
+    ├── 02-tools-and-function-calling.mdx
+    └── ...
+```
+
+URL shape: `/learn/<track>/<module>` — e.g., `/learn/agentic-ai/foundations`.
+
+Schema additions over the docs schema:
+
+```ts
+const learn = defineCollection({
+  schema: z.object({
+    title: z.string(),
+    description: z.string().optional(),
+    sidebar_label: z.string().optional(),
+    track: z.string().optional(),                  // explicit track tag (optional; usually derivable from folder)
+    estimated_minutes: z.number().optional(),      // reading time
+    prereqs: z.array(z.string()).optional(),       // slugs of prerequisite modules
+    last_updated: z.coerce.date().optional(),
+    draft: z.boolean().default(false),
+  }),
+});
+```
+
+UI:
+
+- **`LearnLayout.astro`** — mirrors `DocsLayout.astro`, with a small metadata line that surfaces `estimated_minutes` and `last_updated` above each module.
+- **`LearnSidebar.astro`** — mirrors `DocsSidebar.astro`, with "Learning" branding and the same filter/recurse behavior.
+- **`buildLearnTree()`** in `src/utils/navTree.ts` — type-specific wrapper around the docs tree-builder. Could be generalized later.
+- **`/learn/index.astro`** — landing page with a table of contents listing all tracks and their modules, using the existing `DocsTocNode.astro` component (which is generic enough to reuse across docs and learn).
+- **`/learn/[...slug].astro`** — dynamic route for rendering individual modules.
+
+Main blog sidebar gains a **`learn ↗` CTA** (alongside `docs ↗` and `whiteboard ↗`) at the bottom so readers can navigate from blog to learn without knowing the URL.
+
+## Consequences
+
+**What this enables:**
+
+- **A real curriculum experience.** Ordered modules, reading-time hints, "next: module N+1" links between modules, dedicated sidebar.
+- **Extensible to more tracks.** Adding a *Data Engineering in 2026* or *Production AI Operations* track is a matter of creating `src/content/learn/<track>/` and writing modules. No code changes — the sidebar and index page pick them up automatically.
+- **Clear audience separation.** Blog posts are for sharing; platform docs are for operating; learn modules are for learning. Each has its own URL space.
+
+**What this costs:**
+
+- **Triplicate sidebar/layout/tree-builder.** `Sidebar` / `DocsSidebar` / `LearnSidebar` are near-duplicates. Same for layouts and tree-builders. The CSS is shared via `global.css`. The sidebar JS filter logic is identical across the three. A generalization pass could reduce this to one parameterized component, but the duplication isn't yet painful enough to justify the abstraction.
+- **No cross-collection navigation primitives.** "Related post" links from a learn module to a blog post are raw URL strings, not Astro `getEntry` references. Acceptable; not first-class.
+- **No cross-collection search.** Out of scope for this ADR. Pagefind or a small index step could solve it later.
+
+**What we deferred:**
+
+- Multi-track home page (currently the index lists all tracks but assumes one or two).
+- Automatic "module N → N+1" navigation. Currently each module has hand-written `Next: Module N+1` links.
+- Prerequisite-aware module ordering (e.g., "this module assumes you've completed X").
+- Progress tracking across modules (intentionally out of scope — the blog is static and stateless).
+
+## Alternatives considered
+
+- **Blog category (`LEARN`)** — rejected. Mixes blog and curriculum URL spaces; loses the ordered-modules and reading-time features.
+- **Docs sub-folder** — rejected. Mixes audience. The platform docs are for OpenShift operators; the learn modules are for AI engineers learning agents. Different people read these.
+- **Separate site** (`learn.zeshaq.pages.dev`) — rejected as over-engineering. Sub-domain adds DNS / cert / cross-origin friction for what's still one personal blog.
+
+## Related
+
+- [Blog ADR 0001 — Multi-collection content model](./adr-0001-multi-collection-content-model/) — established the precedent of separate collections per audience.
+- The Agentic AI track is the first track shipped; see `src/content/learn/agentic-ai/`.
+- The `mkBranch()` helper introduced earlier for the mindmap diagrams turned out to be reusable inside individual learn modules too.

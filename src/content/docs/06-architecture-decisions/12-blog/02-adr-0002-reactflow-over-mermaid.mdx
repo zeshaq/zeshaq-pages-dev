@@ -1,0 +1,75 @@
+---
+title: "Blog ADR 0002 — ReactFlow over Mermaid for all diagrams"
+sidebar_label: "ADR 0002 — ReactFlow over Mermaid"
+description: "Single diagram library across the blog: ReactFlow via the <Whiteboard> component. Mermaid was removed after rendering errors and tooling friction."
+last_reviewed: 2026-05-10
+---
+
+## Status
+
+**Accepted** — 2026-05-10. Supersedes the earlier mixed-use approach where simple flowcharts used Mermaid and architecture diagrams used ReactFlow.
+
+## Context
+
+For most of the blog's lifetime, two diagram libraries lived side by side:
+
+- **ReactFlow** (`@xyflow/react`) via a custom `<Whiteboard>` component — used for architecture diagrams, mind maps, mid- and large-scale flow visualizations. Supported pan, zoom, fullscreen, custom node styles.
+- **Mermaid** via a thin `<Mermaid>` wrapper — used for simple flowcharts, sequence diagrams, and short pipeline visualizations where ReactFlow felt like overkill.
+
+This was a reasonable initial choice but accumulated friction:
+
+1. **Mermaid rendering errors.** Several posts had build-time and render-time issues — `<200ms` interpreted as JSX tag starts, MDX-vs-Mermaid parser conflicts on `{...}` patterns, and intermittent client-side rendering failures.
+2. **Two visual languages.** The two libraries produced visually different diagrams. A mermaid flowchart next to a ReactFlow architecture diagram in the same post looked inconsistent.
+3. **Two skill sets to maintain.** Authors had to remember which library to pick and learn both APIs.
+4. **Reaching feature parity.** Once we needed pan/zoom/fullscreen on every diagram, Mermaid was the laggard. ReactFlow had it natively; we'd have needed to wrap Mermaid output to match.
+5. **User directive** ("mermaid is giving error, use reactflow instead") — the explicit signal to consolidate.
+
+## Decision
+
+**Use ReactFlow (`<Whiteboard>`) for every diagram on the blog. Remove all Mermaid usage.**
+
+Specifically:
+
+- All existing `<Mermaid chart={...} />` blocks were converted to `<Whiteboard data={{ nodes, edges }} />`.
+- The `import Mermaid from "../../components/Mermaid"` lines were removed from every post.
+- The Mermaid component file is no longer referenced; it can be deleted in a future cleanup.
+- All future diagrams — including simple 3-node flowcharts — use `<Whiteboard>`.
+
+Mapping reference for common Mermaid shapes:
+
+| Mermaid pattern | ReactFlow equivalent |
+| --- | --- |
+| `flowchart LR` with `A --> B` | Horizontal-positioned nodes with directed edges |
+| Subgraphs | Spatial clustering with distinct node `style` per cluster |
+| Loops (`A --> B --> A`) | Two directed edges, optionally one dashed/animated to show the cycle |
+| Class definitions for color coding | `style: stage / ctrl / accent` style objects defined per post |
+
+A standing memory rule (`feedback_no_mermaid.md`) keeps future sessions from reintroducing Mermaid by default.
+
+## Consequences
+
+**What this gives us:**
+
+- **One visual language.** Every diagram on the blog looks like it belongs to the same site.
+- **Consistent interactivity.** Pan, zoom, and fullscreen work the same way on every diagram. The "⛶ fullscreen" button is the standard affordance.
+- **Single set of style primitives.** `stage`, `ctrl`, `accent`, `agent`, `phaseLabel`, `branchHeader` and similar style objects are reused across posts via copy-paste, producing a consistent visual identity.
+- **MDX-friendly authoring.** ReactFlow data lives in `export const` declarations at the top of the MDX file. No template-string DSL to escape carefully.
+- **Reuse via `mkBranch` / `mkCluster` helpers.** Mind maps and cluster diagrams use small helper functions exported from the same MDX file, which reduces the verbosity for large diagrams.
+
+**What this costs:**
+
+- **More code per simple diagram.** A 4-node flowchart in Mermaid is ~6 lines; in ReactFlow, it's ~30 lines of nodes + edges + style definitions. This is the main downside.
+- **No automatic layout.** Mermaid auto-positions; ReactFlow positions are explicit. For most diagrams we want explicit positioning anyway — the rare time we don't, layout libraries like Dagre or ELK can be added.
+- **More boilerplate to remember.** Style objects, edge marker definitions, polar-coordinate helpers for mind maps. Captured in the `feedback_no_mermaid.md` memory.
+
+## Alternatives considered
+
+- **Keep Mermaid only for sequence diagrams** — rejected. Inconsistency cost > Mermaid's strengths in this narrow shape. Sequence diagrams in ReactFlow with explicit labeled edges are workable.
+- **Fix the Mermaid rendering bugs** — rejected. The underlying parse-conflict issue would recur; the wider consolidation benefit outweighs the partial fix.
+- **Switch ReactFlow to a different graph library** (Cytoscape, vis.js, d3-force) — rejected. ReactFlow's React-component-as-node model is what enables the fullscreen + custom-styling pattern we rely on.
+
+## Related
+
+- [`feedback_no_mermaid.md`](../../../../) memory rule prevents accidental reintroduction.
+- `src/components/Whiteboard.tsx` is the ReactFlow component. No internal MiniMap (per a separate memory rule).
+- All current blog posts under `src/content/blog/` and learning modules under `src/content/learn/` use this pattern.
