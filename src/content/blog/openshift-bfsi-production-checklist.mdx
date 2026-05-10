@@ -1,0 +1,246 @@
+---
+title: "OpenShift production readiness for BFSI: the checklist"
+description: "An opinionated production-readiness checklist for taking OpenShift live in a Banking, Financial Services, or Insurance environment — infrastructure, security, identity, observability, resilience, operations, compliance, application readiness — with what regulators actually ask about."
+date: 2026-05-10
+category: OPENSHIFT
+---
+
+import Whiteboard from "../../components/Whiteboard";
+
+export const center = { background: "#0c1812", border: "2px solid #15803d", borderRadius: 16, padding: 18, color: "#ffffff", width: 260, textAlign: "center", fontWeight: 700, fontSize: 15, letterSpacing: "0.04em", textTransform: "uppercase" };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 200, textAlign: "center", fontWeight: 700, fontSize: 13, letterSpacing: "0.03em", textTransform: "uppercase" };
+export const leaf = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 6, padding: 6, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+
+export const branch = (header, angleDeg, leaves, cx, cy) => {
+  const nodes = [];
+  const edges = [];
+  const headerId = slug(header);
+
+  const ang = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(ang);
+  const dy = Math.sin(ang);
+  const px = -Math.sin(ang);
+  const py = Math.cos(ang);
+
+  const R_HEADER = 380;
+  const headerCenter = { x: cx + R_HEADER * dx, y: cy + R_HEADER * dy };
+  nodes.push({
+    id: headerId,
+    position: { x: headerCenter.x - 100, y: headerCenter.y - 25 },
+    data: { label: header },
+    style: branchHeader,
+  });
+  edges.push({
+    id: "trunk_" + headerId,
+    source: "bfsi_readiness",
+    target: headerId,
+    style: { stroke: "#15803d", strokeWidth: 2 },
+  });
+
+  const FORWARD_START = 150;
+  const FORWARD_STEP = 170;
+  const PERP_OFFSET = 95;
+
+  leaves.forEach((label, i) => {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    const forwardDist = FORWARD_START + row * FORWARD_STEP;
+    const perpDist = col === 0 ? -PERP_OFFSET : PERP_OFFSET;
+
+    const x = headerCenter.x + forwardDist * dx + perpDist * px;
+    const y = headerCenter.y + forwardDist * dy + perpDist * py;
+
+    const id = headerId + "_" + slug(label);
+    nodes.push({
+      id,
+      position: { x: x - 75, y: y - 15 },
+      data: { label },
+      style: leaf,
+    });
+    edges.push({
+      id: "br_" + id,
+      source: headerId,
+      target: id,
+      style: { stroke: "#9ca3af", strokeWidth: 1 },
+    });
+  });
+
+  return { nodes, edges };
+};
+
+export const CX = 1200;
+export const CY = 900;
+
+export const branches = [
+  branch("Infrastructure", -90, ["3-node control plane", "AZ spread workers", "Block + File + Object storage", "Hardware certified", "Capacity model", "Network MTU + CNI", "Time + DNS HA", "Bootstrap proxy"], CX, CY),
+  branch("Compliance", -45, ["Compliance Operator", "PCI-DSS scope", "SOX controls map", "DORA register (EU)", "Data residency", "FIPS mode", "Pen test report", "Encryption attestation"], CX, CY),
+  branch("Identity & Access", 0, ["Enterprise OIDC / SAML", "MFA enforced", "Group → role mapping", "Break-glass procedure", "Service account hygiene", "Privileged access mgmt", "Audit log export", "Quarterly access review"], CX, CY),
+  branch("Application Readiness", 45, ["Image signing required", "Resource requests + limits", "Liveness + readiness probes", "PodDisruptionBudget", "Anti-affinity", "HPA configured", "Secrets via Vault", "Distroless / UBI images"], CX, CY),
+  branch("Resilience & DR", 90, ["Multi-cluster topology", "etcd backup automated", "etcd restore tested", "OADP / Velero", "RPO + RTO per tier", "DR drill executed", "Network failover tested", "Cross-region replication"], CX, CY),
+  branch("Operations", 135, ["GitOps everything", "Canary upgrades", "Change advisory board", "24x7 on-call", "Runbooks indexed", "Patch SLA defined", "Capacity review monthly", "Cluster lifecycle policy"], CX, CY),
+  branch("Observability & Audit", 180, ["Logs to SIEM (WORM)", "Metrics + Thanos retention", "Distributed tracing", "SLI / SLO per service", "Audit log retention 1y+", "Alert routing tested", "Synthetic monitoring", "Capacity dashboards"], CX, CY),
+  branch("Security & Network", -135, ["Pod Security restricted", "NetworkPolicy default-deny", "Egress firewall", "Service Mesh mTLS", "Encryption at rest", "RHACS deployed", "Image scanning gates", "Quay + signed images"], CX, CY),
+];
+
+export const mindNodes = [
+  { id: "bfsi_readiness", position: { x: CX - 130, y: CY - 40 }, data: { label: "BFSI Production Readiness" }, style: center },
+  ...branches.flatMap((b) => b.nodes),
+];
+
+export const mindEdges = branches.flatMap((b) => b.edges);
+
+Taking an OpenShift cluster to production in a Banking, Financial Services, or Insurance (BFSI) environment is a categorically different exercise from "deploy OpenShift in our dev environment and try it." Regulators ask specific questions. Auditors want evidence trails. The data on the cluster is subject to RBI / FFIEC / MAS / HKMA / FINRA / GDPR / DORA — pick your jurisdiction — and the cost of a missed control is measured in millions plus regulatory action plus reputational damage.
+
+This is the production-readiness checklist I run through before signing off on a BFSI cluster going live. It assumes you've already installed OpenShift correctly; this is the *operational* and *compliance* posture review that separates "we have a cluster" from "we have a production banking-grade platform."
+
+## The eight readiness domains
+
+<Whiteboard client:load data={{ nodes: mindNodes, edges: mindEdges }} height={1000} />
+
+Eight branches from the center, each with the items that get explicitly signed off during readiness review. The rest of the post is the checklist itself.
+
+## 1. Infrastructure
+
+The substrate everything else stands on. Get this wrong and nothing above it matters.
+
+- [ ] **3-node control plane minimum.** Production OpenShift clusters need 3 master nodes for etcd quorum. Five if you're being conservative for very large clusters. **Spread across availability zones** if your underlying infra supports it.
+- [ ] **Worker node spread.** Distribute workers across AZs / racks / failure domains. Anti-affinity is per-workload but the *capacity* to honor it requires the spread underneath.
+- [ ] **Hardware certified for OpenShift.** Check the Red Hat ecosystem catalog. Banking auditors will ask for the vendor certification letter.
+- [ ] **Storage classes for all three modes.** Block (RWO) for databases, file (RWX) for shared workloads, object (S3-compatible) for backups and artifacts. Specify default classes and replication factors per tier.
+- [ ] **Time synchronization.** All nodes on hardened NTP or PTP. Auditors will ask about clock drift between nodes; etcd hates clock drift.
+- [ ] **DNS HA + recursive resolution.** Two internal resolvers minimum. Cluster DNS should not depend on a single upstream.
+- [ ] **CNI + MTU validated.** OVN-Kubernetes is the default; calico if you have specific reasons. MTU mismatch between cluster and underlay causes intermittent latency that's brutal to debug post-go-live.
+- [ ] **Bootstrap proxy / disconnected install.** Most BFSI clusters install via egress proxy or fully air-gapped. Mirror registry (Quay or `oc-mirror`), correct CA trust bundle, ImageContentSourcePolicy / ImageDigestMirrorSet configured.
+- [ ] **Capacity model documented.** Initial size + 12-month growth projection + headroom for upgrades (rolling upgrade drains nodes; you need spare capacity).
+
+## 2. Security & Network
+
+Banking-grade security isn't "we have RBAC." It's defense-in-depth with documented controls.
+
+- [ ] **Pod Security Standards: restricted by default.** Namespaces enforce `restricted` profile; exceptions are namespace-scoped, approved, and reviewed.
+- [ ] **Custom SCCs documented and reviewed.** Any workload running with elevated SCC has a written justification.
+- [ ] **NetworkPolicy default-deny in every workload namespace.** Explicit allow-list per namespace. This is the single highest-impact security control most teams skip.
+- [ ] **Egress firewall / EgressIP** for outbound control. All cluster egress through known IPs auditable at the perimeter. No "the cluster talks to the internet from random worker IPs."
+- [ ] **Service Mesh for mTLS.** Istio (OpenShift Service Mesh) configured for STRICT mTLS in production namespaces. Plaintext inter-service traffic is not acceptable.
+- [ ] **Encryption at rest: etcd, secrets, storage.** etcd encryption provider configured. Storage class with encryption (LUKS or vendor-native). Secrets encrypted with KMS where supported.
+- [ ] **Image scanning + admission gates.** [RHACS](/blog/rhacs) deployed, image scanning runs at build *and* admission. Policies block deployments above the configured CVE severity threshold.
+- [ ] **Quay (or external registry) with signed images only.** ImagePolicy denying unsigned images. Cosign / Sigstore signatures attached at build.
+- [ ] **No `:latest` tags in production.** Image references by digest or versioned tag only.
+- [ ] **CVE remediation SLA documented.** Critical: 7 days. High: 30 days. Medium: 90 days. Tracked in a ticket queue regulators can review.
+
+## 3. Identity & Access
+
+This is where audits live or die. Document everything.
+
+- [ ] **OIDC / SAML SSO** to enterprise IdP (AD, Okta, [Ping Identity](/blog/ping-identity)). HTPasswd auth is for lab only.
+- [ ] **MFA enforced at IdP.** No bypass paths.
+- [ ] **Group → role mapping** declarative (`OAuth` + `Group` CRs in Git). No manual `oc adm policy` commands.
+- [ ] **Break-glass procedure** documented: who can use it, how it's activated, how it's logged, automatic ticket generation, mandatory post-use review. Two people minimum (dual control).
+- [ ] **Service account hygiene.** No service accounts with `cluster-admin`. Audit existing service accounts annually. Token rotation if long-lived tokens are used.
+- [ ] **Privileged access management.** PAM integration (CyberArk, HashiCorp Boundary, Teleport) for elevated cluster access. Session recording for break-glass and prod-cluster shell access.
+- [ ] **Audit log export to SIEM** within 5 minutes of event. Immutable storage (WORM bucket) for retention.
+- [ ] **Quarterly access review.** Generate a report of who has what role, sign-off by application owners. Auditors will ask for the last four quarters.
+- [ ] **Joiner / mover / leaver process** automated. SSO-driven; departures revoke cluster access within the same SLA as the rest of the enterprise.
+
+## 4. Application Readiness
+
+Production-grade workloads, not "deployed in dev, hope it works in prod."
+
+- [ ] **Image signing required at deploy.** Any image without a valid signature is rejected by admission.
+- [ ] **Resource `requests` and `limits` set on every pod.** No unlimited containers in production.
+- [ ] **Liveness, readiness, startup probes.** Long-startup apps (Java) need startup probes; without them, liveness fires too early and kills the pod mid-warmup.
+- [ ] **PodDisruptionBudget** for every multi-replica deployment. Otherwise rolling cluster operations can take all replicas down.
+- [ ] **Anti-affinity rules** for replicas of the same service. Don't run all replicas on one node.
+- [ ] **Horizontal Pod Autoscaler** configured for scaling workloads. Min replicas ≥ 2 for HA.
+- [ ] **Secrets via Vault / External Secrets / Sealed Secrets.** Not committed to Git. Not in environment variables on a Deployment manifest in Git.
+- [ ] **Distroless or UBI minimal base images.** No `apt install random-tool` in production images.
+- [ ] **TLS termination strategy decided.** At the Route, at the Ingress Controller, or at the pod (mTLS via Service Mesh).
+- [ ] **Logs to stdout/stderr,** never to a file inside the pod. Use the platform's log collector.
+
+## 5. Resilience & Disaster Recovery
+
+The drill is the test. Documented procedures that haven't been executed don't count.
+
+- [ ] **Multi-cluster topology defined.** Active-active across regions, active-passive with warm standby, or hub-spoke via [RHACM](/blog/rhacm). The decision drives every following control.
+- [ ] **etcd backup automated.** Off-cluster storage (S3 with versioning + cross-region replication). Daily minimum, hourly for tier-1.
+- [ ] **etcd restore drill executed in the last 6 months.** Not "documented" — *executed*. Date and outcome captured.
+- [ ] **OADP / Velero deployed.** Application backups configured per tier. Pre/post hooks defined for stateful workloads.
+- [ ] **RPO and RTO defined per application tier.** Tier-1: RPO ≤ 15 min, RTO ≤ 1 hour. Tier-2: RPO ≤ 4 hours, RTO ≤ 8 hours. Tier-3: RPO ≤ 24 hours, RTO ≤ 24 hours. Numbers are illustrative; the *commitment* is the point.
+- [ ] **Full DR drill scheduled annually** at minimum. Switch primary traffic to the DR cluster, run for 2-4 hours, switch back. Document the deltas.
+- [ ] **Network failover tested.** DNS failover (GSLB), BGP failover (if applicable), or VIP failover all proven.
+- [ ] **Cross-region storage replication** for any persistent data the application can't reconstruct.
+- [ ] **Database HA strategy defined.** [CloudNativePG](https://cloudnative-pg.io/) or operator-managed equivalent for Postgres; vendor solutions for Oracle / DB2 / MS SQL.
+
+## 6. Operations
+
+The day-2 reality. Going live is one day; running for years is the rest.
+
+- [ ] **Everything in GitOps.** Cluster config, application manifests, operator subscriptions. ArgoCD (via [OpenShift GitOps](/blog/openshift-gitops)) for the application layer. No manual `oc apply` after go-live.
+- [ ] **Canary upgrade strategy** documented. Dev → staging → prod cluster sequence. Upgrade lab cluster matches production version path.
+- [ ] **Change Advisory Board** process. Every prod change has a CAB ticket. Emergency changes have a post-event CAB review.
+- [ ] **24x7 on-call rotation.** Primary + secondary, defined escalation path. Pages route through PagerDuty / Opsgenie with confirmed alert delivery.
+- [ ] **Runbooks indexed** for every alert. A page that doesn't have a runbook link is a defect in the alert.
+- [ ] **Patch SLA documented.** Cluster CVE patches within 30 days for high/critical; 90 days for medium. OS-level patches within 14 days for critical.
+- [ ] **Monthly capacity review.** CPU, memory, storage, etcd disk, network. Trend analysis catches problems 60 days before they fire.
+- [ ] **Cluster lifecycle policy.** When you upgrade, when you decommission, when you scale out. Multi-year roadmap aligned with Red Hat's support lifecycle.
+- [ ] **Cluster lifecycle automation tested.** Adding/removing nodes via MachineSet / Cluster API. No "we add nodes by hand" stories.
+
+## 7. Observability & Audit
+
+Compliance lives or dies by what you can prove happened.
+
+- [ ] **Logs shipped to enterprise SIEM** (Splunk, [Datadog](/blog/datadog), Elastic, Sentinel) within 5 minutes. **WORM bucket** for retention 1 year minimum, often 7 years for BFSI.
+- [ ] **Metrics with Thanos** (or external Mimir / Cortex) for 13-month minimum retention.
+- [ ] **Distributed tracing** deployed where revenue-bearing services live. See [the distributed tracing post](/blog/distributed-tracing) for the architecture.
+- [ ] **SLI / SLO per service.** Defined, alerted on, reviewed in a monthly business review with application owners.
+- [ ] **Audit log retention 1 year minimum** (regulator-dependent; often 7 years for SOX / PCI). API server audit, Kubernetes audit, OAuth audit, SCC violations, RBAC denials.
+- [ ] **Alert routing tested.** Synthetic alerts fired end-to-end at least monthly to confirm Pager → human flow works.
+- [ ] **Synthetic monitoring** (Pingdom / Datadog Synthetics / Catchpoint) hitting production from outside-in. Catches the cases where internal monitoring lies.
+- [ ] **Capacity + cost dashboards** for FinOps / cost allocation. BFSI cost allocation per LOB is non-optional.
+
+## 8. Compliance & Regulatory
+
+The paperwork that auditors actually read.
+
+- [ ] **Compliance Operator deployed.** Profiles enabled for CIS, PCI-DSS, NIST 800-53, HIPAA (if applicable). Automated scan results stored.
+- [ ] **PCI-DSS scope documented.** Which namespaces / clusters / nodes are in scope. Cardholder data segregation. Quarterly external scan if applicable.
+- [ ] **SOX controls mapped.** ITGCs for change management, logical access, computer operations, program development. Mapping document signed off by IA.
+- [ ] **DORA register** for EU operations. Third-party risk mapping, ICT incident reporting, threat-led penetration testing.
+- [ ] **Data residency documented.** Which data lives in which region. Cross-border transfer agreements (SCCs, BCRs) in place.
+- [ ] **FIPS mode** if the regulator requires it (often US Federal, some banking). OpenShift supports FIPS-mode install; cluster must be installed in FIPS mode from day one — can't be flipped on later.
+- [ ] **Penetration test report.** Annual or per major change. Findings tracked through closure.
+- [ ] **Encryption attestation.** Documented evidence: etcd encryption configured, storage encrypted at rest, mTLS for service-to-service, TLS 1.2+ at the edge, key rotation policy.
+- [ ] **Vendor risk assessment** for Red Hat / IBM / cluster operators. SIG / GDPR-DPA / cyber insurance.
+- [ ] **Business Continuity Plan** integrated. The cluster's DR plan is one paragraph in the org's broader BCP, not standalone.
+
+## What regulators actually ask
+
+In my experience leading these reviews, the questions that come up most:
+
+- **"Show me your last etcd restore drill."** Date, who ran it, RTO observed, lessons. If you don't have one — that's the finding.
+- **"Who can `cluster-admin`?"** Expect to provide a roster with business justification per person.
+- **"Where are the audit logs for the last 6 months?"** Live demo of pulling specific events. The answer "it's in Splunk somewhere" doesn't pass.
+- **"How do you know your secrets aren't in Git history?"** Secret-scanning tooling proof + signed attestation.
+- **"What's your CVE remediation SLA, and what's currently overdue?"** They will ask for the overdue list.
+- **"How does a hot-patch get to prod in 4 hours?"** Emergency change process. CAB exemption path. Documented.
+- **"How many clusters do you have, what version, and when do they go end-of-support?"** A list that matches the actual environment. Discrepancies are findings.
+
+## The sign-off process
+
+A real readiness review involves:
+
+1. **Domain owner sign-off** — Infrastructure lead, Security lead, IAM lead, Application owner, Ops lead. Each signs their domain checklist.
+2. **Pre-prod validation** in a staging cluster that mirrors production. Performance test, chaos test, security test, DR drill.
+3. **Go-live readiness review** with all stakeholders + risk + compliance + audit. The diagram above is essentially the agenda.
+4. **Phased cutover.** Low-tier workloads first, two weeks of monitoring, then mid-tier, then top-tier.
+5. **30-day post-go-live review.** What broke, what was missed, what controls need adjusting.
+
+## The trap
+
+The mistake that recurs in BFSI OpenShift programs: treating the checklist as a *box-ticking exercise* rather than as a *thinking framework*. A signed checklist where every box is "yes, documented" but the DR drill was never actually executed, the break-glass account was never tested, the SIEM never received an audit event during the validation window — that's not a production-ready cluster. It's a paper readiness review.
+
+The checklist exists because the failure modes it covers are *real* and *expensive*. Every BFSI OpenShift outage I've reviewed traces back to a box that was ticked but not actually tested. The discipline is to **prove every claim with evidence**: an execution log, a screenshot, a test run, a witness — not a Confluence page.
+
+Stamp the page only after the evidence exists. Then go live.
