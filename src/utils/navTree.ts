@@ -6,12 +6,12 @@ export type NavNode = {
   children?: NavNode[];
 };
 
-type CollectionItem = CollectionEntry<"blog">;
+type BlogItem = CollectionEntry<"blog">;
 
 const prettify = (s: string) =>
   s.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toLowerCase());
 
-export function buildTree(items: CollectionItem[], base: string): NavNode[] {
+export function buildTree(items: BlogItem[], base: string): NavNode[] {
   const root: NavNode = { label: "", children: [] };
   const sorted = [...items].sort((a, b) => a.id.localeCompare(b.id));
 
@@ -36,6 +36,50 @@ export function buildTree(items: CollectionItem[], base: string): NavNode[] {
   }
 
   return root.children ?? [];
+}
+
+export function buildCategoryTree(items: BlogItem[], base: string): NavNode[] {
+  const groups = new Map<string, BlogItem[]>();
+  const uncategorized: BlogItem[] = [];
+
+  for (const item of items) {
+    const cat = (item.data as { category?: string }).category;
+    if (!cat) {
+      uncategorized.push(item);
+      continue;
+    }
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat)!.push(item);
+  }
+
+  const result: NavNode[] = [];
+
+  for (const cat of Array.from(groups.keys()).sort()) {
+    const posts = groups
+      .get(cat)!
+      .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+    result.push({
+      label: prettify(cat),
+      children: posts.map((p) => ({
+        label: (p.data as { title: string }).title,
+        href: `${base}/${p.id}`,
+      })),
+    });
+  }
+
+  if (uncategorized.length) {
+    uncategorized.sort(
+      (a, b) => b.data.date.valueOf() - a.data.date.valueOf()
+    );
+    for (const p of uncategorized) {
+      result.push({
+        label: (p.data as { title: string }).title,
+        href: `${base}/${p.id}`,
+      });
+    }
+  }
+
+  return result;
 }
 
 const norm = (p: string) => p.replace(/\/+$/, "");
