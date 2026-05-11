@@ -11,7 +11,8 @@ export type NavNode = {
 type BlogItem = CollectionEntry<"blog">;
 type DocItem = CollectionEntry<"docs">;
 type LearnItem = CollectionEntry<"learn">;
-type AnyItem = BlogItem | DocItem | LearnItem;
+type BracPocItem = CollectionEntry<"brac-poc">;
+type AnyItem = BlogItem | DocItem | LearnItem | BracPocItem;
 
 const prettify = (s: string) =>
   s.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toLowerCase());
@@ -66,6 +67,44 @@ export function buildTree(items: BlogItem[], base: string): NavNode[] {
 
 /** Like buildTree but for the `docs` collection — accepts a per-item `sidebar_label` override. */
 export function buildDocsTree(items: DocItem[], base: string): NavNode[] {
+  const root: NavNode = { label: "", children: [] };
+  const sorted = [...items].sort((a, b) => a.id.localeCompare(b.id));
+
+  for (const item of sorted) {
+    const parts = item.id.split("/");
+    let cursor = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const dir = parts[i];
+      const cleanDir = stripPrefix(dir);
+      let child = cursor.children!.find(
+        (c) => c.sortKey === dir && !c.href
+      );
+      if (!child) {
+        child = { label: prettify(cleanDir), children: [], sortKey: dir };
+        cursor.children!.push(child);
+      }
+      cursor = child;
+    }
+    const data = item.data as { title: string; sidebar_label?: string };
+    cursor.children!.push({
+      label: data.sidebar_label ?? data.title,
+      href: `${base}/${stripIdPrefixes(item.id)}`,
+      sortKey: parts[parts.length - 1],
+    });
+  }
+
+  const sortRecursive = (nodes: NavNode[] | undefined) => {
+    if (!nodes) return;
+    nodes.sort((a, b) => (a.sortKey ?? a.label).localeCompare(b.sortKey ?? b.label));
+    for (const n of nodes) sortRecursive(n.children);
+  };
+  sortRecursive(root.children);
+
+  return root.children ?? [];
+}
+
+/** Same shape as buildDocsTree, scoped to the `brac-poc` collection. */
+export function buildBracPocTree(items: BracPocItem[], base: string): NavNode[] {
   const root: NavNode = { label: "", children: [] };
   const sorted = [...items].sort((a, b) => a.id.localeCompare(b.id));
 

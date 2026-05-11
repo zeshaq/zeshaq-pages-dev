@@ -1,0 +1,106 @@
+---
+import { getCollection } from "astro:content";
+import NavNode from "./NavNode.astro";
+import SectionNav from "./SectionNav.astro";
+import Search from "./Search.astro";
+import { buildBracPocTree, type NavNode as NavNodeT } from "../utils/navTree";
+
+interface Props {
+  currentPath: string;
+}
+
+const { currentPath } = Astro.props;
+
+const items = await getCollection("brac-poc", ({ data }) => !data.draft);
+
+const tree: NavNodeT[] = buildBracPocTree(items, "/brac-poc");
+---
+
+<aside class="sidebar">
+  <details class="sidebar-toggle" open>
+    <summary class="sidebar-summary">
+      <div class="sidebar-brand-row">
+        <a href="/" class="sidebar-home-btn" title="Home — Blog" aria-label="Home" onclick="event.stopPropagation()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+            <polyline points="9 22 9 12 15 12 15 22" />
+          </svg>
+        </a>
+        <a href="/brac-poc" class="sidebar-brand" onclick="event.stopPropagation()">Brac POC</a>
+      </div>
+      <span class="sidebar-hamburger" aria-hidden="true">≡</span>
+    </summary>
+
+    <SectionNav currentPath={currentPath} />
+
+    <Search />
+
+    <div class="sidebar-filter-wrap">
+      <input
+        type="search"
+        class="sidebar-filter"
+        placeholder="filter pages…"
+        autocomplete="off"
+        spellcheck="false"
+        data-filter
+      />
+    </div>
+
+    <nav class="sidebar-nav">
+      <ul data-filter-list>
+        {tree.length === 0 ? (
+          <li class="docs-empty">No pages yet — check back soon.</li>
+        ) : (
+          tree.map((node) => (
+            <li>
+              <NavNode node={node} currentPath={currentPath} />
+            </li>
+          ))
+        )}
+      </ul>
+    </nav>
+  </details>
+</aside>
+
+<script is:inline>
+  (() => {
+    const input = document.querySelector("[data-filter]");
+    const root = document.querySelector("[data-filter-list]");
+    if (!input || !root) return;
+
+    const filter = (li, q) => {
+      const link = li.querySelector(":scope > a.nav-link");
+      if (link) {
+        const match = !q || link.textContent.toLowerCase().includes(q);
+        li.style.display = match ? "" : "none";
+        return match;
+      }
+      const details = li.querySelector(":scope > details");
+      if (details) {
+        const summary = details.querySelector(":scope > summary");
+        const summaryMatch = !q || (summary?.textContent.toLowerCase().includes(q) ?? false);
+        const childUl = details.querySelector(":scope > ul");
+        let anyChild = false;
+        if (childUl) {
+          for (const child of childUl.children) {
+            if (child.tagName === "LI" && filter(child, q)) anyChild = true;
+          }
+        }
+        const visible = summaryMatch || anyChild;
+        li.style.display = visible ? "" : "none";
+        if (q && anyChild) details.open = true;
+        return visible;
+      }
+      return true;
+    };
+
+    const apply = () => {
+      const q = input.value.trim().toLowerCase();
+      for (const li of root.children) {
+        if (li.tagName === "LI") filter(li, q);
+      }
+    };
+
+    input.addEventListener("input", apply);
+  })();
+</script>

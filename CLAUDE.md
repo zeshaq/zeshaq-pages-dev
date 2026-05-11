@@ -9,10 +9,11 @@ This file is for the **next AI agent** working on this repository. It captures t
 - **Public blog + docs + learning tracks** at `https://zeshaq.pages.dev`.
 - Built with **Astro 5**, **MDX**, **React islands** (`@xyflow/react` for diagrams), **Tailwind v4**, hosted on **Cloudflare Pages** via a GitHub Actions workflow.
 - The author is **Zahid** (`zeshaq@gmail.com`, GH handle `zeshaq`). The CF project is named `zeshaq` because `zahid.pages.dev` was globally taken at the time of creation — see [Blog ADR 0001](src/content/docs/06-architecture-decisions/12-blog/01-adr-0001-multi-collection-content-model.mdx) and the `project_zahid_blog.md` memory.
-- The site has three audiences, served by three content collections:
+- The site has four audiences, served by four content collections:
   - **Blog posts** (`/blog/*`) — opinionated technical writing for the public.
   - **Platform docs** (`/docs/*`) — internal-style documentation for the comptech OpenShift platform.
   - **Learning tracks** (`/learn/<track>/<module>`) — self-paced curriculum (currently Agentic AI + Cloudflare).
+  - **Brac POC** (`/brac-poc/*`) — proof-of-concept work for the BRAC Bank engagement, with its own sidebar and TOC (Blog ADR 0006). Promoted out of `/docs/` so engagement readers and platform readers don't share a sidebar.
 - Plus a `/whiteboard` interactive editor and a `/rss.xml` feed.
 
 ## 2. Deploy + push workflow
@@ -40,11 +41,12 @@ This file is for the **next AI agent** working on this repository. It captures t
 │   ├── favicon.svg
 │   └── robots.txt                       ← allows all + sitemap pointer
 ├── src/
-│   ├── content.config.ts                ← three collections: blog, docs, learn
+│   ├── content.config.ts                ← four collections: blog, docs, learn, brac-poc
 │   ├── content/
 │   │   ├── blog/*.mdx                   ← posts (flat, category in frontmatter)
 │   │   ├── docs/NN-section/NN-*.mdx     ← platform docs, numbered for sort
-│   │   └── learn/<track>/NN-*.mdx       ← learn modules, numbered for sort
+│   │   ├── learn/<track>/NN-*.mdx       ← learn modules, numbered for sort
+│   │   └── brac-poc/NN-*.mdx            ← BRAC engagement POC pages, numbered for sort
 │   ├── components/
 │   │   ├── Whiteboard.tsx               ← ReactFlow viewer (NO minimap)
 │   │   ├── WhiteboardEditor.tsx         ← /whiteboard interactive editor
@@ -54,11 +56,13 @@ This file is for the **next AI agent** working on this repository. It captures t
 │   │   ├── Sidebar.astro                ← blog sidebar (with category groups)
 │   │   ├── DocsSidebar.astro            ← docs sidebar
 │   │   ├── LearnSidebar.astro           ← learn sidebar (with back-link)
+│   │   ├── BracPocSidebar.astro         ← brac-poc sidebar
 │   │   └── DocsTocNode.astro            ← reused by docs + learn TOC pages
 │   ├── layouts/
 │   │   ├── Layout.astro                 ← blog post + home layout
 │   │   ├── DocsLayout.astro             ← docs layout
 │   │   ├── LearnLayout.astro            ← learn layout
+│   │   ├── BracPocLayout.astro          ← brac-poc layout
 │   │   └── BareLayout.astro             ← whiteboard (full-window, no sidebar)
 │   ├── pages/
 │   │   ├── index.astro                  ← blog home (lists posts)
@@ -111,6 +115,17 @@ Defined in `src/content.config.ts`.
   2. `/learn/<track>/` — per-track TOC.
   3. `/learn/<track>/<module>` — module content.
 - Track display titles + taglines live in `src/utils/tracks.ts` (`TRACK_TITLES`, `TRACK_TAGLINES`).
+
+### brac-poc
+
+- URL: `/brac-poc/<stripped-slug>` (numeric prefixes stripped from filenames).
+- Schema: same as `docs` — `title`, `description?`, `sidebar_label?`, `last_reviewed?`, `draft?`.
+- Files: flat under `src/content/brac-poc/NN-*.mdx`; numbered for sort order.
+- Two-level navigation:
+  1. `/brac-poc/` — landing page (lists pages).
+  2. `/brac-poc/<page>` — content.
+- Layout: `BracPocLayout.astro`; Sidebar: `BracPocSidebar.astro`; Tree builder: `buildBracPocTree`.
+- Promoted out of `/docs/09-brac-poc/` per [Blog ADR 0006](src/content/docs/06-architecture-decisions/12-blog/06-adr-0006-brac-poc-collection.mdx). If a second engagement lands, refactor into a generic `engagements/` collection.
 
 ## 5. Voice / writing style
 

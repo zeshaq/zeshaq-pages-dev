@@ -1,0 +1,40 @@
+---
+import BracPocLayout from "../../layouts/BracPocLayout.astro";
+import { getCollection } from "astro:content";
+import { buildBracPocTree, type NavNode } from "../../utils/navTree";
+
+const items = await getCollection("brac-poc", ({ data }) => !data.draft);
+const tree = buildBracPocTree(items, "/brac-poc");
+
+function countLeaves(n: NavNode): number {
+  if (n.href) return 1;
+  return (n.children ?? []).reduce((acc, c) => acc + countLeaves(c), 0);
+}
+
+const totalLeaves = tree.reduce((acc, n) => acc + countLeaves(n), 0);
+---
+
+<BracPocLayout title="Brac POC">
+  <section class="mb-10">
+    <h1 class="text-2xl font-semibold mb-2">Brac POC</h1>
+    <p class="text-[var(--color-muted)] mb-3">
+      Proof-of-concept work for the BRAC Bank engagement. Scope, environments, milestones,
+      and the requirements that drive each deliverable. A POC is not a pilot — the goal is
+      to <em>prove</em> a small number of load-bearing assumptions in a contained
+      environment, with a written go/no-go decision at the end.
+    </p>
+    <p class="text-[var(--color-muted)] text-sm">
+      <strong>{totalLeaves}</strong> {totalLeaves === 1 ? "page" : "pages"}.
+    </p>
+  </section>
+
+  <section>
+    <ul class="docs-top-pages">
+      {tree.map((node) => (
+        <li>
+          <a href={node.href ?? "#"}>{node.label}</a>
+        </li>
+      ))}
+    </ul>
+  </section>
+</BracPocLayout>

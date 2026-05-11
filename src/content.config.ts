@@ -37,4 +37,15 @@ const learn = defineCollection({
   }),
 });
 
-export const collections = { blog, docs, learn };
+const bracPoc = defineCollection({
+  loader: glob({ pattern: "**/*.{md,mdx}", base: "./src/content/brac-poc" }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string().optional(),
+    sidebar_label: z.string().optional(),
+    last_reviewed: z.coerce.date().optional(),
+    draft: z.boolean().default(false),
+  }),
+});
+
+export const collections = { blog, docs, learn, "brac-poc": bracPoc };

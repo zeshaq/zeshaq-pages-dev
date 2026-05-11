@@ -1,0 +1,74 @@
+---
+title: "Blog ADR 0006 — Brac POC as a top-level content collection"
+sidebar_label: "ADR 0006 — Brac POC collection"
+description: "Why client / engagement docs got promoted out of /docs/ into their own content collection with a dedicated sidebar and TOC."
+last_reviewed: 2026-05-11
+draft: false
+---
+
+## Status
+
+Accepted — 2026-05-11.
+
+## Context
+
+The CompTech full-platform docs at `/docs/` are operator-facing reference material: how the platform is built, what's where, how to run it. The audience is "anyone touching the platform."
+
+The **BRAC Bank POC** is a different surface: client-engagement scope, the requirements email, what each deliverable is, milestones, decisions, evidence. The audience is "anyone working the BRAC engagement." It shares almost nothing with the platform docs except the underlying platform itself.
+
+Initially the POC docs landed under `src/content/docs/09-brac-poc/`, surfaced as just another section card on `/docs/`. That was wrong on three axes:
+
+1. **Audience mixing.** Platform readers got a client-engagement card in their sidebar; engagement readers had to scroll through 8 platform sections to find their content.
+2. **TOC ownership.** The `/docs/` sidebar lists every section's pages. A POC sub-section appearing alongside Foundations / Operations / ADRs makes the engagement read like a platform domain, not a focused workstream.
+3. **Lifecycle mismatch.** Platform docs are long-lived. POC docs are bound to a specific engagement and either graduate (become platform docs) or get archived. They shouldn't live in the same tree as evergreen reference material.
+
+## Decision
+
+Promote **Brac POC** out of `src/content/docs/` into its own top-level content collection at `src/content/brac-poc/`.
+
+- **URL:** `/brac-poc/<page>` (was `/docs/brac-poc/<page>`).
+- **Layout:** `src/layouts/BracPocLayout.astro` — clone of `DocsLayout` with engagement-specific brand and OG defaults.
+- **Sidebar:** `src/components/BracPocSidebar.astro` — clone of `DocsSidebar` scoped to the brac-poc collection only. Carries the `SectionNav` icon row + Pagefind search + filter input + tree.
+- **Routing:** `src/pages/brac-poc/index.astro` (landing) + `src/pages/brac-poc/[...slug].astro` (content pages).
+- **Section nav:** `SectionNav.astro` gains a Brac POC icon between Docs and Whiteboard, so cross-section navigation stays one-click from any sidebar.
+- **Collection registration:** `src/content.config.ts` registers `brac-poc` with the same schema as `docs` (title, description, sidebar_label, last_reviewed, draft).
+- **Tree builder:** `buildBracPocTree` in `src/utils/navTree.ts`, parallel to `buildDocsTree` and `buildLearnTree`.
+
+The `09-brac-poc` directory under `src/content/docs/` is removed. Old URLs (`/docs/brac-poc/overview/`, `/docs/brac-poc/poc-requirements-email/`) are not redirected — the content is recent (2026-05-11), no live external links yet.
+
+## Alternatives considered
+
+1. **Keep under `/docs/` with sidebar filtering.**
+   - Would require adding a "scope" axis to the docs sidebar so platform readers can hide engagement content. Adds UI surface area without solving the audience-mixing problem in OG meta, search results, or RSS.
+   - Rejected.
+
+2. **Generic `engagements/` collection (`/engagements/brac-poc/...`).**
+   - More reusable if multiple client POCs land. But YAGNI today — there's exactly one engagement, and naming the URL `/brac-poc/` is more direct than `/engagements/brac-poc/`.
+   - Easy to refactor to a generic collection later: rename the collection key, move files, update the tree builder.
+   - Rejected for now; revisit when a second engagement appears.
+
+3. **Separate Astro site / separate Cloudflare Pages project.**
+   - Would force a fully separate deploy pipeline, separate sidebar (no cross-section nav), separate search index. The current site is a single deployable; splitting it for one engagement is over-engineering.
+   - Rejected.
+
+## Consequences
+
+**Positive:**
+
+- Engagement readers see only engagement content in their sidebar.
+- Platform docs sidebar stays focused on long-lived reference material.
+- Future engagements can either get the same shape (clone the layout/sidebar) or trigger a refactor to a generic `engagements/` collection if there are 3+.
+- The collection schema and tree builder match `docs/`, so authoring a POC page feels identical to authoring a docs page.
+
+**Negative:**
+
+- One more collection to maintain. Adds ~150 lines across `content.config.ts`, `navTree.ts`, a layout, a sidebar, two page routes, and the SectionNav.
+- Two existing URLs (`/docs/brac-poc/overview/` and `/docs/brac-poc/poc-requirements-email/`) stop resolving. No redirects added because the content is brand new and no external links exist yet.
+- If a second client engagement lands without first refactoring to a generic collection, we'll duplicate this scaffolding. The decision to refactor is deferred to that moment.
+
+## Related
+
+- [Blog ADR 0001](./01-adr-0001-multi-collection-content-model) — the original 3-collection model (blog, docs, learn) that this ADR extends to 4.
+- [Blog ADR 0004](./04-adr-0004-learn-section-structure) — the `/learn/<track>/<module>` pattern; Brac POC's collection layout was modeled on Learn's three-level navigation, simplified for a single engagement.
+- `src/content/brac-poc/00-overview.mdx` — the section's first page (the POC framing).
+- `src/content/brac-poc/01-requirements-email.mdx` — the requirements email as received from BRAC Bank PLC.
