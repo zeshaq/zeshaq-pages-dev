@@ -1,0 +1,116 @@
+---
+title: "Brac POC — demo scope (v2 from client)"
+sidebar_label: "Demo scope (v2)"
+description: "Second message from BRAC Bank PLC narrowing the original POC scope to eight specific demonstration components, with a reference architecture diagram (MFE Router → WSO2 API GW → BFF router → Meshow → Identity → Product, and WSO2 IAM beside the mesh)."
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../components/Whiteboard.tsx";
+
+> Source: second message from BRAC Bank PLC, captured 2026-05-11. The
+> message tightens the [original requirements email](/brac-poc/requirements-email)
+> down to eight specific demonstration items and ships a reference
+> architecture photo. Both are reproduced verbatim below.
+
+## BRAC Bank Demonstration Scope
+
+Reference architecture image and requested demonstration components.
+
+## Requested demonstration items
+
+| No. | Demonstration Component |
+| :-: | :--- |
+| 1 | API Gateway |
+| 2 | IAM |
+| 3 | MTLS (Commply MTLS / Service mesh) |
+| 4 | Canary deployment using service mesh |
+| 5 | Design robust Observability including Kafka — high level (**High Priority**) |
+| 6 | Redis |
+| 7 | SigNoz |
+| 8 | Nexus OSS |
+
+> Note: Preserves the provided architecture image and demonstration scope
+> text for the BRAC Bank discussion.
+
+## Reference architecture (re-rendered)
+
+The client sent the architecture as a photo of a slide. Re-rendered here
+so the flow is navigable and searchable; the photo is preserved as a
+fallback below.
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const archNodes = [
+  { id: "user",      data: { label: "User" },                   position: { x: 320, y:   0 }, style: stage },
+  { id: "mfe",       data: { label: "MFE Router" },             position: { x: 320, y: 110 }, style: ctrl  },
+  { id: "apigw",     data: { label: "WSO2 API GW" },            position: { x: 320, y: 220 }, style: ctrl  },
+  { id: "bff",       data: { label: "BFF router" },             position: { x: 320, y: 330 }, style: ctrl  },
+  { id: "mesh",      data: { label: "Meshow (service mesh)" },  position: { x: 320, y: 440 }, style: ctrl  },
+  { id: "iam",       data: { label: "WSO2 IAM" },               position: { x: 580, y: 440 }, style: ext   },
+  { id: "identity",  data: { label: "Identity" },               position: { x: 220, y: 560 }, style: stage },
+  { id: "product",   data: { label: "Product" },                position: { x: 420, y: 660 }, style: stage },
+];
+
+export const archEdges = [
+  { id: "user-mfe",     source: "user",     target: "mfe",      label: "HTTPS",       style: { stroke: "#1f2937" } },
+  { id: "tls1",         source: "user",     target: "mfe",      label: "TLS terminate", style: { stroke: "#6b7280", strokeDasharray: "5,5" }, animated: false },
+  { id: "mfe-apigw",    source: "mfe",      target: "apigw",    label: "HTTP",        style: { stroke: "#1f2937" } },
+  { id: "tls2",         source: "mfe",      target: "apigw",    label: "TLS terminate", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "apigw-bff",    source: "apigw",    target: "bff",      label: "HTTP/HTTPS",  style: { stroke: "#1f2937" } },
+  { id: "bff-mesh",     source: "bff",      target: "mesh",     label: "HTTP",        style: { stroke: "#1f2937" } },
+  { id: "mesh-iam",     source: "mesh",     target: "iam",      label: "HTTP",        style: { stroke: "#1f2937" } },
+  { id: "mesh-identity",source: "mesh",     target: "identity", style: { stroke: "#1f2937" } },
+  { id: "identity-product", source: "identity", target: "product", style: { stroke: "#1f2937" } },
+];
+
+<Whiteboard nodes={archNodes} edges={archEdges} height={680} client:only="react" />
+
+**Reading the diagram:**
+
+- TLS terminates twice on the way in — once at the MFE Router (so the
+  edge sees plaintext) and once at the **WSO2 API Gateway**. Each
+  northbound hop is HTTPS; each southbound hop the API GW issues is
+  HTTP (intra-cluster).
+- The **BFF router** sits between the API GW and the service mesh —
+  it's the per-tenant aggregation layer, not the gateway.
+- **Meshow** (the service mesh) hosts the workload pods and brokers
+  mTLS between them. **WSO2 IAM** sits beside it (called out by IAM
+  flow rather than in-mesh), implementing OIDC for the identity
+  service.
+- Behind the mesh: two services, **Identity** and **Product**.
+  Identity is the auth service the apps consult; Product is the
+  business service.
+
+## Mapping back to the eight demonstration items
+
+A quick cross-walk so the demo cockpit panels line up with the client's
+scope table:
+
+| Client item | What the panel proves |
+| :--- | :--- |
+| API Gateway | WSO2 API GW box in the diagram — show route + transform + token validation. |
+| IAM | WSO2 IAM box — OIDC login, token issued, session established for the SPA. |
+| MTLS | Service mesh sidecar handshake — show the cert + identity per pod. |
+| Canary using service mesh | VirtualService weight split (v1 / v2), live header override to a sticky lane. |
+| Observability incl. Kafka *(High Priority)* | SigNoz traces across MFE → API GW → BFF → Identity → Product, with a Kafka topic showing producer/consumer span. |
+| Redis | Sentinel-driven failover walkthrough; reads/writes during primary kill. |
+| SigNoz | Native dashboard view + alert routing. |
+| Nexus OSS | App-registry push + dev-pull endpoint shapes; image digest pinning. |
+
+The demo cockpit (`brac-poc.apps.sub.comptech-lab.com`) carries one panel
+per row above.
