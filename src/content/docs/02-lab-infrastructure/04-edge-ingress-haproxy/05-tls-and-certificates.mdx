@@ -1,0 +1,173 @@
+---
+title: "TLS and certificates"
+description: "How the wildcard certificates are issued, loaded, and renewed at the HAProxy edge — Let's Encrypt via ACME DNS-01 against PowerDNS, two wildcard certs on one bind, and the renewal hook that reloads HAProxy without dropping connections."
+sidebar_label: "TLS and certificates"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The HAProxy edge serves two Let's Encrypt wildcard certificates — `*.apps.sub.comptech-lab.com` and `*.mon.sub.comptech-lab.com` — from a single internal bind on `127.0.0.1:8443`. This page is about how they're issued, where they live, how they're renewed, and the gotchas.
+
+## The certs
+
+| Cert file | Wildcard | Issued via | Where loaded |
+| --- | --- | --- | --- |
+| `/etc/haproxy/certs/wildcard-apps.pem` | `*.apps.sub.comptech-lab.com` | Let's Encrypt, ACME DNS-01 via `acme.sh --dns dns_pdns` | `vm-tls` frontend bind on `127.0.0.1:8443` |
+| `/etc/haproxy/certs/wildcard-mon.pem` | `*.mon.sub.comptech-lab.com` | Let's Encrypt, ACME DNS-01 via `acme.sh --dns dns_pdns` | Same bind, second `crt` directive (SNI-driven cert selection) |
+
+Both are PEM-format combined files (fullchain + private key concatenated, the format HAProxy expects). HAProxy validates the file at load and presents the cert chain whose SAN matches the inner-handshake SNI.
+
+## Why DNS-01 (not HTTP-01)
+
+Three reasons:
+
+1. **Wildcards require DNS-01.** Let's Encrypt does not issue wildcard certs via HTTP-01. That alone forces DNS-01.
+2. **The lab DNS authoritative is reachable to ACME validators.** The pdns VM serves `sub.comptech-lab.com` on a public NIC — so ACME's validator can resolve the `_acme-challenge` TXT records that `acme.sh` plants.
+3. **Renewal doesn't need port 80 open.** HTTP-01 would require leaving a `:80` route open during renewal. DNS-01 punches a TXT record and removes it; HAProxy doesn't have to do anything.
+
+## How `acme.sh` interacts with PowerDNS
+
+`acme.sh` runs on the PDNS VM itself (operationally simpler — same host as the authoritative API). Its `dns_pdns` provider uses the PowerDNS HTTP API on `127.0.0.1:8081` with the API key from `pdns.conf`. The flow per renewal:
+
+1. `acme.sh` requests a new wildcard cert from Let's Encrypt.
+2. Let's Encrypt issues a challenge: "prove you control `*.apps.sub.comptech-lab.com` by setting a TXT record at `_acme-challenge.apps.sub.comptech-lab.com` with value `<nonce>`."
+3. `acme.sh` calls the local PowerDNS API to add the TXT record.
+4. Let's Encrypt's validators resolve the TXT record (over the public DNS path → public delegation → the pdns VM's authoritative public-NIC bind).
+5. `acme.sh` removes the TXT record once validated.
+6. Let's Encrypt issues the cert; `acme.sh` writes it to its own `~/.acme.sh/<wildcard>_ecc/` directory.
+
+After issuance, `acme.sh`'s post-hook copies the new fullchain+key into HAProxy's cert directory and reloads HAProxy.
+
+## File layout on the PDNS VM (where `acme.sh` keeps state)
+
+```
+/root/.acme.sh/
+  *.apps.sub.comptech-lab.com_ecc/   # ECC keys preferred over RSA
+    *.apps.sub.comptech-lab.com.cer        # leaf cert
+    *.apps.sub.comptech-lab.com.key        # private key
+    *.apps.sub.comptech-lab.com.fullchain  # leaf + intermediates
+    ca.cer                                  # issuer chain
+  *.mon.sub.comptech-lab.com_ecc/
+    ...
+```
+
+The combined PEM that HAProxy actually consumes is built by concatenating the fullchain and the key:
+
+```bash
+cat \
+  /root/.acme.sh/*.apps.sub.comptech-lab.com_ecc/fullchain.cer \
+  /root/.acme.sh/*.apps.sub.comptech-lab.com_ecc/*.apps.sub.comptech-lab.com.key \
+  > /etc/haproxy/certs/wildcard-apps.pem
+chmod 600 /etc/haproxy/certs/wildcard-apps.pem
+```
+
+The `acme.sh` `--reloadcmd` runs this concat + a `systemctl reload haproxy` (over SSH from the pdns VM to the haproxy VM, or with the file copied to a shared location — exact path is documented in the operator's renewal cheatsheet).
+
+## ECC, not RSA
+
+The lab issues ECC (P-256) wildcards via `acme.sh`'s `--keylength ec-256`. Two reasons:
+
+- Smaller cert size, faster handshake.
+- The lab has no client that's stuck on a Java JRE old enough to not understand ECC.
+
+Switching back to RSA would mean `--keylength 4096` and a one-time re-issue. Not planned.
+
+## What lives in the HAProxy bind
+
+```haproxy
+frontend vm-tls
+    bind 127.0.0.1:8443 accept-proxy ssl \
+         crt /etc/haproxy/certs/wildcard-apps.pem \
+         crt /etc/haproxy/certs/wildcard-mon.pem
+    mode http
+    ...
+```
+
+Two `crt` lines. HAProxy parses both, indexes their SANs, and at handshake time picks the cert whose SAN matches the incoming SNI. If neither matches, the handshake fails with a TLS alert — clients see a cert-mismatch error, which is the correct user-visible failure mode for an unknown hostname.
+
+A future third wildcard (e.g., `*.dev.sub.comptech-lab.com`) would be one more `crt` line and a reload.
+
+## TLS posture (cipher suites, version)
+
+From the `global` block:
+
+```haproxy
+ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+ssl-default-bind-ciphers ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+```
+
+- **TLS 1.2 minimum** — TLS 1.0/1.1 rejected on every bind. TLS 1.3 is enabled by default; the ciphers above apply to TLS 1.2.
+- **No tickets** — `no-tls-tickets` disables session tickets. Session resumption falls back to session IDs (server-side cache). Trade: slightly more CPU per first-handshake, less variance.
+- **ECDHE only** — no static RSA key exchange; forward secrecy required.
+- **AEAD only** — ChaCha20-Poly1305 and AES-GCM. No CBC-SHA1 ciphers.
+
+For TLS 1.3 the cipher list is OS-default and includes `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.
+
+## Backend TLS
+
+The HAProxy → backend hop is **not** subject to the wildcard's CA. For backends that speak TLS (MinIO, Nexus, WSO2, anything Shape B/C from the backend-conventions page), the lab uses `ssl verify none`:
+
+```haproxy
+server <vm> <ip>:443 ssl verify none check
+```
+
+This is acceptable because:
+
+- The HAProxy → VM hop is on the lab `/16` only — there is no traversal across an untrusted network.
+- The VM may present a self-signed cert (some default installs) and the lab doesn't want to maintain a private CA chain for backend verification.
+- The wildcard cert at the edge already establishes trust for the client.
+
+If lab posture were to tighten (e.g., compliance regime that requires verified backends), the next step would be to issue per-backend certs from a lab CA and switch to `ssl verify required ca-file <ca.pem>` per backend.
+
+## What does *not* serve `*.apps.<cluster>.sub.comptech-lab.com`
+
+Per ADR 0005 and `feedback_haproxy_scope.md`: this HAProxy does not handle OpenShift cluster routes. `*.apps.hub-dc-v6.sub.comptech-lab.com` and `*.apps.spoke-dc-v6.sub.comptech-lab.com` are served by the in-cluster OpenShift router with its **own** certificates. Those are managed by the cluster (`oc -n openshift-ingress get ...`), not by `acme.sh` on the pdns VM.
+
+If a single client tried to reach both `signoz.apps.sub.comptech-lab.com` (HAProxy) and `app-x.apps.spoke-dc-v6.sub.comptech-lab.com` (OpenShift router), the TLS would terminate at two completely different places with two completely different cert chains. That's deliberate.
+
+## Renewal cadence and monitoring
+
+- Let's Encrypt issues 90-day certs by default. `acme.sh` renews at the 60-day mark unless forced.
+- A systemd timer (or root cron) on the pdns VM runs `acme.sh --cron` daily; renewals happen idempotently when needed.
+- After renewal the post-hook concatenates fullchain+key into `/etc/haproxy/certs/wildcard-apps.pem` (or `wildcard-mon.pem`) and reloads HAProxy.
+- Monitoring (planned, not all wired): Blackbox exporter from the monitoring VM probes `https://signoz.apps.sub.comptech-lab.com/` and reports cert expiry. Alert at 14 days remaining.
+
+## Manual rotation (when needed)
+
+If the auto-renewal fails or a cert needs to be replaced outside the schedule:
+
+```bash
+ssh ze@<pdns-vm>
+sudo /root/.acme.sh/acme.sh --renew -d "*.apps.sub.comptech-lab.com" --dns dns_pdns --keylength ec-256 --force
+
+# verify the new files
+sudo openssl x509 -in /root/.acme.sh/*.apps.sub.comptech-lab.com_ecc/fullchain.cer -noout -dates
+
+# rebuild the HAProxy PEM and reload
+sudo cat /root/.acme.sh/*.apps.sub.comptech-lab.com_ecc/fullchain.cer \
+        /root/.acme.sh/*.apps.sub.comptech-lab.com_ecc/*.apps.sub.comptech-lab.com.key \
+        | ssh ze@<haproxy-vm> 'sudo tee /etc/haproxy/certs/wildcard-apps.pem >/dev/null && sudo chmod 600 /etc/haproxy/certs/wildcard-apps.pem'
+ssh ze@<haproxy-vm> 'sudo haproxy -c -f /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy'
+
+# verify from a client
+echo | openssl s_client -connect signoz.apps.sub.comptech-lab.com:443 -servername signoz.apps.sub.comptech-lab.com 2>/dev/null | openssl x509 -noout -dates
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Cert expired in production | `acme.sh --cron` timer disabled or `acme.sh` lost API access to PowerDNS | Re-run renewal manually (steps above); check `journalctl -u acme.sh.timer`; verify the API key in `pdns.conf` works against `127.0.0.1:8081` | Monitor cert expiry via Blackbox exporter; alert at 14 days |
+| Renewal succeeded but clients still see old cert | Concat hook didn't run, or HAProxy didn't reload | Re-run the concat + `systemctl reload haproxy`; verify with `openssl s_client` | Test the renewal hook end-to-end after every change to `acme.sh` config |
+| `HAProxy.cfg` reload reports "unable to load certificate" | New PEM file is missing the private key, or has wrong permissions | Re-concat the file with fullchain+key; `chmod 600`; reload | Always concatenate via the canonical script, never copy a stray `fullchain.cer` directly |
+| Client sees `unknown CA` instead of the LE chain | Concat omitted the intermediate(s); only the leaf is in the PEM | Re-concat using `fullchain.cer`, not the leaf-only file | The canonical script uses `fullchain.cer`; spot-check on each new wildcard |
+| `*.mon` hostname client gets the `*.apps` cert | Second `crt` directive missing from the `vm-tls` bind | Add the missing `crt`; reload | Audit the bind line whenever a new wildcard is introduced |
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- ADR 0005 (rebuild network/ingress/PKI)
+- Memory: `reference_haproxy_vm.md`, `reference_lab_infrastructure.md`
+- Let's Encrypt: <https://letsencrypt.org/docs/>
+- acme.sh: <https://github.com/acmesh-official/acme.sh>
+- HAProxy SSL config: <https://docs.haproxy.org/2.8/configuration.html#5.1-crt>

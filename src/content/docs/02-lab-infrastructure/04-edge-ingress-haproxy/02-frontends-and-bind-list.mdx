@@ -1,0 +1,232 @@
+---
+title: "Frontends and bind list"
+description: "The HAProxy frontend inventory — public edge :80/:443 (primary and DR), private edge, RKE2 API/supervisor, and the internal loopback re-decrypt bind. Listening surface and what each frontend does."
+sidebar_label: "Frontends and binds"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The HAProxy edge VM has seven distinct frontends, each with one or more `bind` lines. This page enumerates them, what they listen on, and which backends they fan out to. The companion pages drill into the SNI/loopback pattern and the backend conventions.
+
+## Frontend inventory
+
+| Frontend name | Binds | Role |
+| --- | --- | --- |
+| `public-apps-http` | public edge `:80`; private edge `:80` | Plain HTTP (`*.apps.sub.comptech-lab.com`) — redirects to HTTPS and serves ACME http-01 challenge if/when used |
+| `public-apps-https` | public edge `:443`; private edge `:443` | TLS frontend; SNI passthrough to either `vm-tls` (loopback re-decrypt) or directly to a TCP backend for non-HTTP TLS passthrough |
+| `public-apps-dr-http` | public DR edge `:80` | Secondary public HTTP edge (DR/standby) |
+| `public-apps-dr-https` | public DR edge `:443` | Secondary public TLS edge (DR/standby) |
+| `rke2-api` | private edge `:6443` | Legacy RKE2 cluster API frontend (kept for archeology / partial decommission) |
+| `rke2-supervisor` | private edge `:9345` | Legacy RKE2 supervisor port |
+| `vm-tls` | `127.0.0.1:8443` (loopback, PROXY protocol) | Internal frontend that actually terminates TLS using the wildcard certs |
+
+## Listen address summary
+
+Every bind in `haproxy.cfg`, redacted to bind role rather than address:
+
+| Bind role | Frontend | Purpose |
+| --- | --- | --- |
+| public edge `:80` | `public-apps-http` | Plain HTTP redirect target |
+| public edge `:443` | `public-apps-https` | **Primary public TLS** for `*.apps.sub.comptech-lab.com` |
+| public DR edge `:80/:443` | `public-apps-dr-*` | Secondary public edge (DR/standby) |
+| private edge `:80/:443` | `public-apps-*` | Lab-network edge for the same hostnames — same TLS handling |
+| private edge `:6443` | `rke2-api` | Legacy RKE2 cluster API |
+| private edge `:9345` | `rke2-supervisor` | Legacy RKE2 supervisor |
+| `127.0.0.1:8443` | `vm-tls` (internal) | Loopback PROXY-protocol bind where wildcard certs decrypt SNI-routed traffic |
+
+The same public hostnames (`*.apps.sub.comptech-lab.com`) work from both inside and outside the lab because `public-apps-https` listens on both the public edge address and the private edge address. The TLS behavior is identical regardless of which side the connection comes in on; the SNI determines routing.
+
+## Globals and defaults
+
+`haproxy.cfg` opens with the conventional `global` and `defaults` sections. The lab-specific tweaks worth knowing:
+
+```haproxy
+global
+    log         /dev/log local0
+    log         /dev/log local1 notice
+    chroot      /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    stats timeout 30s
+    user        haproxy
+    group       haproxy
+    daemon
+    maxconn     4000
+
+    # SSL defaults
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+    ssl-default-bind-ciphers ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+    timeout http-request 10s
+    timeout queue 30s
+```
+
+Notes:
+
+- **TLSv1.2 minimum.** TLS 1.0/1.1 are rejected at every TLS-terminating bind.
+- **No TLS tickets.** Cuts the session-resumption variability — every handshake is full, which is fine at lab volume.
+- **Modern cipher suite.** ChaCha20 and AES-GCM; ECDHE only. No RC4, no CBC SHA1.
+- **`mode http` default** but individual frontends override to `mode tcp` where SNI passthrough is in play (the top-level public binds use `tcp` so they can inspect SNI without terminating).
+
+## `public-apps-https` (the top-level TLS edge)
+
+The single most important frontend. Skeleton:
+
+```haproxy
+frontend public-apps-https
+    bind <public-edge>:443
+    bind <private-edge>:443
+    mode tcp
+    option tcplog
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+
+    # SNI-based routing decisions. The longest list of ACLs in the file.
+    acl is_kafka_host req_ssl_sni -m end -i .kafka.apps.sub.comptech-lab.com
+    acl is_vm_host    req_ssl_sni -i gitlab.apps.sub.comptech-lab.com \
+                                     minio.apps.sub.comptech-lab.com \
+                                     minio-console.apps.sub.comptech-lab.com \
+                                     jenkins.apps.sub.comptech-lab.com \
+                                     signoz.apps.sub.comptech-lab.com \
+                                     trivy.apps.sub.comptech-lab.com \
+                                     defectdojo.apps.sub.comptech-lab.com \
+                                     monitoring.apps.sub.comptech-lab.com \
+                                     grafana.apps.sub.comptech-lab.com \
+                                     nexus.apps.sub.comptech-lab.com \
+                                     nexus-mirror.apps.sub.comptech-lab.com \
+                                     mirror-registry.apps.sub.comptech-lab.com \
+                                     docker-group.apps.sub.comptech-lab.com \
+                                     app-registry.apps.sub.comptech-lab.com \
+                                     ...
+    acl is_wso2_host  req_ssl_sni -i is.apps.sub.comptech-lab.com \
+                                     apim.apps.sub.comptech-lab.com \
+                                     publisher.apps.sub.comptech-lab.com \
+                                     devportal.apps.sub.comptech-lab.com \
+                                     admin.apps.sub.comptech-lab.com \
+                                     gateway.apps.sub.comptech-lab.com
+
+    use_backend vm-tls-pp        if is_vm_host
+    use_backend wso2-tls-pp      if is_wso2_host
+    use_backend kafka-tls-pp     if is_kafka_host
+    default_backend              public-apps-https-be   # fallback (in-cluster RKE2 routes; mostly historical)
+```
+
+Three things to notice:
+
+1. **`mode tcp`**, not http. This frontend never decrypts. It uses `req_ssl_sni` (the parsed SNI from the ClientHello) as a 7-layer-ish hook on top of TCP. HAProxy buffers up to the SNI extension, makes a routing decision, then streams the rest of the connection.
+2. **The `*-tls-pp` backends** (where `pp` = PROXY protocol) are not the actual service backends — they're stepping stones that forward to `127.0.0.1:8443` with PROXY protocol so the inner `vm-tls` frontend can both decrypt *and* know the original client IP and SNI.
+3. **`default_backend public-apps-https-be`** is the catch-all for any SNI that doesn't match an ACL. Historically this fed in-cluster RKE2 routes; now mostly returns a generic error. The lab does not silently route unknown SNIs to in-cluster targets.
+
+## `vm-tls` (the inner TLS-terminating frontend)
+
+This is where the wildcard cert actually does the decryption. Skeleton:
+
+```haproxy
+frontend vm-tls
+    bind 127.0.0.1:8443 accept-proxy ssl crt /etc/haproxy/certs/wildcard-apps.pem crt /etc/haproxy/certs/wildcard-mon.pem
+    mode http
+    option httplog
+
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Forwarded-For %[src]
+
+    # Host-header → backend routing
+    acl is_gitlab        hdr_dom(host) -i gitlab.apps.sub.comptech-lab.com
+    acl is_minio_api     hdr_dom(host) -i minio.apps.sub.comptech-lab.com
+    acl is_minio_console hdr_dom(host) -i minio-console.apps.sub.comptech-lab.com
+    acl is_jenkins       hdr_dom(host) -i jenkins.apps.sub.comptech-lab.com
+    acl is_signoz        hdr_dom(host) -i signoz.apps.sub.comptech-lab.com
+    acl is_trivy         hdr_dom(host) -i trivy.apps.sub.comptech-lab.com
+    acl is_defectdojo    hdr_dom(host) -i defectdojo.apps.sub.comptech-lab.com
+    acl is_monitoring    hdr_dom(host) -i monitoring.apps.sub.comptech-lab.com
+    acl is_grafana       hdr_dom(host) -i grafana.apps.sub.comptech-lab.com
+    acl is_nexus_mirror  hdr_dom(host) -i nexus-mirror.apps.sub.comptech-lab.com
+    acl is_mirror_reg    hdr_dom(host) -i mirror-registry.apps.sub.comptech-lab.com
+    acl is_docker_group  hdr_dom(host) -i docker-group.apps.sub.comptech-lab.com
+    acl is_app_registry  hdr_dom(host) -i app-registry.apps.sub.comptech-lab.com
+    # ...
+
+    use_backend gitlab-vm-be          if is_gitlab
+    use_backend minio-api-vm-be       if is_minio_api
+    use_backend minio-console-vm-be   if is_minio_console
+    use_backend jenkins-vm-be         if is_jenkins
+    use_backend signoz-vm-be          if is_signoz
+    use_backend trivy-vm-be           if is_trivy
+    use_backend defectdojo-vm-be      if is_defectdojo
+    use_backend monitoring-vm-be      if is_monitoring   # also grafana
+    use_backend nexus-rke2-be         if is_nexus_mirror
+    use_backend nexus-docker-rke2-be  if is_mirror_reg
+    use_backend docker-group-vm-be    if is_docker_group
+    use_backend app-registry-vm-be    if is_app_registry
+    # ...
+
+    default_backend                   public-apps-https-be
+```
+
+Important specifics:
+
+- **`bind 127.0.0.1:8443 accept-proxy ssl crt /etc/haproxy/certs/wildcard-apps.pem crt /etc/haproxy/certs/wildcard-mon.pem`** — one bind, two cert files. SNI on the inner connection still drives cert selection, so `*.mon` traffic gets the `mon` cert and `*.apps` traffic gets the `apps` cert. `accept-proxy` enables receiving PROXY protocol from the outer frontend.
+- **`http-request set-header X-Forwarded-Proto https`** — restored because the inner frontend speaks plain HTTP to backends, but downstream apps need to know the original connection was TLS.
+- **`http-request set-header X-Forwarded-For %[src]`** — the `%[src]` here is the *original* client IP from PROXY protocol, not the localhost address of the outer frontend.
+- **Mostly one ACL per service.** This is where the bulk of the file's complexity lives; adding a new service is adding one `acl`, one `use_backend`, and one backend block.
+
+## `rke2-api` and `rke2-supervisor`
+
+Two TCP frontends bound on the private edge:
+
+```haproxy
+frontend rke2-api
+    bind <private-edge>:6443
+    mode tcp
+    default_backend rke2-api-be
+
+frontend rke2-supervisor
+    bind <private-edge>:9345
+    mode tcp
+    default_backend rke2-supervisor-be
+```
+
+These predate the v6 OpenShift rebuild — they routed Kubernetes API traffic to the historical RKE2 hub. With v6 OpenShift now in place, these are kept against decommission, not actively used for production traffic.
+
+## `public-apps-dr-*`
+
+Mirror of the primary public frontends, bound on the secondary public address. Same ACLs, same backends, same TLS handling — the DR public address is only used if the primary public address is unreachable from outside. Internally the same `vm-tls` inner frontend handles both.
+
+## What happens when SNI matches nothing
+
+If a client opens a TLS connection with an SNI that doesn't match any ACL, `default_backend public-apps-https-be` returns a generic HTTP response or simply drops the connection depending on the catch-all configuration. There is no silent forwarding to a backend — the lab refuses to route a hostname it doesn't recognize.
+
+## How `vm-tls-pp` works (the PROXY protocol hand-off)
+
+```haproxy
+backend vm-tls-pp
+    mode tcp
+    server vm-tls 127.0.0.1:8443 send-proxy
+```
+
+That's it. One server line. `send-proxy` prepends a PROXY-protocol header to the TCP stream so the inner frontend's `accept-proxy` bind can recover the original client IP and TLS metadata. The bytes after the header are the still-encrypted TLS stream from the original client.
+
+Inside HAProxy this hop is free — same process, no kernel round-trip beyond the loopback `connect()`.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| New `*.apps.sub.comptech-lab.com` hostname returns the catch-all | Missing ACL or `use_backend` line in `vm-tls` (or in `public-apps-https` if the host needs SNI routing) | Add the ACL + `use_backend` + backend; `haproxy -c -f`; `systemctl reload haproxy` | Add new hostnames in pairs — outer SNI ACL + inner Host-header ACL — never just one |
+| Hostname matches the SNI ACL but client gets cert error | Wildcard `crt` not loaded at `vm-tls` bind, or new hostname is outside `*.apps`/`*.mon` | Verify the cert covers the SNI; for non-wildcard names, add a `crt` for the specific hostname | Keep the bind's `crt` list synchronized with the wildcard coverage |
+| `mode http` confusion: backend sees `http` requests from a passthrough frontend | `public-apps-https` is `mode tcp` — its backends must also be `mode tcp` | Set the backend's `mode tcp` for SNI passthrough targets | Audit `mode` consistency when adding any new frontend → backend pair |
+| Reload reports config error | Syntax change touches a referenced label that no longer exists | `haproxy -c -f /etc/haproxy/haproxy.cfg` shows the offender; revert to `haproxy.cfg.bak.<latest>` | Always `haproxy -c -f` before `systemctl reload` |
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- ADR 0005 (rebuild network/ingress/PKI)
+- Memory: `reference_haproxy_vm.md`
+- HAProxy 2.8 configuration manual: <https://docs.haproxy.org/2.8/configuration.html>

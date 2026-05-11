@@ -1,0 +1,171 @@
+---
+title: "SNI passthrough and loopback re-decrypt"
+description: "The keystone HAProxy pattern: SNI-aware TCP frontend on :443 forwards via PROXY protocol to an inner TLS-terminating bind on 127.0.0.1:8443 with the wildcard cert. Why this shape, what it enables, and the operational consequences."
+sidebar_label: "SNI passthrough + loopback re-decrypt"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page is about the single architectural choice that defines how HAProxy works in this lab: instead of terminating TLS at the public bind, the outer frontend stays in TCP mode and uses SNI for routing, then hands the byte stream to an inner frontend over loopback (with PROXY protocol) where the wildcard cert actually does the decryption.
+
+If you're skimming HAProxy tutorials, this is the unusual move. Most tutorials decrypt at the bind. This lab does not. Read on for why.
+
+## The pattern, restated
+
+Outer frontend:
+
+- `mode tcp`
+- `bind :443` on the public and private edges
+- Inspects the TLS ClientHello (without decrypting) to extract SNI
+- ACLs on `req_ssl_sni` map hostnames to backends
+- Forwards the TCP stream to one of:
+  - `vm-tls-pp` → internal loopback, will be decrypted
+  - `wso2-tls-pp` → internal loopback, will be decrypted with WSO2-specific routing
+  - `kafka-tls-pp` → routes to Kafka brokers with no decryption (true passthrough)
+  - or a passthrough backend that connects to the VM:443 directly (also no decryption — true passthrough)
+
+Inner frontend (`vm-tls`):
+
+- `mode http`
+- `bind 127.0.0.1:8443 accept-proxy ssl crt <wildcard-apps.pem> crt <wildcard-mon.pem>`
+- Terminates TLS using the wildcard certificate(s)
+- Reads `Host:` header, routes to per-service backend
+
+The hop between the two is over loopback with PROXY protocol carrying the original client IP and other connection metadata.
+
+## What "SNI passthrough" means concretely
+
+When a TLS client opens a connection, the very first message it sends after `TCP SYN/ACK` is the **ClientHello**. The ClientHello includes the `server_name` (SNI) extension — a plaintext field naming which hostname the client wants to talk to. HAProxy in `mode tcp` can read this field without participating in the TLS handshake. It uses `req_ssl_sni` ACLs to dispatch the connection based on the SNI value.
+
+Reading the SNI is cheap (no certificate involved, no key operations). The trade-off is the outer frontend never sees decrypted bytes — it can't read the HTTP path, headers, or method. All it has is "the client said it wants `<hostname>`."
+
+For most platform services that's enough. The Host header (which is what HTTP routing uses) is generally the same as the SNI; if HAProxy routes a TCP stream to a backend that expects that SNI, the rest works out.
+
+## What the loopback re-decrypt adds
+
+If the outer frontend were the only frontend, every backend would have to either:
+
+- Accept TLS directly with a per-host certificate it owns (so HAProxy is pure passthrough), or
+- Accept plaintext from HAProxy and rely on a private network for confidentiality (less ideal).
+
+Neither generalizes. The lab uses a third option: dispatch the still-encrypted stream to an inner HAProxy frontend that owns the wildcard cert. The inner frontend decrypts, reads the `Host:` header at the HTTP layer, and routes to backends that speak whatever protocol they speak (HTTP, HTTPS, gRPC).
+
+This means:
+
+- **One wildcard cert, one decryption point.** `wildcard-apps.pem` lives on `127.0.0.1:8443` and nowhere else.
+- **Backends are simple.** A Jenkins VM accepts plaintext HTTP on `:8080`; an HTTPS-only backend accepts TLS on `:443`; the inner HAProxy frontend handles both.
+- **`X-Forwarded-Proto`, `X-Forwarded-For`, `Host`** all get added/preserved by the inner frontend. Backends see a normal HTTP-with-XFF request.
+
+## Why not just decrypt at the public bind?
+
+A simpler architecture: bind `:443` on the public edge, `ssl crt <wildcard>`, `mode http`, route by Host. Why doesn't the lab do that?
+
+1. **Some hostnames need pure passthrough.** Kafka SNI hosts (`bootstrap.kafka.apps.sub.comptech-lab.com`, `broker-{0,1,2}.kafka.apps.sub.comptech-lab.com`) carry Kafka protocol, not HTTP. Decrypting at the edge would either require Kafka clients to use HAProxy's wildcard cert (they expect their own) or break the SNI-based broker discovery.
+2. **WSO2 hostnames** (`is.apps`, `apim.apps`, etc.) speak HTTPS but also Identity-Server-specific traffic (OIDC, SAML) that historically did not tolerate edge termination cleanly. Keeping them on a passthrough path was simpler than debugging it.
+3. **Future protocols.** Anything new that wants TLS-passthrough on `:443` slots in at the SNI-aware outer frontend without disturbing the `vm-tls` decryption logic.
+4. **Separation of concerns.** The outer frontend deals with "which family of service is this connection for?" The inner deals with "which exact backend for this HTTP host?" If both jobs lived in one frontend, the config would be twice as long and twice as confusing.
+5. **Multi-cert binds are easier inside.** When `wildcard-mon.pem` was added (2026-05-09), it was a one-line addition to the `vm-tls` `bind crt …` list. If the public bind owned the cert(s), every public bind on every edge would need the new file.
+
+## PROXY protocol semantics
+
+PROXY protocol is a tiny header prepended to a TCP stream that carries the original client IP/port and the destination IP/port that the relay saw. HAProxy supports both v1 (text) and v2 (binary); the lab uses v2.
+
+In `haproxy.cfg`:
+
+- Outer frontend backend definitions use `server <inner> 127.0.0.1:8443 send-proxy` to prepend the PROXY header.
+- Inner frontend uses `bind 127.0.0.1:8443 accept-proxy …` to require and parse the header.
+
+The header buys two things:
+
+- **Client IP fidelity.** The inner frontend's `%[src]` returns the *original* client IP, not `127.0.0.1`. That populates `X-Forwarded-For` and any other logging.
+- **TLS state carryover.** `accept-proxy` makes the inner frontend aware that this is not a fresh TCP connection from the kernel — it's a relayed one, and various HAProxy operations behave accordingly (logging, connection tracking).
+
+If `accept-proxy` were missing on the inner bind, the inner frontend would see the literal PROXY header bytes at the start of the TLS handshake, fail TLS, and reject. So the pairing is mandatory.
+
+## Operational consequences
+
+This design adds complexity. The consequences worth knowing:
+
+### Two log lines per request
+
+Outer frontend (`public-apps-https`) logs the TCP-level connection with SNI. Inner frontend (`vm-tls`) logs the HTTP-level request with method, path, status. Operators need to correlate by client IP + timestamp when debugging.
+
+### Outer frontend can't enforce HTTP-level limits
+
+Anything path-based (rate-limit by URL, geoblock by header) has to live at the inner frontend or further downstream. The outer frontend has TCP-level + SNI-level visibility only.
+
+### Adding a passthrough backend is two lines
+
+If a new service speaks TLS but should not be re-decrypted at the wildcard cert:
+
+```haproxy
+# in public-apps-https:
+acl is_newsvc req_ssl_sni -i newsvc.apps.sub.comptech-lab.com
+use_backend newsvc-pp if is_newsvc
+
+# new backend (no PROXY protocol; pure passthrough):
+backend newsvc-pp
+    mode tcp
+    server newsvc <ip>:443 check
+```
+
+No certificate work in HAProxy; the backend VM presents its own cert; client validates that cert. This is exactly how WSO2 and Kafka hosts work.
+
+### Adding a wildcard-terminated backend is three lines
+
+If a new service speaks HTTP (or HTTPS-but-fine-to-re-decrypt):
+
+```haproxy
+# in public-apps-https:
+acl is_newsvc req_ssl_sni -i newsvc.apps.sub.comptech-lab.com
+use_backend vm-tls-pp if is_newsvc
+
+# in vm-tls (inner):
+acl is_newsvc hdr_dom(host) -i newsvc.apps.sub.comptech-lab.com
+use_backend newsvc-vm-be if is_newsvc
+
+# new backend (HTTP to backend port):
+backend newsvc-vm-be
+    mode http
+    server newsvc <ip>:8080 check
+```
+
+Three sites to touch, but each touch is one line. The pattern is highly mechanical and copy-paste-friendly.
+
+## Hostname collision: `*.apps` cert vs `*.mon` cert
+
+When `*.mon.sub.comptech-lab.com` was introduced for monitoring-0 hostnames, the bind line at `127.0.0.1:8443` already loaded `wildcard-apps.pem`. The fix was one extra `crt`:
+
+```haproxy
+bind 127.0.0.1:8443 accept-proxy ssl \
+     crt /etc/haproxy/certs/wildcard-apps.pem \
+     crt /etc/haproxy/certs/wildcard-mon.pem
+```
+
+HAProxy supports loading multiple `crt` directives on one bind and uses the **SNI in the inner TLS handshake** to pick which cert to present. SNI in this lab is therefore used at two levels:
+
+1. Outer frontend: SNI on `:443` → choose the inner frontend / passthrough path.
+2. Inner frontend (`vm-tls` on `127.0.0.1:8443`): SNI on this inner TLS handshake → choose which cert to present.
+
+The two SNI inspections are independent and the second isn't visible to the client. From the client's perspective it's still a single TLS handshake that yields a cert covering the requested hostname.
+
+## What this is not appropriate for
+
+- **A high-volume external public TLS edge.** The lab does ~10s of req/s peak, not 10k/s. The loopback hop is fine; for higher volumes a dedicated TLS-terminating layer (Envoy, or HAProxy split across multiple processes) would be more appropriate.
+- **Strict separation of decrypt and route.** Some compliance regimes (e.g., card-data) require TLS to remain end-to-end. In that case the outer SNI-routing layer should send to a backend VM that owns its own cert, never to a re-decrypt step. The lab does both: WSO2 and Kafka go passthrough, the rest goes through re-decrypt.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Client gets `unknown protocol` on the first byte | Inner bind missing `accept-proxy` while outer sends `send-proxy` | Add `accept-proxy` to `127.0.0.1:8443`; reload | Always pair `send-proxy` with `accept-proxy`; verify on each `vm-tls-pp` add |
+| `X-Forwarded-For` shows `127.0.0.1` in backend logs | Missing `accept-proxy`, or backend reads the wrong header | Add `accept-proxy`; ensure `http-request set-header X-Forwarded-For %[src]` sees PROXY-protocol src | Verify with `curl -ksSI` from outside the lab and check the backend log |
+| New hostname returns cert mismatch | New name not under `*.apps` or `*.mon`, but only those wildcards are loaded | Add a service-specific cert to the `vm-tls` bind, or pick a name under one of the existing wildcards | Standardize new platform hostnames under `*.apps.sub.comptech-lab.com` |
+| Inner frontend log shows route `default_backend public-apps-https-be` instead of the expected backend | Outer SNI ACL was added but inner Host ACL was forgotten | Add the inner `acl is_<svc>` + `use_backend` | Pair the two ACL adds in one edit, one reload |
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- ADR 0005 (rebuild network/ingress/PKI)
+- Memory: `reference_haproxy_vm.md`, `feedback_haproxy_scope.md`, `reference_lab_infrastructure.md`
+- HAProxy 2.8 docs: `tcp-request inspect-delay`, `req_ssl_sni`, `accept-proxy`, `send-proxy`
