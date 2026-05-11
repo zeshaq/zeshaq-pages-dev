@@ -1,8 +1,223 @@
 ---
 title: "Glossary"
-description: "Section 01-foundations: Glossary (placeholder)."
+description: "Every acronym and term used elsewhere in the CompTech platform documentation, defined and cross-referenced. Alphabetical."
 sidebar_label: "Glossary"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Every acronym used elsewhere in this docs site, with a 1-3 sentence definition and a pointer to the main page where the term is exercised. Grouped alphabetically. If you find an acronym in the docs that isn't here, that's a gap — open an issue against `zeshaq/codex-opp-agent` milestone "Public Blog Documentation."
+
+## A
+
+**ACM** — *Advanced Cluster Management*. Red Hat's multi-cluster management offering, built on the upstream Open Cluster Management (OCM) project. In this lab, ACM runs on `hub-dc-v6` and manages spoke clusters via the klusterlet pull pattern. See [OpenShift Platform → RHACM](/docs/03-openshift-platform).
+
+**ACS** — *Advanced Cluster Security*, Red Hat's productization of StackRox. Provides runtime threat detection, network policy enforcement, vulnerability management, and image-policy automation across the fleet. Central runs on the hub; Sensor + Collector + Admission-controller run on each secured cluster. See [OpenShift Platform → ACS](/docs/03-openshift-platform).
+
+**ADR** — *Architecture Decision Record*. Markdown documents under `codex-opp-agent/adr/0000-*.md` that record the *why* behind a platform decision. ADRs supersede each other when context changes (e.g., ADR 0022 supersedes the cluster-list portion of ADR 0001). See [Architecture Decisions](/docs/06-architecture-decisions).
+
+**AGS** — *Alertmanager Grouping Strategy*. Convention used in the LGTM testing VM and SigNoz config; appears in observability docs.
+
+**AppSet / ApplicationSet** — Argo CD CRD that generates Application objects for a templated set of targets. Used with the RHACM `clusterDecisionResource` generator to fan an Application out across spokes selected by Placement. See [OpenShift Platform → OpenShift GitOps](/docs/03-openshift-platform).
+
+**ArgoCD / Argo CD** — Declarative GitOps continuous delivery tool for Kubernetes. Provided in OpenShift via the OpenShift GitOps operator. Runs both on the hub (for fleet coordination) and on each spoke (for spoke-local reconciliation). See [OpenShift Platform → OpenShift GitOps](/docs/03-openshift-platform).
+
+## B
+
+**BR / Bare Repo** — A Git repository in "bare" form (no working tree, just the `.git` contents). Used as the canonical clone for GitLab-side projects.
+
+## C
+
+**CDN** — *Content Delivery Network*. Cloudflare Pages serves the published `zeshaq.pages.dev` blog as a CDN; not used inside the lab itself.
+
+**CIDR** — *Classless Inter-Domain Routing*. Notation for IP address blocks (e.g., `30.30.0.0/16`). The lab uses a private `/16` with role-banded `/24` slices. See [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map).
+
+**CRD** — *Custom Resource Definition*. Kubernetes API extension that defines a new resource type. Operators install CRDs as part of their CSV.
+
+**CR** — *Custom Resource*. An instance of a CRD. Examples: `Subscription`, `ManagedCluster`, `ExternalSecret`, `LokiStack`.
+
+**CRO** — *Cluster Resource Override* (informal); also occasionally *Custom Resource Operator*. Context-dependent; see the page where it appears.
+
+**CSV** — *ClusterServiceVersion*. The OLM resource that records the installed version of an operator, its operand permissions, and its lifecycle. `oc get csv -n <ns>` shows what's installed. See [Operations → Operator Install Workflow](/docs/05-operations).
+
+**CT** — *CompTech*. The lab tenant prefix. Used in GitLab role-group names (`ct-openshift-platform-maintainers`, `ct-security-reviewers`, etc.). See [Naming Conventions](/docs/01-foundations/02-naming-conventions).
+
+**CWD** — *Current Working Directory*. Appears in operator runbook command snippets.
+
+## D
+
+**DNS** — *Domain Name System*. The lab runs PowerDNS (authoritative + recursor) on a single dual-homed VM. See [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map).
+
+**DNSSEC** — *DNS Security Extensions*. Not currently in use on the lab's PowerDNS; future ADR if it becomes relevant.
+
+## E
+
+**ESO** — *External Secrets Operator*. The Red Hat productization (operator name `openshift-external-secrets-operator`) of the upstream external-secrets project. Delivers secrets from external systems (Vault, HSMs, K8s) into Kubernetes Secrets in target namespaces. Two surfaces in this lab: platform `ClusterSecretStore vault-cluster` and per-tenant `SecretStore vault-apps`. See [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules).
+
+**ETag** — HTTP cache-control header; appears in S3/MinIO and Nexus contexts.
+
+## G
+
+**GitOps** — Operational model where the desired state of a system is expressed as version-controlled files in Git and a controller (here Argo CD) reconciles live state toward Git. ADR 0025 makes GitOps the only normal change channel; everything else is break-glass. See [Operations → GitOps Workflow](/docs/05-operations).
+
+**gRPC** — *gRPC Remote Procedure Calls*. Used by the klusterlet for hub-spoke communication and by OpenTelemetry collector OTLP gRPC ingest at `:4317`.
+
+## H
+
+**HA** — *High Availability*. The active fleet today is not HA — there is one PowerDNS VM, one HAProxy VM, one GitLab VM, one Vault VM. Future ADRs may introduce HA postures.
+
+**HAProxy** — Open-source TCP/HTTP load balancer. The lab's edge VM runs HAProxy 2.8 with ~40 frontend/backend blocks. Handles public + private edge for platform-VM hostnames; **does not** front OpenShift routes. See [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map) and the memory entry `feedback_haproxy_scope.md`.
+
+**htpasswd** — Plain-text-readable hashed-password file format used by Apache and adopted by Kubernetes / OpenShift for bootstrap IdP and for Quay / ACS Central admin credentials. See [Credential Custody → htpasswd pattern](/docs/01-foundations/04-credential-custody-rules).
+
+## I
+
+**IAM** — *Identity and Access Management*. Generic term; the lab uses Kubernetes RBAC + GitLab role-groups + Vault policies + ACS roles as the IAM surface.
+
+**IDMS / ITMS** — *ImageDigestMirrorSet* and *ImageTagMirrorSet*. OpenShift CRDs that redirect image pulls from upstream registry hostnames (e.g., `registry.redhat.io`) to the local Nexus mirror. Required for disconnected operation. See [OpenShift Platform → Image Supply](/docs/03-openshift-platform).
+
+**init-bundle** — Bootstrap material generated by RHACS Central for a new secured cluster. Contains TLS certs and tokens used by the Sensor/Collector/Admission controllers to register with Central. See `reference_rhacs_init_bundle_via_api.md`.
+
+**IngressController** — OpenShift CRD that manages the cluster's ingress routers. The default ingress controller answers `*.apps.<cluster>.sub.comptech-lab.com`.
+
+## K
+
+**Klusterlet** — Two-pod agent (`registration` + `work`) that runs on a managed cluster and handles its registration + pull from the RHACM hub. The defining component of the RHACM pull-mode architecture. See [OpenShift Platform → RHACM](/docs/03-openshift-platform).
+
+**Kustomize** — Built-in `kubectl`/`oc` overlay/patch system for Kubernetes manifests. The lab's GitOps repos use Kustomize for cluster overlays (`clusters/<cluster>/...`). `kubectl kustomize <dir>` renders the desired-state.
+
+## L
+
+**LokiStack** — Red Hat operator-managed Loki deployment. Stores logs as chunks + index in S3-compatible object storage (here NooBaa-fronted MinIO via OBC + ESO bridge). Operand of `loki-operator`. See [OpenShift Platform → Logging](/docs/03-openshift-platform).
+
+**LSO** — *Local Storage Operator*. OpenShift operator that turns physical block devices on worker nodes into PVs usable by ODF. Runs on `spoke-dc-v6`'s physical workers.
+
+**LVMS** — *Logical Volume Manager Storage*. The kept-it-simple storage path for management hubs. ADR 0004 keeps LVMS on hubs and removes ODF/NooBaa from hub desired state.
+
+## M
+
+**MAC** — *Media Access Control* address. Appears in node hardware inventory; redacted in published docs.
+
+**ManagedCluster** — RHACM CRD on the hub that represents a managed cluster. Paired with the spoke-side klusterlet. See [OpenShift Platform → RHACM](/docs/03-openshift-platform).
+
+**ManifestWork** — RHACM CRD on the hub that wraps a bundle of K8s resources to be applied on a specific spoke. The klusterlet work agent pulls and applies these.
+
+**MCH** — *MultiClusterHub*. RHACM's top-level CR that installs the hub-side components.
+
+**MCO** — *Machine Config Operator*. The OpenShift operator responsible for node configuration. IDMS/ITMS changes that affect node config trigger MachineConfigPool (MCP) rollouts.
+
+**MR** — *Merge Request*. The GitLab equivalent of a GitHub Pull Request. The lab's `platform-gitops` is GitLab-hosted; merge requests are the change channel. See [Naming Conventions → MR titles](/docs/01-foundations/02-naming-conventions).
+
+## N
+
+**NetworkPolicy** — Kubernetes resource that controls pod-to-pod and pod-to-external traffic at L3/L4. The lab uses default-deny baselines with explicit allow rules — e.g., ESO needs `allow-egress` to the Vault VM (`project_eso_egress_to_vault.md`).
+
+**NooBaa** — Cloud-native object store, part of ODF. Provides an S3-compatible endpoint backed by ODF's underlying storage or by external object stores. Issues `ObjectBucketClaim` (OBC) resources.
+
+## O
+
+**oc** — The OpenShift CLI, a superset of `kubectl` with OCP-specific commands.
+
+**OBC** — *ObjectBucketClaim*. Kubernetes CRD that requests an S3-compatible bucket from NooBaa. Creates a Secret with AWS-style keys + a ConfigMap with endpoint. Needs the ESO bridge pattern for operand secrets that expect a different shape. See [Credential Custody → OBC bridge](/docs/01-foundations/04-credential-custody-rules).
+
+**OCP** — *OpenShift Container Platform*. Red Hat's enterprise Kubernetes distribution. The lab runs OCP 4.20.18 on `hub-dc-v6` and `spoke-dc-v6`.
+
+**ODF** — *OpenShift Data Foundation*. Red Hat's productization of Rook-Ceph + NooBaa + Multicloud Object Gateway. Provides Ceph block, Ceph file, RGW S3, and NooBaa object storage. Runs on `spoke-dc-v6` only (hubs are storage-light per ADR 0004).
+
+**OLM** — *Operator Lifecycle Manager*. OpenShift subsystem that installs, updates, and removes operators. Two versions: OLM v0 (Subscription / CatalogSource) and OLM v1 (ClusterCatalog / ClusterExtension). Both run today.
+
+**OperatorGroup** — OLM v0 resource that scopes the namespaces an operator can watch.
+
+**OperatorHub** — The OLM marketplace surface. In this disconnected lab, the default external OperatorHub sources are disabled and only mirrored CatalogSources are exposed.
+
+**OSSM** — *OpenShift Service Mesh* (v3). Istio-based service mesh for OpenShift, paired with Kiali. Listed in the planned-operator queue for future installation.
+
+## P
+
+**PCI-DSS** — *Payment Card Industry Data Security Standard*. The compliance baseline the lab is profiled against. The PCI-0 → PCI-5 phase chain (issues #108-#113 plus PCI-1.13 #135) closed on 2026-05-11 with the post-MR-53 scan baseline. See [Operations → Compliance](/docs/05-operations).
+
+**PDNS** — *PowerDNS*. The DNS server used in the lab. Runs both authoritative (`pdns` 4.8.3) and recursor (`pdns-recursor` 4.9.3) on a single dual-homed VM. See [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map).
+
+**Placement** — RHACM CRD that declaratively selects a subset of managed clusters by label, claim, or tolerations. Paired with `PlacementDecision`.
+
+**PlacementDecision** — RHACM CRD that holds the controller's evaluation of a Placement — the actual list of selected cluster names.
+
+**PVC** — *PersistentVolumeClaim*. Kubernetes resource that requests storage.
+
+**PV** — *PersistentVolume*. The cluster-scoped storage resource a PVC binds to.
+
+## R
+
+**RHACM** — *Red Hat Advanced Cluster Management*. See *ACM*.
+
+**RHACS** — *Red Hat Advanced Cluster Security*. See *ACS*.
+
+**RHOCP** — *Red Hat OpenShift Container Platform*. See *OCP*.
+
+**Robot Token** — Per-tenant CI credential generated by Quay (or its convention applied to Nexus). Materialized as a `dockerconfigjson` Secret named `quay-robot-team-<team>` (or equivalent for Nexus) and delivered via ESO. See `reference_quay_robot_token_convention.md`.
+
+**Route** — OpenShift CRD that exposes a Service via the cluster's ingress controller. Cluster routes do **not** traverse HAProxy; they go direct to the cluster ingress VIP. See [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map).
+
+**RoxCtl** — RHACS command-line tool. Not used in this lab because the init-bundle generation goes through the Central API directly (`reference_rhacs_init_bundle_via_api.md`).
+
+## S
+
+**SAST** — *Static Application Security Testing*. Source-code-level scanning. The lab uses Trivy primarily for image scanning; SAST is a future addition.
+
+**SBOM** — *Software Bill of Materials*. JSON document enumerating the components and licenses inside a container image. The lab stores SBOMs in MinIO under the `sbom/` prefix (365-day retention).
+
+**SCC** — *SecurityContextConstraints*. OpenShift's pod-security mechanism (predates Kubernetes Pod Security Admission). Lab uses `restricted-v2` as the default for tenant workloads.
+
+**ScanSetting / ScanSettingBinding** — Compliance Operator CRDs that schedule and bind ComplianceScan runs. See [Operations → Compliance](/docs/05-operations).
+
+**SecretStore / ClusterSecretStore** — ESO CRDs that define a backend (Vault, K8s, AWS, etc.) for secret sourcing. `SecretStore` is namespace-scoped; `ClusterSecretStore` is cluster-scoped. See [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules).
+
+**SigNoz** — Open-source observability platform; the lab runs SigNoz EE on a dedicated VM as the intended production observability track (ADR 0010). OTLP ingest at `:4317` (gRPC) and `:4318` (HTTP).
+
+**SLA** — *Service Level Agreement*. Not formalized for the lab today; the operator handoff records target steady-state behavior.
+
+**StackRox** — The upstream open-source project that became RHACS. The Kubernetes namespace `stackrox` carries Sensor/Collector/Admission pods on secured clusters.
+
+**Subscription** — OLM v0 resource that requests an operator install. Names a package, channel, and starting CSV. See `connection-details/platform-admin-handoff.md` Subscription skeleton.
+
+## T
+
+**TempoStack** — Red Hat operator-managed Tempo deployment. Stores traces in S3-compatible object storage (NooBaa-fronted MinIO via OBC + ESO bridge). Operand of `tempo-product`.
+
+**Tekton** — Kubernetes-native CI/CD primitives (`Task`, `Pipeline`, `PipelineRun`). Provided in OpenShift via the `openshift-pipelines` operator. Used for the in-cluster build path that pushes to Quay via tenant robot tokens.
+
+**Trivy** — Open-source container image and IaC scanner. Required scan step on the developer golden path before image push. Reports stored in MinIO under `trivy/` (180-day retention).
+
+## V
+
+**VAP** — *ValidatingAdmissionPolicy*. The newer Kubernetes-native admission policy mechanism (post-Gatekeeper). Tracked under `vap-tenant-exclusions.md` for tenant exclusions.
+
+**Vault** — HashiCorp Vault, the lab's secret store. VM-hosted, sealed at rest, KV-v2 mount at `secret/`, Kubernetes auth per cluster, per-division paths under `secret/apps/<division>/<app>/...`. See [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules).
+
+## W
+
+**Whitelist / Allowlist** — Approved list. The runtime image-allowlist (ADR 0019) names the five permitted registry prefixes; everything else requires an IDMS/ITMS rule.
+
+**Whiteboard** — The React Flow-based architecture-diagram component used throughout this docs site. Source at `src/components/Whiteboard.tsx`. Embedded with `<Whiteboard client:load data={{...}} height={...} />`.
+
+**Worktree** — A Git working tree associated with a branch. The 13-subagent docs-writing workflow uses one worktree per section to allow parallel writes without branch conflict. See `feedback_parallel_subagent_isolation.md`.
+
+## X
+
+**XDR** — *Extended Detection and Response*. Security analytics category that RHACS sits adjacent to; not a separate product in this lab.
+
+## See also
+
+- [Naming Conventions](/docs/01-foundations/02-naming-conventions) — for the patterns these acronyms appear in
+- [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map) — for DNS, HAProxy, edge terms
+- [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules) — for Vault, ESO, secret terms
+- [Architecture Decisions](/docs/06-architecture-decisions) — for ADR references
+
+## References
+
+- `adr/0001-operator-workspace.md` through `adr/0026-*.md` (the ADR record)
+- `connection-details/platform-admin-handoff.md`
+- `connection-details/gitlab-operator-guide.md`
+- `connection-details/vault-app-secrets.md`
+- `connection-details/nexus.md`, `connection-details/minio.md`
+- Memory entries cross-referenced throughout

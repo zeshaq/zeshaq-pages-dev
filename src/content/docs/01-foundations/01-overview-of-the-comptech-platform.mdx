@@ -1,8 +1,171 @@
 ---
 title: "Overview of the CompTech Platform"
-description: "Section 01-foundations: Overview of the CompTech Platform (placeholder)."
-sidebar_label: "Overview of the CompTech Platform"
+description: "What the CompTech platform is, the audience for this documentation, the shape of the v6 fleet (hub-dc-v6 + spoke-dc-v6), and how this docs site relates to the source-of-truth in codex-opp-agent."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const hubBox = { background: "#dbeafe", border: "1.5px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1e3a8a", width: 220, textAlign: "center", fontWeight: 600 };
+export const spokeBox = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 220, textAlign: "center", fontWeight: 600 };
+export const vmBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+export const subBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 6, padding: 6, color: "#1f2937", width: 130, textAlign: "center", fontSize: 12 };
+export const extBox = { background: "#fafafa", border: "1px dashed #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { style: { stroke: "#7c3aed", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#7c3aed" }, labelStyle: { fill: "#5b21b6", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const fleetNodes = [
+  { id: "hub",       position: { x: 60,  y: 0   }, data: { label: "hub-dc-v6\n(management cluster, compact)" }, style: hubBox },
+  { id: "spoke",     position: { x: 360, y: 0   }, data: { label: "spoke-dc-v6\n(workload cluster, 3+3)" }, style: spokeBox },
+  { id: "acm",       position: { x: 0,   y: 130 }, data: { label: "RHACM 2.16 +\nMulticluster Engine" }, style: subBox },
+  { id: "argoH",     position: { x: 140, y: 130 }, data: { label: "OpenShift\nGitOps (hub)" }, style: subBox },
+  { id: "argoS",     position: { x: 290, y: 130 }, data: { label: "OpenShift\nGitOps (spoke)" }, style: subBox },
+  { id: "eso",       position: { x: 430, y: 130 }, data: { label: "External\nSecrets" }, style: subBox },
+  { id: "odf",       position: { x: 290, y: 200 }, data: { label: "ODF / LSO\n(local storage)" }, style: subBox },
+  { id: "lokitempo", position: { x: 430, y: 200 }, data: { label: "LokiStack /\nTempoStack" }, style: subBox },
+  { id: "acs",       position: { x: 570, y: 130 }, data: { label: "ACS Central\n+ Sensor" }, style: subBox },
+  { id: "oadp",      position: { x: 570, y: 200 }, data: { label: "OADP\n(backup)" }, style: subBox },
+  { id: "haproxy",   position: { x: 0,   y: 340 }, data: { label: "HAProxy edge\n(VM)" }, style: vmBox },
+  { id: "pdns",      position: { x: 160, y: 340 }, data: { label: "PowerDNS\n(auth + recursor)" }, style: vmBox },
+  { id: "gitlab",    position: { x: 320, y: 340 }, data: { label: "GitLab CE 18\n(LAN + edge)" }, style: vmBox },
+  { id: "vault",     position: { x: 480, y: 340 }, data: { label: "HashiCorp\nVault" }, style: vmBox },
+  { id: "nexus",     position: { x: 640, y: 340 }, data: { label: "Nexus\n(three Docker endpoints)" }, style: vmBox },
+  { id: "minio",     position: { x: 0,   y: 440 }, data: { label: "MinIO\n(evidence + backup)" }, style: vmBox },
+  { id: "jenkins",   position: { x: 160, y: 440 }, data: { label: "Jenkins\n(CI)" }, style: vmBox },
+  { id: "signoz",    position: { x: 320, y: 440 }, data: { label: "SigNoz\n(observability)" }, style: vmBox },
+  { id: "docker",    position: { x: 480, y: 440 }, data: { label: "Docker runtime\nVM" }, style: vmBox },
+  { id: "ocmirror",  position: { x: 640, y: 440 }, data: { label: "oc-mirror\nworker VM" }, style: vmBox },
+  { id: "github",    position: { x: 280, y: 560 }, data: { label: "GitHub\ncodex-opp-agent (planning)" }, style: extBox },
+];
+
+export const fleetEdges = [
+  { id: "e1",  source: "spoke", target: "hub", label: "klusterlet pull (gRPC)", ...pullEdge },
+  { id: "e2",  source: "hub", target: "acm", ...muted },
+  { id: "e3",  source: "hub", target: "argoH", ...muted },
+  { id: "e4",  source: "spoke", target: "argoS", ...muted },
+  { id: "e5",  source: "spoke", target: "eso", ...muted },
+  { id: "e6",  source: "spoke", target: "odf", ...muted },
+  { id: "e7",  source: "spoke", target: "lokitempo", ...muted },
+  { id: "e8",  source: "spoke", target: "acs", ...muted },
+  { id: "e9",  source: "spoke", target: "oadp", ...muted },
+  { id: "e10", source: "argoH", target: "gitlab", label: "pull desired state", ...pullEdge },
+  { id: "e11", source: "argoS", target: "gitlab", label: "pull desired state", ...pullEdge },
+  { id: "e12", source: "eso", target: "vault", label: "Kubernetes auth → KV-v2", ...dataEdge },
+  { id: "e13", source: "lokitempo", target: "minio", label: "S3 / OBC", ...dataEdge },
+  { id: "e14", source: "oadp", target: "minio", label: "Velero backups", ...dataEdge },
+  { id: "e15", source: "spoke", target: "nexus", label: "platform + app pulls", ...dataEdge },
+  { id: "e16", source: "jenkins", target: "nexus", label: "scan + push app images", ...reqEdge },
+  { id: "e17", source: "jenkins", target: "gitlab", label: "build from source", ...reqEdge },
+  { id: "e18", source: "docker", target: "nexus", label: "pull app images", ...dataEdge },
+  { id: "e19", source: "haproxy", target: "spoke", label: "n/a — bypassed", style: { stroke: "#dc2626", strokeDasharray: "2,4" } },
+  { id: "e20", source: "ocmirror", target: "nexus", label: "oc mirror --v2", ...dataEdge },
+  { id: "e21", source: "github", target: "argoH", label: "(planning only, not live source)", style: { stroke: "#6b7280", strokeDasharray: "3,3" }, labelStyle: { fill: "#6b7280", fontSize: 10 } },
+];
+
+This is the front door for the CompTech Platform documentation. If you've just arrived, this page tells you what the platform is, who this site is written for, the shape of the fleet you'll be reading about, and how this published site relates to the private operator workspace where the source-of-truth actually lives.
+
+## What the CompTech platform is
+
+The CompTech platform is a BFSI-oriented operating environment built around two active OpenShift clusters and a fleet of supporting platform VMs. It is being rebuilt from the ground up under the "v6" naming generation, intentionally as a **disconnected / internet-unreliable** environment — everything from operator catalogs to application base images is mirrored locally, no workload may rely on an upstream registry at runtime, and admission is being prepared to enforce that allowlist after the mirror inventory stabilizes.
+
+Three operating principles drive almost every concrete decision documented in the rest of this site:
+
+1. **GitOps is the only normal change channel.** Every resource reconciled by an Argo CD `Application` or `ApplicationSet` is changed only by a merged commit. `oc edit`, console mutation, and direct API calls are break-glass exceptions with mandatory record-keeping. ADR 0025 codifies this; the "Operations" section walks through the runbook.
+2. **Ownership boundaries are physical, not aspirational.** The OpenShift platform GitOps repository is OpenShift-operations-only; application teams literally cannot write to it. VM-hosted platform tools live in their own repository tree. Divisions get their own application and application-GitOps repositories. ADR 0015 records the federated GitOps layout; ADR 0024 nails down the OpenShift-only boundary.
+3. **Images come from local Nexus, period.** OpenShift platform mirror, developer base-image pulls, and CI-produced application image pushes each have their own dedicated registry hostname backed by a separate Nexus repository. ADR 0019 records the Nexus-only image supply chain; the [Lab Infrastructure](/docs/02-lab-infrastructure) section walks through the three endpoints.
+
+The lab serves as the disconnected reference build for the broader CompTech program. It is small — two OpenShift clusters, roughly a dozen supporting VMs — but the patterns it exercises (federated GitOps, ACM pull model, Vault + ESO bridging, PCI-DSS Compliance Operator baselines, image-supply guardrails) are explicitly designed to scale to additional clusters and divisions without redesigning the operating model.
+
+## Audience
+
+This site is written for four overlapping audiences:
+
+| Audience | What they need from this site |
+| --- | --- |
+| **Platform admins** new to the rebuild | The reading order in the next section, plus the operator handoff (§5) and the architecture decisions (§6). |
+| **Application developers** onboarding to the golden path | The [Application Delivery](/docs/04-application-delivery) section: how to build, scan, push, deploy. Foundations (§1) for the shared vocabulary, [Lab Infrastructure](/docs/02-lab-infrastructure) for the registry endpoints. |
+| **Security and audit reviewers** | The compliance and PCI-DSS material in [Operations](/docs/05-operations), the credential custody rules on the [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules) page, and the [ADR](/docs/06-architecture-decisions) record. |
+| **Curious external readers** | The blog posts on [zeshaq.pages.dev](https://zeshaq.pages.dev/blog/) cover individual subsystems in narrative form. This docs site is the structured reference. |
+
+If you are operating the platform — making changes, troubleshooting, onboarding a new tenant — the source-of-truth runbooks live in the private `codex-opp-agent` workspace, not here. This site is published with sanitized prose; internal IP addresses, credentials, and secret values are redacted. Treat this site as the orientation layer.
+
+## Fleet shape
+
+<Whiteboard client:load data={{ nodes: fleetNodes, edges: fleetEdges }} height={700} />
+
+The diagram above is the full v6 fleet at a glance. Read it as four bands:
+
+1. **Top band — the two OpenShift clusters.** `hub-dc-v6` is a compact three-node management cluster running RHACM, OpenShift GitOps, and the gitops-addon that wires hub Argo into ACM placement. `spoke-dc-v6` is a six-node workload cluster (three control-plane VMs plus three physical workers `gold-1`, `gold-2`, `gpu-01`) running ODF, ESO, the ACS Sensor, OADP, LokiStack, TempoStack, and tenant application workloads.
+2. **Middle band — operator subsystems.** Each labelled block is an OpenShift operator and its operand stack. Most live on the spoke; only ACM/MCE and the hub Argo instance live on the hub. The exact installed-versions list is in [Lab Infrastructure §Operator Inventory](/docs/02-lab-infrastructure).
+3. **Lower-middle band — platform VMs.** HAProxy provides the public/private edge with TLS termination; PowerDNS holds the authoritative `sub.comptech-lab.com` zone and serves the lab recursor; GitLab CE is the operational Git source; Vault holds per-app secrets under the `secret/apps/<division>/<app>/...` convention; Nexus exposes three Docker endpoints (install, dev pull, app push).
+4. **Bottom band — supporting VMs and the planning anchor.** MinIO holds evidence and backup data, Jenkins runs CI, SigNoz captures application telemetry, the Docker runtime VM serves non-OpenShift app workloads, and the `oc-mirror` worker VM runs `oc mirror --v2` to refresh OpenShift platform content into Nexus. GitHub `zeshaq/codex-opp-agent` is the planning anchor — issues, milestones, ADRs, reports — but is never a live GitOps source.
+
+Key relationships highlighted on the diagram:
+
+- **Green dashed arrows = pull-mode.** The spoke klusterlet pulls from the hub; both Argo instances pull from internal GitLab. The hub does not push routine spoke configuration; it coordinates placement and lets the spoke reconcile its own local state. This is the ACM + OpenShift GitOps Basic pull pattern from ADR 0018.
+- **Purple solid arrows = data plane.** Workloads pulling images from Nexus, ESO authenticating into Vault, LokiStack/TempoStack writing chunks to MinIO, OADP writing Velero backups to MinIO.
+- **Black solid arrows = control / request.** Jenkins driving build pipelines; the operator subsystem relationships on the spoke.
+- **Red dashed arrow = explicitly NOT a path.** HAProxy is for platform VM edge exposure only. OpenShift routes do not go through HAProxy; the cluster ingress operator answers `*.apps.<cluster>.sub.comptech-lab.com` directly. The memory entry `feedback_haproxy_scope.md` enforces this boundary.
+
+The fleet is intentionally narrow. There is no `hub-dr-v6` or `spoke-dr-v6` today; those names are reserved (ADR 0022) for a future DR build that has not been authorized. The pre-v6 `hub-dc` / `spoke-dc` / `hub-dr` / `spoke-dr` clusters are **decommissioned**; they may appear in historical session logs but do not exist as live targets and must not appear in new manifests.
+
+## Reading order
+
+This docs site is structured so you can read sections sequentially, jump in mid-stack, or use it as a reference manual. The suggested first-pass reading order:
+
+1. **§1 Foundations** (this section). Naming conventions, network map, credential rules, glossary. Five pages, fifteen-minute read.
+2. **§2 Lab Infrastructure**. The VMs and their roles: PowerDNS, HAProxy, GitLab, Jenkins, Nexus, Vault, MinIO, SigNoz, Docker runtime, `oc-mirror`.
+3. **§3 OpenShift Platform**. The two clusters, the operator inventory, the storage layer, image supply, RHACM, OpenShift GitOps, ESO, RHACS, OADP, observability.
+4. **§4 Application Delivery**. The developer golden path: GitLab source, Jenkins build, Trivy scan, Nexus push, OpenShift GitOps or Docker runtime deploy.
+5. **§5 Operations**. Day-2: image-supply drift checks, operator install workflow, compliance/PCI-DSS, break-glass procedure, the platform admin handoff.
+6. **§6 Architecture Decisions**. The ADR record, indexed and grouped by decision area. ADRs are the durable record of *why*; runbooks and connection-details are the *how*.
+7. **§7 References**. External documentation links, vendor reference material, the lab inventory at a glance.
+8. **§8 History and Replay**. The rebuild timeline, what was tried and discarded, the lessons-learned record.
+
+If you are time-boxed and only have an hour, read §1 Foundations end-to-end, then jump to the §3 OpenShift Platform overview, then the [Whiteboard architecture](/docs/03-openshift-platform) on that page. That gives you the operating model and the fleet shape; everything else is detail.
+
+## Relationship to `codex-opp-agent`
+
+This published site is the public face of the platform documentation. The internal source-of-truth lives in the **`codex-opp-agent` workspace** at `~/codex-opp-agent/` on the operator workstation and at `github.com/zeshaq/codex-opp-agent` for the planning record. The relationship is:
+
+| Artifact | This docs site | `codex-opp-agent` |
+| --- | --- | --- |
+| **Why a decision was made** | Summary prose + ADR pointer | Full ADR text under `adr/0000-*.md` |
+| **How to operate a subsystem** | Narrative overview + key commands | Full runbook under `connection-details/<subsystem>.md` |
+| **What state is now** | Out of scope (snapshots stale fast) | `CURRENT_STATE.md`, `TODO.md`, dated session reports |
+| **Internal IPs, hostnames, ports** | Generic descriptions only | Concrete addresses in `connection-details/` |
+| **Credential values** | Never published | Never published; custody only — see [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules) |
+| **Issue / milestone / phase tracking** | Out of scope | GitHub issues under `zeshaq/codex-opp-agent` |
+| **Live cluster manifests** | Out of scope | Internal GitLab `comptech-platform/openshift-ops/openshift-platform-gitops` |
+
+When this site says "see the operator handoff" or "see `connection-details/...`," that pointer is to the private `codex-opp-agent` workspace. The public site is intentionally not a substitute for the private operator material — it is the orientation layer that makes the private material navigable.
+
+## How this site is published
+
+This site is built with [Astro](https://astro.build/) using MDX and React Flow (for the Whiteboard component) and Mermaid (for sequence and state diagrams). Source lives at `github.com/zeshaq/zahid`. A GitHub Actions workflow builds the site on every push to `main` and deploys to [Cloudflare Pages](https://pages.cloudflare.com/) at `zeshaq.pages.dev`. The memory entry `reference_blog_publishing_zahid.md` documents the publishing pipeline.
+
+There is **no live read of cluster state into this site**; everything on these pages is hand-authored prose with `last_reviewed: <date>` frontmatter. If a `last_reviewed` date is more than a few months old, treat the page as historical until a session re-validates it against the source-of-truth.
+
+## Where to go next
+
+- **New here?** Read [Naming Conventions](/docs/01-foundations/02-naming-conventions), [Domain and Network Map](/docs/01-foundations/03-domain-and-network-map), and the [Glossary](/docs/01-foundations/05-glossary), then jump to your area of interest.
+- **Looking for a specific subsystem?** The sidebar groups every page by section. Each subsystem has both a narrative overview and a runbook page.
+- **Looking for *why*?** §6 [Architecture Decisions](/docs/06-architecture-decisions) is the indexed ADR record.
+
+## References
+
+- `connection-details/platform-admin-handoff.md` — operator handoff (private)
+- `connection-details/gitlab-operator-guide.md` — GitLab handoff (private)
+- `adr/0001-operator-workspace.md` — the local operator workspace
+- `adr/0015-federated-gitops-repo-architecture.md` — federated GitOps repo architecture
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — ACM + OpenShift GitOps Basic pull model
+- `adr/0019-nexus-only-image-supply-chain.md` — Nexus-only image supply chain
+- `adr/0022-v6-fleet-membership.md` — active fleet membership and reserved DR names
+- `adr/0024-openshift-only-platform-gitops-boundary.md` — repo boundary
+- `adr/0025-gitops-only-operations-break-glass.md` — GitOps-only operations + break-glass
+- Memory: `project_workspace_scope.md`, `reference_lab_infrastructure.md`, `feedback_workspace_boundary.md`

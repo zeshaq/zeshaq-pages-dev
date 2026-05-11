@@ -1,8 +1,220 @@
 ---
 title: "Domain and Network Map"
-description: "Section 01-foundations: Domain and Network Map (placeholder)."
+description: "The DNS plane, the HAProxy edge, the lab /24 boundary, and how a request travels from a browser to a backend service across the CompTech v6 lab."
 sidebar_label: "Domain and Network Map"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+import Mermaid from "../../../components/Mermaid";
+
+export const clientBox = { background: "#fafafa", border: "1.5px dashed #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const edgeBox = { background: "#fde68a", border: "1.5px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const loopBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const dnsBox = { background: "#dbeafe", border: "1.5px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1e3a8a", width: 200, textAlign: "center", fontWeight: 600 };
+export const vmBox = { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#14532d", width: 160, textAlign: "center" };
+export const clusterBox = { background: "#ede9fe", border: "1.5px solid #6d28d9", borderRadius: 8, padding: 8, color: "#3b0764", width: 180, textAlign: "center", fontWeight: 600 };
+export const bypassBox = { background: "#fee2e2", border: "1px dashed #b91c1c", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const dnsEdge = { style: { stroke: "#1d4ed8", strokeWidth: 1.3 }, markerEnd: { type: "arrowclosed", color: "#1d4ed8" }, labelStyle: { fill: "#1e3a8a", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const tlsEdge = { style: { stroke: "#b45309", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b45309" }, labelStyle: { fill: "#92400e", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const skipEdge = { style: { stroke: "#dc2626", strokeDasharray: "4,3", strokeWidth: 1.3 }, markerEnd: { type: "arrowclosed", color: "#dc2626" }, labelStyle: { fill: "#7f1d1d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const netNodes = [
+  { id: "client",   position: { x: 0,   y: 0   }, data: { label: "Client browser /\nautomation client" }, style: clientBox },
+  { id: "recursor", position: { x: 260, y: 0   }, data: { label: "PowerDNS recursor\n(lab resolver)" }, style: dnsBox },
+  { id: "auth",     position: { x: 520, y: 0   }, data: { label: "PowerDNS authoritative\n(sub.comptech-lab.com)" }, style: dnsBox },
+  { id: "edge",     position: { x: 260, y: 130 }, data: { label: "HAProxy edge\n(public :443 + LAN :443)" }, style: edgeBox },
+  { id: "loop",     position: { x: 260, y: 260 }, data: { label: "HAProxy loopback\n(127.0.0.1:8443, SSL termination)" }, style: loopBox },
+  { id: "gitlab",   position: { x: 0,   y: 390 }, data: { label: "GitLab VM" }, style: vmBox },
+  { id: "nexus",    position: { x: 170, y: 390 }, data: { label: "Nexus VM\n(mirror / docker-group /\napp-registry)" }, style: vmBox },
+  { id: "vault",    position: { x: 340, y: 390 }, data: { label: "Vault VM" }, style: vmBox },
+  { id: "minio",    position: { x: 510, y: 390 }, data: { label: "MinIO VM" }, style: vmBox },
+  { id: "other",    position: { x: 680, y: 390 }, data: { label: "Jenkins / SigNoz /\nTrivy / DefectDojo" }, style: vmBox },
+  { id: "ocp",      position: { x: 260, y: 520 }, data: { label: "OpenShift ingress\n(*.apps.<cluster>.sub.comptech-lab.com)" }, style: clusterBox },
+  { id: "bypass",   position: { x: 0,   y: 520 }, data: { label: "(OpenShift routes\nbypass HAProxy)" }, style: bypassBox },
+];
+
+export const netEdges = [
+  { id: "dns1", source: "client", target: "recursor", label: "A?", ...dnsEdge },
+  { id: "dns2", source: "recursor", target: "auth", label: "forward zone\nsub.comptech-lab.com", ...dnsEdge },
+  { id: "dns3", source: "auth", target: "recursor", label: "A record", ...dnsEdge },
+  { id: "dns4", source: "recursor", target: "client", label: "answer", ...dnsEdge },
+  { id: "h1",   source: "client", target: "edge", label: "TLS :443 (SNI)", ...tlsEdge },
+  { id: "h2",   source: "edge", target: "loop", label: "PROXY-protocol\nto loopback", ...tlsEdge },
+  { id: "h3",   source: "loop", target: "gitlab", label: "decrypt + host-header", ...reqEdge },
+  { id: "h4",   source: "loop", target: "nexus", ...reqEdge },
+  { id: "h5",   source: "loop", target: "vault", ...reqEdge },
+  { id: "h6",   source: "loop", target: "minio", ...reqEdge },
+  { id: "h7",   source: "loop", target: "other", ...reqEdge },
+  { id: "ocp1", source: "client", target: "ocp", label: "TLS direct\n(cluster ingress VIP)", ...reqEdge },
+  { id: "ocp2", source: "edge", target: "bypass", label: "OpenShift routes\ndo NOT traverse HAProxy", ...skipEdge },
+];
+
+This page is the network operator's mental model for the CompTech v6 lab. It walks through the domains in use, the split between authoritative DNS and the lab recursor, the role of the HAProxy edge, the boundary between the lab `/24` and public ingress, and the request-paths an end user actually traverses. Specific internal IP addresses are kept in the private `connection-details/` runbooks; this page documents the topology and the rules that govern it.
+
+## Domain plane
+
+The platform's public DNS plane is **`sub.comptech-lab.com`**. Two derived wildcards do the heavy lifting:
+
+| Domain | Backing record | Use |
+| --- | --- | --- |
+| `sub.comptech-lab.com` | apex + per-host A records | Authoritative zone — every lab service has a name here |
+| `*.apps.sub.comptech-lab.com` | wildcard A → HAProxy edge | Platform VM ingress + cluster ingress for `hub-dc-v6` / `spoke-dc-v6` |
+| `*.mon.sub.comptech-lab.com` | wildcard A → HAProxy edge | Parallel domain for the LGTM testing observability VM |
+| `pdns.local` | LAN-internal name | The PowerDNS VM itself |
+| `*.apps.<cluster>.sub.comptech-lab.com` | per-cluster wildcard | OpenShift route ingress; goes direct to cluster ingress VIP, not HAProxy |
+| `api.<cluster>.sub.comptech-lab.com` | per-cluster A record | OpenShift API server; goes direct to cluster API VIP, not HAProxy |
+
+The wildcard certificate strategy mirrors the wildcard hostnames. There is one Let's Encrypt wildcard for `*.apps.sub.comptech-lab.com` (used by HAProxy at `127.0.0.1:8443` for VM-side TLS termination), and one wildcard for `*.mon.sub.comptech-lab.com` (the monitoring track), both renewed via `acme.sh --dns dns_pdns` from the PowerDNS VM since the lab is internet-disconnected for inbound traffic and the DNS-01 challenge is the only practical issuance path.
+
+The OpenShift clusters issue their own per-cluster ingress wildcards on `*.apps.<cluster>.sub.comptech-lab.com`. Those are independent of HAProxy and are terminated by the cluster's ingress controller. **HAProxy never terminates OpenShift route traffic** (memory entry `feedback_haproxy_scope.md`).
+
+### Why two PowerDNS daemons on one VM
+
+The `pdns.local` VM runs **two daemons side-by-side**, each with its own role:
+
+- **PowerDNS Authoritative** holds the `sub.comptech-lab.com` zone. SQLite-backed, single source of truth for every record in the lab.
+- **PowerDNS Recursor** is the default lab resolver. Every lab VM has it as its `/etc/resolv.conf` upstream. It forwards queries inside `sub.comptech-lab.com` to the local authoritative daemon on the same VM (over `127.0.0.1`) and recurses everything else to `8.8.8.8` and `1.1.1.1`.
+
+The recursor refuses queries from outside the lab `/16` (`allow-from` permits only loopback and the lab subnet). External clients cannot accidentally use the lab recursor; lab clients cannot accidentally bypass it. Public-facing authoritative queries arrive at the authoritative daemon's separate public interface.
+
+The reason for splitting authoritative and recursive is operational, not technical: the recursor handles "what is `google.com`" without ever touching the authoritative SQLite, and the authoritative handles "what is `gitlab.apps.sub.comptech-lab.com`" without forwarding upstream. Either daemon can be restarted, swapped, or replaced without touching the other.
+
+### DNS resolution flow
+
+The Mermaid below traces how a lab VM resolves a name like `nexus-mirror.apps.sub.comptech-lab.com`:
+
+<Mermaid client:load chart={`sequenceDiagram
+  autonumber
+  participant V as Lab VM
+  participant R as PowerDNS recursor
+  participant A as PowerDNS authoritative
+  V->>R: A? nexus-mirror.apps.sub.comptech-lab.com
+  Note over R: forward-zones rule:<br/>sub.comptech-lab.com -> 127.0.0.1:53
+  R->>A: A? nexus-mirror.apps.sub.comptech-lab.com
+  A-->>R: A -> HAProxy edge address
+  R-->>V: A -> HAProxy edge address
+  V->>V: open TLS :443 to HAProxy edge
+`} />
+
+For names outside `sub.comptech-lab.com`, the recursor uses `forward-zones-recurse=.=8.8.8.8;1.1.1.1` and goes upstream. From the client's perspective the recursor is the one resolver it ever needs to know about.
+
+## Network plane
+
+The lab runs on a private `30.30.0.0/16` bridge (`br30`). All platform VMs live on this network; OpenShift nodes use a `/24` slice for the cluster networks. IPv6 is explicitly disabled on the platform plane (DHCPv6 and Router Advertisements are administratively off-limits — ADR 0026 invariants).
+
+> Concrete addresses are kept in the private `connection-details/` runbooks. This page intentionally documents the allocation pattern, not the per-host addresses.
+
+Allocation pattern:
+
+| Band | Used by | Reachable from |
+| --- | --- | --- |
+| Low `/24` | Edge VMs (HAProxy, PowerDNS), platform VMs (GitLab, MinIO, Nexus, Vault, Jenkins, SigNoz, observability) | LAN + public via HAProxy |
+| Middle `/24` | OpenShift cluster networks (machine, API VIP, ingress VIP, control-plane and worker nodes) | LAN-internal only; OpenShift routes via cluster ingress VIP |
+| High `/24` | Physical workers (`gold-1`, `gold-2`, `gpu-01`), dynamic / future | LAN-internal |
+
+The OpenShift cluster networks (pod, service, cluster) are private overlays defined by the cluster installer and not visible on the underlying lab `br30` bridge except through the API and ingress VIPs.
+
+### Architecture: client → backend
+
+<Whiteboard client:load data={{ nodes: netNodes, edges: netEdges }} height={620} />
+
+Read the diagram as two concurrent flows:
+
+**DNS resolution** (blue arrows at the top): the client asks the recursor; the recursor forwards `sub.comptech-lab.com` queries to the local authoritative daemon; the answer comes back via the recursor.
+
+**HTTPS request** (orange / black arrows): the client opens TLS to HAProxy on `:443`. HAProxy uses SNI to identify the hostname, **passes the TCP connection through to its own loopback on `127.0.0.1:8443`**, where the actual TLS handshake happens against the wildcard certificate. After decryption HAProxy can read the HTTP host header and route to the right backend VM.
+
+**OpenShift routes (red dashed)** do **not** traverse HAProxy. The client resolves `*.apps.<cluster>.sub.comptech-lab.com` directly to the cluster ingress VIP and the cluster's ingress controller terminates TLS with its own cert. This is the rule from `feedback_haproxy_scope.md` and is non-negotiable: HAProxy is for platform VM edge exposure only.
+
+### HAProxy: three roles in one VM
+
+HAProxy on the edge VM does three jobs at once. They are coupled (one process, one config file) but operationally distinct:
+
+1. **Public-internet edge** for the small set of services that need internet ingress (DR public route, occasional vendor demo). Listens on public `:80` and `:443`. This is the only TCP path from internet to lab; everything else is LAN-only.
+2. **Private-lab edge** for the same set of hostnames from inside the `/16`. Listens on the lab-network `:80` and `:443`. Same hostnames, same backends, different bind address.
+3. **SNI-passthrough → loopback TLS termination.** All `vm-tls-be`-routed traffic (the vast majority of platform-VM hostnames) is SNI-routed from `:443` to `127.0.0.1:8443`, where HAProxy decrypts with the wildcard cert and inspects the host header for backend selection. This pattern keeps the wildcard cert in one place — the loopback frontend — instead of duplicating it across every backend rule.
+
+A handful of services use direct TCP passthrough rather than loopback re-decrypt:
+
+- The (legacy, partially decommissioned) RKE2 cluster API on `:6443`.
+- Kafka SNI passthrough for `bootstrap.kafka.apps.*` and `broker-{0,1,2}.kafka.apps.*`.
+- A WSO2 management split where the public API gateway and the admin console live on different upstream ports.
+
+The `/etc/haproxy/` directory keeps dated backups of every meaningful edit (the admin convention is `haproxy.cfg.bak.YYYYMMDD-HHMM-<reason>`). The current config is ~21 KB across ~40 frontend/backend/listen blocks; the original install was ~1.3 KB. Any new hostname requires the same shape: ACL entry, `use_backend` rule, backend block, dated backup before edit.
+
+### The lab `/24` vs the public ingress boundary
+
+Two distinct "edges" matter:
+
+- **Lab `/24` edge** is the boundary of the private RFC1918 network. Everything reachable on `30.30.0.0/16` is "inside the lab." Reaching it from outside requires either VPN access, a public-bound HAProxy frontend, or direct cluster ingress for `*.apps.<cluster>.sub.comptech-lab.com`.
+- **Public ingress** is the subset of services that have an internet-routable hostname (the `*.apps.sub.comptech-lab.com` wildcard, fronted by HAProxy's public bind). Most platform VMs are reachable here. OpenShift routes are not — they're cluster-direct, not HAProxy-fronted.
+
+A request originating from inside the lab to `gitlab.apps.sub.comptech-lab.com` resolves through the recursor to HAProxy's **LAN-network** bind address and terminates there. The same request from outside the lab resolves (via public DNS) to HAProxy's **public** bind address and terminates there. The two are different addresses on the same HAProxy VM, with identical backend rules.
+
+For OpenShift routes:
+
+| Origin | Resolves to | Terminates at |
+| --- | --- | --- |
+| Inside lab | cluster ingress VIP (LAN address) | OpenShift ingress controller |
+| Outside lab | cluster ingress VIP (public address) | OpenShift ingress controller |
+
+There is no HAProxy in either path. The OpenShift cluster owns its ingress.
+
+## Hostname inventory — what lives where
+
+The HAProxy host-header ACLs (`acl is_vm_host`, `acl is_wso2_host`) enumerate the platform-VM hostnames. Today's inventory:
+
+**Core platform-VM hostnames** (all `*.apps.sub.comptech-lab.com`): `gitlab`, `minio`, `minio-console`, `haproxy`, `vault-rke2`, `auth`, `nexus`, `nexus-docker`, `nexus-mirror`, `mirror-registry`, `docker-group`, `app-registry`, `defectdojo`, `jenkins`, `signoz`, `trivy`, `monitoring`, `grafana`.
+
+**WSO2 split** (legacy): `is`, `apim`, `publisher`, `devportal`, `admin`, `gateway`.
+
+**Kafka SNI**: `bootstrap.kafka`, `broker-{0,1,2}.kafka`.
+
+**OpenShift cluster ingress** (not via HAProxy): `*.apps.hub-dc-v6.sub.comptech-lab.com`, `*.apps.spoke-dc-v6.sub.comptech-lab.com`.
+
+**OpenShift cluster APIs** (not via HAProxy): `api.hub-dc-v6.sub.comptech-lab.com:6443`, `api.spoke-dc-v6.sub.comptech-lab.com:6443`.
+
+## Adding a new edge-exposed service
+
+The mechanical steps for a new platform-VM hostname (e.g., a new tool VM `tooling.apps.sub.comptech-lab.com`):
+
+1. **DNS:** add A record on the authoritative PowerDNS for `tooling.apps.sub.comptech-lab.com` → HAProxy edge address. Use `pdnsutil add-record` or the HTTP API; changes are immediate, no zone reload needed.
+2. **HAProxy:** backup the config first (`cp haproxy.cfg haproxy.cfg.bak.$(date -u +%Y%m%d-%H%M).<reason>`). Add the hostname to the `is_vm_host` ACL list, add the `use_backend` rule on the `vm-tls` frontend, and add the backend block pointing at the tool VM's LAN address + port. Reload HAProxy.
+3. **Cert:** the existing `wildcard-apps.pem` already covers anything under `*.apps.sub.comptech-lab.com`. No new cert needed.
+4. **Validate:** `dig @<recursor> tooling.apps.sub.comptech-lab.com A +short` returns the HAProxy edge; `curl -sSI https://tooling.apps.sub.comptech-lab.com/` returns the backend's response.
+
+For a `*.mon.sub.comptech-lab.com` hostname the pattern is slightly different — five rule additions across SNI rule, vm-tls host-header → backend, public-apps-http redirect ACL, vm-tls deny-unless ACL, plus the new backend if needed — because the monitoring wildcard is loaded on a separate cert and HAProxy needs explicit SNI rules to pick the right certificate at the loopback termination. The memory entry `reference_lab_infrastructure.md` documents the five-spot mirror procedure.
+
+## Common DNS/edge failure modes
+
+| Symptom | Likely cause | Where to look |
+| --- | --- | --- |
+| `NXDOMAIN` from inside lab | record missing on authoritative | `sudo pdnsutil show-zone sub.comptech-lab.com` on `pdns.local` |
+| `NXDOMAIN` only from a specific VM | VM points at a different resolver | `cat /etc/resolv.conf` on that VM; should list the lab recursor |
+| TLS handshake error | hostname doesn't match cert SAN | wildcard covers `*.apps.sub.comptech-lab.com` — confirm hostname uses that exact wildcard |
+| HTTP 503 from edge | backend down or backend cert/connection failure | HAProxy stats page; check the backend VM service |
+| Wrong backend served for hostname | host-header rule missing in HAProxy | re-check the `acl` and `use_backend` block for the hostname |
+| Cluster API unreachable | API VIP routing problem | `api.<cluster>.sub.comptech-lab.com:6443` resolves direct, not via HAProxy — investigate cluster networking, not HAProxy |
+| OpenShift route returns wrong cert | route hostname doesn't match cluster ingress wildcard | the cluster wildcard is `*.apps.<cluster>.sub.comptech-lab.com` — different cert than the HAProxy wildcard |
+
+## Backup, recovery, and HA posture
+
+The lab runs a **single PowerDNS VM** and a **single HAProxy VM** today. Both are recognized single-VM dependencies; HA is a future ADR (currently out of scope per the workspace scope). Backup posture:
+
+- **PowerDNS:** SQLite zone file at `/var/lib/powerdns/pdns.sqlite3`; dated config backups in `/etc/powerdns/*.bak.YYYYMMDD-HHMM-<reason>`. Zone export available via `pdnsutil show-zone sub.comptech-lab.com`. No replication; if `pdns.local` is lost, every record needs reconstruction from the SQLite snapshot or the operator handoff doc.
+- **HAProxy:** plaintext config at `/etc/haproxy/haproxy.cfg`; dated backups in the same directory. Restore is `cp haproxy.cfg.bak.<latest> haproxy.cfg && systemctl restart haproxy`.
+
+If either VM is lost the lab degrades hard. The operating model treats both as critical-dependency hardware that gets a dated config backup before every meaningful edit.
+
+## References
+
+- Memory: `reference_lab_infrastructure.md`, `reference_haproxy_vm.md`, `reference_pdns_vm.md`, `feedback_haproxy_scope.md`
+- `connection-details/platform-admin-handoff.md` (private) — network details table, cluster API/ingress VIPs
+- `connection-details/nexus.md` (private) — three-endpoint DNS records
+- `adr/0019-nexus-only-image-supply-chain.md` — runtime registry hostname allowlist
+- `adr/0026-ipv6-for-ovn-k-amendment.md` — IPv6 invariants
