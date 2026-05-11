@@ -1,8 +1,258 @@
 ---
-title: "Gatekeeper"
-description: "Section 03-openshift-platform/14-platform-services: Gatekeeper (placeholder)."
-sidebar_label: "Gatekeeper"
+title: "Gatekeeper / OPA and the platform's policy stack"
+description: "How Gatekeeper (Open Policy Agent on Kubernetes) is positioned alongside ValidatingAdmissionPolicy and RHACS deploy-time policies, with constraint templates for the image-registry allowlist, non-root containers, required labels, and resource limits."
+sidebar_label: "Gatekeeper / OPA"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const gkNodes = [
+  { id: "api",    position: { x: 380, y: 0   }, data: { label: "Kubernetes API server" }, style: ctrlBox },
+  { id: "vap",    position: { x: 100, y: 130 }, data: { label: "ValidatingAdmission\nPolicy (native)" }, style: crBox },
+  { id: "gk",     position: { x: 380, y: 130 }, data: { label: "Gatekeeper webhook" }, style: ctrlBox },
+  { id: "rhacs",  position: { x: 660, y: 130 }, data: { label: "RHACS sensor\n(deploy-time policy)" }, style: ctrlBox },
+  { id: "ct",     position: { x: 280, y: 280 }, data: { label: "ConstraintTemplate" }, style: crBox },
+  { id: "constr", position: { x: 480, y: 280 }, data: { label: "Constraint" }, style: crBox },
+  { id: "rego",   position: { x: 380, y: 420 }, data: { label: "Rego policy" }, style: dataBox },
+];
+
+export const gkEdges = [
+  { id: "a1", source: "api", target: "vap",   label: "in-process eval", ...reqEdge },
+  { id: "a2", source: "api", target: "gk",    label: "webhook call", ...reqEdge },
+  { id: "a3", source: "api", target: "rhacs", label: "sensor watch", ...reqEdge },
+  { id: "g1", source: "gk",  target: "ct",    ...muted },
+  { id: "g2", source: "gk",  target: "constr",...muted },
+  { id: "g3", source: "ct",  target: "rego",  label: "embeds", ...muted },
+];
+
+OPA Gatekeeper is one of three layers in the lab's policy stack. It is the most expressive (Rego, custom logic) but also the slowest (webhook call into a separate Deployment). This page is the install, the constraint model, the policies the lab actually enforces, and the layering against ValidatingAdmissionPolicy and RHACS.
+
+## The three policy layers
+
+| Layer | Engine | Strength | Cost | Used for |
+| --- | --- | --- | --- | --- |
+| ValidatingAdmissionPolicy (VAP) | Native K8s, CEL | In-process, fast | Limited expressiveness (CEL only) | Image registry allowlist, label requirements, simple field checks |
+| Gatekeeper | OPA + Rego | Most expressive | Webhook call per admission | Cross-resource rules, audit, parameterised constraints |
+| RHACS deploy-time policy | StackRox engine | Tied to RHACS UI, cluster-fleet | Sensor → Central round-trip | Image scanning policies, runtime behavior, compliance frameworks |
+
+The lab uses all three. VAP for the cheapest checks (image allowlist), Gatekeeper for cross-resource and audit, RHACS for image-quality and supply-chain. When a check is feasible in two layers, prefer the lower-cost one but enforce in both for defense-in-depth.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: gkNodes, edges: gkEdges }} height={520} />
+
+Reading the diagram:
+
+- The **K8s API** consults three admission policies on every CREATE / UPDATE: VAP (in-process), Gatekeeper (webhook), and RHACS sensor (which can also block via admission).
+- **Gatekeeper** loads `ConstraintTemplate` CRs (which embed Rego) and `Constraint` CRs (which parameterise a template and bind it to API kinds).
+- Rego is evaluated per request; policy violations either deny the request or emit an audit event, depending on the Constraint's `enforcementAction`.
+
+## Install — Red Hat Gatekeeper operator
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: gatekeeper-operator-product
+  namespace: openshift-gatekeeper-system
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: gatekeeper-operator-product
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+```
+
+```yaml
+apiVersion: operator.gatekeeper.sh/v1alpha1
+kind: Gatekeeper
+metadata:
+  name: gatekeeper
+spec:
+  audit:
+    auditChunkSize: 500
+    auditFromCache: Enabled
+    auditInterval: 600s
+    logLevel: INFO
+    replicas: 1
+  validatingWebhook: Enabled
+  mutatingWebhook: Disabled
+  webhook:
+    emitAdmissionEvents: Enabled
+    emitAuditEvents: Enabled
+    failurePolicy: Fail
+    logDenies: true
+    logLevel: INFO
+    replicas: 2
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `audit.auditInterval: 600s` | Audit re-scans the cluster every 10 min. Mismatches against constraints emit violations even on resources that pre-date the constraint. |
+| `validatingWebhook: Enabled` | Block creation of non-compliant resources. |
+| `mutatingWebhook: Disabled` | The lab does not use Gatekeeper mutation. We have a strict no-mutating-webhook policy across the platform; mutation is reserved to operator controllers. |
+| `webhook.failurePolicy: Fail` | If Gatekeeper is unavailable, admission fails closed. Trade-off against `Ignore`: less ergonomic but safer. |
+| `webhook.logDenies: true` | Denies show up in operator logs immediately; aids debugging. |
+| `webhook.replicas: 2` | HA for the webhook path. Audit can be single-replica. |
+
+## ConstraintTemplate and Constraint — the model
+
+A `ConstraintTemplate` declares a *policy class*: parameters, target API kinds, and Rego logic. A `Constraint` *instantiates* that class with specific values and applies it to specific resources.
+
+Example template (require all Deployments to have an `owner` label):
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items: { type: string }
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+        violation[{"msg": msg, "details": {"missing_labels": missing}}] {
+          provided := {label | input.review.object.metadata.labels[label]}
+          required := {label | label := input.parameters.labels[_]}
+          missing := required - provided
+          count(missing) > 0
+          msg := sprintf("missing required labels: %v", [missing])
+        }
+```
+
+The corresponding Constraint:
+
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: deployment-must-have-owner-label
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, openshift-monitoring, openshift-pipelines]
+  parameters:
+    labels: ["owner"]
+```
+
+Reading this together:
+
+- The template creates a new CRD `K8sRequiredLabels` whose `parameters.labels` is a list of strings.
+- The Constraint instantiates the template with `labels: ["owner"]` and binds it to Deployments outside platform namespaces.
+- Any Deployment without an `owner` label is rejected at admission and reported in audit.
+
+## What the lab enforces today
+
+| Constraint | Template | Scope | Status |
+| --- | --- | --- | --- |
+| `deployment-must-have-owner-label` | `K8sRequiredLabels` | tenant Deployments | enforced |
+| `pod-no-privileged` | `K8sPSPPrivilegedContainer` | tenant Pods | enforced |
+| `pod-no-host-namespace` | `K8sPSPHostNamespace` | tenant Pods | enforced |
+| `pod-no-host-path-volumes` | `K8sPSPHostFilesystem` | tenant Pods | enforced (with namespace exemption for storage operators) |
+| `container-resource-limits-required` | `K8sRequiredResources` | tenant Pods | warn-only (enforcementAction: dryrun) |
+| `image-registry-allowed-prefix` | `K8sAllowedRepos` | tenant Pods | enforced — but VAP is the primary control (see §6 disconnected-image-supply) |
+
+Most of the "no privileged / no host namespace" constraints duplicate PodSecurityAdmission's `restricted` profile. The duplication is intentional: PSA is a label-driven contract; Gatekeeper adds a Rego-driven audit log so you can see who tried to deploy what.
+
+## VAP, Gatekeeper, RHACS — the image-registry allowlist case
+
+This is the lab's canonical "policy layered three deep" case:
+
+- **VAP** (`platform-gitops/.../allowed-image-registries.yaml`) is the primary cluster-side control. CEL-based; in-process; fast; per-cluster.
+- **Gatekeeper** `K8sAllowedRepos` is the secondary cluster-side control. Rego-based; webhook; per-cluster.
+- **RHACS** `IMG-SUPPLY-3 disallowed image registries` is the fleet-side control on Central; deploy-time check that also surfaces alerts in the Central UI.
+
+A new registry must be added in all three places. The `image-registry-allowlist.md` connection-details doc is the source of truth for that change. See `/docs/03-openshift-platform/06-disconnected-image-supply/` for the broader supply-chain story.
+
+## Audit
+
+The `audit` Deployment scans existing resources every 10 minutes and emits `violation` objects for non-compliant resources, even if they pre-date the constraint:
+
+```bash
+oc get k8srequiredlabels deployment-must-have-owner-label \
+  -o jsonpath='{.status.violations}{"\n"}' | jq .
+```
+
+Audit is useful for *catching* drift; the webhook *blocks* new violations. Both matter.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-gatekeeper-system get sub,csv
+oc --kubeconfig "$K" get gatekeeper gatekeeper
+
+# Webhook + audit pods
+oc --kubeconfig "$K" -n openshift-gatekeeper-system get deploy
+
+# ConstraintTemplates
+oc --kubeconfig "$K" get constrainttemplate
+
+# Constraints (CRDs created from templates)
+oc --kubeconfig "$K" get k8srequiredlabels,k8spsphostnamespace
+
+# Live test: try to create a Deployment without the required label
+cat <<EOF | oc --kubeconfig "$K" apply --dry-run=server -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gk-test
+  namespace: apps-team-x
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: gk-test } }
+  template:
+    metadata:
+      labels: { app: gk-test }
+    spec:
+      containers:
+        - { name: c, image: registry.redhat.io/ubi9/ubi:9.4 }
+EOF
+# Expected: server-side dry-run rejects with "missing required labels: owner".
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Random admission failures cluster-wide. | Gatekeeper webhook pods unhealthy and `failurePolicy: Fail`. | `oc get pods -n openshift-gatekeeper-system`; if degraded, increase replicas. | Run >=2 webhook replicas; pod anti-affinity; monitor webhook latency. |
+| Constraint applies to operator-managed resources and breaks platform. | `namespaceSelector` does not exclude operator namespaces. | Add `kubernetes.io/metadata.name NotIn [openshift-*, kube-*, ...]`. | Constraint template library includes the exclusion list. |
+| Audit reports violations but admission lets new ones in. | Constraint applied with `enforcementAction: dryrun`. | Switch to `deny`. | Be explicit about dryrun vs deny; review on rollout. |
+| Rego policy unbounded; webhook timeouts. | A Rego rule iterates over all pods cluster-wide. | Tighten the rule; cache via `data.inventory`. | Code-review constraint Rego before merging. |
+| Constraint count balloons. | Tenants adding their own constraints. | Tenants do not own Gatekeeper; platform owns the policy library. | Document the boundary; only platform-team commits accepted under `policies/gatekeeper/`. |
+
+## References
+
+- ADR 0023 (or equivalent) — admission-control layering decision.
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` — three-layer image control.
+- Gatekeeper upstream docs: `ConstraintTemplate`, `Constraint`, Rego.
+- Red Hat Gatekeeper Operator: `Gatekeeper` v1alpha1.

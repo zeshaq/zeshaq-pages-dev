@@ -1,8 +1,292 @@
 ---
-title: "Backup-Restore Drill"
-description: "Section 03-openshift-platform/13-backup-oadp: Backup-Restore Drill (placeholder)."
-sidebar_label: "Backup-Restore Drill"
+title: "Backup-restore drill, schedules, and DR readiness"
+description: "The repeatable drill that proves a backup is restorable, plus the Schedule templates used on spoke-dc-v6 and the disaster-recovery readiness checklist they cover."
+sidebar_label: "Drill + Schedules + DR"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+import Mermaid from "../../../../components/Mermaid";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const drillNodes = [
+  { id: "sched",    position: { x: 0,   y: 0   }, data: { label: "Schedule\ndaily-apps" }, style: crBox },
+  { id: "backup",   position: { x: 220, y: 0   }, data: { label: "Backup\ndaily-apps-20260511-..." }, style: crBox },
+  { id: "minio",    position: { x: 440, y: 0   }, data: { label: "MinIO\noadp-backups/spoke-dc-v6/" }, style: extBox },
+  { id: "valid",    position: { x: 660, y: 0   }, data: { label: "Validate\n(velero backup describe)" }, style: ctrlBox },
+  { id: "drillns",  position: { x: 0,   y: 180 }, data: { label: "drill-target ns\n(scratch namespace)" }, style: dataBox },
+  { id: "restore",  position: { x: 220, y: 180 }, data: { label: "Restore CR" }, style: crBox },
+  { id: "verify",   position: { x: 440, y: 180 }, data: { label: "Verify workload\n(routes, db rows, etc.)" }, style: ctrlBox },
+  { id: "report",   position: { x: 660, y: 180 }, data: { label: "MinIO\ndrills/" }, style: extBox },
+];
+
+export const drillEdges = [
+  { id: "s1", source: "sched",   target: "backup",  label: "creates daily", ...reqEdge },
+  { id: "b1", source: "backup",  target: "minio",   label: "tarball + snapshots", ...pullEdge },
+  { id: "v1", source: "minio",   target: "valid",   label: "metadata", ...muted },
+  { id: "r1", source: "backup",  target: "restore", label: "referenced by", ...muted },
+  { id: "r2", source: "restore", target: "drillns", label: "restores into", ...reqEdge },
+  { id: "r3", source: "drillns", target: "verify",  label: "asserted by", ...reqEdge },
+  { id: "p1", source: "verify",  target: "report",  label: "drill evidence", ...pullEdge },
+];
+
+A backup is just an object until you have restored from it. This page is the recurring backup-restore drill that proves the backup tarballs Velero writes to MinIO are actually restorable, plus the Schedule shapes that produce those tarballs, and the broader DR-readiness posture that all of this fits into.
+
+It is for the platform operator on backup duty, the on-call who would run a restore for real, and anyone designing a tenant-level recovery exercise.
+
+## Why a drill, not just "we have backups"
+
+The OADP fleet has run cleanly on all four clusters across 2026-05, but the 2026-05-05 validation campaign produced a useful negative result: concurrent full-resource backups across the fleet hit a MinIO single-node ceiling and failed in *finalization*, not in item collection (cf. §13.1, §13.3). The Items=N count looked right; the tarball never landed.
+
+The lesson is that a successful-looking `Backup.status.phase = Completed` is necessary but not sufficient. The only signal that genuinely matters is: *can you stand the workload back up from MinIO without the live cluster being involved?* That is what the drill validates.
+
+## Architecture of the drill
+
+<Whiteboard client:load data={{ nodes: drillNodes, edges: drillEdges }} height={420} />
+
+The drill takes one of the Schedule-produced Backups, restores it into a *scratch namespace* (not over the live one), asserts the workload is functional, and uploads an evidence record to a separate MinIO prefix.
+
+We restore into a scratch namespace because a real-cluster restore over a live namespace is destructive and skipped during routine drills. The full destructive path is exercised on `spoke-dr-v6` only, where there is no live workload, on a quarterly cadence.
+
+## Schedule templates
+
+The spoke-dc-v6 fleet runs three platform Schedules, one per data class. Tenant namespaces inherit `daily-apps` unless explicitly excluded.
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-apps
+  namespace: openshift-adp
+spec:
+  schedule: "15 02 * * *"     # 02:15 cluster time
+  template:
+    ttl: 720h0m0s              # 30 days; lifecycle on the bucket extends to 90d
+    storageLocation: spoke-dc-v6-1
+    snapshotVolumes: true
+    defaultVolumesToFsBackup: false
+    includedNamespaces:
+      - "apps-*"               # platform convention for tenant app namespaces
+    excludedNamespaces:
+      - apps-system             # excluded; protected separately
+    includedResources:
+      - "*"
+    storageClasses:
+      - ocs-storagecluster-ceph-rbd
+      - ocs-storagecluster-cephfs
+      - lvms-vg1
+```
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: weekly-platform
+  namespace: openshift-adp
+spec:
+  schedule: "15 03 * * 0"     # Sunday 03:15
+  template:
+    ttl: 2160h0m0s             # 90 days
+    storageLocation: spoke-dc-v6-1
+    snapshotVolumes: true
+    defaultVolumesToFsBackup: false
+    includedNamespaces:
+      - openshift-pipelines
+      - openshift-logging
+      - openshift-tempo-operator
+      - tracing
+      - quay-enterprise
+      - external-secrets
+      - openshift-adp           # backup the backup operator itself
+```
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hourly-state
+  namespace: openshift-adp
+spec:
+  schedule: "5 */1 * * *"     # every hour at :05
+  template:
+    ttl: 168h0m0s              # 7 days
+    storageLocation: spoke-dc-v6-1
+    snapshotVolumes: false      # metadata-only, no PVC data
+    defaultVolumesToFsBackup: false
+    includedResources:
+      - applications
+      - applicationsets
+      - appprojects
+      - clusterissuers
+      - certificates
+      - externalsecrets
+      - secretstores
+      - clustersecretstores
+      - policies
+      - placements
+      - placementdecisions
+```
+
+The three schedules are intentionally different in volume and intent:
+
+| Schedule | Cadence | TTL | Coverage |
+| --- | --- | --- | --- |
+| `daily-apps` | Daily 02:15 | 30d | All `apps-*` tenant namespaces, with CSI snapshots. |
+| `weekly-platform` | Weekly Sun 03:15 | 90d | Platform services with state — Pipelines, Logging, Tempo, Quay, ESO, OADP itself. |
+| `hourly-state` | Hourly :05 | 7d | Tiny, metadata-only: GitOps + cert-manager + ESO CRs. Cheap, high-recovery-value. |
+
+Schedules are staggered across the fleet so they do not all hit MinIO at the same time (see §13.3 failure mode).
+
+## Schedule rotation and naming
+
+Velero names generated backups `<schedule-name>-<utc-timestamp>`. The bucket sees, over 30 days, ~30 `daily-apps-*` rows under `oadp-backups/spoke-dc-v6/backups/`. Velero owns rotation:
+
+- Backups older than `ttl` are marked for deletion through `DeleteBackupRequest`.
+- The lifecycle rule on the bucket is the fallback if Velero's gc is offline.
+- A re-applied Schedule continues from where it left off; deleting and recreating a Schedule produces a new name prefix and the old backups age out on their own TTL.
+
+To pause a Schedule (for example during a cluster upgrade):
+
+```bash
+oc -n openshift-adp patch schedule daily-apps \
+  --type=merge -p '{"spec":{"paused":true}}'
+```
+
+Resume by patching `paused: false`. Do *not* delete the Schedule for short pauses; deletion forces a new chain.
+
+## The drill — happy path
+
+Once a week, on a Tuesday morning, the platform operator runs the drill. The script is conceptually:
+
+```bash
+# 0. Pick a recent successful backup
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+BACKUP=$(oc --kubeconfig "$K" -n openshift-adp get backup \
+  -l velero.io/schedule-name=daily-apps \
+  --sort-by=.metadata.creationTimestamp -o name | tail -1 | cut -d/ -f2)
+
+echo "Drill candidate: $BACKUP"
+
+# 1. Validate the metadata
+oc --kubeconfig "$K" -n openshift-adp get backup "$BACKUP" \
+  -o jsonpath='{.status.phase}{"\n"}{.status.itemOperationsAttempted}{"\n"}{.status.errors}{"\n"}'
+
+# Optional: inspect with the velero CLI which renders the tarball metadata
+velero --kubeconfig "$K" -n openshift-adp backup describe "$BACKUP" --details
+
+# 2. Create a scratch namespace
+DRILL_NS=drill-${BACKUP}
+oc --kubeconfig "$K" create namespace "$DRILL_NS"
+
+# 3. File a Restore CR that maps every included namespace into the scratch ns
+cat <<EOF | oc --kubeconfig "$K" apply -f -
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: drill-$BACKUP
+  namespace: openshift-adp
+spec:
+  backupName: $BACKUP
+  namespaceMapping:
+    apps-sample: $DRILL_NS
+  restorePVs: true
+  includedResources:
+    - "*"
+  excludedResources:
+    - nodes
+    - events
+    - events.events.k8s.io
+EOF
+
+# 4. Wait
+oc --kubeconfig "$K" -n openshift-adp get restore drill-"$BACKUP" -w
+
+# 5. Sanity-check the workload
+oc --kubeconfig "$K" -n "$DRILL_NS" get pods,svc,routes,pvc
+
+# 6. Tear down
+oc --kubeconfig "$K" delete namespace "$DRILL_NS"
+```
+
+The Restore writes its own `Restore.status` block and emits events. On the happy path the entire drill takes 5–15 minutes for an `apps-sample` namespace.
+
+## What "passes" means
+
+A drill passes if **all** of the following are true:
+
+1. `Restore.status.phase = Completed`.
+2. The drill namespace contains the same pod count, PVC count, and Service count as the source namespace at backup time.
+3. PVCs are `Bound` (data was restored, not just the PVC manifest).
+4. The workload pods reach `Ready`.
+5. A workload-specific health check passes — for an HTTP app, a `curl /health` returning 200 from inside the cluster (don't exercise Routes, they were redirected to the scratch namespace and would collide with the source).
+
+If any one of these fails, the drill is a *fail*, the operator opens an incident, and the next two days' backups are inspected to verify whether the failure is in the source data or in the restore path.
+
+## Tenant restore (production, destructive)
+
+The drill is non-destructive. A real restore that overwrites a live namespace is destructive and follows a different recipe:
+
+1. Confirm with the workload owner. There is no rolling-back a Restore once it has overwritten Secrets / PVCs.
+2. Scale the workload to zero replicas first to prevent the Restore from racing the in-flight pods.
+3. Delete any resources whose UIDs the Restore will collide with (Routes, Services, PVCs if you intend to recreate).
+4. File the Restore with `namespaceMapping` set to the *same* source namespace.
+5. Scale the workload back up.
+6. Verify the same health-check as the drill.
+
+This is operator-on-call territory. Tenant requests for restore go through a ticket; tenants do not file `Restore` CRs.
+
+## DR readiness checklist
+
+Backup is one pillar of disaster recovery. The full readiness pillar list:
+
+| Pillar | Status on spoke-dc-v6 |
+| --- | --- |
+| OADP installed + DPA reconciled | Yes (§13.1) |
+| BSL `Available` against MinIO | Yes |
+| Cloud credentials delivered via ESO | Yes (§13.2) |
+| MinIO bucket exists with prefix per cluster | Yes (§13.3) |
+| Per-cluster IAM scope | Yes |
+| Schedules running | Yes (the three above) |
+| Weekly drill passing | Required; tracked by the operator on-call |
+| Quarterly destructive restore on `spoke-dr-v6` | Required; tracked by the platform team |
+| ACM cluster-backup running on the hub | Yes (§13.6) |
+| Documented RPO + RTO per data class | RPO 24h for apps, RPO 1h for metadata; RTO 1h for a single namespace, RTO ~1d for cluster-wide |
+
+> Internal-only specifics — workload owner contacts, paging rotations — are kept in `codex-opp-agent/connection-details/`.
+
+## RPO / RTO
+
+| Data class | RPO | RTO | Mechanism |
+| --- | --- | --- | --- |
+| Tenant app data | 24h | 1h per namespace | `daily-apps` Schedule, restore into mapped ns |
+| Platform service config (CRDs, ESO, GitOps) | 1h | 30 min | `hourly-state` Schedule |
+| Platform services with state (Loki, Tempo, Quay) | 7d | 4h | `weekly-platform` + workload-specific recipes |
+| Hub fleet inventory (ACM) | 6h | 6h | `hub-backup-daily` on hub-dc-v6 (§13.6) |
+
+Schedules and TTLs are the levers. To improve RPO on tenant data, the lever is `daily-apps.spec.schedule` — but smaller cadence means more MinIO load.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Drill Restore stuck `InProgress`. | Velero waiting on a snapshot's source `VolumeSnapshotContent` to become available. | Inspect `volumesnapshot/volumesnapshotcontent` in the drill ns; check the CSI driver. | Don't drill during ODF rebalances; verify CSI driver readiness in pre-drill checks. |
+| Drill namespace's pods CrashLoopBackOff. | Restored Secrets reference a Vault-backed ExternalSecret that did not get re-reconciled. | Wait one ESO refresh interval; or `oc annotate externalsecret/<name> force-sync=$(date +%s)`. | Include ESO CRs in the source namespace backup and the Restore. |
+| Drill passes but the live equivalent does not. | The live namespace has cluster-scoped dependencies (ClusterRoleBindings, IngressClasses) the drill mapped away. | Build a more faithful drill that restores those into the scratch namespace too, even if read-only. | Quarterly destructive drill on spoke-dr-v6 exercises the full surface. |
+| Schedule paused, nobody noticed. | An upgrade pause was never reset. | Check `oc get schedules -A`; alert on `paused=true` lasting > 24h. | Add a Cluster Observability Operator alert: `velero_schedule_paused > 0 for 1d`. |
+| `daily-apps` finishing 6h+. | Tenant added a 5 TiB PVC; CSI snapshot is slow. | Exclude the PVC from snapshot via pod annotation; consider moving it to a separate Schedule. | Sizing review when onboarding any tenant PVC > 1 TiB. |
+
+## References
+
+- `codex-opp-agent/reports/sessions/20260505-183038-oadp-finalization-validation.md` — full fleet drill including the negative result.
+- `codex-opp-agent/reports/sessions/20260505-202939-oadp-minio-finalization-fix.md` — follow-up on the finalization failure.
+- `platform-gitops/clusters/spoke-dc-v6/backup/` — Schedules and DPA.
+- ADR 0015 — federated GitOps repo architecture (platform-team ownership of Schedules).

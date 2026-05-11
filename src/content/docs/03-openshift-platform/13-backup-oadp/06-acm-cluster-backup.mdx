@@ -1,8 +1,231 @@
 ---
-title: "ACM Cluster Backup"
-description: "Section 03-openshift-platform/13-backup-oadp: ACM Cluster Backup (placeholder)."
-sidebar_label: "ACM Cluster Backup"
+title: "ACM cluster-backup on the hub"
+description: "How Red Hat Advanced Cluster Management uses OADP under the hood to back up hub-side fleet state (ManagedClusters, Policies, Placements, Argo CD Applications) and the active-vs-passive hub posture that makes restore safe."
+sidebar_label: "ACM cluster-backup"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const acmNodes = [
+  { id: "active",   position: { x: 0,   y: 0   }, data: { label: "hub-dc-v6\n(active hub)" }, style: ctrlBox },
+  { id: "passive",  position: { x: 540, y: 0   }, data: { label: "hub-dr-v6\n(passive hub)" }, style: ctrlBox },
+  { id: "acmop",    position: { x: 0,   y: 150 }, data: { label: "ACM operator\n+ cluster-backup-operator" }, style: ctrlBox },
+  { id: "bsched",   position: { x: 0,   y: 300 }, data: { label: "BackupSchedule CR\nhub-backup-daily" }, style: crBox },
+  { id: "rsched",   position: { x: 540, y: 150 }, data: { label: "Restore CR\n(passive only on failover)" }, style: crBox },
+  { id: "oadp1",    position: { x: 260, y: 300 }, data: { label: "OADP on hub-dc-v6\n(openshift-adp)" }, style: ctrlBox },
+  { id: "oadp2",    position: { x: 540, y: 300 }, data: { label: "OADP on hub-dr-v6\n(openshift-adp)" }, style: ctrlBox },
+  { id: "minio",    position: { x: 260, y: 460 }, data: { label: "MinIO\noadp-backups bucket" }, style: extBox },
+  { id: "hubpfx",   position: { x: 60,  y: 460 }, data: { label: "hub-dc-v6/" }, style: dataBox },
+  { id: "drpfx",    position: { x: 460, y: 460 }, data: { label: "hub-dr-v6/" }, style: dataBox },
+];
+
+export const acmEdges = [
+  { id: "a1", source: "active",  target: "acmop",   ...muted },
+  { id: "a2", source: "acmop",   target: "bsched",  label: "manages", ...muted },
+  { id: "b1", source: "bsched",  target: "oadp1",   label: "creates Backups", ...reqEdge },
+  { id: "o1", source: "oadp1",   target: "minio",   label: "S3 PUT", ...pullEdge },
+  { id: "f1", source: "minio",   target: "hubpfx",  ...muted },
+  { id: "f2", source: "minio",   target: "drpfx",   ...muted },
+  { id: "p1", source: "passive", target: "rsched",  label: "manages", ...muted },
+  { id: "r1", source: "rsched",  target: "oadp2",   label: "drives", ...reqEdge },
+  { id: "o2", source: "oadp2",   target: "minio",   label: "S3 GET", ...pullEdge },
+];
+
+OADP backs up *application namespaces*. The hub-side problem is different: when the active hub burns down, what brings the fleet inventory — ManagedClusters, Policies, Placements, Argo CD Applications, MultiClusterObservability config — back online on a new hub? The answer is Red Hat Advanced Cluster Management's `cluster-backup-operator`, which sits on top of OADP and runs `BackupSchedule` and `Restore` CRs that wrap the right scope.
+
+This page is the orientation. It is for the platform team that owns the hub. Workload teams do not interact with it.
+
+## Active hub, passive hub
+
+The hub posture is two clusters:
+
+| Cluster | Role | Active operator components |
+| --- | --- | --- |
+| `hub-dc-v6` | Active hub | RHACM operator + cluster-backup-operator + OADP + active `BackupSchedule` |
+| `hub-dr-v6` | Passive hub | RHACM operator + cluster-backup-operator + OADP; **no** `BackupSchedule`, no managed clusters |
+
+Both hubs run the same operator stack. The difference is which one is currently driving the fleet. Only one of them is "active" at a time. The passive hub is a hot standby: the operators are installed and configured, but it does not adopt any ManagedCluster CRs and does not run any BackupSchedule.
+
+On failover, you:
+
+1. Stop the BackupSchedule on the (now broken) active hub if it is reachable.
+2. File a `Restore` CR on the passive hub pointing at the most recent `BackupSchedule`-produced backup in MinIO.
+3. The cluster-backup-operator drives the underlying OADP `Restore` CRs in the right order, restores ManagedCluster CRs, Policies, Placements, AppSets, Apps.
+4. Each managed cluster's klusterlet re-handshakes with the new hub.
+5. ApplicationSet drift converges spokes to whatever the *post-restore* AppSet generators decide.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: acmNodes, edges: acmEdges }} height={600} />
+
+Reading the diagram:
+
+- The **active hub** runs a single `BackupSchedule` CR; the **cluster-backup-operator** translates that into a coordinated set of OADP `Backup` CRs and writes them to the hub's MinIO prefix.
+- The **passive hub** has the same operator stack idle. When a `Restore` is filed, the operator drives the OADP path on that cluster to read the bucket prefix the failed hub wrote, and restore into the local hub.
+- Both hubs use the same `oadp-backups` MinIO bucket; only the *prefix* differs (per §13.3).
+
+## The CR ecosystem on the hub
+
+| CR | API | Purpose |
+| --- | --- | --- |
+| `BackupSchedule` | `cluster.open-cluster-management.io/v1beta1` | Top-level schedule on the active hub. Owns several underlying Velero Schedules. |
+| `Restore` (ACM) | `cluster.open-cluster-management.io/v1beta1` | Top-level restore on the passive hub. Coordinates several Velero Restores. |
+| `Backup` / `Schedule` / `Restore` (Velero) | `velero.io/v1` | What ACM creates underneath; you usually do not touch these directly. |
+
+The ACM `BackupSchedule` and `Restore` CRs are *coordinators*, not new backup engines. Under the hood they create regular Velero CRs with the right resource selectors:
+
+- `acm-credentials-schedule` — long-lived credentials (managed-cluster pull secrets, addon credentials).
+- `acm-managed-clusters-schedule` — ManagedCluster CRs and ManagedClusterSet CRs.
+- `acm-resources-schedule` — Policies, Placements, AppSets, observability config.
+- `acm-resources-generic-schedule` — anything labelled `cluster.open-cluster-management.io/backup`.
+
+Each of these maps to a Velero Schedule on the active hub.
+
+## The BackupSchedule on the active hub
+
+The single CR the platform team configures:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: BackupSchedule
+metadata:
+  name: hub-backup-daily
+  namespace: open-cluster-management-backup
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+spec:
+  veleroSchedule: "0 3 * * *"          # daily 03:00
+  veleroTtl: 720h0m0s                   # 30 days
+  useManagedServiceAccount: false       # MSA off in the lab
+```
+
+Field-by-field:
+
+| Field | Purpose |
+| --- | --- |
+| `veleroSchedule` | Cron expression handed to every underlying Velero Schedule. |
+| `veleroTtl` | TTL on every Backup the underlying schedules produce. Same belt-and-braces with the bucket lifecycle. |
+| `useManagedServiceAccount` | When true, the cluster-backup-operator uses a Managed Service Account on each managed cluster to obtain its admin kubeconfig. In our lab the klusterlet handshake re-establishes connectivity without MSA. |
+
+When the BackupSchedule is reconciled, the operator brings up four Velero Schedules in `open-cluster-management-backup`:
+
+```text
+acm-credentials-schedule         */backup
+acm-managed-clusters-schedule    */backup
+acm-resources-schedule           */backup
+acm-resources-generic-schedule   */backup
+```
+
+You can `oc get schedule -n open-cluster-management-backup` to see them. *Do not edit them directly* — the cluster-backup-operator owns them and will revert manual changes.
+
+## The passive-hub Restore
+
+On failover, the platform team files a Restore on the passive hub:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Restore
+metadata:
+  name: hub-restore-from-dc
+  namespace: open-cluster-management-backup
+spec:
+  cleanupBeforeRestore: CleanupRestored
+  veleroManagedClustersBackupName: latest
+  veleroCredentialsBackupName: latest
+  veleroResourcesBackupName: latest
+```
+
+Field-by-field:
+
+| Field | Purpose |
+| --- | --- |
+| `cleanupBeforeRestore: CleanupRestored` | Wipes resources from any *prior* restore attempt on this hub. Safer than `None`; less destructive than `CleanupAll`. |
+| `veleroManagedClustersBackupName: latest` | Read the newest managed-cluster Backup from the BSL. |
+| `veleroCredentialsBackupName: latest` | Same for credentials. |
+| `veleroResourcesBackupName: latest` | Same for AppSets / Policies / Placements. |
+
+The cluster-backup-operator coordinates the order:
+
+1. Restore credentials (so subsequent restores can authenticate to managed clusters).
+2. Restore managed-cluster CRs.
+3. Restore generic resources (the labelled set).
+4. Restore the main resource set (Apps, AppSets, Policies, Placements).
+
+This ordering is non-negotiable. The reverse order would re-create AppSets pointing at clusters the new hub does not yet know about, generating a transient set of orphan Applications.
+
+## What's in scope vs. out of scope for ACM cluster-backup
+
+| In scope (backed up by `hub-backup-daily`) | Out of scope |
+| --- | --- |
+| ManagedCluster + ManagedClusterSet CRs | The managed clusters themselves (their workload state — that is OADP per-spoke) |
+| Policies, PolicySets, PlacementBindings | Per-spoke policy compliance status records (regenerated on first eval after restore) |
+| Argo CD AppProjects / Applications / ApplicationSets | The Git repos the AppSets read (those are in GitLab, independent) |
+| MultiClusterObservability config | The Thanos data plane (lives elsewhere) |
+| Addon credentials (managed-cluster pull secrets) | Bare-metal IPI install artifacts |
+| Per-team RBAC on the hub | Per-spoke tenant app data |
+
+The crisp split: the hub backup is *fleet metadata*. Application data on each spoke is OADP per-spoke. A full DR exercise restores the hub *and* a representative spoke; the spoke restore is the §13.5 drill scaled up to "destructive on spoke-dr-v6."
+
+## Validation on the active hub
+
+```bash
+K=/home/<user>/.kube/configs/hub-dc-v6.kubeconfig
+
+# Operator + BackupSchedule
+oc --kubeconfig "$K" -n open-cluster-management-backup get sub,csv
+oc --kubeconfig "$K" -n open-cluster-management-backup get backupschedule
+
+# Underlying Velero Schedules
+oc --kubeconfig "$K" -n open-cluster-management-backup get schedule
+
+# Latest Backups
+oc --kubeconfig "$K" -n open-cluster-management-backup get backup \
+  --sort-by=.metadata.creationTimestamp | tail -10
+```
+
+Expected:
+
+- `BackupSchedule` `phase=Enabled`.
+- All four `acm-*-schedule` rows present.
+- Latest Backups from each schedule `phase=Completed`.
+
+On the passive hub, the equivalent sanity check is that the operator + OADP + BSL are healthy:
+
+```bash
+K=/home/<user>/.kube/configs/hub-dr-v6.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-adp get bsl,dpa
+oc --kubeconfig "$K" -n open-cluster-management-backup get sub,csv
+
+# Crucially: NO BackupSchedule should be enabled here.
+oc --kubeconfig "$K" -n open-cluster-management-backup get backupschedule
+# Expected: no rows, or only ones in DisableState.
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `BackupSchedule` `phase=BackupCollision`. | A second active hub also has a BackupSchedule writing to the same prefix. | Pause one. There must be exactly one active hub. | Keep `useManagedServiceAccount` and the BackupSchedule disabled on hub-dr-v6 by GitOps. |
+| Passive-hub Restore stalls at "credentials". | The MinIO user on the passive hub does not have read on the active hub's prefix. | The §13.3 IAM policy gives each cluster read+write on *its own* prefix only. For DR, attach a temporary read policy on the source prefix to the passive hub's user, or share a `dr-readonly` policy across both. | Decide and document the cross-prefix DR policy before the first drill. |
+| Restore completes but managed clusters show `Unknown` in the ACM console. | The klusterlet on each spoke still points at the dead hub. | Re-import the spoke or wait for the klusterlet's reconnect window. | Schedule a quarterly DR drill that validates the import-flow on spoke-dr-v6. |
+| `acm-resources-schedule` produces backups but they are tiny. | The resource selector found no matching resources. | Confirm Policies / AppSets exist on the active hub. If empty, the hub is empty by design and the backup is correct. | Don't run BackupSchedule on a hub before the bootstrap of fleet state is complete. |
+| Restore exists on passive hub but spokes never converge. | The new hub's API URL differs from the old hub's, so klusterlet xDS endpoints are stale. | Rotate the klusterlet config on each spoke to the new hub URL. | Use a fleet-stable hub DNS name (e.g., `acm.hub.apps.sub.comptech-lab.com`) that you can re-point on DNS. |
+
+## References
+
+- Red Hat ACM docs: cluster-backup-operator.
+- `codex-opp-agent/connection-details/openshift-hub-dc-v6.md` and `openshift-gitops-hub-dc-v6.md` — the active hub.
+- `codex-opp-agent/reports/sessions/20260505-183038-oadp-finalization-validation.md` — hub backup tested alongside spoke.
+- ADR 0018 / 0019 — ACM + OpenShift GitOps pull-model decisions.

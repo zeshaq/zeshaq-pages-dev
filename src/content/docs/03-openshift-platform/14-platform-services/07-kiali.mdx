@@ -1,8 +1,190 @@
 ---
-title: "Kiali"
-description: "Section 03-openshift-platform/14-platform-services: Kiali (placeholder)."
+title: "Kiali — mesh console + tracing overlay"
+description: "How Kiali is installed on spoke-dc-v6 with OAuth integration, cluster-wide visibility, and the Tempo wiring that turns the mesh console into a tracing front-end."
 sidebar_label: "Kiali"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const queryEdge = { style: { stroke: "#4b5563" }, markerEnd: { type: "arrowclosed", color: "#4b5563" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const kialiNodes = [
+  { id: "user",  position: { x: 320, y: 0   }, data: { label: "Operator browser\n(OCP OAuth)" }, style: dataBox },
+  { id: "kiali", position: { x: 320, y: 130 }, data: { label: "Kiali Deployment\nistio-system" }, style: ctrlBox },
+  { id: "k8s",   position: { x: 0,   y: 280 }, data: { label: "Kubernetes API\n(topology + CRDs)" }, style: extBox },
+  { id: "prom",  position: { x: 320, y: 280 }, data: { label: "Prometheus\n(user-workload)" }, style: extBox },
+  { id: "tempo", position: { x: 640, y: 280 }, data: { label: "TempoStack\nJaegerQuery :16685" }, style: ctrlBox },
+  { id: "istiod",position: { x: 0,   y: 430 }, data: { label: "istiod ConfigMap" }, style: dataBox },
+  { id: "ambient",position: { x: 320, y: 430 }, data: { label: "ambient namespaces" }, style: dataBox },
+  { id: "ztunnel",position: { x: 640, y: 430 }, data: { label: "ztunnel L4 metrics" }, style: dataBox },
+];
+
+export const kialiEdges = [
+  { id: "u1", source: "user",  target: "kiali", label: "OAuth login", ...reqEdge },
+  { id: "q1", source: "kiali", target: "k8s",   label: "topology + Istio CRDs", ...queryEdge },
+  { id: "q2", source: "kiali", target: "prom",  label: "PromQL metrics",        ...queryEdge },
+  { id: "q3", source: "kiali", target: "tempo", label: "JaegerQuery gRPC :16685", ...queryEdge },
+  { id: "i1", source: "k8s",   target: "istiod", label: "watch", ...muted },
+  { id: "a1", source: "k8s",   target: "ambient", label: "watch", ...muted },
+  { id: "m1", source: "prom",  target: "ztunnel", label: "scrape", ...muted },
+];
+
+Kiali is the management console for Istio. On `spoke-dc-v6` it gets the OSSM 3 (ambient) data plane, the cluster's user-workload Prometheus, and the TempoStack as its trace backend. This page is the operator install, the Kiali CR, and the OAuth integration.
+
+For the conceptual "what Kiali does" frame, see the `/blog/kiali` post. This page is the spoke-dc-v6 implementation.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: kialiNodes, edges: kialiEdges }} height={580} />
+
+Reading the diagram:
+
+- The **operator** logs into Kiali through the OCP Console's OAuth (no separate Kiali auth).
+- Kiali queries three backends:
+  - **Kubernetes API** for topology and Istio CRDs (`VirtualService`, `DestinationRule`, `AuthorizationPolicy`, ...).
+  - **Prometheus** (the user-workload monitoring stack, see §14.8) for sidecar/ztunnel metrics.
+  - **TempoStack JaegerQuery** for trace overlays.
+- It writes to the Kubernetes API only when an operator uses a wizard to create/edit an Istio CRD.
+
+## Operator and CR
+
+Kiali on OpenShift Service Mesh 3 ships as the `kiali-ossm` operator. Once installed, the operator looks for `Kiali` CRs in the namespaces it watches and reconciles them.
+
+```yaml
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: istio-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+spec:
+  auth:
+    strategy: openshift
+  deployment:
+    accessible_namespaces:
+      - "**"
+    cluster_wide_access: true
+    namespace: istio-system
+  server:
+    web_root: /
+  external_services:
+    istio:
+      root_namespace: istio-system
+    tracing:
+      enabled: true
+      provider: tempo
+      use_grpc: true
+      in_cluster_url: http://tempo-tempo-platform-query-frontend.tracing.svc.cluster.local:16685
+      grpc_port: 16685
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `auth.strategy: openshift` | Users authenticate through OCP OAuth — the same identity they use for the Console. |
+| `deployment.accessible_namespaces: ["**"]` | All namespaces visible to Kiali. Restrictive labels can be applied later. |
+| `deployment.cluster_wide_access: true` | Kiali's SA has cluster-wide RBAC; the alternative is per-namespace RoleBindings, awkward at fleet scale. |
+| `server.web_root: /` | Kiali serves at the root of its Route. |
+| `external_services.istio.root_namespace: istio-system` | Where istiod's ConfigMap lives — Kiali auto-discovers from this. |
+| `external_services.tracing.provider: tempo` | Read traces from TempoStack, not Jaeger backend. |
+| `external_services.tracing.use_grpc: true` | gRPC is faster than HTTP for trace ranges. |
+| `external_services.tracing.in_cluster_url` | Operator-generated TempoStack service name (`tempo-<TempoStack.name>-query-frontend.<ns>.svc.cluster.local`). |
+| `external_services.tracing.grpc_port: 16685` | Default JaegerQuery gRPC port. |
+
+## OAuth integration
+
+`auth.strategy: openshift` is the OpenShift-aware mode. The Kiali operator creates an `OAuthClient` named `kiali-istio-system` that points to Kiali's Route. When a user navigates to Kiali, they are redirected to the OCP OAuth flow, authenticate (LDAP, htpasswd, ID-provider-of-the-day), and come back with a bearer token that Kiali validates.
+
+The OAuthClient's grant URL set:
+
+```text
+https://kiali-istio-system.apps.sub.comptech-lab.com/api/auth/callback
+```
+
+The operator handles this; you do not configure OAuth by hand.
+
+## RBAC — what Kiali can see and do
+
+Kiali's SA (`kiali-service-account` in `istio-system`) is bound to:
+
+- `kiali` ClusterRole — read on most resources, write on Istio CRDs (for wizards), no write on Pods/Deployments.
+- `kiali-viewer` ClusterRole (when `cluster_wide_access: true`) — fleet-wide read.
+
+A user's effective permissions in Kiali are the *intersection* of Kiali's SA permissions and the user's own OCP RBAC. A user with `view` ClusterRole sees everything Kiali surfaces; a user with namespace-scoped RBAC sees only that namespace's workloads.
+
+## Tempo trace overlay
+
+With the `external_services.tracing` block above, every workload page in Kiali shows a "Traces" tab. Clicking it pulls recent traces for that workload from Tempo via JaegerQuery gRPC. You can drill from a Kiali topology node to a specific trace, then to a specific span, then to the OCP Console "Logs" view filtered by trace_id.
+
+That cross-pillar drill is the most valuable feature on Kiali for the operator's workflow:
+
+1. Topology shows you a service is hot or erroring.
+2. Click into the workload — see RPS and error rate.
+3. Click "Traces" — see the slow/erroring traces.
+4. From a trace span, deeplink to logs at the same trace ID.
+
+## Ambient mode caveats
+
+Kiali was built for sidecar Istio. Ambient mode is supported but the experience differs:
+
+- **No per-pod proxy metrics.** Workload pages show ambient-aware metrics (ztunnel + waypoint).
+- **L4-only namespaces have less detail.** L7 metrics require a Waypoint.
+- **Sidecar wizards don't apply.** Wizards for Istio CRDs (VirtualService, DestinationRule) still work but their effect on ambient-mode traffic is different. Kiali shows ambient-aware policy paths.
+
+For a fully-featured Kiali experience, a waypoint per important namespace pays off.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Operator + CR
+oc --kubeconfig "$K" -n istio-system get sub,csv | grep -i kiali
+oc --kubeconfig "$K" -n istio-system get kiali kiali \
+  -o jsonpath='{.status.conditions[?(@.type=="Successful")].status}{"\n"}'
+
+# Deployment
+oc --kubeconfig "$K" -n istio-system get deploy/kiali
+
+# Route
+oc --kubeconfig "$K" -n istio-system get route kiali \
+  -o jsonpath='{.spec.host}{"\n"}'
+
+# Tempo reachability (from inside the pod)
+oc --kubeconfig "$K" -n istio-system exec -it deploy/kiali -- \
+  curl -s http://tempo-tempo-platform-query-frontend.tracing.svc.cluster.local:3100/api/services
+```
+
+Expected:
+
+- Kiali CR `Status.Conditions[type=Successful].status=True`.
+- `kiali` Deployment 1/1 Ready.
+- Browsing the Route in a browser redirects through OAuth and lands on the topology view.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Kiali login loop. | OAuthClient mis-registered; redirect URL mismatch. | `oc get oauthclient kiali-istio-system -o yaml`; verify `redirectURIs` matches the Route. | Don't change the Kiali Route host without re-registering. |
+| Topology empty. | Prometheus not scraping ambient/ztunnel metrics, or user-workload monitoring disabled. | Verify §14.8 user-workload-monitoring-config is applied. | Include UWM config in the platform overlay. |
+| Traces tab blank. | TempoStack name changed; JaegerQuery URL stale. | Update Kiali CR `external_services.tracing.in_cluster_url`. | Pin TempoStack name as part of the contract. |
+| Validation findings missing. | Kiali SA lacks read on Istio CRDs. | Re-apply Kiali CR; operator should restore RBAC. | Don't hand-edit Kiali's RoleBinding. |
+| Wizards return 403. | OCP user lacks `update` on Istio CRDs. | Bind a workload-admin Role to the user; or use a service account. | Document the minimal RBAC for Kiali-wizard users. |
+
+## References
+
+- DEV-OCP-1.4 #178 (Istio + Kiali OSSM 3 ambient).
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/service-mesh/kiali.yaml`.
+- Kiali docs: `Kiali` v1alpha1 schema, OAuth strategy, ambient mode notes.
+- The `/blog/kiali` post for the conceptual frame.

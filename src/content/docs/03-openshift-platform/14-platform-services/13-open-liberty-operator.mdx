@@ -1,8 +1,240 @@
 ---
-title: "Open Liberty Operator"
-description: "Section 03-openshift-platform/14-platform-services: Open Liberty Operator (placeholder)."
+title: "Open Liberty Operator and OpenLibertyApplication"
+description: "The IBM Open Liberty operator on spoke-dc-v6, the OpenLibertyApplication CR that bundles Deployment + Service + Route + serviceability, and how the lab's hello-world golden-path sample uses it with ESO-delivered DB credentials."
 sidebar_label: "Open Liberty Operator"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const olNodes = [
+  { id: "op",       position: { x: 380, y: 0   }, data: { label: "Open Liberty Operator\n(icr.io/appcafe)" }, style: ctrlBox },
+  { id: "cr",       position: { x: 380, y: 130 }, data: { label: "OpenLibertyApplication CR\nliberty-hello" }, style: crBox },
+  { id: "deploy",   position: { x: 100, y: 280 }, data: { label: "Deployment\nliberty-hello" }, style: ctrlBox },
+  { id: "svc",      position: { x: 300, y: 280 }, data: { label: "Service\nliberty-hello (9080)" }, style: dataBox },
+  { id: "route",    position: { x: 500, y: 280 }, data: { label: "Route\nliberty-hello.apps..." }, style: dataBox },
+  { id: "img",      position: { x: 700, y: 280 }, data: { label: "Image\nquay/...team-platform/\nliberty-hello:<sha>" }, style: extBox },
+  { id: "vault",    position: { x: 100, y: 430 }, data: { label: "Vault\napps/platform/liberty-hello/dev/db-creds" }, style: extBox },
+  { id: "es",       position: { x: 300, y: 430 }, data: { label: "ExternalSecret\nliberty-hello-db" }, style: crBox },
+  { id: "secret",   position: { x: 500, y: 430 }, data: { label: "Secret\nliberty-hello-db" }, style: dataBox },
+  { id: "tls",      position: { x: 700, y: 430 }, data: { label: "cert-manager Secret\nliberty-hello-tls" }, style: dataBox },
+];
+
+export const olEdges = [
+  { id: "e1", source: "op",     target: "cr",     ...muted },
+  { id: "e2", source: "cr",     target: "deploy", label: "creates", ...reqEdge },
+  { id: "e3", source: "cr",     target: "svc",    label: "creates", ...reqEdge },
+  { id: "e4", source: "cr",     target: "route",  label: "creates", ...reqEdge },
+  { id: "e5", source: "deploy", target: "img",    label: "uses image", ...muted },
+  { id: "e6", source: "es",     target: "vault",  label: "ESO read", ...pullEdge },
+  { id: "e7", source: "es",     target: "secret", label: "produces", ...reqEdge },
+  { id: "e8", source: "deploy", target: "secret", label: "env mount", ...muted },
+  { id: "e9", source: "route",  target: "tls",    label: "externalCertificate", ...muted },
+];
+
+The Open Liberty Operator (from IBM, `icr.io/appcafe`) ships an `OpenLibertyApplication` CR that bundles Deployment + Service + Route + serviceability (heap dumps, server dumps, traces) into one resource. The lab uses it as the canonical platform path for Liberty applications; the `liberty-hello` sample app under `apps/team-platform/liberty-hello/` exercises the full golden path.
+
+## Why an opinionated CRD vs. plain Deployment
+
+Plain Deployment + Service + Route works for Liberty too. The CRD pays back in:
+
+- **Serviceability primitives** — `kubectl libertysupport` can grab a heap dump, thread dump, or trace from a running pod through the operator without `exec`.
+- **Affinity defaults** — pod anti-affinity across nodes is a one-liner.
+- **Monitoring integration** — `spec.monitoring` adds a `PodMonitor` for Liberty's Prometheus endpoint.
+- **Route + cert-manager** integration — `spec.route.certificateSecretName` plus `route.tls.externalCertificate` is auto-wired.
+- **License attribution** — `IBM Cloud Pak for Applications` license terms are surfaced via the operand's labels (needed for some procurement audits).
+
+Tenants who don't need these can ignore the operator and use plain manifests. The lab convention is: Liberty apps use the CR (it's free); other JVMs use plain Deployment.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: olNodes, edges: olEdges }} height={580} />
+
+Reading the diagram:
+
+- The **Open Liberty operator** (image `icr.io/appcafe`) reconciles `OpenLibertyApplication` CRs anywhere in the cluster.
+- Each CR creates a **Deployment, Service, Route**.
+- The Deployment pulls its image from **Quay** (Path B target).
+- An **ExternalSecret** materialises a Secret from Vault that the Deployment mounts as env vars.
+- The Route consumes a **cert-manager Secret** for its external certificate.
+
+## The OpenLibertyApplication CR
+
+```yaml
+apiVersion: apps.openliberty.io/v1
+kind: OpenLibertyApplication
+metadata:
+  name: liberty-hello
+  namespace: apps-platform-liberty-hello-dev
+spec:
+  applicationImage: quay.apps.sub.comptech-lab.com/team-platform/liberty-hello@sha256:<digest>
+  pullPolicy: IfNotPresent
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 9080
+  route:
+    host: liberty-hello.apps.sub.comptech-lab.com
+    termination: edge
+    certificateSecretName: liberty-hello-tls
+  expose: true
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: liberty-hello
+  envFrom:
+    - secretRef:
+        name: liberty-hello-db          # ESO-managed
+  monitoring:
+    labels:
+      release: prometheus
+  probes:
+    liveness:
+      httpGet:
+        path: /health/live
+        port: 9080
+      initialDelaySeconds: 60
+      periodSeconds: 10
+    readiness:
+      httpGet:
+        path: /health/ready
+        port: 9080
+      initialDelaySeconds: 30
+      periodSeconds: 5
+    startup:
+      httpGet:
+        path: /health/started
+        port: 9080
+      initialDelaySeconds: 30
+      periodSeconds: 5
+      failureThreshold: 30
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1
+      memory: 1Gi
+```
+
+Field-by-field:
+
+| Field | Purpose |
+| --- | --- |
+| `applicationImage` | Image reference, *digest-pinned* per the build-once-promote-by-digest decision (ADR 0014). |
+| `replicas: 2` | HA across nodes. |
+| `service.port: 9080` | Liberty's default HTTP port. |
+| `route.termination: edge` | TLS at the router; the pod speaks HTTP internally. |
+| `route.certificateSecretName: liberty-hello-tls` | cert-manager-issued Secret. |
+| `envFrom.secretRef: liberty-hello-db` | Env vars come from the ESO-managed Secret. |
+| `monitoring.labels.release: prometheus` | Label the operator-created PodMonitor with this — user-workload Prometheus picks it up by selector. |
+| `probes.startup` | Startup probe gives the JVM up to ~150s to start before liveness kicks in. |
+
+## ExternalSecret for DB creds
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: liberty-hello-db
+  namespace: apps-platform-liberty-hello-dev
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: SecretStore
+    name: vault-apps-platform
+  target:
+    name: liberty-hello-db
+  data:
+    - secretKey: DB_HOST
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: host
+    - secretKey: DB_PORT
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: port
+    - secretKey: DB_USER
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: user
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: password
+```
+
+Notes:
+
+- **SecretStore, not ClusterSecretStore.** Tenant-scoped. The tenant onboarding seeded `vault-apps-platform` per ADR 0014.
+- **Vault path follows the convention** `apps/<division>/<app>/<env>/<artifact>`.
+- The Secret keys (`DB_HOST`, `DB_PORT`, ...) map 1:1 to env vars in the Liberty container.
+
+## Image registry allowlist note
+
+The Open Liberty operator's own image lives at `icr.io/appcafe`. That registry is on the lab's image-registry allowlist (with IDMS rewriting to the Nexus pull-through cache). Tenant Liberty *app* images go to Quay (Path B). The Operator is the only thing that pulls from `icr.io/appcafe`.
+
+## Validation (sample app)
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+NS=apps-platform-liberty-hello-dev
+
+# Operator
+oc --kubeconfig "$K" -n openshift-operators get sub,csv | grep -i liberty
+
+# Application CR
+oc --kubeconfig "$K" -n "$NS" get openlibertyapplication
+
+# Deployment + Pods + Service + Route
+oc --kubeconfig "$K" -n "$NS" get deploy,pods,svc,route
+
+# Secret materialised
+oc --kubeconfig "$K" -n "$NS" get secret liberty-hello-db,liberty-hello-tls
+
+# Hit the route
+ROUTE=$(oc --kubeconfig "$K" -n "$NS" get route liberty-hello -o jsonpath='{.spec.host}')
+curl -fsS "https://$ROUTE/health/ready"
+
+# Live logs in the Console (via Loki)
+oc --kubeconfig "$K" -n "$NS" logs deploy/liberty-hello --tail 50
+```
+
+Expected:
+
+- `OpenLibertyApplication.status.reconciled=True`.
+- Deployment 2/2 Ready.
+- `/health/ready` returns 200.
+- Logs visible via `oc logs` *and* via the Console Logs view.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Pod ImagePullBackOff. | Image pushed to Quay but the tenant's pull-secret missing. | Apply the tenant's quay-pull-secret via ESO; verify SA's `imagePullSecrets` list includes it. | Tenant onboarding includes pull-secret wiring. |
+| `OpenLibertyApplication.status.conditions[type=ResourcesReady].status=False`. | Route's `certificateSecretName` references a Secret that doesn't exist (cert-manager not yet reconciled). | Wait for cert-manager; or pre-create the Certificate at a lower sync-wave. | Set Argo sync-wave on Certificate < OpenLibertyApplication. |
+| Probes fail; pod restart loop. | Liberty's `mpHealth-4.0` not enabled in `server.xml`. | Add feature; rebuild image. | Liberty starter template includes `mpHealth`. |
+| `OpenLibertyApplication.status.images[].digest` empty. | Image was deployed by tag, not digest. | Use digest; ADR 0014 requires it. | CI lint rejects tag-only references. |
+| `OpenLibertyTrace` does not produce a trace file. | Pod's `/serviceability` volume not mounted. | Add `spec.serviceability.size: 1Gi` to the OpenLibertyApplication. | Sample app sets this by default. |
+
+## References
+
+- DEV-OCP-5.1 #200 (Liberty hello-world golden path).
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` — `icr.io/appcafe` allowlist.
+- IBM Open Liberty Operator docs: `OpenLibertyApplication` v1.
+- ADR 0014 — developer readiness; Liberty as a first-tier app stack.

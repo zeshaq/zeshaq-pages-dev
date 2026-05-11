@@ -1,8 +1,237 @@
 ---
-title: "MinIO Bucket and IAM"
-description: "Section 03-openshift-platform/13-backup-oadp: MinIO Bucket and IAM (placeholder)."
-sidebar_label: "MinIO Bucket and IAM"
+title: "MinIO bucket and IAM for OADP"
+description: "Bucket layout, MinIO user, policy, and lifecycle rules behind the OADP backup target, and how the cluster-side credentials map to MinIO concepts."
+sidebar_label: "MinIO bucket + IAM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const minioNodes = [
+  { id: "minio",    position: { x: 320, y: 0   }, data: { label: "MinIO VM\n(single-node)" }, style: extBox },
+  { id: "bucket",   position: { x: 60,  y: 140 }, data: { label: "oadp-backups\nbucket" }, style: dataBox },
+  { id: "users",    position: { x: 280, y: 140 }, data: { label: "Users\noadp-spoke-dc-v6\noadp-hub-dc-v6\n..." }, style: dataBox },
+  { id: "policies", position: { x: 500, y: 140 }, data: { label: "Policies\noadp-prefix-rw" }, style: dataBox },
+  { id: "lifecycle",position: { x: 720, y: 140 }, data: { label: "Lifecycle rules\n(retention)" }, style: dataBox },
+  { id: "spokebsl", position: { x: 60,  y: 300 }, data: { label: "spoke-dc-v6/\n(prefix)" }, style: dataBox },
+  { id: "hubbsl",   position: { x: 240, y: 300 }, data: { label: "hub-dc-v6/" }, style: dataBox },
+  { id: "drsbsl",   position: { x: 420, y: 300 }, data: { label: "spoke-dr-v6/" }, style: dataBox },
+  { id: "drhbsl",   position: { x: 600, y: 300 }, data: { label: "hub-dr-v6/" }, style: dataBox },
+  { id: "velero",   position: { x: 320, y: 440 }, data: { label: "Velero (per cluster)" }, style: ctrlBox },
+];
+
+export const minioEdges = [
+  { id: "b1", source: "minio", target: "bucket",    ...muted },
+  { id: "b2", source: "minio", target: "users",     ...muted },
+  { id: "b3", source: "minio", target: "policies",  ...muted },
+  { id: "b4", source: "minio", target: "lifecycle", ...muted },
+  { id: "p1", source: "policies", target: "users",  label: "attached to", ...muted },
+  { id: "f1", source: "bucket",   target: "spokebsl", ...muted },
+  { id: "f2", source: "bucket",   target: "hubbsl",   ...muted },
+  { id: "f3", source: "bucket",   target: "drsbsl",   ...muted },
+  { id: "f4", source: "bucket",   target: "drhbsl",   ...muted },
+  { id: "v1", source: "velero",   target: "spokebsl", label: "S3 PUT (per cluster)", ...pullEdge },
+];
+
+The OADP DPA already says enough about the S3 *consumer* side. This page is the producer side: what the MinIO bucket looks like, which users + policies exist, and what lifecycle rules keep storage bounded. It is for the operator running the MinIO VM and for anyone whose backup is failing with a MinIO error.
+
+## Single-bucket, prefix-per-cluster
+
+There is one bucket, `oadp-backups`, shared across the four OADP clusters in the fleet. Each cluster has a unique prefix derived from its `DataProtectionApplication.spec.backupLocations[0].velero.objectStorage.prefix`:
+
+| Cluster | Prefix |
+| --- | --- |
+| `spoke-dc-v6` | `spoke-dc-v6/` |
+| `hub-dc-v6` | `hub-dc-v6/` |
+| `spoke-dr-v6` | `spoke-dr-v6/` |
+| `hub-dr-v6` | `hub-dr-v6/` |
+
+Inside each prefix Velero writes its own folder structure: `backups/`, `restores/`, `metadata/`, `plugins/`, plus the per-backup tarballs. You do not configure that layout; Velero owns it.
+
+Why single bucket with prefixes, not one bucket per cluster?
+
+- **Operational ergonomics.** One bucket, one set of lifecycle rules, one user-to-policy mapping per cluster. Easier to audit.
+- **Backups across clusters compose.** ACM cluster-backup on the hub references the same bucket layout so the hub can restore a spoke. Splitting buckets would make that wiring more brittle.
+- **MinIO single-node has no advantage to many buckets.** All space is on the same filesystem regardless of bucket count.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: minioNodes, edges: minioEdges }} height={560} />
+
+Reading the diagram:
+
+- One **MinIO VM** runs a single MinIO server process on the lab `/24`. Its data directory is `/var/minio/data`; it speaks S3 on port 9000 and the console on 9001.
+- One **`oadp-backups` bucket** carries all OADP traffic.
+- Per-cluster **users** (`oadp-spoke-dc-v6`, `oadp-hub-dc-v6`, ...) hold the access keys consumed by Velero on each cluster.
+- One **policy** (`oadp-prefix-rw`) is parameterised by the user's `${aws:username}` so each user can only read/write their own prefix.
+- **Lifecycle rules** enforce retention by prefix.
+
+The dashed green arrow is one cluster's Velero writing into its prefix.
+
+## Bucket creation
+
+The bucket is created once by the MinIO operator. Using the `mc` (MinIO Client) tool against a host alias `lab` pre-configured with the MinIO admin credentials:
+
+```bash
+# Create the bucket
+mc mb lab/oadp-backups
+
+# Verify
+mc ls lab/oadp-backups
+```
+
+Object locking is *not* enabled on this bucket. OADP does not require it for correctness, and enabling object lock forces every backup tarball to be retained for the lock period regardless of Velero's TTL — which would make storage growth uncontrollable. If a future compliance requirement mandates object lock, it must be paired with a per-cluster bucket so the lock period can be tuned per data class.
+
+## IAM — one policy, many users
+
+The MinIO IAM model is AWS-shaped. We use a policy that uses `${aws:username}` to scope writes to the user's own prefix. This keeps the policy itself stable while the user list grows.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::oadp-backups"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "${aws:username}/*"
+          ]
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::oadp-backups/${aws:username}/*"
+      ]
+    }
+  ]
+}
+```
+
+Applied:
+
+```bash
+# Create the policy
+cat > /tmp/oadp-prefix-rw.json <<'EOF'
+{ ...the JSON above... }
+EOF
+mc admin policy create lab oadp-prefix-rw /tmp/oadp-prefix-rw.json
+
+# Create a per-cluster user, name the user after the prefix
+# so the ${aws:username} substitution lines up.
+mc admin user add lab oadp-spoke-dc-v6 <generated-secret-key>
+
+# Attach the policy
+mc admin policy attach lab oadp-prefix-rw --user oadp-spoke-dc-v6
+```
+
+User-name-equals-prefix is intentional. It is the simplest mechanism that gives the policy its tenant-isolation property:
+
+- User `oadp-spoke-dc-v6` can write only under `oadp-backups/spoke-dc-v6/`.
+- User `oadp-hub-dc-v6` can write only under `oadp-backups/hub-dc-v6/`.
+- Listing is scoped to the user's own prefix; a cluster cannot list another cluster's backups.
+
+This is defence-in-depth. Velero on each cluster only knows its own prefix; the policy ensures the cluster cannot reach beyond that even if a misconfigured DPA pointed at a different prefix.
+
+## Lifecycle rules
+
+OADP `Backup` CRs carry a `spec.ttl` and Velero garbage-collects expired backups on its own. Lifecycle rules on the bucket act as a *belt-and-braces* mechanism: even if Velero stops running, MinIO will still age objects out and reclaim space.
+
+```bash
+mc ilm rule add --expire-days 90 --prefix "spoke-dc-v6/" lab/oadp-backups
+mc ilm rule add --expire-days 90 --prefix "hub-dc-v6/"   lab/oadp-backups
+mc ilm rule add --expire-days 90 --prefix "spoke-dr-v6/" lab/oadp-backups
+mc ilm rule add --expire-days 90 --prefix "hub-dr-v6/"   lab/oadp-backups
+```
+
+90 days is the lab default and matches the per-cluster Schedule TTL (see §13.3 `backup-schedules-and-rotation` — covered here under `04-csi-snapshots.mdx` and `05-backup-restore-drill.mdx` since the leaf naming differs slightly). Different data classes warrant different rules:
+
+| Data class | Cluster prefix(es) | TTL | Notes |
+| --- | --- | --- | --- |
+| Platform-state | hub-dc-v6/ | 90 days | Hub cluster-backup tarballs are large; longer TTL inflates the bucket fast. |
+| Spoke app namespaces | spoke-dc-v6/ | 90 days | Most app namespaces; matches the schedule TTL. |
+| DR clusters (cold) | hub-dr-v6/, spoke-dr-v6/ | 90 days | DR clusters do not back up frequently; the few backups present are kept for the same window. |
+| Disaster archive (future) | `archive/` | 365 days | Reserved prefix for hand-rolled long-retention copies. Not yet in use. |
+
+When changing a TTL, change both the `Schedule.spec.template.ttl` on every cluster *and* the lifecycle rule. They are independent; leaving the lifecycle rule shorter than the Schedule TTL will delete in-flight tarballs.
+
+## Validation
+
+From any workstation that can reach the MinIO endpoint:
+
+```bash
+# Bucket exists
+mc ls lab/oadp-backups
+
+# Per-cluster user exists and has the policy attached
+mc admin user info lab oadp-spoke-dc-v6
+
+# Lifecycle rules attached
+mc ilm rule list lab/oadp-backups
+
+# Health
+curl -fsS http://<lab-minio-host>:9000/minio/health/live
+curl -fsS http://<lab-minio-host>:9000/minio/health/ready
+```
+
+From inside the cluster (sanity check of the cluster's egress):
+
+```bash
+oc -n openshift-adp run minio-probe --rm -it --image curlimages/curl \
+  --command -- curl -v http://<lab-minio-host>:9000/minio/health/live
+```
+
+> Internal-only specifics — exact MinIO host address and credential custody — are kept in `codex-opp-agent/connection-details/minio.md`.
+
+## Capacity sizing
+
+MinIO is single-node in the lab. Typical observed sizes per cluster (90-day window, daily scheduled backup of all app namespaces with snapshots):
+
+| Cluster | Approx. 90-day footprint |
+| --- | --- |
+| spoke-dc-v6 | 60–120 GiB |
+| hub-dc-v6 | 80–200 GiB (cluster-backup tarballs are bigger) |
+| spoke-dr-v6 | < 30 GiB (cold) |
+| hub-dr-v6 | < 30 GiB (cold) |
+
+Plan for 500 GiB free under `/var/minio/data` to give the lifecycle rules headroom on a busy week. The "RequestTimeout while trying to lock a resource" failure noted in §13.1 is independent of capacity — that is a concurrency-on-a-single-node-MinIO ceiling, not a disk-space ceiling.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `AccessDenied` on `s3:PutObject`. | The user's prefix and the user's name disagree, so the `${aws:username}` condition does not match. | Recreate the user with a name equal to the prefix, or duplicate the policy with a hardcoded resource. | Make user-name-equals-prefix part of the bucket runbook. |
+| Lifecycle rules attached but nothing is being expired. | Lifecycle scanner is paused, or the rule was added with a typo in the prefix (no trailing slash). | `mc admin info lab` shows scanner activity; re-add the rule with the trailing slash. | Use `mc ilm rule list` after every change. |
+| `mc admin` calls fail with `signature mismatch`. | The `mc` alias was configured with a stale admin secret key. | `mc alias set lab http://<host>:9000 <accessKey> <secretKey>`. | Keep the admin alias config under root's home only; rotate using a single canonical script. |
+| Backups land in the bucket but never expire. | Velero TTL is `0s` (the default) on the Backup CR. Backups created without a Schedule inherit no TTL. | Set `Backup.spec.ttl` explicitly when filing one-shot backups; for scheduled backups, always set `template.ttl`. | Provide a Schedule template tenants can derive from, with `ttl` already populated. |
+| Concurrent backups across clusters fail with HTTP 503 `RequestTimeout`. | Single-node MinIO ceiling under multipart upload pressure. | Serialise schedules; offset by 30 minutes between clusters. | Long-term, scale MinIO out (multi-node erasure coded) before adding more clusters to the same bucket. |
+
+## References
+
+- `codex-opp-agent/connection-details/minio.md` — endpoint, credential custody, lifecycle policies.
+- `codex-opp-agent/reports/sessions/20260505-183038-oadp-finalization-validation.md` — the concurrent-backup MinIO ceiling.
+- MinIO docs: `mc admin user`, `mc admin policy`, `mc ilm`.
+- ADR 0014 — developer readiness platform contract (MinIO evidence parity).

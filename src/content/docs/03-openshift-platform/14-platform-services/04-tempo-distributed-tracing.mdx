@@ -1,8 +1,256 @@
 ---
-title: "Tempo (distributed tracing)"
-description: "Section 03-openshift-platform/14-platform-services: Tempo (distributed tracing) (placeholder)."
-sidebar_label: "Tempo (distributed tracing)"
+title: "TempoStack — distributed tracing backend"
+description: "How TempoStack is deployed on spoke-dc-v6 with NooBaa S3 storage and the ESO bridge that turns the OBC outputs into the lowercase-key Secret Tempo expects, plus JaegerQuery integration for the Console."
+sidebar_label: "TempoStack"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const tempoNodes = [
+  { id: "apps",    position: { x: 0,   y: 0   }, data: { label: "App pods (OTel SDK)" }, style: dataBox },
+  { id: "sidecar", position: { x: 0,   y: 130 }, data: { label: "Istio sidecar / ztunnel\n(trace forwarder)" }, style: dataBox },
+  { id: "otel",    position: { x: 260, y: 65  }, data: { label: "OpenTelemetryCollector\notelcol-platform" }, style: ctrlBox },
+  { id: "tempo",   position: { x: 520, y: 65  }, data: { label: "TempoStack\nplatform" }, style: ctrlBox },
+  { id: "obc",     position: { x: 520, y: 230 }, data: { label: "ObjectBucketClaim\ntempo-traces" }, style: crBox },
+  { id: "es",      position: { x: 260, y: 230 }, data: { label: "ExternalSecret bridge\ntempo-object-storage" }, style: crBox },
+  { id: "noobaa",  position: { x: 780, y: 230 }, data: { label: "NooBaa MCG" }, style: extBox },
+  { id: "qf",      position: { x: 780, y: 65  }, data: { label: "Tempo Query Frontend\n+ JaegerQuery" }, style: ctrlBox },
+  { id: "console", position: { x: 780, y: 400 }, data: { label: "OCP Console\nObserve → Traces" }, style: dataBox },
+  { id: "kiali",   position: { x: 520, y: 400 }, data: { label: "Kiali\n(traces overlay)" }, style: dataBox },
+];
+
+export const tempoEdges = [
+  { id: "a1", source: "apps",    target: "otel",   label: "OTLP gRPC 4317", ...reqEdge },
+  { id: "s1", source: "sidecar", target: "otel",   label: "OTLP", ...reqEdge },
+  { id: "o1", source: "otel",    target: "tempo",  label: "OTLP gRPC\ntempo-platform-distributor", ...reqEdge },
+  { id: "t1", source: "tempo",   target: "obc",    label: "reads bucket spec", ...muted },
+  { id: "e1", source: "es",      target: "obc",    label: "reads OBC outputs", ...muted },
+  { id: "e2", source: "es",      target: "tempo",  label: "produces s3 Secret", ...reqEdge },
+  { id: "o2", source: "obc",     target: "noobaa", label: "provisions bucket", ...pullEdge },
+  { id: "t2", source: "tempo",   target: "qf",     ...muted },
+  { id: "q1", source: "qf",      target: "console",label: "JaegerQuery API", ...reqEdge },
+  { id: "q2", source: "qf",      target: "kiali",  label: "JaegerQuery gRPC :16685", ...reqEdge },
+];
+
+TempoStack is the Tempo-Operator-managed distributed tracing backend on `spoke-dc-v6`. It accepts OTLP spans, stores them in a NooBaa S3 bucket, exposes them via Tempo's native query API and a JaegerQuery shim for the Console and Kiali. This page is the operator install, the TempoStack CR, the OBC + bridge, and the integration points.
+
+For the broader "what is tracing" frame, see the `/blog/distributed-tracing` post. This page is the spoke-dc-v6 implementation.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: tempoNodes, edges: tempoEdges }} height={520} />
+
+Reading the diagram:
+
+- **App pods** instrumented with OpenTelemetry SDKs export OTLP to the in-cluster `otelcol-platform` collector (covered in §14.5).
+- **Service-mesh sidecars** (Istio in ambient mode — §14.6) also export their trace data via OTLP to the same collector.
+- The **OpenTelemetryCollector** batches and forwards to the **TempoStack distributor** service via gRPC OTLP.
+- **TempoStack** writes trace blocks to NooBaa S3 via the OBC; metadata indexes land on ODF Ceph RBD PVCs.
+- The **JaegerQuery** subcomponent of the Tempo query-frontend exposes the data through the JaegerQuery API on `:3100` (HTTP) and `:16685` (gRPC). That is what the OCP Console plugin and Kiali consume.
+
+## TempoStack CR
+
+```yaml
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata:
+  name: platform
+  namespace: tracing
+  annotations:
+    argocd.argoproj.io/sync-wave: "40"
+spec:
+  managementState: Managed
+  size: 1x.extra-small
+  storage:
+    secret:
+      name: tempo-object-storage
+      type: s3
+  storageSize: 10Gi
+  template:
+    queryFrontend:
+      jaegerQuery:
+        enabled: true
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `size: 1x.extra-small` | Single-binary footprint sized for the lab. Larger sizes split distributor/ingester/querier/compactor into separate Deployments. |
+| `storage.secret.name: tempo-object-storage, type: s3` | TempoStack reads bucket creds from this Secret (in the same namespace). |
+| `storageSize: 10Gi` | Per-component PVC size for the index/cache; not the trace data itself. |
+| `template.queryFrontend.jaegerQuery.enabled: true` | Enables the Jaeger-compatible query API so the Console plugin and Kiali can query traces. |
+
+## NooBaa bucket via OBC
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: tempo-traces
+  namespace: tracing
+spec:
+  bucketName: tempo-traces
+  storageClassName: openshift-storage.noobaa.io
+```
+
+The OBC outputs a Secret with `AWS_*` keys and a ConfigMap with `BUCKET_*` keys, same as the LokiStack case in §14.3. TempoStack's storage Secret needs different keys: `endpoint`, `bucketnames`, `access_key_id`, `access_key_secret`.
+
+## The ESO bridge for Tempo
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: kubernetes-tracing
+  namespace: tracing
+spec:
+  provider:
+    kubernetes:
+      remoteNamespace: tracing
+      server:
+        caProvider:
+          type: ConfigMap
+          name: kube-root-ca.crt
+          key: ca.crt
+      auth:
+        serviceAccount:
+          name: eso-tempo-obc-reader
+```
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: tempo-object-storage
+  namespace: tracing
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: kubernetes-tracing
+  target:
+    name: tempo-object-storage
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        endpoint: "https://s3.openshift-storage.svc"
+        bucketnames: "tempo-traces"
+        access_key_id: "{{ .access_key_id }}"
+        access_key_secret: "{{ .access_key_secret }}"
+  data:
+    - secretKey: access_key_id
+      remoteRef:
+        key: tempo-traces
+        property: AWS_ACCESS_KEY_ID
+    - secretKey: access_key_secret
+      remoteRef:
+        key: tempo-traces
+        property: AWS_SECRET_ACCESS_KEY
+```
+
+The same pattern as Loki §14.3. The only differences are the names and the Secret target name (`tempo-object-storage`, which is what the TempoStack `storage.secret.name` points at).
+
+## How Kiali finds Tempo
+
+Kiali looks up its tracing backend by the service name. The Tempo operator names component services `tempo-<TempoStack.metadata.name>-<component>`. Our TempoStack is named `platform` in the `tracing` namespace, so the query-frontend service is `tempo-tempo-platform-query-frontend.tracing.svc.cluster.local`. JaegerQuery is available on the same Service at port `16685` (gRPC).
+
+Kiali's CR (covered in §14.7) references this exact URL:
+
+```yaml
+external_services:
+  tracing:
+    enabled: true
+    provider: tempo
+    use_grpc: true
+    in_cluster_url: http://tempo-tempo-platform-query-frontend.tracing.svc.cluster.local:16685
+    grpc_port: 16685
+```
+
+If the TempoStack is renamed, the Kiali CR must be updated in lockstep, or Kiali's traces tab will go blank.
+
+## How the Console finds Tempo
+
+The OCP Console uses the COO `UIPlugin/distributed-tracing` resource (covered in §14.8). The plugin in turn talks to the JaegerQuery API. Once installed, navigating to **Observe → Traces** in the Console gives you a trace search UI.
+
+## Sample data path verification
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# TempoStack is Ready
+oc --kubeconfig "$K" -n tracing get tempostack platform \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+# OBC + bridge Secret
+oc --kubeconfig "$K" -n tracing get obc tempo-traces
+oc --kubeconfig "$K" -n tracing get secret tempo-object-storage \
+  -o jsonpath='{.data}{"\n"}' | tr ',' '\n' | head
+
+# Deployment readiness
+oc --kubeconfig "$K" -n tracing get deploy,statefulset
+
+# JaegerQuery endpoint
+oc --kubeconfig "$K" -n tracing exec -it deploy/tempo-tempo-platform-query-frontend -- \
+  curl -s http://localhost:3100/api/services
+```
+
+Expected:
+
+- `TempoStack` Ready=True.
+- `tempo-object-storage` Secret has `endpoint`/`bucketnames`/`access_key_id`/`access_key_secret`.
+- A list of services that have shipped traces (empty until an OTel-instrumented workload runs).
+
+## Tenancy and isolation
+
+TempoStack in 1x.extra-small does not multi-tenant traces by default. All apps' traces land in the same store. For multi-tenant deployments you would:
+
+1. Move to `1x.small` or larger so the query-frontend and distributor scale independently.
+2. Set `spec.tenants.mode: openshift` and a list of `tenants[]`.
+3. Each tenant gets its own OAuth-token-authenticated endpoint on the gateway.
+
+The lab does not do this yet because all in-cluster trace producers are platform components or trusted tenants. When a tenant explicitly needs tracing isolation, the conversation moves to a per-tenant TempoStack rather than gateway-managed tenancy.
+
+## Retention and compaction
+
+TempoStack's compactor consolidates trace blocks every few minutes and reclaims storage on the OBC bucket. The default retention period is 14 days; configurable via `spec.template.compactor.config.compaction.block_retention`.
+
+```yaml
+spec:
+  template:
+    compactor:
+      config:
+        compaction:
+          block_retention: 168h0m0s   # 7 days
+```
+
+Traces older than the retention period are deleted by the compactor on its next pass.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| TempoStack `Degraded`, ingester pods OOM. | Single-binary on `1x.extra-small` cannot handle ingest spike. | Move to `1x.small`; or reduce OTel collector's send-batch-max-size. | Capacity-plan based on expected spans/sec. |
+| TempoStack `Pending`, `endpoint` missing in storage Secret. | OBC was applied but the ESO bridge wasn't. | Apply the bridge ExternalSecret. | Tie OBC + bridge in a single Kustomize overlay. |
+| Console "Traces" view returns nothing. | Service name in the COO UIPlugin doesn't match the TempoStack name. | Update the UIPlugin's `serviceURL`. | Pin TempoStack name `platform`; treat as platform contract. |
+| Kiali traces tab blank. | Kiali CR `external_services.tracing.in_cluster_url` doesn't match Tempo's service. | Update Kiali CR. | Same — pin the TempoStack name. |
+| Spans arrive at the collector but never reach Tempo. | OTel collector's exporter URL is wrong, or NetworkPolicy blocks egress. | `oc -n tracing logs deploy/otelcol-platform`; check for connection refused. | Add an integration test: a synthetic span every minute, alert if Tempo says zero received in 10m. |
+
+## References
+
+- DEV-OCP-1.3 #177 (TempoStack + OpenTelemetryCollector).
+- Memory: `project_obc_to_operand_secret_bridge.md` — bridge pattern, identical to Loki.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/tracing/`.
+- Grafana Tempo Operator: `TempoStack` v1alpha1 schema.

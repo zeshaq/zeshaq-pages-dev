@@ -1,8 +1,310 @@
 ---
-title: "Quay on Cluster"
-description: "Section 03-openshift-platform/14-platform-services: Quay on Cluster (placeholder)."
-sidebar_label: "Quay on Cluster"
+title: "Quay on cluster — operator, QuayRegistry, Organizations + Robot Accounts"
+description: "How Red Hat Quay is installed as the OCP-native registry for the Tekton (Path B) push target, the QuayRegistry CR with NooBaa-backed object storage, Clair scanning, the ESO-delivered config-bundle and superuser, and per-team Organizations + Robot Accounts."
+sidebar_label: "Quay Registry"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const quayNodes = [
+  { id: "op",       position: { x: 380, y: 0   }, data: { label: "Quay operator\nquay-operator v3.17" }, style: ctrlBox },
+  { id: "qr",       position: { x: 380, y: 130 }, data: { label: "QuayRegistry CR\nquay-platform" }, style: crBox },
+  { id: "quay",     position: { x: 80,  y: 280 }, data: { label: "Quay app\nDeployment" }, style: ctrlBox },
+  { id: "clair",    position: { x: 280, y: 280 }, data: { label: "Clair (security)\nDeployment" }, style: ctrlBox },
+  { id: "pg",       position: { x: 480, y: 280 }, data: { label: "Postgres\nStatefulSet" }, style: ctrlBox },
+  { id: "redis",    position: { x: 680, y: 280 }, data: { label: "Redis\nDeployment" }, style: ctrlBox },
+  { id: "obc",      position: { x: 280, y: 430 }, data: { label: "ObjectBucketClaim\nquay-storage" }, style: crBox },
+  { id: "noobaa",   position: { x: 480, y: 430 }, data: { label: "NooBaa MCG" }, style: extBox },
+  { id: "cb",       position: { x: 80,  y: 430 }, data: { label: "ExternalSecret\nquay-config-bundle" }, style: crBox },
+  { id: "vault",    position: { x: 80,  y: 560 }, data: { label: "Vault\nocp/spoke-dc-v6/quay/...\nsuperuser + config" }, style: extBox },
+  { id: "route",    position: { x: 680, y: 430 }, data: { label: "Route\nquay.apps..." }, style: dataBox },
+  { id: "robot",    position: { x: 380, y: 560 }, data: { label: "per-tenant\nRobot Account" }, style: crBox },
+];
+
+export const quayEdges = [
+  { id: "e1", source: "op",    target: "qr",    ...muted },
+  { id: "e2", source: "qr",    target: "quay",  label: "creates", ...reqEdge },
+  { id: "e3", source: "qr",    target: "clair", label: "creates", ...reqEdge },
+  { id: "e4", source: "qr",    target: "pg",    label: "creates", ...reqEdge },
+  { id: "e5", source: "qr",    target: "redis", label: "creates", ...reqEdge },
+  { id: "e6", source: "qr",    target: "obc",   label: "creates", ...reqEdge },
+  { id: "e7", source: "obc",   target: "noobaa",label: "provisions bucket", ...pullEdge },
+  { id: "e8", source: "qr",    target: "route", label: "creates", ...reqEdge },
+  { id: "e9", source: "cb",    target: "vault", label: "ESO read", ...pullEdge },
+  { id: "e10", source: "cb",   target: "quay",  label: "supplies config.yaml", ...reqEdge },
+  { id: "e11", source: "robot", target: "quay", label: "per-team push creds", ...muted },
+];
+
+Red Hat Quay is the on-cluster registry for the **Path B (Tekton)** build target. Path A (Jenkins) continues to push to Nexus app-registry. Quay adds Clair vulnerability scanning, repository mirroring, geo-replication (single cluster here, but the option is in the operator), and OAuth-integrated UI for Robot Account management.
+
+This page is the operator install, the QuayRegistry CR, the ODF/NooBaa storage bridge, the ESO-delivered superuser + config-bundle, the OCP Route, and per-team Organizations + Robot Accounts.
+
+## Why an in-cluster registry vs. only Nexus
+
+| Feature | Quay (in-cluster) | Nexus (VM) |
+| --- | --- | --- |
+| Vulnerability scanning | Clair, built-in, indexed | Trivy (out-of-band) |
+| Organization model | First-class, per-team | Flat repository list |
+| Robot Accounts | Native CR-able | Manual users |
+| Multi-arch manifest lists | Native | Native |
+| Repository mirroring (geo or upstream) | Native | Possible via Nexus groups |
+| Cluster blast radius if down | Tenant Path B blocked | Tenant Path A blocked |
+| Sits in OCP RBAC / OAuth | Yes (superuser bootstrap + OAuth) | No (separate auth plane) |
+
+The lab runs both because each path serves a different developer cohort and Path B is the newer build target. The choice of registry per tenant is documented in `app-repo-contract.md`.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: quayNodes, edges: quayEdges }} height={680} />
+
+Reading the diagram:
+
+- The **operator** (`quay-operator` v3.17.1 in the lab) reconciles `QuayRegistry` CRs.
+- A single **QuayRegistry CR** instantiates a full stack: Quay app, Clair, Postgres, Redis, plus a Route.
+- **Object storage** is NooBaa via OBC (same pattern as Loki/Tempo).
+- The **config-bundle Secret** is materialised by ESO from Vault.
+- A **superuser** is bootstrapped from Vault on first install; subsequent users authenticate via OCP OAuth (configurable).
+- Per-team **Robot Accounts** are created in the Quay UI (or by API); their tokens are stored in Vault and materialised by ESO per the tenant convention (covered separately in §14.5 push-image and `reference_quay_robot_token_convention.md`).
+
+## Operator install
+
+The Quay operator was **not** in the original 13-operator dev-eval bundle. It is installed separately:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: quay-operator
+  namespace: quay-enterprise
+spec:
+  channel: stable-3.13
+  installPlanApproval: Automatic
+  name: quay-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: quay-operator.v3.17.1
+```
+
+The operator's namespace is `quay-enterprise` — the suggested namespace per the package manifest.
+
+## QuayRegistry CR
+
+```yaml
+apiVersion: quay.redhat.com/v1
+kind: QuayRegistry
+metadata:
+  name: quay-platform
+  namespace: quay-enterprise
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,ServerSideApply=true
+spec:
+  configBundleSecret: quay-config-bundle-secret
+  components:
+    - kind: clair
+      managed: true
+    - kind: postgres
+      managed: true
+    - kind: objectstorage
+      managed: true
+    - kind: redis
+      managed: true
+    - kind: horizontalpodautoscaler
+      managed: true
+    - kind: route
+      managed: true
+    - kind: mirror
+      managed: true
+    - kind: monitoring
+      managed: true
+    - kind: tls
+      managed: true
+    - kind: quay
+      managed: true
+    - kind: clairpostgres
+      managed: true
+```
+
+Each `components[].kind` is a Quay subsystem. `managed: true` means the operator owns it. `managed: false` means you provide it externally (e.g., bring your own Postgres). The lab keeps everything managed; the operator owns the lifecycle.
+
+PVC sizing — set in the QuayRegistry's optional `overrides` or the implicit operator defaults:
+
+| Component | Default PVC | Lab choice |
+| --- | --- | --- |
+| Postgres | 50Gi | 50Gi |
+| Redis | 5Gi | 5Gi |
+| Clair Postgres | 20Gi | 20Gi |
+| Quay (logs/cache) | 25Gi | 25Gi |
+
+## NooBaa bucket via OBC
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: quay-storage
+  namespace: quay-enterprise
+spec:
+  bucketName: quay-storage
+  storageClassName: openshift-storage.noobaa.io
+```
+
+Quay's `objectstorage` component reads bucket creds from a Secret it creates automatically (`quay-platform-managed-secret-keys`); the OBC's outputs are wired into Quay's `config.yaml` by the operator. Unlike Loki/Tempo, Quay does *not* need the OBC-to-lowercase-keys bridge — the operator knows the OBC shape and handles it natively when `objectstorage.managed: true`.
+
+## The config-bundle Secret
+
+The `configBundleSecret` is the Quay-config-as-Secret. Its key `config.yaml` is consumed verbatim. Sensitive fields (SUPER_USERS, OAuth secrets, mailer creds) go into this Secret via ESO from Vault:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: quay-config-bundle-secret
+  namespace: quay-enterprise
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: quay-config-bundle-secret
+    template:
+      type: Opaque
+      data:
+        config.yaml: "{{ .config_yaml }}"
+  data:
+    - secretKey: config_yaml
+      remoteRef:
+        key: ocp/spoke-dc-v6/quay/config-bundle
+        property: config.yaml
+```
+
+The Vault property `config.yaml` is the complete Quay config:
+
+```yaml
+SUPER_USERS:
+  - quay-admin
+
+AUTHENTICATION_TYPE: Database     # OR OIDC if OCP OAuth integrated
+
+SETUP_COMPLETE: true
+PREFERRED_URL_SCHEME: https
+SERVER_HOSTNAME: quay.apps.sub.comptech-lab.com
+
+FEATURE_USER_INITIALIZE: true
+FEATURE_SECURITY_NOTIFICATIONS: true
+FEATURE_SECURITY_SCANNER: true
+
+SECURITY_SCANNER_V4_ENDPOINT: http://quay-platform-clair-app:8080
+SECURITY_SCANNER_V4_NAMESPACE_WHITELIST:
+  - team-platform
+
+# ... (more keys)
+```
+
+The superuser password is *not* in the config-bundle — Quay's super-user is created on first run with the password stored at `ocp/spoke-dc-v6/quay/superuser` in Vault and applied by a one-shot Job.
+
+## OCP Route
+
+The QuayRegistry's `route` component (managed: true) creates a Route automatically. Re-pointing to the platform DNS:
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: quay-platform-quay
+  namespace: quay-enterprise
+spec:
+  host: quay.apps.sub.comptech-lab.com
+  to:
+    kind: Service
+    name: quay-platform-quay-app
+  port:
+    targetPort: 8443
+  tls:
+    termination: passthrough
+    externalCertificate:
+      name: quay-tls
+```
+
+The cert-manager-issued certificate is `quay-tls`; cert-manager's `Certificate` resource manages renewal.
+
+## Per-team Organizations + Robot Accounts
+
+Each onboarded tenant gets:
+
+1. A Quay **Organization** named `team-<team>` (e.g., `team-platform`, `team-apps-internal`).
+2. A **Robot Account** named `<team>+ci` with `Write` permission on the org's repos.
+3. The robot's token stored in Vault at `secret/apps/<division>/<app>/ci/quay-robot` with keys `username` + `token`.
+4. The tenant's `SecretStore` materialises the token into a `dockerconfigjson` Secret `quay-robot-team-<team>` in `openshift-pipelines`.
+5. The shared Tekton Task `push-image-quay` mounts that Secret per-pipeline (see §14.5).
+
+This convention is documented in `reference_quay_robot_token_convention.md` and ensures tenant isolation at the registry level — Tenant A cannot push to Tenant B's org because their respective robot tokens have non-overlapping repo scope.
+
+## Image registry allowlist
+
+Quay's hostname `quay.apps.sub.comptech-lab.com` is on the image-registry allowlist (entries: VAP + Gatekeeper + RHACS). See `connection-details/image-registry-allowlist.md`.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+NS=quay-enterprise
+
+oc --kubeconfig "$K" -n "$NS" get sub,csv
+oc --kubeconfig "$K" -n "$NS" get quayregistry quay-platform \
+  -o jsonpath='{.status.conditions[?(@.type=="Available")].status}{"\n"}'
+
+oc --kubeconfig "$K" -n "$NS" get deploy,statefulset,svc,route
+oc --kubeconfig "$K" -n "$NS" get pvc
+
+# OBC + bucket
+oc --kubeconfig "$K" -n "$NS" get obc
+
+# Config-bundle Secret materialised by ESO
+oc --kubeconfig "$K" -n "$NS" get secret quay-config-bundle-secret
+
+# Health
+ROUTE=$(oc --kubeconfig "$K" -n "$NS" get route quay-platform-quay -o jsonpath='{.spec.host}')
+curl -fsSk "https://$ROUTE/health/instance"
+
+# API: list Organizations (requires Bearer of superuser token; do not paste tokens)
+# Robot-Account-driven pushes happen automatically from Pipeline runs.
+```
+
+Expected:
+
+- QuayRegistry `Available=True`.
+- All Quay-* Deployments and StatefulSets Ready.
+- OBC `phase=Bound`.
+- `/health/instance` returns 200.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| QuayRegistry stuck `Quay Pods Not Ready`. | Vault path `ocp/spoke-dc-v6/quay/config-bundle` empty; config-bundle Secret missing `config.yaml`. | Populate the Vault path; ESO reconciles. | Treat Vault paths as bring-up prerequisites; lint catches empty paths. |
+| Clair fails to scan images. | Clair-Postgres PVC out of space. | Bump `clairpostgres` size; pause indexing until cleanup. | Capacity-plan Clair as a separate database. |
+| Robot push fails 403 from Pipeline. | Robot Secret materialised but the robot lacks `Write` on the org's repo. | In Quay UI, grant `Write` on `team-<team>` to `<team>+ci`. | Onboarding script verifies permission before the first build. |
+| Quay's Route TLS fails handshake. | Passthrough route expects cert at `quay-tls` Secret; cert-manager not reconciled. | Verify cert-manager `Certificate quay-tls`; resolve any HTTP-01 issue. | cert-manager + Route at correct sync-waves. |
+| Image push hangs at "blob upload". | NooBaa OBC + Quay storage misconfigured; transient network. | `oc logs deploy/quay-platform-quay-app -c quay-app` and look for NooBaa S3 errors. | Health-check the OBC + bucket reachability at install. |
+
+## References
+
+- DEV-OCP-1.6 #180 (Quay operator + QuayRegistry).
+- DEV-OCP-1.7 #181 (Quay Route + ESO superuser + Organizations).
+- DEV-OCP-3B.5 #193 (Tekton image push to Quay).
+- Memory: `reference_quay_robot_token_convention.md` — robot tokens; `project_obc_to_operand_secret_bridge.md` — OBC pattern.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/quay/` — QuayRegistry + OBC + config-bundle.
+- Red Hat Quay docs: `QuayRegistry` schema, Clair, Robot Accounts.

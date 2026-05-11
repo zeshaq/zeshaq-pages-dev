@@ -1,8 +1,246 @@
 ---
-title: "Kube Descheduler"
-description: "Section 03-openshift-platform/14-platform-services: Kube Descheduler (placeholder)."
-sidebar_label: "Kube Descheduler"
+title: "Kube Descheduler and Tekton git-cli (overlay-digest) Task"
+description: "The Kube Descheduler operator that periodically evicts pods to rebalance node entropy, and the Tekton update-overlay-digest Task that closes the GitOps loop by patching the app's image digest back into the GitOps repo."
+sidebar_label: "Descheduler + update-overlay-digest"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const descNodes = [
+  { id: "op",     position: { x: 0,   y: 0   }, data: { label: "KubeDescheduler operator" }, style: ctrlBox },
+  { id: "cr",     position: { x: 0,   y: 130 }, data: { label: "KubeDescheduler CR\ncluster" }, style: crBox },
+  { id: "deploy", position: { x: 0,   y: 260 }, data: { label: "descheduler Deployment\n(CronJob)" }, style: ctrlBox },
+  { id: "api",    position: { x: 280, y: 130 }, data: { label: "K8s API\n(pods, nodes)" }, style: extBox },
+  { id: "evict",  position: { x: 280, y: 260 }, data: { label: "evicts pods\n(respecting PDBs)" }, style: dataBox },
+  { id: "sched",  position: { x: 280, y: 390 }, data: { label: "kube-scheduler\nre-places" }, style: ctrlBox },
+  { id: "tekton", position: { x: 560, y: 0   }, data: { label: "Tekton Pipeline\nupdate-overlay-digest Task" }, style: ctrlBox },
+  { id: "vault",  position: { x: 560, y: 130 }, data: { label: "Vault\napps/<div>/<team>/gitlab-bot" }, style: extBox },
+  { id: "es",     position: { x: 560, y: 260 }, data: { label: "ExternalSecret\ngitlab-bot-<team>" }, style: crBox },
+  { id: "gitlab", position: { x: 560, y: 390 }, data: { label: "GitLab\napp-gitops repo MR" }, style: extBox },
+];
+
+export const descEdges = [
+  { id: "o1", source: "op",     target: "cr",     ...muted },
+  { id: "c1", source: "cr",     target: "deploy", label: "creates", ...reqEdge },
+  { id: "d1", source: "deploy", target: "api",    label: "lists pods", ...reqEdge },
+  { id: "d2", source: "deploy", target: "evict",  ...muted },
+  { id: "e1", source: "evict",  target: "sched",  label: "kube-scheduler reschedules", ...reqEdge },
+  { id: "t1", source: "tekton", target: "es",     label: "uses Secret", ...muted },
+  { id: "v1", source: "es",     target: "vault",  label: "ESO read", ...pullEdge },
+  { id: "t2", source: "tekton", target: "gitlab", label: "git push / MR", ...reqEdge },
+];
+
+Two unrelated platform-services on one page: the Kube Descheduler (cluster housekeeping) and the Tekton `update-overlay-digest` Task (build loop closure). Both are small enough to share a page; both are essential platform-services in the overlay.
+
+## Kube Descheduler — why it exists
+
+The `kube-scheduler` makes a placement decision at pod creation time and never revisits it. Over the cluster's lifetime that produces drift:
+
+- A node that filled up first holds more pods.
+- A node that drained for maintenance comes back empty.
+- Pods that were evicted to fit a critical workload now block better placement.
+- A long-running app sitting on a node that has higher utilisation than peers.
+
+The descheduler periodically scans the cluster and **evicts** pods that violate one of its policies. The scheduler then re-places them. Over a few cycles, the cluster converges to a more balanced state.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: descNodes, edges: descEdges }} height={520} />
+
+Reading the diagram (left side — descheduler, right side — update-overlay-digest):
+
+- The **KubeDescheduler operator** reconciles a `KubeDescheduler` CR (one cluster-wide).
+- The operand is a **Deployment + CronJob** in `openshift-kube-descheduler-operator` namespace that runs on a schedule (10-minute default).
+- On each run it lists pods, picks candidates per policy, and evicts. PodDisruptionBudgets are respected; pods opted-out via annotation are skipped.
+- `kube-scheduler` re-places the evicted pods. Net effect: the cluster moves toward the policy's idea of balanced.
+
+## KubeDescheduler CR
+
+```yaml
+apiVersion: operator.openshift.io/v1
+kind: KubeDescheduler
+metadata:
+  name: cluster
+  namespace: openshift-kube-descheduler-operator
+spec:
+  managementState: Managed
+  deschedulingIntervalSeconds: 600         # 10 min
+  mode: Automatic
+  profiles:
+    - AffinityAndTaints
+    - TopologyAndDuplicates
+    - LifecycleAndUtilization
+    - SoftTopologyAndDuplicates
+  profileCustomizations:
+    namespaces:
+      excluded:
+        - openshift-*
+        - kube-*
+        - external-secrets
+        - openshift-gitops
+        - openshift-pipelines
+        - openshift-adp
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `deschedulingIntervalSeconds: 600` | One eviction sweep every 10 min. Quick enough to act, slow enough that workloads have time to start after eviction. |
+| `mode: Automatic` | Apply evictions. The alternative `Predictive` mode dry-runs and emits events only. |
+| `profiles` | Four profiles enabled: respect affinity/taints, balance topology + dedup pods on the same node, evict for utilisation, soft-topology heuristics. |
+| `profileCustomizations.namespaces.excluded` | Platform-critical namespaces never get their pods evicted by the descheduler. |
+
+The exclusion list is the most important field. Pods in `openshift-*`, `kube-*`, the platform GitOps namespaces, ESO, and OADP must not be perturbed by descheduling. Tenant namespaces (`apps-*`) are eligible.
+
+## Per-pod opt-out
+
+Tenant pods can opt out of eviction:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    metadata:
+      annotations:
+        descheduler.alpha.kubernetes.io/evict: "false"
+```
+
+The descheduler honours `descheduler.alpha.kubernetes.io/evict: "false"`. Tenants that have specific reasons (stateful apps without a good restart story, jobs with no resumability) annotate their workloads.
+
+## The update-overlay-digest Tekton Task
+
+Pivoting to the build loop. The `update-overlay-digest` Task is the last platform Tekton Task before evidence-publish. It:
+
+1. Clones the application GitOps repo (per-team monorepo or per-app repo).
+2. Runs `update-overlay-digest.sh` with the team/app/env/digest as args.
+3. Commits and pushes the change to a `dev/<app>` branch (or opens a GitLab MR for protected branches).
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: update-overlay-digest
+  namespace: openshift-pipelines
+spec:
+  description: >-
+    Patch the GitOps overlay's image digest for the given team/app/target-env
+    and push the change to the application's GitOps repo.
+  params:
+    - name: team
+    - name: app
+    - name: target-env
+      default: dev
+    - name: image
+      description: Full image reference without tag (host/repo).
+    - name: digest
+      description: sha256: digest from push-image-quay.
+    - name: gitops-repo
+      description: HTTPS URL of the GitLab GitOps repo for the tenant.
+  steps:
+    - name: clone-patch-push
+      image: alpine/git:2.40.1
+      env:
+        - name: GIT_USER
+          valueFrom: { secretKeyRef: { name: gitlab-bot-$(params.team), key: username } }
+        - name: GIT_TOKEN
+          valueFrom: { secretKeyRef: { name: gitlab-bot-$(params.team), key: token } }
+      script: |
+        #!/bin/sh
+        set -eu
+        TMP=/tmp/repo
+        rm -rf "$TMP"
+        AUTH_URL="$(echo "$(params.gitops-repo)" | sed "s|https://|https://${GIT_USER}:${GIT_TOKEN}@|")"
+        git clone --depth 1 "$AUTH_URL" "$TMP"
+        cd "$TMP"
+        BRANCH="dev/$(params.app)-$(echo $(params.digest) | head -c 7)"
+        git checkout -b "$BRANCH"
+
+        cd "apps/$(params.team)/$(params.app)/overlays/$(params.target-env)"
+        sed -i -E "s|image: $(params.image).*|image: $(params.image)@$(params.digest)|" kustomization.yaml
+
+        git config user.email "tekton-$(params.team)@apps.sub.comptech-lab.com"
+        git config user.name  "tekton-$(params.team)"
+        git add kustomization.yaml
+        git commit -m "$(params.app) $(params.target-env): bump image to $(params.digest)"
+        # Bounded retry on push race
+        for i in 1 2 3; do
+          git pull --rebase origin main || true
+          if git push origin "$BRANCH"; then exit 0; fi
+          sleep 5
+        done
+        echo "push failed after retries" >&2
+        exit 1
+```
+
+Notes:
+
+- **Auth via Secret materialised by ESO.** Each tenant has a GitLab bot account at `apps/<division>/<team>/gitlab-bot` in Vault. ESO turns that into a `gitlab-bot-<team>` Secret in `openshift-pipelines` with `username` + `token` keys.
+- **Branch name carries the short digest.** Race-safe; multiple PipelineRuns for the same app won't fight over the same branch.
+- **Push retry on race.** If a parallel run pushed to `main` between our pull and our push, rebase and retry. Three attempts cap the loop.
+
+## How the loop closes
+
+1. Developer pushes to GitLab app repo.
+2. EventListener fires; Pipeline runs.
+3. buildah-build, trivy-scan, push-image-quay produce a digest.
+4. **update-overlay-digest** patches `kustomization.yaml` to use the new digest.
+5. Argo CD on hub-dc-v6 sees the GitOps repo change.
+6. Argo applies the new overlay to spoke-dc-v6.
+7. The new image is deployed.
+
+Steps 4-7 are the GitOps half of the loop. The Tekton half is steps 2-3.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Descheduler operator and CR
+oc --kubeconfig "$K" -n openshift-kube-descheduler-operator get sub,csv
+oc --kubeconfig "$K" -n openshift-kube-descheduler-operator get kubedescheduler cluster
+oc --kubeconfig "$K" -n openshift-kube-descheduler-operator get deploy
+
+# Tekton Task
+oc --kubeconfig "$K" -n openshift-pipelines get task update-overlay-digest
+
+# Last few PipelineRuns and whether they reached the Task
+oc --kubeconfig "$K" -n openshift-pipelines get pipelinerun --sort-by=.metadata.creationTimestamp | tail -5
+```
+
+Expected:
+
+- `KubeDescheduler` `Conditions[type=Available].status=True`.
+- Descheduler Deployment running.
+- `update-overlay-digest` Task present.
+- Recent PipelineRuns Succeeded.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Critical platform pods getting evicted. | A namespace was not added to `profileCustomizations.namespaces.excluded`. | Add the ns; the operator re-reconciles. | Treat exclusion list as platform contract; lint when new ops namespaces are added. |
+| Tenant pods churn excessively. | Profile too aggressive for the workload. | Tenant annotates pods with `descheduler.alpha.kubernetes.io/evict: "false"`. | Onboarding doc covers the annotation. |
+| update-overlay-digest fails with `401 Unauthorized`. | GitLab bot token rotated; ESO has not refreshed. | Force ESO refresh; rotate the GitLab bot token in lockstep. | Document the rotation runbook. |
+| update-overlay-digest fails after push retry. | Protected branch on GitLab disallows direct push. | Switch the Task to open an MR via GitLab API instead. | Pick "direct push to dev branch" vs "MR to main" per app at onboarding. |
+| Two PipelineRuns racing on the same app. | Both produce different `dev/<app>-*` branches; one win is non-deterministic. | This is by design — the short-digest suffix prevents collisions; the *last* branch merged wins. | Use environment promotion (dev → uat) to serialise per-env. |
+
+## References
+
+- DEV-OCP-3B.4 #192 (Tekton git-cli to patch GitOps overlay).
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines-tasks/task-update-overlay-digest.yaml`.
+- OpenShift Kube Descheduler docs: profiles, `KubeDescheduler.spec` schema.

@@ -1,8 +1,321 @@
 ---
-title: "OpenTelemetry"
-description: "Section 03-openshift-platform/14-platform-services: OpenTelemetry (placeholder)."
-sidebar_label: "OpenTelemetry"
+title: "OpenTelemetry Collector"
+description: "The OpenTelemetryCollector operand on spoke-dc-v6 — Deployment-mode collector that receives OTLP from app pods and forwards to TempoStack, and the Tekton push-image-quay Task that pairs the collector with the rest of the build evidence."
+sidebar_label: "OpenTelemetry Collector + push-image-quay"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const otelNodes = [
+  { id: "apps",     position: { x: 0,   y: 0   }, data: { label: "App workloads\n(any namespace)" }, style: dataBox },
+  { id: "mesh",     position: { x: 0,   y: 130 }, data: { label: "OSSM ambient\n(istio + ztunnel)" }, style: dataBox },
+  { id: "tekton",   position: { x: 0,   y: 260 }, data: { label: "Tekton TaskRuns\n(OTel exporter)" }, style: dataBox },
+  { id: "otel",     position: { x: 260, y: 130 }, data: { label: "otelcol-platform\nDeployment, 1 replica" }, style: ctrlBox },
+  { id: "otlpgrpc", position: { x: 260, y: 0   }, data: { label: "OTLP gRPC :4317" }, style: crBox },
+  { id: "otlphttp", position: { x: 260, y: 260 }, data: { label: "OTLP HTTP :4318" }, style: crBox },
+  { id: "tempo",    position: { x: 520, y: 130 }, data: { label: "TempoStack\ntempo-platform-distributor:4317" }, style: ctrlBox },
+];
+
+export const otelEdges = [
+  { id: "a1", source: "apps",    target: "otlpgrpc", label: "spans (gRPC)", ...reqEdge },
+  { id: "m1", source: "mesh",    target: "otlpgrpc", label: "envoy/ztunnel spans", ...reqEdge },
+  { id: "t1", source: "tekton",  target: "otlphttp", label: "spans (HTTP)", ...reqEdge },
+  { id: "ig", source: "otlpgrpc",target: "otel",     ...muted },
+  { id: "ih", source: "otlphttp",target: "otel",     ...muted },
+  { id: "o1", source: "otel",    target: "tempo",    label: "OTLP gRPC forward", ...reqEdge },
+];
+
+The OpenTelemetry Collector sits between trace producers and the TempoStack. It is a Deployment in the `tracing` namespace; it receives OTLP over gRPC (`:4317`) and HTTP (`:4318`) and forwards everything to the Tempo distributor. This page is the operand spec, the routing rationale, and the pairing with the Tekton `push-image-quay` Task that feeds the same collector with span data from build runs.
+
+Why two topics on one page: the OpenTelemetryCollector and the Tekton `push-image-quay` Task are both small enough that one shared page is the natural shape (the brief lists this file as the OpenTelemetry doc; the push-image-quay Task is the other small wrapper that pairs with the build evidence pipeline).
+
+## Why a collector in the middle
+
+Apps could send OTLP directly to TempoStack. The collector exists because:
+
+- **Batching.** The collector accumulates spans and dispatches in larger batches; reduces TempoStack ingest load.
+- **Backpressure.** If Tempo is degraded, the collector retries with exponential backoff so app pods do not hang.
+- **Filtering / redaction.** The collector can drop spans, strip attributes, sample, redact PII — without touching app code.
+- **Decoupling.** Apps point at one URL; Tempo can be replaced with another exporter at the collector layer without an app redeploy.
+
+OpenTelemetry's whole pitch is "instrument once, route the data anywhere." The collector is what makes that promise true at runtime.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: otelNodes, edges: otelEdges }} height={420} />
+
+Reading the diagram:
+
+- Three classes of producers feed the collector: **applications** (with OTel SDK auto-instrumentation), the **service mesh** (Envoy/ztunnel spans for L7 / L4 traffic), and **Tekton TaskRuns** (the push-image step emits a span per push).
+- The **collector** exposes both OTLP gRPC and HTTP endpoints; producers pick whichever is convenient.
+- The collector forwards everything to the **TempoStack distributor** over gRPC OTLP.
+
+## The OpenTelemetryCollector CR
+
+```yaml
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otelcol-platform
+  namespace: tracing
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+spec:
+  mode: deployment
+  replicas: 1
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch: {}
+    exporters:
+      otlp:
+        endpoint: tempo-platform-distributor.tracing.svc.cluster.local:4317
+        tls:
+          insecure: true
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlp]
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `mode: deployment` | Single Deployment, not DaemonSet — this is platform-shared infrastructure, not per-node. |
+| `replicas: 1` | Single replica is fine for lab volume. Increase + add a HorizontalPodAutoscaler for production. |
+| `receivers.otlp.protocols.grpc.endpoint: 0.0.0.0:4317` | OTLP gRPC, the default for SDK exporters. |
+| `receivers.otlp.protocols.http.endpoint: 0.0.0.0:4318` | OTLP HTTP. Useful for browser-side exporters and Tekton runners. |
+| `processors.batch: {}` | Default batching — collapses spans into <=8192-span batches every 200ms. |
+| `exporters.otlp.endpoint` | Tempo's distributor Service — note the operator-generated naming `tempo-<TempoStack.name>-distributor.<ns>.svc.cluster.local`. |
+| `exporters.otlp.tls.insecure: true` | In-cluster traffic, plain HTTP/2. Tempo's distributor does not require TLS for in-cluster clients. |
+| `service.pipelines.traces` | Wires receivers → processors → exporters for the trace signal. |
+
+The operand operator creates the Deployment, the Service (`otelcol-platform-collector` on ports 4317/4318/8888), the ConfigMap with the rendered config, the SA, and the RBAC.
+
+## What workloads should point at
+
+Inside the cluster:
+
+```yaml
+# In the workload Deployment
+env:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otelcol-platform-collector.tracing.svc.cluster.local:4318
+  - name: OTEL_SERVICE_NAME
+    value: my-app
+  - name: OTEL_RESOURCE_ATTRIBUTES
+    value: deployment.environment=dev,service.namespace=apps-team-x
+```
+
+For gRPC SDKs:
+
+```yaml
+env:
+  - name: OTEL_EXPORTER_OTLP_PROTOCOL
+    value: grpc
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otelcol-platform-collector.tracing.svc.cluster.local:4317
+```
+
+The collector Service name `otelcol-platform-collector` is generated by the operand operator — note the `-collector` suffix.
+
+## Sampling — not yet enabled
+
+The lab does not enable sampling at the collector. Every span the receivers see is forwarded. This is fine at lab scale; at fleet scale a tail-sampling processor would be added:
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow
+        type: latency
+        latency: { threshold_ms: 1000 }
+      - name: random
+        type: probabilistic
+        probabilistic: { sampling_percentage: 1 }
+```
+
+That is configured in the collector, not in the app SDK. The "no app changes to change sampling" property is the whole reason the collector exists.
+
+## The Tekton push-image-quay Task
+
+The collector is the same instance every workload exports to, including Tekton runs. The shared Task `push-image-quay` is the last Task in every Path B Pipeline before the evidence-publish step. It is documented here because its output (an image-digest and image-ref) flows into the GitOps patch step in §14.4, and it is the closing piece of the build chain.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-image-quay
+  namespace: openshift-pipelines
+spec:
+  params:
+    - name: image-name
+      type: string
+    - name: image-tag
+      type: string
+    - name: team
+      type: string
+    - name: source-image
+      type: string
+      default: "docker-archive:$(workspaces.source.path)/image.tar"
+    - name: quay-host
+      type: string
+      default: "quay.apps.sub.comptech-lab.com"
+    - name: robot-secret
+      type: string
+      description: dockerconfigjson Secret in openshift-pipelines, per-team.
+  workspaces:
+    - name: source
+  results:
+    - name: image-digest
+    - name: image-ref
+  steps:
+    - name: skopeo-copy
+      image: quay.io/skopeo/stable:v1.13.3
+      env:
+        - name: REGISTRY_AUTH_FILE
+          value: /workspace/quay-creds/.dockerconfigjson
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        DEST_REF="$(params.quay-host)/team-$(params.team)/$(params.image-name):$(params.image-tag)"
+        echo "[push-image-quay] src=$(params.source-image) dest=docker://${DEST_REF}"
+
+        skopeo copy \
+          --authfile "${REGISTRY_AUTH_FILE}" \
+          --dest-tls-verify=true \
+          "$(params.source-image)" \
+          "docker://${DEST_REF}"
+
+        DIGEST=$(skopeo inspect \
+          --authfile "${REGISTRY_AUTH_FILE}" \
+          --format '{{.Digest}}' \
+          "docker://${DEST_REF}")
+
+        printf "%s" "${DIGEST}"   > "$(results.image-digest.path)"
+        printf "%s" "${DEST_REF}" > "$(results.image-ref.path)"
+      volumeMounts:
+        - name: quay-creds
+          mountPath: /workspace/quay-creds
+          readOnly: true
+  volumes:
+    - name: quay-creds
+      secret:
+        secretName: $(params.robot-secret)
+        items:
+          - key: .dockerconfigjson
+            path: .dockerconfigjson
+```
+
+Three things to call out:
+
+- **skopeo, not buildah push.** skopeo only needs read of the source workspace and the robot Secret — no privileged build container. The build container did its work in the previous Task.
+- **Per-team robot Secret name as a param.** The Task is reused unchanged across tenants; the Secret name is passed in.
+- **`/workspace/quay-creds` mount path.** Tekton rejects mounts under `/tekton/` (operator-reserved); use a workspace-prefixed path. This was a real failure mode during W4 of the buildout.
+
+## Tenant onboarding for push-image
+
+The robot Secret is materialised by ESO from Vault, following the per-tenant convention:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: quay-robot-team-<team>
+  namespace: openshift-pipelines
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: SecretStore
+    name: vault-apps-<division>
+  target:
+    name: quay-robot-team-<team>
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: |
+          { "auths": { "quay.apps.sub.comptech-lab.com":
+              { "username": "{{ .username }}", "password": "{{ .token }}" } } }
+  data:
+    - secretKey: username
+      remoteRef:
+        key: apps/<division>/<app>/ci/quay-robot
+        property: username
+    - secretKey: token
+      remoteRef:
+        key: apps/<division>/<app>/ci/quay-robot
+        property: token
+```
+
+The flow:
+
+1. Platform admin creates a Quay Organization + Robot Account.
+2. Robot username + token go into Vault at `secret/apps/<division>/<app>/ci/quay-robot`.
+3. The tenant's `SecretStore` (kind=`SecretStore`, not `ClusterSecretStore` — tenant-scoped) reads the path.
+4. The ExternalSecret in `openshift-pipelines` materialises the dockerconfigjson Secret.
+5. The PipelineRun's TriggerTemplate mounts `quay-robot-team-<team>` into the workspace.
+
+No platform-wide shared robot. Tenant isolation is enforced at the Quay org level.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Collector
+oc --kubeconfig "$K" -n tracing get opentelemetrycollector otelcol-platform
+oc --kubeconfig "$K" -n tracing get svc otelcol-platform-collector
+oc --kubeconfig "$K" -n tracing logs deploy/otelcol-platform | tail -20
+
+# Reachable from a sample workload
+oc --kubeconfig "$K" -n default run otel-probe --rm -it --image=curlimages/curl --command -- \
+  curl -v http://otelcol-platform-collector.tracing.svc.cluster.local:4318/v1/traces
+
+# push-image-quay Task
+oc --kubeconfig "$K" -n openshift-pipelines get task push-image-quay
+```
+
+Expected:
+
+- `otelcol-platform` `Status.Conditions[type=Ready].status=True`.
+- Probe returns 405 (the endpoint is alive but expects POST) — the connection itself is what we care about.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Spans arrive at collector but Tempo has zero. | Exporter URL points at the wrong TempoStack name. | Update `exporters.otlp.endpoint` to the operator-generated distributor name. | Pin TempoStack name; lint the collector config. |
+| Collector pod restarts every few minutes. | OOM — single replica vs. high span volume. | Add a memory limit and HPA; or shrink batching window. | Capacity-plan; alert on pod restart rate. |
+| push-image Task fails 401. | Robot Secret missing or robot account lacks repo permission. | Check Vault path, ESO refresh; verify the robot has `Write` on `team-<team>` org in Quay UI. | Onboarding script validates Quay perms before the first build. |
+| push-image succeeds but the digest result is empty. | `skopeo inspect` failed silently due to a transient TLS error. | Add `set -o pipefail`; retry once. | Include retry in the Task script. |
+
+## References
+
+- DEV-OCP-1.3 #177 (OpenTelemetryCollector).
+- DEV-OCP-3B.5 #193 (push-image-quay Task).
+- Memory: `reference_quay_robot_token_convention.md` — per-tenant robot pattern.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/tracing/opentelemetrycollector.yaml`.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines-tasks/task-push-image-quay.yaml`.

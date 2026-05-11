@@ -1,8 +1,392 @@
 ---
-title: "OpenShift Pipelines (Tekton)"
-description: "Section 03-openshift-platform/14-platform-services: OpenShift Pipelines (Tekton) (placeholder)."
-sidebar_label: "OpenShift Pipelines (Tekton)"
+title: "OpenShift Pipelines (Tekton) — TektonConfig, EventListener, Triggers"
+description: "How the OpenShift Pipelines operator is configured on spoke-dc-v6, the EventListener / Trigger / TriggerTemplate fan-out that turns GitLab push events into per-language PipelineRuns, and the GitLab webhook secret delivery via ESO."
+sidebar_label: "Tekton: TektonConfig + Triggers"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+import Mermaid from "../../../../components/Mermaid";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const tektonNodes = [
+  { id: "gitlab",   position: { x: 0,   y: 0   }, data: { label: "GitLab\nproject webhook" }, style: extBox },
+  { id: "route",    position: { x: 240, y: 0   }, data: { label: "OCP Route\ntekton-listener.apps..." }, style: dataBox },
+  { id: "elsvc",    position: { x: 480, y: 0   }, data: { label: "EventListener Svc\nel-gitlab-listener" }, style: dataBox },
+  { id: "elpod",    position: { x: 720, y: 0   }, data: { label: "EventListener Pod" }, style: ctrlBox },
+  { id: "gitlab-i", position: { x: 720, y: 130 }, data: { label: "GitLab interceptor\nHMAC verify" }, style: crBox },
+  { id: "cel-i",    position: { x: 720, y: 260 }, data: { label: "CEL interceptor\nlanguage routing" }, style: crBox },
+  { id: "binding",  position: { x: 480, y: 260 }, data: { label: "TriggerBinding\ngitlab-push-binding" }, style: crBox },
+  { id: "template", position: { x: 240, y: 260 }, data: { label: "TriggerTemplate\nper language" }, style: crBox },
+  { id: "pr",       position: { x: 0,   y: 260 }, data: { label: "PipelineRun" }, style: crBox },
+  { id: "pipeline", position: { x: 0,   y: 400 }, data: { label: "Pipeline\nliberty|node|spring-build-deploy" }, style: ctrlBox },
+  { id: "secret",   position: { x: 480, y: 400 }, data: { label: "gitlab-webhook-secret\n(via ESO)" }, style: dataBox },
+  { id: "vault",    position: { x: 720, y: 400 }, data: { label: "Vault\nsecret/ocp/.../tekton/gitlab-webhook" }, style: extBox },
+];
+
+export const tektonEdges = [
+  { id: "g1", source: "gitlab",   target: "route",    label: "POST", ...reqEdge },
+  { id: "g2", source: "route",    target: "elsvc",    ...muted },
+  { id: "g3", source: "elsvc",    target: "elpod",    ...muted },
+  { id: "i1", source: "elpod",    target: "gitlab-i", ...muted },
+  { id: "i2", source: "gitlab-i", target: "cel-i",    ...muted },
+  { id: "i3", source: "gitlab-i", target: "secret",   label: "HMAC", ...muted },
+  { id: "s1", source: "secret",   target: "vault",    label: "ESO read", ...pullEdge },
+  { id: "i4", source: "cel-i",    target: "binding",  ...muted },
+  { id: "b1", source: "binding",  target: "template", ...muted },
+  { id: "t1", source: "template", target: "pr",       label: "creates", ...reqEdge },
+  { id: "p1", source: "pr",       target: "pipeline", label: "instantiates", ...reqEdge },
+];
+
+OpenShift Pipelines is the engine behind **Path B** of the lab's CI/CD model — the OCP-native track that takes a developer push, builds an image, scans it, pushes it to Quay, and patches the GitOps overlay. Path A (Jenkins on a VM) is the alternative track. The two paths produce evidence in a parity contract (`ci-evidence-schema.md`) so consumers downstream do not need to know which path produced a build.
+
+This page is about the operator (TektonConfig), the EventListener that converts a GitLab webhook into a PipelineRun, and the credential plumbing that keeps the listener authentic. The individual Tasks live in §14.3 (Trivy), §14.4 (git-cli), and §14.5 (push-image-quay). The Pipeline templates are touched lightly here and detailed in §14.5 too.
+
+## The operator and TektonConfig
+
+OpenShift Pipelines installs via the standard Operator pattern. Once installed, the operator looks for a single `TektonConfig` CR named `config` (the name is non-negotiable) and reconciles it into the full Tekton stack: Pipelines core, Triggers, Chains, Hub, and the addon.
+
+```yaml
+apiVersion: operator.tekton.dev/v1alpha1
+kind: TektonConfig
+metadata:
+  name: config
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/sync-options: ServerSideApply=true
+spec:
+  targetNamespace: openshift-pipelines
+  profile: all                        # full operand: pipelines + triggers + chains + hub + addon
+  pruner:
+    resources:
+      - pipelinerun
+      - taskrun
+    keep: 5
+    schedule: "0 8 * * *"
+```
+
+Field-by-field:
+
+| Field | Purpose |
+| --- | --- |
+| `targetNamespace: openshift-pipelines` | Standard install namespace. All cluster-shared Tasks and Pipelines live here. |
+| `profile: all` | Enables every Tekton component. `basic` would drop Triggers/Hub/Addon; we need Triggers. |
+| `pruner.resources: [pipelinerun, taskrun]` | Auto-cleanup of completed runs after `keep: 5`. Otherwise the namespace fills with thousands of CRs. |
+| `pruner.schedule: "0 8 * * *"` | Run pruner daily at 08:00. The schedule does not affect in-flight runs. |
+| `sync-options: ServerSideApply=true` | SSA avoids three-way-merge fights with the operator's own writes to the same CR. |
+
+The operator writes back to many sub-fields of the `TektonConfig` (status, derived defaults). Without SSA, Argo would loop on the diffs forever.
+
+Once reconciled, the operator brings up:
+
+- `tekton-pipelines-controller` and `tekton-pipelines-webhook`
+- `tekton-triggers-controller`, `tekton-triggers-webhook`, and `tekton-triggers-core-interceptors`
+- `tekton-chains-controller`
+- `tekton-pipelines-pruner` CronJob
+
+All in `openshift-pipelines`. Cluster-wide CRDs (`Pipeline`, `Task`, `PipelineRun`, `EventListener`, ...) become available.
+
+## The full Path B fan-out
+
+<Whiteboard client:load data={{ nodes: tektonNodes, edges: tektonEdges }} height={560} />
+
+Reading the diagram, left-to-right then top-to-bottom:
+
+1. **GitLab** fires a `Push Hook` to the configured **Route** (`tekton-listener.apps.sub.comptech-lab.com`).
+2. The Route is wired to the EventListener's Service, which load-balances to the **EventListener Pod**.
+3. The pod runs two interceptors in order:
+   - **GitLab interceptor** verifies the HMAC signature in `X-Gitlab-Token` against `gitlab-webhook-secret` and gates on `Push Hook` event type.
+   - **CEL interceptor** parses the project path into `team` + `app` extensions, and uses a project topic (`tektonbuild-<language>`) to pick the language-specific trigger.
+4. The **TriggerBinding** maps GitLab payload fields to pipeline params.
+5. The **TriggerTemplate** (one per language) instantiates a **PipelineRun** that references the right **Pipeline**.
+6. The **Pipeline** runs its Tasks (git-clone, buildah-build, trivy-scan, push-image, update-overlay-digest, evidence-publish).
+7. The **gitlab-webhook-secret** itself is delivered to `openshift-pipelines` by ESO reading from Vault.
+
+## The EventListener — three named triggers, one listener
+
+The EventListener has three named triggers (one per language), but they all flow through the same listener Pod. The trigger chain for the Liberty case looks like:
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: gitlab-listener
+  namespace: openshift-pipelines
+spec:
+  serviceAccountName: gitlab-listener-sa
+  triggers:
+    - name: gitlab-push-liberty
+      interceptors:
+        - ref: { name: gitlab, kind: ClusterInterceptor }
+          params:
+            - name: secretRef
+              value:
+                secretName: gitlab-webhook-secret
+                secretKey: secretToken
+            - name: eventTypes
+              value: ["Push Hook"]
+        - ref: { name: cel, kind: ClusterInterceptor }
+          params:
+            - name: filter
+              value: "'tektonbuild-liberty' in body.project.tag_list"
+            - name: overlays
+              value:
+                - { key: team, expression: "body.project.path_with_namespace.split('/')[0]" }
+                - { key: app,  expression: "body.project.path_with_namespace.split('/')[1]" }
+      bindings:
+        - ref: gitlab-push-binding
+      template:
+        ref: liberty-build-deploy-template
+```
+
+The CEL filter on `body.project.tag_list` is the language-routing mechanism. Each language has its own trigger; the filter expression is the only thing that differs. This is the durable mechanism the platform admin uses to onboard a tenant repo:
+
+- Tag the GitLab project with one of `tektonbuild-liberty`, `tektonbuild-node`, `tektonbuild-spring`.
+- The webhook URL is the same for every tenant; the language is decided by the trigger CEL filter.
+
+## The TriggerBinding and TriggerTemplate
+
+The binding pulls the right fields out of the GitLab webhook body and turns them into params:
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: gitlab-push-binding
+  namespace: openshift-pipelines
+spec:
+  params:
+    - name: team
+      value: $(extensions.team)        # set by CEL overlays
+    - name: app
+      value: $(extensions.app)
+    - name: git-url
+      value: $(body.project.git_http_url)
+    - name: git-revision
+      value: $(body.checkout_sha)
+    - name: gitlab-user
+      value: $(body.user_username)
+```
+
+The template instantiates the actual PipelineRun:
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: liberty-build-deploy-template
+  namespace: openshift-pipelines
+spec:
+  params: [{name: team}, {name: app}, {name: git-url}, {name: git-revision}, {name: gitlab-user}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: liberty-$(tt.params.team)-$(tt.params.app)-
+        namespace: openshift-pipelines
+        labels:
+          tekton.dev/pipeline: liberty-build-deploy
+          pipeline.comptech-lab.com/team: $(tt.params.team)
+          pipeline.comptech-lab.com/app: $(tt.params.app)
+          pipeline.comptech-lab.com/language: liberty
+          pipeline.comptech-lab.com/triggered-by: $(tt.params.gitlab-user)
+      spec:
+        pipelineRef:
+          name: liberty-build-deploy
+        params:
+          - name: team
+            value: $(tt.params.team)
+          - name: app
+            value: $(tt.params.app)
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-revision
+            value: $(tt.params.git-revision)
+          - name: target-env
+            value: dev
+        workspaces:
+          - name: source
+            volumeClaimTemplate:
+              spec:
+                accessModes: [ReadWriteOnce]
+                resources:
+                  requests:
+                    storage: 2Gi
+          - name: dockerconfig
+            secret:
+              secretName: quay-robot-$(tt.params.team)
+```
+
+Things to notice:
+
+- **`generateName`** ensures every PipelineRun gets a unique suffix; the static pieces let you grep logs.
+- **Labels** include the team/app/language/triggered-by. Cluster Observability dashboards group runs by these.
+- **`workspaces.dockerconfig`** mounts the per-team Quay robot Secret. The Secret is named `quay-robot-<team>` and materialised by ESO per the per-tenant convention.
+
+## The EventListener Route
+
+The listener is exposed by an OCP Route on `tekton-listener.apps.sub.comptech-lab.com`:
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: gitlab-listener
+  namespace: openshift-pipelines
+spec:
+  host: tekton-listener.apps.sub.comptech-lab.com
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  port:
+    targetPort: http-listener
+  to:
+    kind: Service
+    name: el-gitlab-listener
+```
+
+The Service `el-gitlab-listener` is created by the Triggers controller from the EventListener spec. Edge-TLS termination is fine because the listener pod only speaks HTTP; the Route handles TLS using a cert-manager-issued certificate.
+
+## The webhook secret
+
+The HMAC validation token is delivered by ESO:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gitlab-webhook-secret
+  namespace: openshift-pipelines
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: gitlab-webhook-secret
+    template:
+      type: Opaque
+      data:
+        secretToken: "{{ .secretToken }}"
+  data:
+    - secretKey: secretToken
+      remoteRef:
+        key: ocp/spoke-dc-v6/tekton/gitlab-webhook
+        property: secretToken
+```
+
+GitLab signs the webhook body with the same token; the GitLab interceptor verifies the signature. If the secret is rotated in Vault, the ExternalSecret updates the in-cluster Secret on the next refresh, and the next push is verified against the new token. GitLab's webhook config must be rotated in lockstep.
+
+## The sequence in detail
+
+<Mermaid client:load chart={`sequenceDiagram
+  participant D as Developer
+  participant G as GitLab
+  participant R as Route
+  participant EL as EventListener
+  participant GI as GitLab interceptor
+  participant CEL as CEL interceptor
+  participant TT as TriggerTemplate
+  participant PR as PipelineRun
+  participant P as Pipeline
+
+  D->>G: git push origin main
+  G->>R: POST /<host> + X-Gitlab-Token
+  R->>EL: forward
+  EL->>GI: verify HMAC against gitlab-webhook-secret
+  GI->>GI: check event type = Push Hook
+  GI->>CEL: pass body + extensions
+  CEL->>CEL: filter on project.tag_list
+  CEL->>CEL: overlay team + app
+  CEL->>TT: bind + render
+  TT->>PR: create PipelineRun
+  PR->>P: instantiate
+`} />
+
+The flow takes ~200ms from webhook POST to PipelineRun creation on the wire. Pipeline execution is then governed by the Tasks themselves.
+
+## Cluster-wide vs. namespaced
+
+| Object | Scope |
+| --- | --- |
+| `ClusterInterceptor` (`gitlab`, `cel`, `slack`, etc.) | Cluster — shipped by the Triggers controller. |
+| `EventListener` | Namespaced — one per platform listener namespace; we have only the one in `openshift-pipelines`. |
+| `TriggerBinding`, `TriggerTemplate` | Namespaced. |
+| `Pipeline`, `Task` | Namespaced. Live in `openshift-pipelines` so all tenants reuse the same Tasks. |
+| `PipelineRun`, `TaskRun` | Namespaced (we run them in `openshift-pipelines`). |
+
+Putting tenant PipelineRuns in `openshift-pipelines` (rather than per-tenant namespaces) is a deliberate trade. Pros: shared workspace PVC class, one SA for git-clone, simple Quay secret naming. Cons: blast radius on quota. We mitigate quota by using `requests`/`limits` in the EventListener-injected resources block:
+
+```yaml
+resources:
+  kubernetesResource:
+    spec:
+      template:
+        spec:
+          serviceAccountName: gitlab-listener-sa
+          containers:
+            - resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+```
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Operator + TektonConfig
+oc --kubeconfig "$K" -n openshift-pipelines get sub,csv
+oc --kubeconfig "$K" get tektonconfig config -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+# Triggers stack
+oc --kubeconfig "$K" -n openshift-pipelines get eventlistener,triggerbinding,triggertemplate
+
+# Listener Route and Service
+oc --kubeconfig "$K" -n openshift-pipelines get route gitlab-listener
+oc --kubeconfig "$K" -n openshift-pipelines get svc el-gitlab-listener
+
+# Webhook secret materialised
+oc --kubeconfig "$K" -n openshift-pipelines get secret gitlab-webhook-secret
+
+# Live test: a PipelineRun from a recent push
+oc --kubeconfig "$K" -n openshift-pipelines get pipelinerun --sort-by=.metadata.creationTimestamp | tail -5
+```
+
+Expected:
+
+- `tektonconfig` Ready=True.
+- One `eventlistener/gitlab-listener` and three TriggerTemplates (one per language).
+- Route returns HTTP 200 to a GET (the listener responds even to non-webhook calls with an empty 200).
+- `gitlab-webhook-secret` exists and contains `secretToken`.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| GitLab webhook delivery shows 403. | HMAC mismatch — Vault token rotated but GitLab still has the old one. | Update GitLab's webhook config with the new token; ESO already refreshed. | Have a "rotate webhook" runbook that updates both sides atomically. |
+| Webhook delivery shows 200 but no PipelineRun. | CEL filter does not match — the project topic was not set. | `oc -n openshift-pipelines logs deploy/el-gitlab-listener -f` shows the rejected payload. Add the topic in GitLab. | Onboarding checklist for tenant repos requires the topic. |
+| `TektonConfig` Ready=False after Argo sync. | Profile or pruner field reshaped on operator upgrade. | `oc explain tektonconfig.spec` and reconcile against the operator version. | Operator catalog mirror version-lock; pre-stage upgrades. |
+| PipelineRun stays `Pending`. | `quay-robot-<team>` Secret missing — the volume mount fails at pod startup. | Confirm the tenant's ExternalSecret reconciled. | Tenant onboarding requires the Quay robot path in Vault to be seeded *before* the first push. |
+| `el-gitlab-listener` pod CrashLoopBackOff. | Triggers controller could not find a referenced ClusterInterceptor (mirror lag pulling the image). | `oc -n openshift-pipelines describe pod -l app=el-gitlab-listener` — look for image-pull errors. | Pre-warm the operator's image set in the mirror. |
+
+## References
+
+- `codex-opp-agent/connection-details/ci-evidence-schema.md` — Path A / Path B parity contract.
+- DEV-OCP-1.1 #175 (TektonConfig), DEV-OCP-3B.1 #189 (Pipeline templates), DEV-OCP-3B.2 #190 (EventListener + GitLab secret).
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines/` — TektonConfig.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines-templates/` — EventListener + Triggers + per-language Pipelines.
+- Tekton upstream: Triggers v1beta1, ClusterInterceptor model.
