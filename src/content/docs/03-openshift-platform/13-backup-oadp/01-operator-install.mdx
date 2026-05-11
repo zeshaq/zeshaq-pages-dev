@@ -1,8 +1,290 @@
 ---
-title: "Operator Install"
-description: "Section 03-openshift-platform/13-backup-oadp: Operator Install (placeholder)."
-sidebar_label: "Operator Install"
+title: "OADP Operator install and DataProtectionApplication overview"
+description: "How the Red Hat OADP operator is wired into the spoke-dc-v6 cluster, the CR ecosystem (Backup, Restore, Schedule, BackupStorageLocation, VolumeSnapshotLocation, DataProtectionApplication), and the GitOps-managed install path."
+sidebar_label: "Operator install"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const oadpNodes = [
+  { id: "gitops",    position: { x: 0,   y: 0   }, data: { label: "Argo CD\n(hub-dc-v6)" }, style: ctrlBox },
+  { id: "olm",       position: { x: 260, y: 0   }, data: { label: "OLM Subscription\nopenshift-adp" }, style: crBox },
+  { id: "csv",       position: { x: 520, y: 0   }, data: { label: "OADP CSV\noadp-operator.v1.5.5" }, style: crBox },
+  { id: "operator",  position: { x: 780, y: 0   }, data: { label: "OADP Operator\n(controller)" }, style: ctrlBox },
+  { id: "dpa",       position: { x: 260, y: 140 }, data: { label: "DataProtection\nApplication CR" }, style: crBox },
+  { id: "velero",    position: { x: 520, y: 140 }, data: { label: "Velero Deployment\n+ controller" }, style: agentBox },
+  { id: "nodeagent", position: { x: 780, y: 140 }, data: { label: "Node Agent DS\n(Kopia)" }, style: agentBox },
+  { id: "bsl",       position: { x: 0,   y: 280 }, data: { label: "BackupStorage\nLocation" }, style: crBox },
+  { id: "vsl",       position: { x: 200, y: 280 }, data: { label: "VolumeSnapshot\nLocation" }, style: crBox },
+  { id: "backup",    position: { x: 400, y: 280 }, data: { label: "Backup CR" }, style: crBox },
+  { id: "schedule",  position: { x: 600, y: 280 }, data: { label: "Schedule CR" }, style: crBox },
+  { id: "restore",   position: { x: 800, y: 280 }, data: { label: "Restore CR" }, style: crBox },
+  { id: "minio",     position: { x: 260, y: 420 }, data: { label: "MinIO VM\n(lab object store)" }, style: extBox },
+  { id: "csi",       position: { x: 520, y: 420 }, data: { label: "CSI driver\n+ VolumeSnapshotClass" }, style: dataBox },
+  { id: "vault",     position: { x: 800, y: 420 }, data: { label: "Vault VM\n(cloud-credentials)" }, style: extBox },
+];
+
+export const oadpEdges = [
+  { id: "g1", source: "gitops",   target: "olm",       label: "applies", ...muted },
+  { id: "o1", source: "olm",      target: "csv",       label: "installs", ...muted },
+  { id: "c1", source: "csv",      target: "operator",  label: "runs", ...reqEdge },
+  { id: "g2", source: "gitops",   target: "dpa",       label: "applies", ...muted },
+  { id: "d1", source: "operator", target: "dpa",       label: "watches", ...reqEdge },
+  { id: "d2", source: "operator", target: "velero",    label: "creates", ...reqEdge },
+  { id: "d3", source: "operator", target: "nodeagent", label: "creates", ...reqEdge },
+  { id: "d4", source: "dpa",      target: "bsl",       label: "derives", ...muted },
+  { id: "d5", source: "dpa",      target: "vsl",       label: "derives", ...muted },
+  { id: "v1", source: "velero",   target: "backup",    label: "reconciles", ...reqEdge },
+  { id: "v2", source: "velero",   target: "schedule",  label: "reconciles", ...reqEdge },
+  { id: "v3", source: "velero",   target: "restore",   label: "reconciles", ...reqEdge },
+  { id: "b1", source: "backup",   target: "bsl",       label: "writes to", ...pullEdge },
+  { id: "b2", source: "backup",   target: "csi",       label: "snapshots via", ...pullEdge },
+  { id: "b3", source: "bsl",      target: "minio",     label: "S3 PUT", ...pullEdge },
+  { id: "b4", source: "velero",   target: "vault",     label: "reads creds\n(via ESO)", ...muted },
+];
+
+The OpenShift API for Data Protection (OADP) operator is the supported way to drive Velero-based backup and restore on OpenShift. On `spoke-dc-v6` it backs up namespaced application state plus the CSI snapshots of any PVCs the workloads consume, and it ships those backups to the lab MinIO VM over S3. The same operator runs on the hub cluster as well; the hub flavour is covered in §13.6 (ACM Cluster Backup). This page is the single orientation for the OADP CR ecosystem and the GitOps wiring that puts it on the cluster.
+
+It is for platform admins who own backup posture, plus any app owner who wants to understand which CR they file a Backup against and what guarantees they get.
+
+## What OADP is, in one breath
+
+Red Hat OADP is a productised wrapping of upstream Velero, the OpenShift-specific Velero plugin, and the Kopia node-agent for filesystem-level PVC backups. It is delivered through OperatorHub as `redhat-oadp-operator`. The operator owns one purpose: reconcile a `DataProtectionApplication` (DPA) CR into a running Velero stack plus its supporting node-agent DaemonSet, BackupStorageLocations, and VolumeSnapshotLocations.
+
+Once those are running, Velero itself owns the work: it watches `Backup`, `Schedule`, `Restore`, `DeleteBackupRequest`, and `BackupStorageLocation` CRs, and it executes the backup/restore lifecycle against the configured object storage and CSI snapshot APIs.
+
+## The CR ecosystem at a glance
+
+| CR | Group | Owner | Purpose |
+| --- | --- | --- | --- |
+| `DataProtectionApplication` | `oadp.openshift.io/v1alpha1` | OADP operator | Top-level config; one per cluster. Spawns Velero + node-agent + default BSL/VSL. |
+| `BackupStorageLocation` (BSL) | `velero.io/v1` | Velero | Where backups are persisted. Typically points at an S3-compatible bucket. |
+| `VolumeSnapshotLocation` (VSL) | `velero.io/v1` | Velero | Where CSI VolumeSnapshots live; on OCP this is the CSI driver's snapshot class. |
+| `Backup` | `velero.io/v1` | tenant or platform | One-shot backup request. References a BSL and a namespace selector. |
+| `Schedule` | `velero.io/v1` | platform | A cron-driven `Backup` generator. |
+| `Restore` | `velero.io/v1` | operator on-call | Inverse of `Backup`. References a completed `Backup` and an optional namespace mapping. |
+| `DeleteBackupRequest` | `velero.io/v1` | platform | Marks a backup for deletion in the BSL (gc-safe). |
+
+`Backup` and `Schedule` are the CRs an application owner files. `Restore` is operator-on-call territory because it can stomp running state. `DataProtectionApplication`, `BackupStorageLocation`, and `VolumeSnapshotLocation` are platform-team territory and live in GitOps.
+
+## Architecture diagram
+
+<Whiteboard client:load data={{ nodes: oadpNodes, edges: oadpEdges }} height={580} />
+
+Reading the diagram, top to bottom:
+
+- **Argo CD** on the hub pushes the OADP `Subscription` and the `DataProtectionApplication` to the spoke via the pull-model app-of-apps in `clusters/spoke-dc-v6/`. OLM converts the Subscription into a CSV; the CSV runs the operator.
+- The **OADP operator** watches the DPA and *projects* it into a Velero Deployment plus a Node Agent DaemonSet, plus the default BSL and VSL derived from `spec.backupLocations` / `spec.snapshotLocations`.
+- **Velero** is the actual workhorse: it reconciles Backup, Schedule, and Restore CRs. CSI snapshots happen through the in-cluster `csi` plugin; filesystem backup of pod volumes happens through the Node Agent (Kopia).
+- The **`cloud-credentials` Secret** is delivered to `openshift-adp` by ExternalSecrets reading from Vault. Velero mounts that Secret to authenticate to MinIO. No S3 credentials are committed to GitOps.
+
+## Operator install — actual GitOps shape
+
+The operator is bootstrapped through the standard four-file OLM pattern under `clusters/spoke-dc-v6/operators/oadp/`:
+
+| File | Role |
+| --- | --- |
+| `namespace.yaml` | `openshift-adp` namespace with restricted PSA + Argo `sync-wave: 0`. |
+| `operatorgroup.yaml` | Targeting `openshift-adp` only — operator scope is the namespace. |
+| `subscription.yaml` | Pins the channel and `startingCSV`. |
+| `kustomization.yaml` | Wires the three files into the cluster overlay. |
+
+The Subscription:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: redhat-oadp-operator
+  namespace: openshift-adp
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    operatorframework.io/bundle-unpack-timeout: 30m
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: redhat-oadp-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: oadp-operator.v1.5.5
+```
+
+Notes that matter:
+
+- **`source` is the local catalog mirror** (`cs-redhat-operator-index-v4-20`), not `redhat-operators`. Disconnected installs cannot reach the public catalog index.
+- **`installPlanApproval: Automatic`** is acceptable for backup tooling. The risk surface is small; the operator owns CRDs that are not in the workload path.
+- **`bundle-unpack-timeout: 30m`** is set because the OADP bundle is large and the lab mirror IO can be slow during simultaneous operator installs.
+
+A higher Argo sync-wave (`"20"`) gates the `DataProtectionApplication` so the CRDs exist before the DPA is applied.
+
+## DataProtectionApplication — the one CR you actually configure
+
+Everything else flows from a single DPA per cluster. The spoke-dc-v6 shape:
+
+```yaml
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata:
+  name: spoke-dc-v6
+  namespace: openshift-adp
+spec:
+  configuration:
+    velero:
+      defaultPlugins:
+        - openshift   # CRD-aware backups for OCP objects
+        - aws         # S3 BSL provider
+        - csi         # CSI snapshot integration
+      featureFlags:
+        - EnableCSI
+      defaultItemOperationTimeout: 4h0m0s
+    nodeAgent:
+      enable: true
+      uploaderType: kopia
+      podConfig:
+        nodeSelector:
+          node-role.kubernetes.io/worker: ""
+  backupLocations:
+    - name: default
+      velero:
+        provider: aws
+        default: true
+        objectStorage:
+          bucket: oadp-backups
+          prefix: spoke-dc-v6
+        config:
+          region: default
+          s3ForcePathStyle: "true"
+          s3Url: http://<the-lab-minio-vm>:9000
+          insecureSkipTLSVerify: "true"
+        credential:
+          name: cloud-credentials
+          key: cloud
+```
+
+Field-by-field, the things that matter on this cluster:
+
+| Field | Why this value |
+| --- | --- |
+| `defaultPlugins: [openshift, aws, csi]` | OpenShift plugin handles SCC/Route/ImageStream awareness; aws drives the S3 BSL; csi wires VolumeSnapshot creation into Backup. |
+| `featureFlags: [EnableCSI]` | Required until CSI is moved out of feature-flag in a later OADP release. |
+| `nodeAgent.uploaderType: kopia` | Kopia is the chosen pod-volume uploader (vs Restic). Better dedup, content-addressable storage, snapshot-aware. |
+| `nodeAgent.podConfig.nodeSelector: worker` | Pins the DaemonSet to workers; we don't want masters running data movers. |
+| `backupLocations[].velero.config.s3ForcePathStyle: "true"` | MinIO uses path-style (`http://host/bucket/key`), not the virtual-hosted style AWS S3 uses. Must be `true` for any MinIO target. |
+| `insecureSkipTLSVerify: "true"` | The lab MinIO endpoint is HTTP-only inside the lab `/24`. Production-grade installs should run MinIO behind HTTPS; this is a lab scope decision. |
+| `credential.name: cloud-credentials, key: cloud` | The S3 key/secret is delivered as a single INI-style `cloud` key in the `cloud-credentials` Secret — Velero's convention. ESO materialises this from Vault. |
+
+The operator translates this DPA into:
+
+- A Velero `Deployment` with `--features=EnableCSI` and the three plugins as initContainer images.
+- A `node-agent` DaemonSet running Kopia on every worker.
+- A `BackupStorageLocation` named `<dpa-name>-1` (here, `spoke-dc-v6-1`) marked default.
+- A matching `VolumeSnapshotLocation`.
+
+You do not file the BSL/VSL manifests by hand. The operator owns them and will revert manual edits.
+
+## Where the S3 credentials come from
+
+OADP itself does not know how to read from Vault; it just expects a Secret named `cloud-credentials` in `openshift-adp` with a key named `cloud` containing:
+
+```ini
+[default]
+aws_access_key_id=<minio-user>
+aws_secret_access_key=<minio-key>
+```
+
+That Secret is delivered by an `ExternalSecret`:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: cloud-credentials
+  namespace: openshift-adp
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: cloud-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: cloud
+      remoteRef:
+        key: ocp/spoke-dc-v6/oadp/cloud-credentials
+        property: cloud
+```
+
+The `cloud` property in Vault holds the full INI blob — that way Velero loads it verbatim and we don't have to template `[default]` headers in Kubernetes. The Vault path follows the `secret/ocp/<cluster>/<component>/<artifact>` convention defined in the platform Vault layout.
+
+> Internal-only specifics — including the MinIO endpoint address and the Vault root token custody — are kept in `codex-opp-agent/connection-details/`.
+
+## Validation
+
+Once Argo has synced the operator + DPA, the following must all be true:
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Operator is healthy
+oc --kubeconfig "$K" -n openshift-adp get sub,csv
+
+# DPA reconciled and BSL/VSL projected
+oc --kubeconfig "$K" -n openshift-adp get dpa,bsl,vsl
+
+# Velero + node-agent running on every worker
+oc --kubeconfig "$K" -n openshift-adp get deploy/velero
+oc --kubeconfig "$K" -n openshift-adp get ds/node-agent
+
+# Default BSL is Available
+oc --kubeconfig "$K" -n openshift-adp get bsl <dpa-name>-1 \
+  -o jsonpath='{.status.phase}{"\n"}'
+```
+
+Expected:
+
+- `subscription` `state=AtLatestKnown`, `installedCSV=oadp-operator.v1.5.5`.
+- `csv` `phase=Succeeded`.
+- `dpa` `Status.Conditions[type=Reconciled].status=True`.
+- `bsl` `phase=Available`.
+- `deployment/velero` `1/1 ready`; `ds/node-agent` `Desired=Current=Ready=<worker-count>`.
+
+## Failure modes seen in this lab
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| BSL stays `Unavailable`, Velero log says `403 Forbidden`. | `cloud-credentials` not delivered, or Vault path empty. | `oc -n openshift-adp get secret cloud-credentials` — empty data means ESO has not reconciled. Check the SecretStore status; populate the Vault path if missing. | Wire ESO before the DPA Argo sync-wave fires; require the Vault path to exist as part of the install checklist. |
+| Backup finishes Items=N then fails with `rpc error ... EOF` in finalization. | MinIO is under concurrent multipart upload pressure (validated 2026-05-05 across all four clusters concurrently). | Serialise schedules; stagger by 15–30 min between clusters; add MinIO scale-out before high-volume backups. | Treat the lab single-node MinIO as the throughput bottleneck; do not run concurrent fleet-wide backups against it. |
+| `node-agent` DaemonSet has fewer pods than workers. | A worker has a taint the DaemonSet doesn't tolerate, or the node selector misses it. | Add a matching toleration to `spec.configuration.nodeAgent.podConfig.tolerations`, or adjust the nodeSelector. | Always pin nodeSelector to a stable role label (`node-role.kubernetes.io/worker: ""`) rather than a custom label. |
+| Backup CR stuck in `InProgress` for hours. | Velero is waiting on CSI snapshot completion that never returns. | Inspect `volumesnapshot` and `volumesnapshotcontent` in the source namespace; CSI driver pods or the snapshot controller may have died. | Don't run cluster-wide backups while CSI driver upgrades are in flight; gate Schedule resumption on snapshot-controller readiness. |
+| Operator stuck after `Subscription` created. | OLM cannot pull the bundle through the disconnected mirror. | Increase `operatorframework.io/bundle-unpack-timeout` and verify the mirror catalog has the OADP bundle. | Pre-warm the operator mirror before applying the Subscription. |
+
+## What's next in this section
+
+- §13.2 `dataprotectionapplication-via-eso.mdx` — the ESO-and-Vault wiring in more detail, plus why `cloud-credentials` is split into one Secret with an INI body rather than two scalars.
+- §13.3 `minio-bucket-and-iam.mdx` — what the MinIO side looks like (bucket, user, policy, lifecycle).
+- §13.4 `csi-snapshots.mdx` — VolumeSnapshotClass, CSI driver wiring, and the difference between snapshot-only and snapshot+filesystem backups.
+- §13.5 `backup-restore-drill.mdx` — the recurring drill that proves a backup is restorable.
+- §13.6 `acm-cluster-backup.mdx` — the hub-side ACM cluster-backup flavour and how it differs from app-namespace backup.
+
+## References
+
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — cluster baseline.
+- `codex-opp-agent/connection-details/minio.md` — bucket layout and credential custody (local-only details redacted).
+- `codex-opp-agent/reports/sessions/20260505-183038-oadp-finalization-validation.md` — concurrent-backup MinIO failure pattern.
+- `platform-gitops/clusters/spoke-dc-v6/operators/oadp/` — operator install overlay.
+- `platform-gitops/clusters/spoke-dc-v6/backup/dataprotectionapplication.yaml`.
+- `platform-gitops/clusters/spoke-dc-v6/backup/externalsecret-cloud-credentials.yaml`.
+- ADR 0015 — federated GitOps repo architecture.

@@ -1,8 +1,199 @@
 ---
-title: "DataProtectionApplication via ESO"
-description: "Section 03-openshift-platform/13-backup-oadp: DataProtectionApplication via ESO (placeholder)."
-sidebar_label: "DataProtectionApplication via ESO"
+title: "DataProtectionApplication credentials via ESO"
+description: "How the OADP cloud-credentials Secret is delivered from Vault to openshift-adp via External Secrets Operator, including the INI-body trick that keeps the Secret Velero-compatible without templating."
+sidebar_label: "DPA credentials via ESO"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const esoNodes = [
+  { id: "vault",    position: { x: 0,   y: 0   }, data: { label: "Vault VM\n(KV v2 mount)" }, style: extBox },
+  { id: "css",      position: { x: 260, y: 0   }, data: { label: "ClusterSecretStore\nvault-platform" }, style: crBox },
+  { id: "es",       position: { x: 520, y: 0   }, data: { label: "ExternalSecret\ncloud-credentials" }, style: crBox },
+  { id: "secret",   position: { x: 780, y: 0   }, data: { label: "Secret\ncloud-credentials" }, style: dataBox },
+  { id: "eso",      position: { x: 260, y: 160 }, data: { label: "ESO operator" }, style: ctrlBox },
+  { id: "velero",   position: { x: 780, y: 160 }, data: { label: "Velero Deployment" }, style: ctrlBox },
+  { id: "bsl",      position: { x: 520, y: 280 }, data: { label: "BackupStorageLocation\nspoke-dc-v6-1" }, style: crBox },
+  { id: "minio",    position: { x: 780, y: 280 }, data: { label: "MinIO\noadp-backups bucket" }, style: extBox },
+];
+
+export const esoEdges = [
+  { id: "e1", source: "eso",    target: "css",    label: "reads spec", ...muted },
+  { id: "e2", source: "eso",    target: "es",     label: "reconciles", ...reqEdge },
+  { id: "e3", source: "es",     target: "css",    label: "references", ...muted },
+  { id: "e4", source: "css",    target: "vault",  label: "KV v2 GET", ...pullEdge },
+  { id: "e5", source: "es",     target: "secret", label: "creates / owns", ...reqEdge },
+  { id: "v1", source: "velero", target: "secret", label: "mounts", ...reqEdge },
+  { id: "v2", source: "velero", target: "bsl",    label: "reads creds for", ...muted },
+  { id: "v3", source: "bsl",    target: "minio",  label: "S3 PUT / GET", ...pullEdge },
+];
+
+OADP needs exactly one thing from a credential store: an S3 access key and secret key for the MinIO bucket. This page explains how that single requirement is delivered safely, with no secret values ever landing in Git, using External Secrets Operator (ESO) reading from the lab Vault VM.
+
+It is for platform admins doing the OADP install, and anyone debugging why Velero says `403 Forbidden` against the BSL.
+
+## What Velero actually expects
+
+Velero loads cloud credentials from a Secret named in `DataProtectionApplication.spec.backupLocations[].velero.credential`. The Secret must contain a single key whose value is a self-contained AWS credentials INI body:
+
+```ini
+[default]
+aws_access_key_id=<minio-user>
+aws_secret_access_key=<minio-key>
+```
+
+The Secret name and the key name are both convention-bound to the DPA spec. The OADP defaults are `name: cloud-credentials`, `key: cloud`. Velero reads the Secret, writes the file at `/credentials/cloud` inside its container, and points the AWS SDK at it via `AWS_SHARED_CREDENTIALS_FILE`.
+
+This is not a Kubernetes-native Secret shape (separate `access-key` / `secret-key` keys). It is an INI blob, and it must round-trip exactly. That fact drives the ESO design below.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: esoNodes, edges: esoEdges }} height={420} />
+
+Three things to read from the diagram:
+
+- **ClusterSecretStore `vault-platform`** is the cluster-scoped store wired to the lab Vault. It carries the AppRole credentials used by ESO to authenticate to Vault, and the path-mount mapping.
+- **ExternalSecret `cloud-credentials`** in `openshift-adp` pulls one property from one Vault path and materialises one Secret with one key.
+- **Velero** mounts the resulting Secret as a file. It never talks to Vault directly; ESO is the only thing that does.
+
+The dashed green arrows are the credential-flow path: Vault to ESO to Secret to Velero to MinIO.
+
+## The ExternalSecret manifest
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: cloud-credentials
+  namespace: openshift-adp
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: cloud-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: cloud
+      remoteRef:
+        key: ocp/spoke-dc-v6/oadp/cloud-credentials
+        property: cloud
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `refreshInterval: 1h` | Rotates the Secret hourly. Velero re-reads on each Backup, so rotations propagate within one cycle. |
+| `secretStoreRef.kind: ClusterSecretStore` | Cluster-scoped store — the same one shared across platform components on this cluster. |
+| `secretStoreRef.name: vault-platform` | The platform CSS, distinct from `vault-apps-<division>` which is for tenant secrets. |
+| `target.name: cloud-credentials` | The Secret name Velero expects (DPA's `credential.name`). |
+| `target.creationPolicy: Owner` | ESO owns the Secret; if you `oc delete secret cloud-credentials`, ESO recreates it within seconds. |
+| `data[].secretKey: cloud` | The key Velero expects (DPA's `credential.key`). |
+| `data[].remoteRef.key: ocp/spoke-dc-v6/oadp/cloud-credentials` | The Vault KV v2 path. |
+| `data[].remoteRef.property: cloud` | The property name *inside* the Vault entry. |
+
+`sync-wave: 15` puts this between the operator install (`10`) and the DataProtectionApplication (`20`) so the Secret exists by the time the DPA is reconciled.
+
+## The Vault side — one path, one property, one INI blob
+
+The Vault entry at `secret/ocp/spoke-dc-v6/oadp/cloud-credentials` has a single property named `cloud`. The value is the full INI body, newlines and all:
+
+```bash
+# Run on a workstation with vault CLI + VAULT_TOKEN exported.
+vault kv put secret/ocp/spoke-dc-v6/oadp/cloud-credentials \
+  cloud=$'[default]\naws_access_key_id=<minio-user>\naws_secret_access_key=<minio-key>\n'
+```
+
+The shell `$'...'` quoting form interprets `\n` as real newlines; the resulting Vault property is a multi-line string. When ESO reads it, the Secret data is base64-encoded automatically by the API and decoded by Velero at mount time, so the INI body arrives intact at `/credentials/cloud`.
+
+Why this shape instead of two scalars?
+
+- Velero does not template anything. It expects a literal AWS credentials file.
+- Splitting into `aws_access_key_id` + `aws_secret_access_key` properties would require an ESO `template:` block to reassemble the INI body. That works but adds a moving piece.
+- Keeping the INI body in Vault means we manage rotation by editing one property, not three, and there is one less place where the file shape can drift.
+
+## Validating end-to-end
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# ESO sees the ClusterSecretStore as Ready
+oc --kubeconfig "$K" get clustersecretstore vault-platform \
+  -o jsonpath='{.status.conditions}{"\n"}'
+
+# ExternalSecret reconciled
+oc --kubeconfig "$K" -n openshift-adp get externalsecret cloud-credentials \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+# Secret exists with a non-empty cloud key
+oc --kubeconfig "$K" -n openshift-adp get secret cloud-credentials \
+  -o jsonpath='{.data.cloud}' | base64 -d | head -2
+
+# BSL turns Available once Velero validates the creds against MinIO
+oc --kubeconfig "$K" -n openshift-adp get bsl spoke-dc-v6-1 \
+  -o jsonpath='{.status.phase}{"\n"}'
+```
+
+Expected:
+
+- ClusterSecretStore condition `type=Ready, status=True`.
+- ExternalSecret condition `type=Ready, status=True`.
+- The decoded Secret value starts with `[default]`.
+- BSL `Available` within ~30 seconds of the Secret existing.
+
+If the BSL is `Unavailable`, the Velero pod log explains why. `403 Forbidden` means the credentials decoded fine but the MinIO user does not have `s3:PutObject` on the bucket. `connection refused` means the BSL endpoint is unreachable from the cluster network — almost always a NetworkPolicy or routing issue.
+
+## NetworkPolicy considerations
+
+`openshift-adp` is *not* under the default-deny-egress baseline that ships in some other namespaces, but it does need explicit egress to:
+
+| Destination | Port | Used by |
+| --- | --- | --- |
+| Vault VM | 8200 | ESO controller (for `cloud-credentials` reconcile) |
+| MinIO VM | 9000 | Velero (for BSL upload), node-agent (for Kopia repo) |
+| In-cluster Kubernetes API | 6443 | Velero + node-agent for CR watches and snapshot operations |
+
+If you ever add a default-deny NetworkPolicy to `openshift-adp`, the ESO + MinIO egress allow rules above must be added in lockstep, or backup will silently stop.
+
+> Internal-only specifics — exact Vault and MinIO IP addresses — are kept in `codex-opp-agent/connection-details/`.
+
+## Why we did not put this Secret in the manifest
+
+A common shortcut on disconnected installs is to commit the Secret directly into GitOps, ostensibly because the repo is private. We do not do that here, for three independent reasons:
+
+1. **Rotation cost.** Rotating the MinIO credential would require a Git commit, a CI run, an Argo sync, and a sync-wave dance. With ESO it is one Vault write and a 1-hour ESO refresh.
+2. **Audit surface.** A Git commit is forever. A Vault rotation is one event in Vault's audit log. The audit story for the latter is materially cleaner.
+3. **Blast radius.** A leaked Git history credential is exfiltrated. A leaked Vault token is revocable.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `Secret cloud-credentials not found`. | ExternalSecret has not reconciled yet, or the path / property name in Vault disagrees with the ES manifest. | Check `oc -n openshift-adp describe externalsecret cloud-credentials`; the events list the exact Vault error. | Pre-populate the Vault path before applying the ExternalSecret; treat the path as part of the cluster bring-up checklist. |
+| BSL `403 Forbidden` despite Secret present. | Credentials decoded fine but the MinIO user has no policy on the bucket. | Apply the MinIO policy from §13.3; verify with `mc admin policy list --user <user>`. | Tie the bucket creation and the IAM policy attachment in the same MinIO bootstrap script. |
+| BSL `connection refused`. | NetworkPolicy in `openshift-adp` blocks egress to the MinIO port; or a cluster firewall rule blocks the lab `/24`. | Test from inside the cluster: `oc -n openshift-adp run curl --rm -it --image curlimages/curl -- curl -v http://<minio>:9000/minio/health/live`. | When introducing default-deny in `openshift-adp`, add the egress allow rules in the same commit. |
+| ESO loops `permission denied` reading the Vault path. | The AppRole policy attached to ESO does not grant read on `secret/data/ocp/spoke-dc-v6/oadp/*`. | Update the Vault policy; the AppRole token re-auths on next refresh. | Have a fleet-wide ESO Vault policy that covers all `secret/data/ocp/<cluster>/*` paths uniformly. |
+| Secret exists with the right INI content but Velero still fails. | Velero pod was started before the Secret existed and cached an empty mount. | Restart the Velero Deployment; the mount picks up the new content. | OADP operator typically restarts Velero on DPA spec changes; if you edited the Secret by hand, kick the Deployment. |
+
+## References
+
+- ADR 0006 / 0008 — Vault + ESO platform integration.
+- `codex-opp-agent/connection-details/vault-app-secrets.md` — Vault path tree convention.
+- `platform-gitops/clusters/spoke-dc-v6/backup/externalsecret-cloud-credentials.yaml` — the live manifest.
+- `platform-gitops/clusters/spoke-dc-v6/backup/dataprotectionapplication.yaml` — DPA referencing the Secret.
+- ESO upstream docs: `refreshInterval` semantics and `creationPolicy: Owner`.

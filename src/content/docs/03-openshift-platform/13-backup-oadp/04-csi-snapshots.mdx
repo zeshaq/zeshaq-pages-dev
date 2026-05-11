@@ -1,8 +1,237 @@
 ---
-title: "CSI Snapshots"
-description: "Section 03-openshift-platform/13-backup-oadp: CSI Snapshots (placeholder)."
-sidebar_label: "CSI Snapshots"
+title: "CSI snapshots, VolumeSnapshotClasses, and Kopia filesystem backup"
+description: "The two volume-data paths OADP supports — CSI snapshots and Kopia node-agent filesystem backup — when to use which, and the VolumeSnapshotClass wiring on lvms-vg1, CephFS, and Ceph RBD."
+sidebar_label: "CSI snapshots + Kopia"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+import Mermaid from "../../../../components/Mermaid";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const snapNodes = [
+  { id: "backup",   position: { x: 320, y: 0   }, data: { label: "Backup CR\n(velero.io/v1)" }, style: crBox },
+  { id: "velero",   position: { x: 320, y: 130 }, data: { label: "Velero controller" }, style: ctrlBox },
+  { id: "csiplug",  position: { x: 60,  y: 260 }, data: { label: "csi plugin\n(in Velero pod)" }, style: ctrlBox },
+  { id: "node",     position: { x: 600, y: 260 }, data: { label: "node-agent DS\n(Kopia)" }, style: agentBox },
+  { id: "vsclass",  position: { x: 60,  y: 400 }, data: { label: "VolumeSnapshotClass\n(per CSI driver)" }, style: crBox },
+  { id: "vs",       position: { x: 260, y: 400 }, data: { label: "VolumeSnapshot\nin app ns" }, style: crBox },
+  { id: "csidriver",position: { x: 60,  y: 540 }, data: { label: "CSI driver pods\n(lvms, ceph, ...)" }, style: dataBox },
+  { id: "blockdev", position: { x: 260, y: 540 }, data: { label: "Underlying storage\n(LVM/Ceph)" }, style: dataBox },
+  { id: "pvc",      position: { x: 600, y: 400 }, data: { label: "PVC in app ns" }, style: crBox },
+  { id: "kopiarepo",position: { x: 600, y: 540 }, data: { label: "Kopia repo\non MinIO" }, style: extBox },
+  { id: "minio",    position: { x: 320, y: 670 }, data: { label: "MinIO\noadp-backups" }, style: extBox },
+];
+
+export const snapEdges = [
+  { id: "b1", source: "backup",   target: "velero",   ...reqEdge },
+  { id: "v1", source: "velero",   target: "csiplug",  label: "delegates", ...muted },
+  { id: "v2", source: "velero",   target: "node",     label: "PodVolumeBackup", ...muted },
+  { id: "c1", source: "csiplug",  target: "vs",       label: "creates", ...reqEdge },
+  { id: "c2", source: "vs",       target: "vsclass",  label: "selects driver via", ...muted },
+  { id: "c3", source: "vsclass",  target: "csidriver", label: "calls", ...reqEdge },
+  { id: "c4", source: "csidriver",target: "blockdev", label: "block-level\nsnapshot", ...reqEdge },
+  { id: "n1", source: "node",     target: "pvc",      label: "reads files from mount", ...reqEdge },
+  { id: "n2", source: "node",     target: "kopiarepo",label: "writes chunks", ...pullEdge },
+  { id: "k1", source: "kopiarepo",target: "minio",    label: "S3 PUT", ...pullEdge },
+  { id: "m1", source: "velero",   target: "minio",    label: "metadata tarball", ...pullEdge },
+];
+
+OADP has two completely separate paths for protecting volume data, and a single `Backup` can use either or both. This page is the orientation for which path you pick and why, the VolumeSnapshotClass wiring per CSI driver in the lab, and the moving parts to verify.
+
+## CSI snapshots vs. Kopia filesystem backup
+
+| Property | CSI snapshot path | Kopia (node-agent) path |
+| --- | --- | --- |
+| Source of truth | CSI driver's volume snapshot API | File-level read of the mounted volume |
+| Granularity | Block-level (entire volume) | File-level (only paths that exist) |
+| Storage of the data | Stays in the CSI provisioner (LVMS, Ceph, ODF) | Pushed to the MinIO bucket as a Kopia repo |
+| Restore speed | Fast (clone snapshot) | Slow (re-write files) |
+| Cross-cluster restore | Hard (snapshot is provider-local) | Easy (Kopia repo is portable across clusters) |
+| Backup cost | Cheap initially, accrues with snapshot retention | Higher per backup, scales with file churn |
+| Requirements | CSI driver supports snapshots; matching VolumeSnapshotClass | node-agent DaemonSet healthy on every node |
+
+Rule of thumb in this lab:
+
+- **App PVCs with a few large files (databases, object stores).** CSI snapshot. Kopia file-level pacing would be slow and would not give consistency.
+- **App PVCs with many small files (logs, code, build outputs).** Kopia. Filesystem dedup wins and the data ends up in the same MinIO bucket as the backup metadata.
+- **Cross-cluster DR.** Kopia, every time. CSI snapshots are not transportable; you cannot restore a Ceph snapshot onto an LVMS cluster.
+
+OADP is configured to do both: every Backup that hits a snapshottable PVC gets a CSI snapshot, *and* the node-agent runs filesystem backup for any volume that is referenced through `defaultVolumesToFsBackup` or marked individually.
+
+## End-to-end flow
+
+<Whiteboard client:load data={{ nodes: snapNodes, edges: snapEdges }} height={720} />
+
+Reading the diagram:
+
+- The user (or a Schedule) files a `Backup` CR.
+- The Velero controller fan-outs: the `csi` plugin (an init/controller image inside the Velero pod) creates a `VolumeSnapshot` in the application namespace; the node-agent DaemonSet handles file-level backup for PVCs flagged for FS backup.
+- The `VolumeSnapshot` selects a `VolumeSnapshotClass` (per CSI driver) which in turn drives the CSI driver to take a block-level snapshot of the underlying volume.
+- Velero writes the backup *metadata* tarball (the CR snapshots, the cluster-scoped resources, the pointers to the snapshots) to MinIO.
+- The node-agent's Kopia repository lives inside the same MinIO bucket but under a different key prefix.
+
+The CSI snapshots themselves do not get uploaded to MinIO. They stay in the storage backend. Only their *handles* are written into the Backup metadata.
+
+## VolumeSnapshotClasses in the lab
+
+Two clusters in the fleet have multiple CSI drivers; each driver needs its own VolumeSnapshotClass:
+
+| Cluster | CSI drivers present | VolumeSnapshotClasses |
+| --- | --- | --- |
+| `hub-dc-v6` | LVMS | `lvms-vg1` |
+| `spoke-dc-v6` | LVMS, ODF Ceph RBD, ODF CephFS | `lvms-vg1`, `ocs-storagecluster-rbdplugin-snapclass`, `ocs-storagecluster-cephfsplugin-snapclass` |
+| `hub-dr-v6` | LVMS | `lvms-vg1` |
+| `spoke-dr-v6` | LVMS, ODF Ceph RBD, ODF CephFS | three (same as spoke-dc-v6) |
+
+`hub-dc-v6` and `hub-dr-v6` are "storage-light" hubs that intentionally do not run ODF. They use LVMS for the small local-disk needs of ACM, RHACM observability, and other hub services. CSI snapshots are still available on LVMS.
+
+A typical VolumeSnapshotClass for LVMS:
+
+```yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: lvms-vg1
+  labels:
+    velero.io/csi-volumesnapshot-class: "true"   # OADP marker label
+driverName: topolvm.io
+deletionPolicy: Retain                            # see note below
+```
+
+For ODF Ceph RBD, the equivalent uses `driverName: openshift-storage.rbd.csi.ceph.com` and is shipped by the ODF operator. For CephFS, `openshift-storage.cephfs.csi.ceph.com`.
+
+`deletionPolicy: Retain` is set because:
+
+- Velero deletes the `VolumeSnapshot` CR when a Backup expires, but the CSI driver should keep the underlying snapshot if it is still pointed at by a Backup metadata record on MinIO.
+- Velero handles the actual snapshot lifecycle through the metadata tarball; `Retain` removes the race where deleting the CR would orphan the metadata.
+
+The `velero.io/csi-volumesnapshot-class: "true"` label is the OADP marker. Without it, the `csi` plugin will not pick up that VolumeSnapshotClass when looking for a class to use during a Backup.
+
+## Per-PVC vs. default-all-volumes
+
+A Backup CR's volume policy is set by these spec fields:
+
+| Field | Effect |
+| --- | --- |
+| `snapshotVolumes: true` | Enable CSI snapshots. Default true if you have the csi plugin loaded. |
+| `defaultVolumesToFsBackup: true` | Every PVC included in this Backup also gets a Kopia file-level backup, *unless* annotated to opt out. |
+| `defaultVolumesToFsBackup: false` | Only PVCs with the opt-in annotation get a Kopia backup. |
+
+Opt-in / opt-out annotations on the **pod** (not the PVC):
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    backup.velero.io/backup-volumes: "data,logs"     # opt-in list
+    # OR:
+    backup.velero.io/backup-volumes-excludes: "cache"
+```
+
+In this lab the convention is:
+
+- Platform Backups (run by the Schedule on `openshift-adp` SA): `snapshotVolumes: true`, `defaultVolumesToFsBackup: false`. CSI-snapshot-only for the big, churning volumes; tenants opt into Kopia on the pods that need it.
+- ACM cluster-backup on the hub: `snapshotVolumes: true`, `defaultVolumesToFsBackup: false`. Same shape.
+- One-shot tenant Backups: tenant chooses, but default templates set Kopia for `data` volumes.
+
+## Pre-backup hooks for application consistency
+
+CSI snapshots are *crash-consistent*, not *application-consistent*. For most stateless apps that is fine. For databases, you want a pre-backup hook that quiesces writes:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-database
+  annotations:
+    pre.hook.backup.velero.io/container: "db"
+    pre.hook.backup.velero.io/command: '["/bin/sh","-c","mysqldump --single-transaction --quick > /backup/dump.sql"]'
+    post.hook.backup.velero.io/container: "db"
+    post.hook.backup.velero.io/command: '["/bin/sh","-c","rm /backup/dump.sql"]'
+```
+
+For CloudNativePG, the operator manages its own backup hooks and the lab convention is to let CNPG handle its own backup (see §14.13 `cnpg-postgres-operator`). Do not double-back-up a CNPG cluster with OADP file-level backup; you get a half-state.
+
+## Lifecycle of a CSI snapshot
+
+The order of operations a Backup goes through when it touches a snapshottable PVC:
+
+<Mermaid client:load chart={`sequenceDiagram
+  participant U as User
+  participant V as Velero
+  participant CSI as csi plugin
+  participant K as K8s API
+  participant D as CSI driver
+
+  U->>V: kubectl apply Backup CR
+  V->>K: list PVCs in selected namespaces
+  V->>CSI: snapshot each PVC
+  CSI->>K: create VolumeSnapshot in app ns
+  K->>D: drive snapshot (per VolumeSnapshotClass)
+  D-->>K: VolumeSnapshotContent ready
+  K-->>CSI: snapshot handle available
+  CSI->>V: store handle in backup metadata
+  V->>V: write backup tarball to BSL (MinIO)
+  V->>K: Backup.status.phase = Completed
+`} />
+
+If the snapshot driver is slow (or stuck), Velero will wait up to `DataProtectionApplication.spec.configuration.velero.defaultItemOperationTimeout` (4h in this lab) before failing the Backup. That is intentionally long because real-world ODF Ceph RBD snapshots of a multi-TiB volume can take 10+ minutes.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# What VolumeSnapshotClasses exist and which are marked for OADP?
+oc --kubeconfig "$K" get volumesnapshotclass -o yaml | \
+  yq '.items[] | {name: .metadata.name, driver: .driverName, deletionPolicy: .deletionPolicy, oadp: .metadata.labels["velero.io/csi-volumesnapshot-class"]}'
+
+# Current VolumeSnapshots and their state
+oc --kubeconfig "$K" get volumesnapshot -A
+
+# Current VolumeSnapshotContents
+oc --kubeconfig "$K" get volumesnapshotcontent
+
+# Was a snapshot taken as part of a specific backup?
+oc --kubeconfig "$K" -n openshift-adp get backup my-backup-name \
+  -o json | jq '.status.csiVolumeSnapshotsAttempted, .status.csiVolumeSnapshotsCompleted'
+
+# Node-agent DaemonSet health
+oc --kubeconfig "$K" -n openshift-adp get ds node-agent
+```
+
+Expected:
+
+- For every CSI driver on the cluster, exactly one VolumeSnapshotClass labelled `velero.io/csi-volumesnapshot-class: "true"`.
+- During a Backup that hits PVCs, `volumesnapshot` and `volumesnapshotcontent` rows transition through `Pending → Ready` quickly.
+- `Backup.status.csiVolumeSnapshotsCompleted` equals `csiVolumeSnapshotsAttempted` at the end of a successful run.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Backup `Partially Failed`, `0 / N csi snapshots completed`. | Multiple VolumeSnapshotClasses for the same driver and none labelled. | Add the `velero.io/csi-volumesnapshot-class: "true"` label to exactly one class per driver. | Make the label part of the ODF / LVMS overlay; CI lint catches duplicates. |
+| `VolumeSnapshotContent` stuck `Pending`. | CSI driver pods restarting; or the storage backend is out of snapshot quota. | Inspect the driver pod logs in `openshift-storage` (ODF) or `openshift-storage-lvms` (LVMS). | Schedule backups outside CSI driver upgrade windows. |
+| Kopia uploads fail with `connection refused`. | Node-agent cannot reach MinIO from the worker. Same NetworkPolicy / routing issue as §13.2. | Add the egress allow rule for the worker subnet to the MinIO port. | Same prevention: NetworkPolicy and lab firewall changes go through one MR. |
+| Restore brings the PVC back empty. | The Backup was configured with `snapshotVolumes: false` and `defaultVolumesToFsBackup: false`. | File a new Backup with one of the two enabled. | Default Schedule template has `snapshotVolumes: true`; never use `false`. |
+| `cohort hash mismatch` from Kopia. | Two clusters wrote to the same Kopia prefix (mis-prefixed `objectStorage`). | Wipe the offending Kopia repo prefix; recreate; do *not* share Kopia prefixes across clusters. | Strict prefix-per-cluster discipline at DPA time (already enforced by §13.3 IAM policy). |
+| Snapshot CR exists but Backup metadata does not point to it. | OADP CSI plugin disabled (`defaultPlugins` missing `csi` or `EnableCSI` flag missing). | Edit the DPA `spec.configuration.velero.defaultPlugins` and `featureFlags`. | Lint the DPA in CI; assert `csi` plugin and `EnableCSI` flag together. |
+
+## References
+
+- `codex-opp-agent/reports/sessions/20260505-183038-oadp-finalization-validation.md` — recent CSI snapshot fleet status.
+- `platform-gitops/clusters/spoke-dc-v6/backup/dataprotectionapplication.yaml`.
+- OADP docs: `velero.io/csi-volumesnapshot-class` label semantics.
+- ODF documentation: `ocs-storagecluster-*-snapclass` defaults.
