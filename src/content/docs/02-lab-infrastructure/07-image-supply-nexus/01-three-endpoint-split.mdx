@@ -1,8 +1,209 @@
 ---
 title: "The Three-Endpoint Split"
-description: "Section 02-lab-infrastructure/07-image-supply-nexus: The Three-Endpoint Split (placeholder)."
-sidebar_label: "The Three-Endpoint Split"
+description: "How the lab Nexus VM exposes three independent Docker endpoints — mirror-registry, docker-group, app-registry — and why each one is dedicated to a single audience and lifecycle."
+sidebar_label: "Three-Endpoint Split"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const installBox = { background: "#fee2e2", border: "1px solid #b91c1c", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  { id: "haproxy",  position: { x: 320, y: 0   }, data: { label: "HAProxy edge VM\n*.apps.sub.comptech-lab.com\n(LE wildcard, TLS 443)" }, style: ctrlBox },
+  { id: "mirror",   position: { x: 0,   y: 140 }, data: { label: "mirror-registry.apps.\nsub.comptech-lab.com\n(install only)" }, style: installBox },
+  { id: "group",    position: { x: 260, y: 140 }, data: { label: "docker-group.apps.\nsub.comptech-lab.com\n(developer pulls)" }, style: dataBox },
+  { id: "appreg",   position: { x: 520, y: 140 }, data: { label: "app-registry.apps.\nsub.comptech-lab.com\n(CI push, runtime pull)" }, style: dataBox },
+  { id: "nexus",    position: { x: 260, y: 290 }, data: { label: "nexus-mirror VM\nSonatype Nexus 3 OSS" }, style: ctrlBox },
+  { id: "ocpmir",   position: { x: 0,   y: 430 }, data: { label: "hosted repo: ocp-mirror\n(port 5000)" }, style: dataBox },
+  { id: "grouprepo",position: { x: 260, y: 430 }, data: { label: "group repo: docker-group\n(port 5001)\nmembers: dev-hosted +\nicr/redhat/dockerhub proxies" }, style: dataBox },
+  { id: "devhosted",position: { x: 520, y: 430 }, data: { label: "hosted repo: docker-dev-hosted\n(port 5002)" }, style: dataBox },
+  { id: "ocp",      position: { x: 0,   y: 600 }, data: { label: "OpenShift install\n(oc mirror --v2, IDMS/ITMS)" }, style: installBox },
+  { id: "jenkins",  position: { x: 260, y: 600 }, data: { label: "Jenkins + build agents\n(base-image pulls)" }, style: agentBox },
+  { id: "runtime",  position: { x: 520, y: 600 }, data: { label: "docker-runtime VM +\nOpenShift workloads\n(runtime pulls / pushes)" }, style: agentBox },
+];
+
+export const edges = [
+  { id: "h-m", source: "haproxy", target: "mirror", ...muted },
+  { id: "h-g", source: "haproxy", target: "group",  ...muted },
+  { id: "h-a", source: "haproxy", target: "appreg", ...muted },
+  { id: "m-n", source: "mirror",  target: "nexus",  label: "5000 → ocp-mirror",   ...reqEdge },
+  { id: "g-n", source: "group",   target: "nexus",  label: "5001 → docker-group", ...reqEdge },
+  { id: "a-n", source: "appreg",  target: "nexus",  label: "5002 → dev-hosted",   ...reqEdge },
+  { id: "n-o", source: "nexus",   target: "ocpmir",   ...muted },
+  { id: "n-g", source: "nexus",   target: "grouprepo",...muted },
+  { id: "n-d", source: "nexus",   target: "devhosted",...muted },
+  { id: "ocp-m", source: "ocp",   target: "ocpmir",   label: "pull (digest)", ...pullEdge },
+  { id: "jen-g", source: "jenkins", target: "grouprepo", label: "pull base images", ...pullEdge },
+  { id: "jen-d", source: "jenkins", target: "devhosted", label: "push :build-N", ...pullEdge },
+  { id: "rt-d",  source: "runtime", target: "devhosted", label: "pull (digest/tag)", ...pullEdge },
+];
+
+This page explains the **defining architecture** of the lab image supply chain: a single Nexus VM that exposes three independent, hostname-distinct Docker Registry v2 endpoints — one for the OpenShift platform install path, one for developer base-image pulls, and one for CI-produced application images. The split is not cosmetic. It exists because three different lifecycles, three different audiences, and three different access-control surfaces collide in this single backing store and must be kept un-tangled.
+
+If you remember nothing else: **never reuse `mirror-registry.*` for application work, never push to `docker-group.*`, never pull runtime app images from `docker-group.*`.** The rest of the page is the why and the how.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={760} />
+
+Reading the diagram top-down:
+
+1. **HAProxy edge VM** terminates TLS for `*.apps.sub.comptech-lab.com` using the existing Let's Encrypt wildcard certificate. Three SNI-distinct frontend hostnames decrypt at HAProxy and forward over the private lab `/24` to the Nexus VM on three different ports.
+2. **Three public Docker Registry hostnames** sit at the top of HAProxy's `*.apps` plane:
+   - `mirror-registry.apps.sub.comptech-lab.com` — install-only, OpenShift platform mirror.
+   - `docker-group.apps.sub.comptech-lab.com` — developer and build-tool pull path.
+   - `app-registry.apps.sub.comptech-lab.com` — CI push target, runtime pull source for application images.
+3. **One Nexus VM** behind them (`nexus-mirror`, Sonatype Nexus 3 OSS) exposes three different Docker connectors on three different ports — `5000`, `5001`, `5002` — each bound to a distinct Nexus repository.
+4. **Three Nexus repositories** back the three connectors:
+   - `ocp-mirror` (hosted) — OpenShift release images, operator catalogs, operands, mirrored base images pushed by `oc mirror --v2`.
+   - `docker-group` (group) — a Nexus Docker group that aggregates `docker-dev-hosted` plus three proxy repositories (`icr-proxy`, `redhat-proxy`, `dockerhub-proxy`).
+   - `docker-dev-hosted` (hosted) — the CI push target for Open Liberty / Open JDK / generic application images built by Jenkins.
+5. **Three audiences** at the bottom — OpenShift installer, Jenkins build agents, runtime hosts — talk to exactly one of the three endpoints each. Nothing crosses lanes.
+
+## Why three, not one
+
+A single Docker endpoint would technically work. Nexus supports multiple repositories behind one connector via group repositories. The split is deliberate because the three lifecycles do not share governance:
+
+| Concern | `mirror-registry.*` | `docker-group.*` | `app-registry.*` |
+| --- | --- | --- | --- |
+| **Who pushes** | `oc mirror --v2` and only `oc mirror --v2` | Nobody pushes directly; group is read-only from a client perspective. Proxy repos populate themselves. | `jenkinsbot` and approved CI identities |
+| **Who pulls** | OpenShift CRI-O on cluster nodes (installer-time and operator-runtime) | Jenkins build agents, developer workstations, podman-on-laptop, IDE-driven base-image pulls | Runtime workloads on OpenShift, `docker-runtime-vm`, Argo-deployed pods, smoke tests |
+| **Change window** | Tied to OpenShift release/operator catalog mirroring — large, planned, infrequent | Effectively continuous (proxies hydrate themselves on first miss) | Per-commit; every Jenkins build pushes one immutable tag |
+| **Acceptable downtime** | Hours during install windows; zero during steady-state cluster operation (kubelets pin by digest) | Minutes if Jenkins is paused; can rebuild proxy caches | Zero — runtime workloads depend on it |
+| **Authentication model** | Read-only public-ish from cluster nodes (signed pull-secret); push is admin-only | Read-only from `jenkinsbot` and named developers | Read+write from `jenkinsbot`; read from runtime identities |
+| **Cleanup policy** | None; never delete platform mirror content without a tracked decision | `docker-proxy-retain-14d` on each proxy member | `docker-dev-hosted-retain-30d` on the hosted repo |
+| **Drift if mixed** | A CI push could overwrite a release-image manifest; a kubelet retag would derail `oc mirror` invariants | Pull-through caching mixed with hosted writes is a known footgun in Nexus group ordering | An open `docker-group` write membership would let a build poison the developer cache |
+
+Three hostnames make it obvious in `image:` references, Jenkinsfile env, IDMS/ITMS specs, OpenShift `Deployment` manifests, and even a `crictl pull` line on a node, **which lane** the operation belongs to. A single hostname would force every reader to look up a cleanup-policy attachment to know whether a tag is stable.
+
+## Endpoint inventory
+
+The live inventory as of 2026-05-09:
+
+| Public host | HAProxy backend | Nexus port | Nexus repo | Type | Cleanup policy |
+| --- | --- | --- | --- | --- | --- |
+| `mirror-registry.apps.sub.comptech-lab.com` | nexus VM `:5000` | 5000 | `ocp-mirror` | hosted | none (platform invariant) |
+| `docker-group.apps.sub.comptech-lab.com` | nexus VM `:5001` | 5001 | `docker-group` | group | inherits from members |
+| `app-registry.apps.sub.comptech-lab.com` | nexus VM `:5002` | 5002 | `docker-dev-hosted` | hosted | `docker-dev-hosted-retain-30d` |
+| (group member) | — | — | `icr-proxy` | proxy | `docker-proxy-retain-14d` |
+| (group member) | — | — | `redhat-proxy` | proxy | `docker-proxy-retain-14d` |
+| (group member) | — | — | `dockerhub-proxy` | proxy | `docker-proxy-retain-14d` |
+
+The Nexus UI / REST API itself is on `https://nexus-mirror.apps.sub.comptech-lab.com` (HAProxy → Nexus `:8081`); it is documented under the Nexus operator runbook and intentionally separate from the three Docker endpoints.
+
+## Each endpoint, in one paragraph
+
+### `mirror-registry.*` — install-only
+
+This is the OpenShift platform mirror, populated by `oc mirror --v2` from a workstation that has internet access (the bootstrap host). Disconnected clusters in the lab pull their release image, every operator catalog, every operand, and every approved base image from here. The path is generated by `oc mirror`'s ImageDigestMirrorSet/ImageTagMirrorSet output — application teams must not hand-craft references against this endpoint. Per `feedback_oc_mirror_off_limits.md`, the content of this repository is **off limits** for app work: don't push to it, don't mirror to it, don't extend its membership. See [the mirror-registry deep dive](./02-mirror-registry-endpoint).
+
+### `docker-group.*` — developer pulls
+
+This is the **only** path a developer or Jenkins build agent should use to fetch a base image. It's a Nexus group repository that combines one hosted repo (`docker-dev-hosted` — the same hosted repo CI writes to, but exposed read-only via the group's member ordering) plus three proxy repos to upstream `icr.io`, `registry.redhat.io`, and `docker.io`. The group does the pull-through. Pull `docker-group.apps.sub.comptech-lab.com/appcafe/open-liberty:25.0.0.6-kernel-slim-java17-openj9-ubi-minimal` and Nexus hydrates the layer from ICR on first miss, caches it, and serves it locally on every subsequent pull. See [the docker-group deep dive](./03-docker-group-pull-endpoint).
+
+### `app-registry.*` — CI push, runtime pull
+
+Jenkins builds an image, scans it with Trivy, and pushes an immutable build tag like `app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8` to this endpoint. Runtime systems — `docker-runtime-vm` for the current app-dev phase, and OpenShift workloads when that path reopens — pull from the same endpoint by digest or by the immutable tag. The hosted repository is `docker-dev-hosted` (the cleanup policy retains `30d`). Push is governed by the `nexus-jenkinsbot` user with role `nexus-jenkins-ci`. See [the app-registry deep dive](./04-app-registry-push-endpoint).
+
+## Consumer map
+
+Which clients touch which endpoint:
+
+| Consumer | mirror-registry | docker-group | app-registry |
+| --- | :---: | :---: | :---: |
+| `oc mirror --v2` from bootstrap host | push | — | — |
+| OpenShift cluster nodes (`hub-dc-v6`, `spoke-dc-v6`) — install/upgrade | pull | — | — |
+| OpenShift cluster nodes — operator/operand runtime | pull | — | pull (app workloads) |
+| Jenkins controller / build agents | — | pull (base images) | push (built images) |
+| `docker-runtime-vm` | — | — | pull (runtime) |
+| Developer workstation (podman) | — | pull (local dev) | pull/push (manual builds via approved account) |
+| ArgoCD repo-server (image polls) | — | — | pull (digest validation) |
+
+Nothing in this matrix crosses lanes. If a tool sits in two columns (e.g., OpenShift nodes pull from both mirror-registry and app-registry), the two pulls go through two different IDMS/ITMS rules, two different pull secrets if needed, and two different Nexus repositories — they share only the underlying VM and HAProxy frontend.
+
+## Where this is wired
+
+The three-endpoint split shows up in several config layers:
+
+- **PowerDNS** — three A records, all pointing at the HAProxy private bind in the lab `/24`. The HAProxy private bind is the only DNS hop visible from inside the lab.
+- **HAProxy** — three SNI hostnames in the `*.apps` frontend, each routing to the Nexus VM on the matching port. HAProxy backups, frontend rewrite rules, and ACL blocks are kept narrow per hostname so a change to one endpoint cannot affect another.
+- **Nexus realms and roles** — the `nexus-jenkins-ci` role grants `read` on `docker-group` plus `browse+read+add+edit+delete` on `docker-dev-hosted`. It explicitly does **not** grant anything on `ocp-mirror`. `jenkinsbot` is bound to that role.
+- **Pull secrets** — the OpenShift `dockerconfigjson` pull secret carries credentials for `mirror-registry`, `app-registry`, and the OpenShift internal registry. It does **not** carry credentials for `docker-group` on cluster nodes — cluster runtime should not pull base images, that's a CI activity.
+- **`ImageDigestMirrorSet` / `ImageTagMirrorSet`** — generated by `oc mirror`, scoped to `mirror-registry.*`. App teams do not edit these.
+
+## Failure modes and gotchas
+
+### Symptom: app build pushes to `mirror-registry.*` succeed in a developer's local podman, then OpenShift install fails next quarter
+
+**Root cause.** Some operator wrote a Containerfile that tagged the output as `mirror-registry.apps.sub.comptech-lab.com/myteam/myapp:build-3` and the admin role they were operating under had write access. The push lands inside the `ocp-mirror` hosted repo and pollutes the mirror namespace. `oc mirror --v2` does not detect arbitrary repos inside the mirror registry, but operator catalog reconciliation can become unstable if tags collide.
+
+**Fix.** Identify and delete the rogue tag in Nexus. Re-run the relevant `oc mirror --v2` to verify the platform manifest is still consistent. Audit who has push on `ocp-mirror`.
+
+**Prevention.** Per `feedback_oc_mirror_off_limits.md`: keep push on `ocp-mirror` to the bootstrap-host admin identity only. Never grant push on `mirror-registry` to CI bots. Documentation (this site, the Nexus operator runbook, the developer handbook) consistently names `app-registry.*` for app work.
+
+### Symptom: developer pulls a base image from `docker-group.*` and gets an old layer
+
+**Root cause.** Nexus group repositories evaluate members in order. If a member proxy has a cached blob older than the upstream and the cleanup policy hasn't expired it yet, the group returns the cached layer. Most teams hit this when an upstream pushes a `latest`-style mutable tag with the same name but new content.
+
+**Fix.** Pull by digest, never by mutable tag. Always reference Open Liberty (and similar Red Hat / IBM base images) by the immutable build tag that includes the version (`25.0.0.6-kernel-slim-java17-openj9-ubi-minimal`), not by `latest`.
+
+**Prevention.** The Jenkins shared library and the developer handbook both encode immutable-tag conventions. Cleanup policies on each proxy member (`docker-proxy-retain-14d`) keep the cache fresh enough that long-stale layers age out, and the policy is configured for last-downloaded-at semantics rather than creation date.
+
+### Symptom: Jenkins build pushes to `docker-group.*` and the push fails
+
+**Root cause.** This is **correct** behavior. Group repositories in Nexus do not accept writes — the group endpoint is read-only by construction. The build pipeline has wired the wrong env var.
+
+**Fix.** Change the build to push to `app-registry.apps.sub.comptech-lab.com` (Nexus port `5002` → hosted `docker-dev-hosted`). The Nexus group is structurally not a write target.
+
+**Prevention.** Two Jenkins env vars: `BASE_IMAGE_REGISTRY=docker-group.apps.sub.comptech-lab.com` for pulls, `IMAGE_REGISTRY=app-registry.apps.sub.comptech-lab.com` for pushes. Never collapse them into one.
+
+### Symptom: `docker login docker-group.*` returns 401 even with valid creds
+
+**Root cause.** The Docker Registry v2 spec's `/v2/` endpoint returns 401 to indicate auth is required; clients then re-issue with credentials. A 401 on the first probe is the **healthy** state, not a failure. The actual login succeeds when the client retries with `Basic` auth attached.
+
+**Fix.** None — interpret 401 on the bare `/v2/` probe correctly.
+
+**Prevention.** Quick-validation snippets in `nexus.md` document `401` as the expected unauthenticated response. Don't add monitoring that pages on 401 from `/v2/`.
+
+### Symptom: a request lands asking for a fourth endpoint (`maven-registry.*`, `npm-registry.*`, `helm-registry.*`)
+
+**Root cause.** Someone wants to reuse the Nexus VM as the lab artifact repository for Maven, npm, or Helm. That's reasonable — Nexus supports all of those. But adding a fourth Docker endpoint to "separate one team's images" usually means the three-endpoint split is being asked to compensate for missing tenant ACLs.
+
+**Fix.** Push back. The three-way Docker split is the architecture. Add Maven/npm/Helm endpoints by all means; they are different formats and don't collide. But **do not** add a fourth Docker hosted repo to separate "dev-team-A" images from "dev-team-B" images. Use Nexus repo-level permissions on `docker-dev-hosted` instead.
+
+**Prevention.** The split is captured in ADR 0019 and in the Nexus connection-details runbook. Memory entry `project_nexus_endpoint_split.md` records the "no fourth endpoint" guardrail explicitly.
+
+## What about `oc mirror`?
+
+`oc mirror` (specifically the `--v2` invocation Red Hat ships in 4.16+) is the only writer to `mirror-registry.*`. It is not, and must not be confused with, an app-image tool. The lab convention — per a 2026-05-09 user directive — is:
+
+- Treat `oc mirror` output as **read-only** for app workflows.
+- Treat the `ocp-mirror` hosted repo as **untouchable** by CI.
+- Do not propose mirroring an app image into `ocp-mirror`. Push to `docker-dev-hosted` via `app-registry.*` instead.
+
+If a task seems to require touching `oc-mirror` content for an application reason, stop and revisit the requirement. The split exists precisely so app work has its own surface.
+
+## Related pages
+
+- [`mirror-registry` endpoint](./02-mirror-registry-endpoint) — the install lane, in detail.
+- [`docker-group` endpoint](./03-docker-group-pull-endpoint) — the developer pull lane.
+- [`app-registry` endpoint](./04-app-registry-push-endpoint) — the CI push lane.
+- [Blob stores and lifecycle](./05-blob-stores-and-lifecycle) — Nexus blob stores, cleanup policies, retention model.
+- [Trivy scanning integration](./06-trivy-scanning-integration) — how the scanner sits in front of the push path.
+
+## References
+
+- `codex-opp-agent/connection-details/nexus.md` — canonical operator runbook for the live service.
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md` — the platform decision.
+- Memory: `project_nexus_endpoint_split.md`, `feedback_oc_mirror_off_limits.md`.
+- Live validation: 2026-05-09 — DNS, HAProxy, and Nexus `/v2/` probes confirmed for all three endpoints; `jenkinsbot` push verified to `app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8`.

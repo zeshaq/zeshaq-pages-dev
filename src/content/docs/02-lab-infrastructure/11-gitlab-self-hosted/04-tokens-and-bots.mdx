@@ -1,8 +1,195 @@
 ---
-title: "Tokens and Bots"
-description: "Section 02-lab-infrastructure/11-gitlab-self-hosted: Tokens and Bots (placeholder)."
-sidebar_label: "Tokens and Bots"
+title: "GitLab Tokens and Bots"
+description: "The credential model for GitLab in the lab — operator PAT, deploy tokens, runner registration tokens, project access tokens, and the secret-variable rules."
+sidebar_label: "Tokens & Bots"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+GitLab has a sprawling token model. The lab keeps the surface deliberately small and uses each token type for what it's designed for. This page documents the token taxonomy in use, the credential-custody pattern, and the variable rules.
+
+## Token taxonomy
+
+| Token type | Purpose | Custody |
+| --- | --- | --- |
+| **Operator PAT** | API access for the bootstrap operator; create groups/projects/shares; scoped fine-grained per ADR direction | `secrets/gitlab-md-pat` (Git-ignored) |
+| **Deploy token (read-only)** | Project clone access for Jenkins / Argo CD / runners | Jenkins credential store (`gitlab-<project>-read`); per-project |
+| **Deploy token (read-write)** | Image-registry push token if GitLab Container Registry is used | Not in scope today — Nexus is the registry |
+| **Project access token** | Per-project token, scoped to one project | Per-job custody |
+| **Group access token** | Per-group token, scoped to one group | Reserved for future federated CI flows |
+| **Runner registration token** | One per runner class, used at runner startup | `secrets/gitlab-runner-<class>/` |
+| **CI/CD variables** | Per-project / per-group masked + protected variables | GitLab's own variable store |
+| **OIDC tokens (planned)** | Federation against Keycloak when that lands | Not yet |
+
+The bootstrap admin user `zahid` is the only user with broad GitLab API access today. Move-to-named-users + deploy-tokens is a roadmap item per the operator guide.
+
+## Operator PAT (`gitlab-md-pat`)
+
+The operator's Personal Access Token is the main bootstrap credential:
+
+```bash
+GITLAB_URL=http://<lab-IP-for-gitlab>
+GITLAB_PAT="$(cat /home/ze/codex-opp-agent/secrets/gitlab-md-pat)"
+curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+  "$GITLAB_URL/api/v4/version"
+unset GITLAB_PAT
+```
+
+Custody discipline:
+
+- The PAT lives only in `secrets/gitlab-md-pat`. The directory is Git-ignored and mode-restricted (`0700`).
+- The PAT is never printed, copied into issues, pasted into wiki, or echoed in shell history.
+- The PAT scope is operator-driven (currently `api` scope for the operator workspace). Future hardening: narrow to per-task scopes.
+
+## Deploy tokens (read-only)
+
+For Jenkins jobs and Argo CD repo-server, deploy tokens are the right primitive:
+
+- **Scoped to one project.**
+- **Read-only.**
+- **Can be revoked without affecting any user account.**
+- **Username + password pair**, suitable for HTTP Basic auth in `git clone` URLs.
+
+Current Jenkins credentials of this type:
+
+| ID | Project |
+| --- | --- |
+| `gitlab-openliberty-readiness-probe-read` | `divisions/sandbox/openliberty-readiness-probe` |
+| `gitlab-demo-smoke-read` | `divisions/sandbox/demo-smoke` |
+
+Each app gets its own deploy token, so revoking one app's CI token doesn't affect any other.
+
+## Project access tokens
+
+Project access tokens are per-project bot identities; useful for narrow automation that doesn't belong to a human:
+
+- Webhook delivery from Jenkins → GitLab (commit-status updates).
+- Per-project notifications / integrations.
+
+The current `notifyCommit` Jenkins access tokens are per-job tokens, custody under `secrets/jenkins/git-notifycommit-<job>-token.json`. Same hygiene: never echoed, never committed.
+
+## Runner registration tokens
+
+Each runner class (per the [protected runner model](./03-protected-runner-model)) registers with its own token. The token is **not** a long-lived API credential — it's a one-shot bootstrap that grants the runner an internal identity. After registration, the runner uses its internal credential, not the registration token, for subsequent communication with the GitLab server.
+
+Custody per class:
+
+```text
+secrets/gitlab-runner-validation/registration-token
+secrets/gitlab-runner-build/registration-token
+secrets/gitlab-runner-security/registration-token
+secrets/gitlab-runner-ops/registration-token
+secrets/gitlab-runner-deploy/registration-token
+```
+
+After registration, rotate the registration token to prevent reuse.
+
+## CI/CD variables
+
+GitLab CI/CD variables (set under Project Settings → CI/CD → Variables or at group level) carry credentials available to pipelines. Rules:
+
+- **Mask all values that are credentials.** GitLab will redact them from job logs.
+- **Mark as protected** if they should only be available to protected-branch pipelines.
+- **Scope to environment** when applicable (different creds for dev vs prod).
+- **Document variable names and purpose**, not values, in MRs and runbooks.
+- **Validate the pipeline can use the variable without printing it** — `echo $TOKEN` is a CI lint failure.
+
+## Allowed credential sources
+
+Per the operator guide:
+
+**Allowed**:
+
+- Vault-backed secret delivery (planned; not all secrets there yet).
+- Protected and masked GitLab variables for CI bootstrap credentials.
+- External Secrets references by name.
+- Local-only secret custody during lab bootstrap (`secrets/`).
+- Jenkins credential store for current CI jobs until Vault migration.
+
+**Forbidden**:
+
+- Plaintext secrets in Git.
+- Credentials in issues, wiki pages, MR text, or reports.
+- Kubeconfigs in repos.
+- Runner registration tokens in repos.
+- Nexus/Jenkins/GitLab/Vault tokens in unprotected or unmasked variables.
+- Rendered Kubernetes Secret manifests in GitOps repos.
+
+## Token-creation checklist
+
+Before creating any new GitLab variable or token:
+
+1. Confirm the target project/group and environment scope.
+2. Use masked + protected flags where possible.
+3. Prefer project-specific or group-specific least privilege.
+4. Record variable names and purpose in the repo's README or `docs/`, not values.
+5. Validate the pipeline can use the variable without printing it.
+6. Document the rotation plan (who rotates, on what cadence, where the new value goes).
+
+## Break-glass and rotation
+
+Break-glass examples in the GitLab context (per operator guide):
+
+- GitOps cannot read the platform repo and a temporary credential repair is required.
+- Branch protection accidentally locks out all maintainers.
+- A runner token must be revoked after suspected leakage.
+- A project share must be removed immediately.
+
+Every break-glass action must record:
+
+- Reason
+- Approver
+- Actor
+- Time
+- Target group/project/user/runner
+- Exact API/UI action summary
+- Validation result
+- Rollback path
+- Git backport commit or expiry date
+
+## Failure modes
+
+### Symptom: an operator PAT is leaked
+
+**Root cause.** Pasted into a chat, an issue, an MR comment, or a screenshot.
+
+**Fix.** Revoke the PAT immediately in GitLab UI. Create a new PAT. Update `secrets/gitlab-md-pat`. Audit any tools that may have cached the old value.
+
+**Prevention.** Never paste tokens into anything. Use the runbook pattern: `load from custody, unset after use`.
+
+### Symptom: a runner is doing too much
+
+**Root cause.** Tag misconfiguration; runner accepts untagged jobs or jobs tagged for a different class.
+
+**Fix.** Update runner config to require specific tags; refuse untagged jobs.
+
+**Prevention.** Negative access tests at runner setup time.
+
+### Symptom: a CI/CD variable was used in an MR pipeline and the value got echoed in job logs
+
+**Root cause.** Variable not masked, or a pipeline step printed it directly (e.g., `set -x` debug mode).
+
+**Fix.** Rotate the credential immediately. Update the pipeline to not print the variable. Mask the variable in GitLab.
+
+**Prevention.** Default to masked + protected on every variable; CI lint checks for `set -x` / `set -v` in jobs that touch creds.
+
+### Symptom: a project access token is stale (forgotten in some old credential store)
+
+**Root cause.** Project access tokens don't auto-expire by default; an old one can linger.
+
+**Fix.** Rotate; revoke the old one.
+
+**Prevention.** Set token expiry on creation; review token list periodically.
+
+## Roadmap
+
+- **Migrate operator PAT use to named users + scoped tokens.** The bootstrap pattern should not be the production pattern.
+- **Wire Vault as the credential source.** Move from `secrets/` custody to Vault-delivered values for tokens that benefit from rotation.
+- **Add automated audit logging.** GitLab CE has limited audit support; supplement with operator-driven evidence.
+
+## References
+
+- `codex-opp-agent/connection-details/gitlab-operator-guide.md` — secret and variable policy.
+- `codex-opp-agent/adr/0023-federated-gitlab-group-repo-ownership.md` — ownership boundary the tokens enforce.
+- [Protected runner model](./03-protected-runner-model) — runner-token specifics.
+- `codex-opp-agent/runbooks/secrets-custody-drift-check.md` — periodic drift check across credential custody.

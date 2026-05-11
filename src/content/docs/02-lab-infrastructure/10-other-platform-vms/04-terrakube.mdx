@@ -1,8 +1,80 @@
 ---
-title: "Terrakube"
-description: "Section 02-lab-infrastructure/10-other-platform-vms: Terrakube (placeholder)."
+title: "Terrakube (Planned)"
+description: "Placeholder for a future Terrakube (or equivalent Terraform/OpenTofu controller) — current IaC posture in the lab, why a self-hosted controller is on the radar, and what would have to be decided first."
 sidebar_label: "Terrakube"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+A self-hosted Terraform/OpenTofu execution controller — most likely Terrakube — is **planned but not yet stood up** in the lab. Today, all Terraform invocations are local CLI runs from the operator workstation. This page captures the current state and the decision space.
+
+## Current state
+
+| Aspect | Today |
+| --- | --- |
+| Terraform CLI version on operator workstation | `1.15.2` (matches `docker-runtime-vm` install) |
+| Where state lives | Local files on the operator workstation; some state in operator-managed paths |
+| Where modules live | Plans live in `codex-opp-agent/plans/`, not yet a dedicated Terraform repo |
+| Apply discipline | Manual, operator-driven |
+| Drift detection | None automated |
+| Multi-operator coordination | None today |
+
+This is the right posture for a single-operator lab in bootstrap phase. It is the wrong posture for anything resembling a multi-operator production setup.
+
+## Why a self-hosted Terraform controller
+
+When IaC moves from "operator workstation" to "platform service," a controller is what's missing:
+
+- **Centralized state.** No more "where did I leave that .tfstate?".
+- **Locking.** Two operators can't accidentally apply at the same time.
+- **Workspaces and environments.** Same plan applied to different environments with different vars, tracked.
+- **Plan/apply audit trail.** Who applied what, when, and what was the diff.
+- **Drift detection.** Periodic re-plans surface external changes.
+- **CI/CD integration.** GitLab MR pipelines can plan; merge can apply through the controller.
+- **RBAC.** Different teams have different write surfaces, enforced by the controller.
+
+## Why Terrakube specifically (one option)
+
+Terrakube is an open-source Terraform automation platform that gives most of what proprietary services (Terraform Cloud, Spacelift) give. Pros relevant to this lab:
+
+- **Open source, self-hostable.** Aligns with the lab's lab-self-hosted preference.
+- **Supports OpenTofu.** Future-proofs against HashiCorp licensing changes.
+- **VCS integration with GitLab.** First-class workflow against the lab GitLab.
+- **Pluggable secret backend.** Can use Vault for credential delivery.
+
+Alternatives include Atlantis (lighter weight, less feature-rich), and a homegrown GitLab-CI-driven `terraform plan` / `terraform apply` pipeline with state in a backend-bucket on MinIO. All have tradeoffs.
+
+## Why deferred
+
+- Single-operator lab right now; the coordination problems Terrakube solves are not yet acute.
+- Bootstrap-phase IaC volume is low; manual application is tractable.
+- Other platform services (Vault, Trivy, DefectDojo, monitoring) have higher leverage in the current bootstrap phase.
+
+When operator count grows or the IaC surface widens (multiple BFSI divisions onboard, more cluster-build automation, more VM-platform-ops Terraform), this gets a tracker and an ADR.
+
+## What would need to be decided first
+
+1. **Controller vs CI/CD pipeline.** Terrakube/Atlantis vs GitLab-CI driven. The lighter-weight approach might be enough.
+2. **State backend.** MinIO is the natural choice; alternatives are PostgreSQL-backed or a separate VM with NFS.
+3. **VCS integration.** GitLab webhook + Terrakube or GitLab Pipelines.
+4. **Auth model.** Terrakube users (local), SSO from Keycloak (if/when that lands), or GitLab OAuth.
+5. **Module repository structure.** One mono-repo for all lab Terraform modules vs per-domain repos. The federated-monorepo pattern in [Section 11](../11-gitlab-self-hosted) suggests one IaC repo per ownership boundary.
+6. **State encryption** and backup posture.
+7. **Lock duration** and stale-lock cleanup procedure.
+
+## Current Terraform footprint
+
+The lab Terraform footprint today (as a hint to future Terrakube scope):
+
+- VM provisioning (libvirt provider) for the lab `br30` network.
+- HAProxy backend config (in some installs).
+- DNS records (PowerDNS provider).
+- Cloud-init seed customization.
+- A small amount of OpenShift add-on Terraform (rare; most cluster state is GitOps).
+
+The scope is modest today. A controller would be deployed when the scope tips toward "complex enough that two operators must coordinate."
+
+## References
+
+- The GitLab operator guide (`comptech-platform/infra-ops/vm-platform-ops`) is the natural Terraform repo target.
+- The HAProxy and PowerDNS pages (Section 2A) — current manual workflow for infrastructure-as-code-ish changes.

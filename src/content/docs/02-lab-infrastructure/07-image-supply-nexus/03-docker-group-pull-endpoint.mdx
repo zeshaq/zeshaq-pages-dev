@@ -1,8 +1,196 @@
 ---
-title: "docker-group Pull Endpoint"
-description: "Section 02-lab-infrastructure/07-image-supply-nexus: docker-group Pull Endpoint (placeholder)."
-sidebar_label: "docker-group Pull Endpoint"
+title: "docker-group Pull Endpoint (Dev Lane)"
+description: "How docker-group.apps.sub.comptech-lab.com works — the developer/build-tool pull-through caching path backed by the docker-group Nexus group repo on port 5001."
+sidebar_label: "docker-group (dev pull)"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`docker-group.apps.sub.comptech-lab.com` is the **developer pull lane** of the [three-endpoint split](./01-three-endpoint-split). It is the only Docker endpoint a developer, Jenkins build agent, or any base-image consumer should pull from. It is a Nexus *group* repository — read-only from the client perspective — that fronts a hosted repository plus three pull-through proxy repositories to upstream registries.
+
+This page documents what's behind it, how the group ordering works, the standing rules for clients, and the failure modes that come from misunderstanding group repos.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| Public hostname | `docker-group.apps.sub.comptech-lab.com` |
+| Direct debug hostname | `http://nexus-mirror.sub.comptech-lab.com:5001` |
+| HAProxy backend | nexus VM `:5001` |
+| Nexus repository | `docker-group` (group) |
+| Repository type | Docker group — read-only to clients |
+| TLS | LE wildcard `*.apps.sub.comptech-lab.com` at HAProxy |
+| Auth | Basic auth via Nexus realm (Nexus role `nexus-jenkins-ci` has read) |
+| Cleanup policy | Inherited from member repos (proxies: `docker-proxy-retain-14d`) |
+
+The endpoint terminates at HAProxy, decrypts using the LE wildcard, and forwards to Nexus port `5001`. Behind that connector is a Nexus *group* repository that combines several repositories so a single pull URL resolves transparently across multiple upstreams.
+
+## Group membership
+
+The `docker-group` group repository contains, in order:
+
+1. `docker-dev-hosted` — the same hosted repository CI pushes to via `app-registry.*`. Inclusion here lets developers pull the team's own internal images using the same group URL.
+2. `icr-proxy` — pull-through proxy to `icr.io` (IBM Container Registry; Open Liberty base images live here).
+3. `redhat-proxy` — pull-through proxy to `registry.redhat.io` (selected developer-accessible Red Hat base images).
+4. `dockerhub-proxy` — pull-through proxy to `docker.io` (general open-source images; carefully scoped).
+
+Group member order matters in Nexus: a manifest or blob request is resolved by checking each member in sequence and returning the first hit. Concretely:
+
+- A reference like `docker-group.apps.sub.comptech-lab.com/openliberty:25.0.0.6-...` resolves via `icr-proxy` if it appears under `appcafe/open-liberty` upstream — and Nexus rewrites the local path accordingly.
+- A reference like `docker-group.apps.sub.comptech-lab.com/<our-app>/<image>:<tag>` resolves via `docker-dev-hosted` because that's where the team's images live.
+- Layer blobs are deduplicated by content-addressable digest in Nexus's underlying blob store, so the same layer shared between two upstream images costs disk only once.
+
+The deliberate exclusion: **`ocp-mirror` is not a member of this group.** The platform install path is structurally separate from the developer pull path.
+
+## Who reads here
+
+- **Jenkins build agents** (`jenkins-agent-0` and any future agents) — for `FROM` instructions in Containerfiles, base layers, and intermediate stage images.
+- **Developer workstations** — `podman pull`, `docker pull`, IDE-driven builds.
+- **`docker-runtime-vm`** when it pulls a base image during a host-side build (rare; most runtime images come pre-built via Jenkins from `app-registry.*`).
+- **OpenShift cluster nodes** — explicitly **not** part of the audience. Cluster runtime does not pull base images.
+
+## Who writes here
+
+Nobody writes through this endpoint. Group repositories in Nexus do not accept writes. Member repositories are populated separately:
+
+- `docker-dev-hosted` is populated by Jenkins pushing to `app-registry.*`.
+- `icr-proxy`, `redhat-proxy`, `dockerhub-proxy` are populated on first miss by the proxy mechanism itself. On a pull request for an unseen tag, Nexus fetches from upstream, caches the manifest and layer blobs, and serves them locally; subsequent pulls hit the cache.
+
+## Common image references
+
+```text
+# Open Liberty base image (via icr-proxy)
+docker-group.apps.sub.comptech-lab.com/appcafe/open-liberty:25.0.0.6-kernel-slim-java17-openj9-ubi-minimal
+
+# UBI minimal (via redhat-proxy)
+docker-group.apps.sub.comptech-lab.com/ubi9/ubi-minimal:9.4
+
+# Generic open-source utility (via dockerhub-proxy)
+docker-group.apps.sub.comptech-lab.com/library/alpine:3.20
+
+# In-house starter app (via docker-dev-hosted, but pulled by group URL)
+docker-group.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8
+```
+
+Convention:
+
+- **Do not include the upstream registry hostname in the image path** when using the group. Nexus rewrites the path. Use `appcafe/open-liberty:...` rather than `icr.io/appcafe/open-liberty:...`.
+- **Prefer immutable tags or digests.** A `:latest` reference exposes the cache-staleness gotcha below.
+
+## Pull-through caching, in detail
+
+When a developer runs `podman pull docker-group.apps.sub.comptech-lab.com/appcafe/open-liberty:25.0.0.6-kernel-slim-java17-openj9-ubi-minimal`:
+
+1. The client opens a TLS connection to `docker-group.apps.sub.comptech-lab.com:443` (HAProxy edge).
+2. HAProxy terminates TLS and forwards the request to Nexus `:5001`.
+3. Nexus receives the request on the `docker-group` group connector.
+4. Nexus iterates members in order; `docker-dev-hosted` doesn't have this manifest, so it falls through.
+5. `icr-proxy` reaches its remote storage configuration (`icr.io`) and asks for `appcafe/open-liberty:25.0.0.6-...`.
+6. If the manifest is cached locally and within the proxy's metadata-max-age, Nexus serves it from cache.
+7. If not, Nexus fetches from `icr.io` (or wherever the operator routes the proxy), stores it, and serves it.
+8. Layer blobs follow the same path — typically downloaded once and served from the local blob store thereafter.
+9. The cleanup policy (`docker-proxy-retain-14d`) ages out layers that haven't been pulled in 14 days.
+
+Proxy repositories also have a *metadata max age* (tag → digest resolution caching). For mutable upstream tags like `:latest`, this is the key knob. The lab default is conservative enough to avoid serving brand-new releases but aggressive enough that legitimate updates flow through within a day of upstream changes.
+
+## Authentication
+
+Nexus is configured with the standard `NexusAuthenticatingRealm` (no LDAP/SAML in current state). Practical implications:
+
+- `docker login docker-group.apps.sub.comptech-lab.com` with a Nexus user that has read on the group.
+- The `nexus-jenkins-ci` role (used by `jenkinsbot`) has read on `docker-group`, so Jenkins pulls work without additional configuration.
+- Unauthenticated probes against `/v2/` return `401` — that's the healthy state, not an outage indicator.
+- The OpenShift cluster-node pull secret does **not** include credentials for this endpoint by design.
+
+```bash
+# Login from a developer workstation (use a least-privilege account, not admin)
+export REGISTRY=docker-group.apps.sub.comptech-lab.com
+export NEXUS_USER=<nexus-username>
+read -rs NEXUS_PASSWORD
+printf '%s' "$NEXUS_PASSWORD" | podman login "$REGISTRY" \
+  --username "$NEXUS_USER" \
+  --password-stdin
+unset NEXUS_PASSWORD
+```
+
+## Validation
+
+```bash
+# DNS — should resolve to HAProxy edge in the lab /24
+dig @<lab-dns> docker-group.apps.sub.comptech-lab.com A +short
+
+# /v2/ probe — 401 unauthenticated is healthy
+curl -sSI https://docker-group.apps.sub.comptech-lab.com/v2/ | head -1
+
+# Catalog (authenticated) — should list dev-hosted plus aggregated proxy contents
+curl --netrc-file ~/.netrc-nexus -fsS \
+  https://docker-group.apps.sub.comptech-lab.com/v2/_catalog | jq -r '.repositories[]' | head -30
+
+# Tag list for a known base image
+curl --netrc-file ~/.netrc-nexus -fsS \
+  https://docker-group.apps.sub.comptech-lab.com/v2/appcafe/open-liberty/tags/list | jq -r '.tags[]?' | tail -20
+
+# Actual pull (with podman) by immutable tag
+podman pull docker-group.apps.sub.comptech-lab.com/ubi9/ubi-minimal:9.4
+```
+
+Expected:
+
+- DNS returns the HAProxy private bind address.
+- `/v2/` returns `401` unauthenticated.
+- `_catalog` lists `smoke/readiness-probe`, `appcafe/open-liberty`, `ubi9/ubi-minimal`, etc., depending on what's been pulled and pushed historically.
+
+## Failure modes
+
+### Symptom: push to docker-group.\* fails with 405 Method Not Allowed or similar
+
+**Root cause.** This is **correct**. The group is read-only from a client perspective. Pushes go to `app-registry.*` (which is the same `docker-dev-hosted` hosted repo, exposed on a different connector port `5002` with write access).
+
+**Fix.** Change the Jenkinsfile or `podman push` to target `app-registry.apps.sub.comptech-lab.com`. Keep `BASE_IMAGE_REGISTRY` and `IMAGE_REGISTRY` as separate variables.
+
+**Prevention.** Make the two registries visually distinct in CI templates and code. Don't collapse them.
+
+### Symptom: pull returns an older layer than upstream actually has
+
+**Root cause.** The proxy member has cached a manifest whose metadata-max-age has not expired, and the cleanup policy hasn't aged out the layer yet. The upstream changed a tag's underlying digest but Nexus is still serving the old digest until cache invalidation.
+
+**Fix.** Pull by digest, not by mutable tag. If you must pull by tag, force a re-resolve: log into Nexus UI as an admin and invalidate the proxy's metadata cache for the affected manifest (`Manage > Repositories > <proxy> > Invalidate cache`), then re-pull.
+
+**Prevention.** Code review for Containerfiles must reject mutable base image tags like `:latest`. Always include a version segment in the tag, ideally including the upstream's build/digest identifier.
+
+### Symptom: pull returns 404 for an image that exists upstream
+
+**Root cause.** Either (a) the proxy member's remote storage configuration doesn't route to the right upstream for this image, (b) the upstream-side image has been moved/renamed, or (c) the upstream is rate-limiting and Nexus is returning a stale negative cache.
+
+**Fix.** Confirm the image still exists upstream from a host with internet access. If yes, check the proxy member configuration in Nexus UI (`Manage > Repositories`). If a manifest is cached as 404, invalidate the proxy cache for the affected name.
+
+**Prevention.** Standardize on a small, reviewed list of base images (Open Liberty, UBI minimal/standard, a few open-source utilities). Random pulls from Docker Hub through this endpoint should be rare and reviewed.
+
+### Symptom: developer pulls a base image, builds, pushes the result, and the result is suddenly visible via docker-group.\*
+
+**Root cause.** Working as designed. `docker-dev-hosted` is a member of `docker-group`, so anything CI pushes via `app-registry.*` is readable through the group too. This is intentional: Open Liberty base images and in-house base images live together in one developer pull namespace.
+
+**Fix.** None — this is intended.
+
+**Prevention.** If a team wants in-house images to be unreachable via `docker-group`, that is a tenant-scoping concern, not a group-membership concern. Use Nexus role-based access on `docker-dev-hosted` (per-namespace privileges) rather than redesigning the group.
+
+### Symptom: a tag pulled today vs a tag pulled yesterday produces different layer hashes
+
+**Root cause.** Either an upstream registry mutated the tag (Docker Hub does this; ICR usually does not), or someone re-tagged inside `docker-dev-hosted`. Both are red flags.
+
+**Fix.** Audit the pull provenance. If it was a Docker Hub `:latest` style mutable tag, redo the dependency reference to use an immutable tag/digest. If it was an internal re-tag, identify who and what.
+
+**Prevention.** Immutable tags and digests, end-to-end. The internal hosted repo `docker-dev-hosted` is configured with `Allow redeploy = false` for the same reason — once a build pushes `:build-8`, that tag's digest cannot be overwritten.
+
+## Operational guidance
+
+- Don't extend `docker-group` membership without a tracked decision. Adding new upstream proxies is fine *if* there's a justified developer need. Adding hosted repos (other than `docker-dev-hosted`) needs a stronger argument, because the read-only-via-group property only holds for hosted repos that are also reachable elsewhere for writes.
+- Keep proxy cleanup policies on `docker-proxy-retain-14d` (or equivalent). Don't disable cleanup just because someone reports a slow first-pull after a long weekend.
+- Monitor proxy member health independently in observability. A failing upstream proxy gives Nexus a misleading "404" for users; surfacing the actual upstream-reachability state separately reduces incident time.
+
+## References
+
+- `codex-opp-agent/connection-details/nexus.md` — section "Docker Group Exposure" and the cleanup-policy table.
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md` — runtime allowlist; this endpoint is part of the approved set.
+- Memory: `project_nexus_endpoint_split.md` — including the "group is read-only" architecture note.
+- Live validation 2026-05-09 — `401` on `/v2/`; authenticated `_catalog` returns aggregated members; jenkinsbot read confirmed.

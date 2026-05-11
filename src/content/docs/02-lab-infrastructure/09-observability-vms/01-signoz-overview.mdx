@@ -1,8 +1,210 @@
 ---
 title: "SigNoz Overview"
-description: "Section 02-lab-infrastructure/09-observability-vms: SigNoz Overview (placeholder)."
+description: "The lab SigNoz observability VM — standalone Docker Compose deployment, OTLP ingestion model, ClickHouse backing store, and the production-side observability track per ADR 0010."
 sidebar_label: "SigNoz Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  { id: "app1",   position: { x: 0,   y: 0   }, data: { label: "OpenShift workload\n(OTLP exporter)" }, style: agentBox },
+  { id: "app2",   position: { x: 220, y: 0   }, data: { label: "docker-runtime app\n(OTLP exporter)" }, style: agentBox },
+  { id: "browser",position: { x: 440, y: 0   }, data: { label: "Operator browser" }, style: extBox },
+  { id: "otlp_h", position: { x: 0,   y: 150 }, data: { label: "OTLP HTTP\n:4318 (signoz VM)" }, style: dataBox },
+  { id: "otlp_g", position: { x: 220, y: 150 }, data: { label: "OTLP gRPC\n:4317 (signoz VM)" }, style: dataBox },
+  { id: "ui",     position: { x: 440, y: 150 }, data: { label: "HAProxy\nsignoz.apps.*\n(LE wildcard)" }, style: ctrlBox },
+  { id: "signoz", position: { x: 220, y: 320 }, data: { label: "SigNoz v0.122.0 EE\n(Docker Compose)" }, style: ctrlBox },
+  { id: "ch",     position: { x: 0,   y: 470 }, data: { label: "ClickHouse\n(traces/metrics/logs)" }, style: dataBox },
+  { id: "sqlite", position: { x: 220, y: 470 }, data: { label: "SQLite\nsignoz-sqlite volume\n(orgs, users, dashboards)" }, style: dataBox },
+  { id: "zk",     position: { x: 440, y: 470 }, data: { label: "Zookeeper\n(ClickHouse coordination)" }, style: dataBox },
+];
+
+export const edges = [
+  { id: "a1-h", source: "app1",  target: "otlp_h", label: "POST /v1/traces", ...reqEdge },
+  { id: "a2-h", source: "app2",  target: "otlp_h", ...reqEdge },
+  { id: "a1-g", source: "app1",  target: "otlp_g", ...reqEdge },
+  { id: "br-ui",source: "browser",target: "ui",    label: "HTTPS", ...reqEdge },
+  { id: "h-s",  source: "otlp_h",target: "signoz", ...muted },
+  { id: "g-s",  source: "otlp_g",target: "signoz", ...muted },
+  { id: "u-s",  source: "ui",    target: "signoz", label: "HAProxy → :8080", ...muted },
+  { id: "s-ch", source: "signoz",target: "ch",     ...muted },
+  { id: "s-sl", source: "signoz",target: "sqlite", ...muted },
+  { id: "s-zk", source: "signoz",target: "zk",     ...muted },
+];
+
+SigNoz is the lab's **production-side observability** target — the OTLP-native traces, metrics, and logs platform deployed as a standalone Docker Compose stack on the `signoz` VM. Per ADR 0010 and `reference_lab_infrastructure.md`, SigNoz is the intended destination for application telemetry; the parallel `monitoring-0` VM (LGTM components on bare systemd) is a learning sandbox for trying observability primitives, not a production telemetry destination.
+
+This page is the SigNoz overview: what it is, what's behind it, the OTLP ingestion model, and how it relates to the two observability VMs and their distinct roles. The auth v0.122 wrinkle has its own page ([Auth Quirk](./03-signoz-auth-quirk)); the ClickHouse storage layer has its own page ([ClickHouse Storage](./02-signoz-clickhouse-storage)); the `monitoring-0` LGTM sandbox is documented at [Monitoring VM](./04-monitoring-vm).
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={640} />
+
+The path:
+
+1. **OpenShift workloads** and **docker-runtime apps** export OTLP traces/metrics/logs to the SigNoz VM directly over the lab network — gRPC on `:4317` or HTTP on `:4318`. The OTLP endpoint is **not** HAProxy-fronted (telemetry is private, plain HTTP/gRPC inside the lab).
+2. **Operator browsers** reach the SigNoz UI via `https://signoz.apps.sub.comptech-lab.com` — that path **is** HAProxy-fronted with the LE wildcard.
+3. **SigNoz** parses OTLP, stores traces and metrics in **ClickHouse**, stores user/org/dashboard config in an embedded **SQLite**, and uses **Zookeeper** for ClickHouse cluster coordination.
+
+The diagram shows the production-grade EE topology (`v0.122.0`) but the lab runs the open-source EE build with the same general topology.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `signoz` |
+| Private FQDN | `signoz.sub.comptech-lab.com` |
+| Public hostname | `https://signoz.apps.sub.comptech-lab.com` |
+| HAProxy backend | host-specific → SigNoz UI `:8080` |
+| TLS terminator | HAProxy edge VM, LE wildcard `*.apps.sub.comptech-lab.com` |
+| OS | Ubuntu 24.04 LTS cloud-init |
+| Runtime | Docker Engine + Docker Compose |
+| SigNoz version | `v0.122.0` EE (open-source build) |
+| OTLP gRPC | port `4317` on the VM (private, no TLS) |
+| OTLP HTTP | port `4318` on the VM (private, no TLS) |
+| Backing stores | ClickHouse (telemetry), SQLite (org/user/dashboard config), Zookeeper |
+| SQLite host path | `/var/lib/docker/volumes/signoz-sqlite/_data/` |
+| Default admin user | `zahid` (lab convention) |
+| Admin password custody | `secrets/signoz-vm/` (Git-ignored, mode-restricted) |
+
+## Why a standalone VM (not in-cluster)
+
+Per ADR 0010 the user explicitly reintroduced SigNoz as a standalone Ubuntu cloud-init VM service. The decision is driven by:
+
+- **Decouple from OpenShift cluster lifecycle.** If a cluster goes down or is being rebuilt, telemetry should still be reachable and historical traces should still be queryable.
+- **The official upstream self-host path is Docker Compose** on Linux. Following the upstream supported path keeps upgrades predictable.
+- **External observability for the platform itself.** OpenShift workloads emit telemetry to a VM outside the cluster, which is the correct posture for cluster-wide observability.
+- **Avoid mixing with the retired RKE2/OpenShift SigNoz manifests.** Those are read-only history; the new install does not reactivate them as desired state.
+
+The lab decision is to keep SigNoz **OpenShift-facing only** (per ADR 0010 framing). It is an observability support service for OpenShift core operations, not a general application catalogue entry; it must not be exposed publicly without explicit source restrictions, TLS, and auth on the OTLP listener.
+
+## Why two observability VMs?
+
+`signoz` and `monitoring-0` exist in parallel:
+
+| Property | `signoz` | `monitoring-0` |
+| --- | --- | --- |
+| Role | Production telemetry destination | Learning sandbox |
+| Components | SigNoz EE (single product) | Grafana + Prometheus + Alertmanager + Loki + Tempo + Pyroscope + Alloy + exporters |
+| Packaging | Docker Compose | Native systemd services |
+| OTLP endpoint | `:4317`/`:4318` (private) | `:4317`/`:4318` (owned by Alloy, fan-out) |
+| Per | ADR 0010 | ADR 0012 |
+| Memory | "intended production track" | "testing / learning sandbox; *not* the prod telemetry destination" |
+
+Apps shipping OTLP to the lab must **deliberately choose** which target they're shipping to. The two VMs have the same port numbers but different semantics — the same telemetry hitting `monitoring-0:4318` lands in Alloy and is fanned out to Tempo/Loki/Prometheus for sandbox exploration; the same telemetry hitting `signoz:4318` lands in SigNoz and stays there.
+
+The `monitoring-0` track is covered in [its own page](./04-monitoring-vm).
+
+## OTLP ingestion
+
+SigNoz accepts OTLP over both HTTP and gRPC:
+
+| Protocol | Port | Path (HTTP only) | Notes |
+| --- | --- | --- | --- |
+| OTLP HTTP | `4318` | `/v1/traces`, `/v1/metrics`, `/v1/logs` | Plain HTTP; no TLS in v0.122 install |
+| OTLP gRPC | `4317` | (binary) | Plain gRPC; no TLS |
+
+The OTLP listener is intentionally not behind HAProxy. SigNoz fronts it directly on the VM. The path is plain HTTP/gRPC because v0.122's standard install does not terminate TLS on the OTLP listener and HAProxy does not proxy `:4318` either. NetworkPolicy in the emitting namespace must allow egress to the SigNoz VM's OTLP port.
+
+A successful OTLP ingest returns `200 partialSuccess:{}`. The span surfaces under `/api/v1/services` within roughly 30 seconds after ingestion (ClickHouse buffer flush window).
+
+If OTLP needs to be exposed externally later (cross-cluster, off-network), ADR 0010 requires that exposure be done with explicit hostnames, source restrictions, TLS, and auth — not by widening the current plain-HTTP exposure.
+
+## Where things are stored
+
+- **Traces, metrics, logs:** ClickHouse — covered in [its own page](./02-signoz-clickhouse-storage).
+- **Organizations, users, dashboards, alert rules, alert channels:** SQLite. The DB file lives in the Docker volume `signoz-sqlite` at `/var/lib/docker/volumes/signoz-sqlite/_data/signoz.db`. The DB uses WAL mode (the `.db-wal` file is part of the live state).
+- **ClickHouse cluster coordination:** Zookeeper. Part of the Compose stack.
+
+The SQLite location matters for the auth quirk: the org-id UUID required by the v0.122 login API is **only** readable from this SQLite, not from any unauthenticated API. See the [auth quirk page](./03-signoz-auth-quirk).
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> signoz.sub.comptech-lab.com A +short
+dig @<lab-dns> signoz.apps.sub.comptech-lab.com A +short
+
+# UI
+curl -sSI https://signoz.apps.sub.comptech-lab.com/login | head -1
+
+# Version (unauthenticated, GET — NOT HEAD; HEAD hits SPA fallback)
+curl -sS https://signoz.apps.sub.comptech-lab.com/api/v1/version
+
+# Health
+curl -sS https://signoz.apps.sub.comptech-lab.com/api/v1/health
+
+# OTLP HTTP probe (from inside the lab)
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{}' http://signoz.sub.comptech-lab.com:4318/v1/traces
+```
+
+Expected:
+
+- DNS resolves.
+- `/login` returns `HTTP/2 200`.
+- `/api/v1/version` returns version JSON.
+- `/api/v1/health` returns health JSON.
+- The OTLP probe returns `200` with `{"partialSuccess":{}}` (an empty OTLP body is accepted).
+
+## Operational guardrails
+
+Per ADR 0010 + the SigNoz connection-details runbook:
+
+- **Keep telemetry private** until explicit TLS/auth/source-restriction is decided.
+- **Don't store admin or generated keys in Git.** Custody under `secrets/signoz-vm/`. ClickHouse passwords, OTLP tokens (if added later), API keys all stay out of trackers.
+- **HAProxy scope is narrow** — only the SigNoz UI hostname.
+- **Treat first deployment as lab-bootstrap** — production observability readiness still requires TLS/auth decisions on ingestion, ClickHouse backup/restore, retention policy, monitoring of SigNoz itself, restart drills, and upgrade rehearsal.
+
+## Known issues (high-level)
+
+- **v0.122 auth API moved.** v0.121 → v0.122 broke the login endpoint, the response field name, and made orgID a required input that is not retrievable from any unauthenticated API. The fix path requires reading SQLite directly. See [the auth quirk page](./03-signoz-auth-quirk).
+- **HEAD requests hit the SPA fallback.** `curl -I` returns the SPA index.html for any API path; always use `GET`.
+- **No initial dashboards or alerts.** A freshly-installed SigNoz is empty by design. Build dashboards and alert rules as the application footprint grows.
+- **SSH host key has rotated** at least once during the v0.122 install window. Clean stale `known_hosts` entries.
+
+## Failure modes
+
+### Symptom: OTLP POST returns 200 but spans never appear
+
+**Root cause.** Either the receiver dropped the body (malformed OTLP), or ClickHouse buffer flush hasn't run yet, or service-name resource attribute is missing so the span lands in an unnamed bucket.
+
+**Fix.** Wait 30+ seconds. Verify the OTLP body includes `service.name` resource attribute. Check `/api/v1/services` for the expected service name; check `/api/v1/services?start=<ms>&end=<ms>` with an explicit recent time window.
+
+**Prevention.** OpenTelemetry instrumentation in every emitting app must set `service.name` and `service.namespace`. Pipeline templates encode this.
+
+### Symptom: HAProxy returns 502 on the SigNoz UI
+
+**Root cause.** SigNoz container is restarting; ClickHouse OOM; container can't reach Zookeeper.
+
+**Fix.** SSH to the signoz VM, `docker compose ps`, find the unhealthy container, check logs.
+
+**Prevention.** Monitor SigNoz container health; alert on restarts.
+
+### Symptom: ClickHouse disk is full
+
+**Root cause.** Trace/log volume exceeded the retention sizing.
+
+**Fix.** Adjust retention policy in SigNoz settings (default ~15 days for traces), or grow the data disk. See [ClickHouse storage page](./02-signoz-clickhouse-storage) for the storage model.
+
+**Prevention.** Monitor disk usage; size retention to expected volume.
+
+## References
+
+- `codex-opp-agent/connection-details/signoz.md` — runbook for the live service.
+- `codex-opp-agent/adr/0010-signoz-standalone-vm-observability.md` — VM design decision.
+- Memory: `reference_lab_infrastructure.md` — two-VM observability split, port collision warning.
+- [ClickHouse storage](./02-signoz-clickhouse-storage)
+- [Auth quirk (v0.122)](./03-signoz-auth-quirk)
+- [Monitoring VM (LGTM sandbox)](./04-monitoring-vm)

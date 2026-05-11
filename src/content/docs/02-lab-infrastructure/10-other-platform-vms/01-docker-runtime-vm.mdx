@@ -1,8 +1,183 @@
 ---
 title: "Docker Runtime VM"
-description: "Section 02-lab-infrastructure/10-other-platform-vms: Docker Runtime VM (placeholder)."
+description: "docker-runtime-vm — the standalone private runtime host for developer apps that ship through the GitLab → Jenkins → Trivy → Nexus chain but don't target OpenShift."
 sidebar_label: "Docker Runtime VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`docker-runtime-vm` is the **standalone private runtime host** for developer apps. It is the runtime endpoint of the current app-dev path: GitLab → Jenkins → Trivy → Nexus → docker-runtime. Per the 2026-05-09 user direction (`project_app_dev_direction.md`), OpenShift application delivery is paused; new apps target this VM until that scope reopens.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `docker-runtime-vm` |
+| Private FQDN | `docker-runtime-vm.sub.comptech-lab.com` |
+| Private alias | `docker-runtime.sub.comptech-lab.com` |
+| Network | private lab `br30` `/24` |
+| Operator SSH user | `ze` |
+| Deploy SSH user | `docker-deploy` (sudo-limited to the deploy wrapper) |
+| Runtime root | `/opt/docker-runtime` |
+| Public exposure | None by default (per-app decision) |
+
+The VM intentionally has no public HAProxy route. Each application's exposure is a separate, explicit decision; the default is "private only."
+
+## Installed runtime tools
+
+| Tool | Version |
+| --- | --- |
+| Docker Engine | `29.1.3` |
+| Docker Compose | `2.40.3` |
+| Docker Buildx | `0.30.1` |
+| Podman | `4.9.3` |
+| Buildah | `1.33.7` |
+| Skopeo | `1.13.3` |
+| Ansible core | `2.16.3` |
+| Terraform | `1.15.2` |
+
+Both Docker Engine and Podman are present. App runtime uses Docker Compose; Podman/Buildah/Skopeo support build-time work and registry interaction for ad-hoc operations.
+
+## Why a standalone Docker VM
+
+The OpenShift app delivery path has been paused (`project_app_dev_direction.md`). The Docker runtime VM is the current production-capable target for app delivery, because:
+
+- The GitLab → Jenkins → Trivy → Nexus pipeline already produces immutable, scanned, digest-pinned images.
+- Pulling those images and running them with Docker Compose is straightforward and well-understood.
+- It decouples app development from OpenShift cluster readiness gates (ESO not yet wired, namespace baseline undecided, cross-cluster pull-secret wiring open).
+- When the OpenShift path reopens, the same immutable images can be deployed to a cluster instead — the supply-chain side doesn't change.
+
+## Image source
+
+Application images come from `app-registry.apps.sub.comptech-lab.com`, by immutable tag or digest. Pulls from `mirror-registry.*` are explicitly forbidden — that registry is platform install content only.
+
+```text
+# Correct
+app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8
+
+# Wrong (platform install content)
+mirror-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8
+```
+
+See the [app-registry endpoint page](../07-image-supply-nexus/04-app-registry-push-endpoint) for the contract.
+
+## docker-deploy wrapper
+
+Routine deploys do not use the `ze` SSH account. They use a least-privilege `docker-deploy` system user whose sudo is restricted to a single wrapper:
+
+```text
+/usr/local/sbin/docker-runtime-deploy *
+```
+
+Wrapper interface:
+
+```bash
+sudo /usr/local/sbin/docker-runtime-deploy deploy <app>
+sudo /usr/local/sbin/docker-runtime-deploy status <app>
+sudo /usr/local/sbin/docker-runtime-deploy logs <app>
+sudo /usr/local/sbin/docker-runtime-deploy health <app>
+sudo /usr/local/sbin/docker-runtime-deploy rollback <app> <release>
+sudo /usr/local/sbin/docker-runtime-deploy validate <app>
+```
+
+The wrapper is what Jenkins (when triggered) and operators use. The shape of a routine deploy:
+
+```bash
+ssh -i /home/ze/codex-opp-agent/secrets/docker-runtime-deploy/jenkins-deploy-key \
+  docker-deploy@docker-runtime-vm.sub.comptech-lab.com \
+  'sudo /usr/local/sbin/docker-runtime-deploy status readiness-probe'
+```
+
+Rollback was validated 2026-05-09 with:
+
+```bash
+sudo /usr/local/sbin/docker-runtime-deploy rollback readiness-probe 20260509T133018Z
+```
+
+## Runtime layout
+
+| Path | Use |
+| --- | --- |
+| `/opt/docker-runtime/apps` | Compose files or service definitions, one directory per app |
+| `/opt/docker-runtime/env` | Secret-bearing runtime env files (approved custody only) |
+| `/opt/docker-runtime/releases` | Release snapshots for rollback (timestamped) |
+| `/opt/docker-runtime/logs` | Runtime log handoff location for host-retained logs |
+| `/opt/docker-runtime/health` | One health URL file per app |
+| `/opt/docker-runtime/templates/app` | Starter Compose template |
+| `/etc/docker-runtime/bootstrap-ready` | Marker created by cloud-init after baseline install |
+
+Runtime env files are **not** committed to Git. They are the env-file bridge per `project_app_dev_direction.md` — used until Vault/ESO is reopened.
+
+## Current app port allocations
+
+| App | Host port | Notes |
+| --- | --- | --- |
+| `demo-smoke` | `18080` | Developer smoke/demo allocation |
+| `readiness-probe` | `19080` | Starter app health path |
+
+New allocations must be recorded in app release evidence and in this connection-details runbook. Per the current handoff: do not create public hostnames or HAProxy frontends without explicit reopening of app exposure by the platform owner.
+
+## Starter app
+
+The validated starter is `readiness-probe`:
+
+```text
+Image: app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8
+Health: http://localhost:19080/health   (private to the runtime VM)
+Deploy: sudo /usr/local/sbin/docker-runtime-deploy deploy readiness-probe
+```
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> docker-runtime-vm.sub.comptech-lab.com A +short
+
+# Tool versions
+ssh ze@docker-runtime-vm.sub.comptech-lab.com 'docker info --format "{{.ServerVersion}} {{.Driver}}"'
+ssh ze@docker-runtime-vm.sub.comptech-lab.com 'docker compose version'
+ssh ze@docker-runtime-vm.sub.comptech-lab.com 'ansible --version | head -n1'
+ssh ze@docker-runtime-vm.sub.comptech-lab.com 'terraform version | head -n1'
+```
+
+A scripted validation lives at `codex-opp-agent/scripts/rebuild/docker-runtime/validate-docker-runtime-vm.sh`.
+
+## Operational guidance
+
+- **No public exposure by default.** Per-app decision; require explicit reopening before adding HAProxy routes or public DNS.
+- **Always use the wrapper for deploys.** Don't SSH as `ze` and `docker compose up` directly; the wrapper enforces the release snapshot + rollback discipline.
+- **Pin app images by immutable tag or digest.** Don't reference `:latest` in Compose files.
+- **Don't pull from `mirror-registry.*`.** That's platform install content; not for app runtime.
+
+## Failure modes
+
+### Symptom: deploy fails with "registry not authorized"
+
+**Root cause.** `/opt/docker-runtime/env/<app>.env` is missing or has stale Nexus credentials.
+
+**Fix.** Refresh the env file with current `nexus-jenkinsbot`-equivalent runtime creds. Verify with `docker login` from the VM.
+
+**Prevention.** Track credential rotation; update env files as part of rotation.
+
+### Symptom: rollback target release is not present
+
+**Root cause.** Release directory was cleaned up (manual or by a too-aggressive retention script).
+
+**Fix.** Rebuild the previous image tag and redeploy. Future rollbacks require keeping the release snapshot.
+
+**Prevention.** Don't delete release snapshots without a tracked decision. Retention is a deliberate policy, not a routine cleanup.
+
+### Symptom: app port conflict
+
+**Root cause.** Two apps allocated to the same host port.
+
+**Fix.** Pick a different host port; update the app's Compose file; record in the allocation table.
+
+**Prevention.** Maintain the port allocation table as a single source of truth.
+
+## References
+
+- `codex-opp-agent/connection-details/docker-runtime-vm.md` — runbook for the live service.
+- Memory: `project_app_dev_direction.md` — Docker-runtime first direction.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/docker-runtime-vm-plan.md` — VM plan.
+- [app-registry endpoint](../07-image-supply-nexus/04-app-registry-push-endpoint) — image source contract.

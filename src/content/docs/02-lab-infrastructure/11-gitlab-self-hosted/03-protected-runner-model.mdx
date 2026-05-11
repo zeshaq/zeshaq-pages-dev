@@ -1,8 +1,143 @@
 ---
 title: "Protected Runner Model"
-description: "Section 02-lab-infrastructure/11-gitlab-self-hosted: Protected Runner Model (placeholder)."
-sidebar_label: "Protected Runner Model"
+description: "The five planned GitLab Runner classes — validation, build, security, ops, deploy — with the trust boundaries that prevent platform credentials from sharing a runner with untrusted app builds."
+sidebar_label: "Protected Runners"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+GitLab Runners are the execution side of GitLab CI. The lab's intent is **five distinct runner classes**, each with a tight privilege bound, each protected for the branches and projects it serves. The current state has **one** unprotected runner (`gitlab-vm-docker`), which is explicitly **not** the future trusted platform runner — the protected classes must be created before production-like CI work runs in-GitLab.
+
+This page covers the five planned runner classes, the rules, and the repository-to-runner mapping.
+
+## The five planned classes
+
+| Class | Purpose | Must NOT have |
+| --- | --- | --- |
+| **Validation runner** | Render templates (Kustomize, Helm dry-run), lint, policy checks | Live apply credentials; cluster kubeconfigs; deploy tokens |
+| **Build runner** | Build/test/scan app images | Platform infra credentials; cluster admin tokens |
+| **Security runner** | Trivy/SBOM/SCA checks (independent of build runner where useful) | Broad deploy credentials; cluster admin tokens |
+| **Ops runner** | Terraform/OpenTofu, Ansible, platform API work | Shared with app builds; **protected, restricted to platform repos** |
+| **Deploy runner** | VM runtime deployment (`docker-runtime-vm`, etc.) | Unrestricted target list; **scoped to approved VM targets** |
+
+Each class has its own runner registration with a dedicated tag. Pipelines select their runner by tag.
+
+## Repository-to-runner mapping
+
+Which repository can use which runner class:
+
+| Repo/domain | Allowed runner class |
+| --- | --- |
+| `openshift-platform-gitops` | Validation runner only |
+| `openshift-cluster-build` | Ops runner by approval |
+| `vm-platform-ops` | Ops runner |
+| `<division>-apps-monorepo` | Build runner + security runner |
+| `<division>-gitops` | Validation runner + security runner |
+| VM runtime deployment paths | Deploy runner |
+
+The platform GitOps repo runs **only validation**. There is no path by which a build runner has credentials to deploy something to the cluster directly — deploys flow through Argo CD pulling from a GitLab repo. The runner is for lint, policy, render, evidence — nothing that requires write access to a cluster.
+
+## Rules
+
+Per the operator guide:
+
+- **Use the internal LAN endpoint.** Runners register against the lab LAN URL, not the public route.
+- **Store runner tokens outside Git.** Runner registration tokens live in `secrets/`, never committed.
+- **Use protected runners for protected branches.** A runner that's allowed to run untagged jobs on any branch is not a protected runner.
+- **Don't share ops runners with untrusted app builds.** Different trust levels, different runners.
+- **Don't put platform kubeconfigs or admin tokens on build runners.** Cluster admin lives on the platform team's workstations, not on shared CI infrastructure.
+- **OpenShift deploys through Argo CD pull, not runner-side `oc apply`.** A build runner that has `oc apply` rights to a cluster is a deploy runner in disguise; the design intentionally separates these.
+
+## Trust boundary rationale
+
+The five-class model is the standard "blast-radius minimization" pattern applied to CI. The questions each boundary answers:
+
+| Boundary | Question | Why the answer matters |
+| --- | --- | --- |
+| Build vs Validation | Can this runner pull arbitrary base images and execute build steps? | Build runners run arbitrary code from a Containerfile — they cannot also hold infra credentials. |
+| Build vs Security | Can the security check run independently of the build itself? | Some teams want a fully isolated scan host so a compromised build cannot fake a passing scan. The lab can co-locate today; separation is a future hardening. |
+| Ops vs Build | Can this runner run `terraform apply` against the lab platform? | Ops runners hold Terraform state credentials and platform API tokens. They must never see app source. |
+| Deploy vs Ops | Can this runner SSH to `docker-runtime-vm` and execute `docker-runtime-deploy`? | Deploy runners hold the `jenkins-deploy-key`-equivalent. They must be restricted to the specific VM targets they deploy to. |
+| Validation everywhere | Can this runner ever apply anything? | No. Validation runners are read-only on everything except their own workspace. |
+
+## Current state: `gitlab-vm-docker`
+
+The existing runner:
+
+- **Project-scoped** rather than group-scoped.
+- **Unprotected** — runs on any branch, not just protected ones.
+- **Untagged-jobs allowed** — accepts any pipeline that doesn't pin a runner tag.
+
+This is fine for bootstrap smoke runs (the sandbox dev workflow) but **must not** be promoted to platform CI duty. The protected-runner work is part of the GitLab Runner Operating Model milestone (open).
+
+## What protected runner setup needs
+
+1. **Runner VM(s)** — one per class, or a smaller number with strict tag boundaries. Lab choice TBD; likely two VMs initially (validation + build/security combo, ops + deploy combo) with strict tags.
+2. **Runner registration tokens** in `secrets/`, distinct per runner.
+3. **Tag taxonomy** documented in CI templates.
+4. **Protected branch + protected tag config** on each repo: runners with `*-protected` tags only run on protected refs.
+5. **Group-scoped registration**, not project-scoped, so platform repos share a runner pool while app repos share a different pool.
+6. **Validation pipeline templates** for `openshift-platform-gitops`: Kustomize render, YAML parse, no plaintext Secrets, no unmanaged public images, no app-team cluster-admin.
+7. **Build pipeline templates** for `<division>-apps-monorepo` that mirror the existing Jenkins behavior (Nexus pull from `docker-group.*`, Trivy scan, push to `app-registry.*`).
+8. **Negative access tests**: a build runner attempting to clone `openshift-platform-gitops` should fail; an app team attempting to register a build runner against an ops runner's group should fail.
+
+## Why not just use Jenkins?
+
+Jenkins is the current CI driver for image builds (see [Jenkins page](../08-ci-platform-vms/01-jenkins-single-vm)). Why also plan GitLab Runners?
+
+- **Validation pipelines** in MR review are a GitLab-CI strength: the MR view shows the pipeline result inline; a separate Jenkins job for MR validation is awkward.
+- **Branch-protection-aware pipelines** are easier in GitLab CI than orchestrating across Jenkins.
+- **Ops/deploy runners** for Terraform/Ansible fit GitLab CI's protected-branch + protected-variable model naturally.
+- **Per-tenant runners** can be group-scoped — a division's CI uses the division's runners, no cross-tenant leakage.
+
+The long-term picture is **Jenkins for image builds** (existing, working, scanned, pushed) **plus GitLab Runners for everything else** (validation, Terraform/Ansible, deploys, in-MR checks).
+
+## Runner-side credential hygiene
+
+For each class, **what's allowed in credentials**:
+
+| Class | Allowed credentials |
+| --- | --- |
+| Validation | Read-only deploy tokens for the project under MR; nothing cluster-side |
+| Build | `nexus-jenkinsbot`-equivalent (or scoped CI Nexus user), Trivy server token, MinIO writer for evidence |
+| Security | Trivy server token; SBOM tool credentials if separate |
+| Ops | Terraform backend creds, Vault token for platform vars, platform API tokens — **all narrow** |
+| Deploy | SSH key for the specific deploy target; no other VM access |
+
+No runner ever holds cluster-admin. No runner ever holds the GitLab admin PAT. No runner ever holds Vault root token.
+
+## Validation tests
+
+When the protected runner classes are stood up, negative access tests are mandatory:
+
+```bash
+# Build runner cannot clone platform GitOps
+gitlab-runner exec docker my-build-job \
+  --env CI_PROJECT_URL=http://<lab-IP-for-gitlab>/comptech-platform/openshift-ops/openshift-platform-gitops \
+  # Expected: clone fails with 403/404
+
+# Ops runner cannot pick up an app repo MR pipeline
+# Expected: pipeline fails to find a matching runner tag
+
+# Deploy runner cannot reach an unapproved SSH target
+ssh -i /path/to/deploy-key docker-deploy@some-other-vm
+# Expected: connection refused or key rejected
+```
+
+The negative test pattern: try to do the thing you should not be able to do, confirm it fails, record the evidence.
+
+## Drift indicators (specific to runners)
+
+Per the operator guide:
+
+- **Unprotected runner executes protected-branch jobs.** That's a tag/protection misconfig.
+- **App-team build job using the ops runner.** That's a tag-leakage incident.
+- **Platform kubeconfig appears on a build runner.** That's a credential incident.
+- **Runner registration token in repo files or issue text.** That's a credential leak.
+
+## References
+
+- `codex-opp-agent/connection-details/gitlab-operator-guide.md` — runner classes, rules, repo mapping.
+- `codex-opp-agent/adr/0023-federated-gitlab-group-repo-ownership.md` — ownership boundary the runners enforce.
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md` — what build runners are allowed to push/pull.
+- [Jenkins controller page](../08-ci-platform-vms/01-jenkins-single-vm) — current CI driver coexistence.

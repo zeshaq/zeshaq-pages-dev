@@ -1,8 +1,272 @@
 ---
 title: "Federated Monorepo Architecture"
-description: "Section 02-lab-infrastructure/11-gitlab-self-hosted: Federated Monorepo Architecture (placeholder)."
-sidebar_label: "Federated Monorepo Architecture"
+description: "The two-tree GitLab group layout — comptech-platform vs divisions — the eleven ct-* role groups, repository ownership, and the boundaries that keep app teams off platform state."
+sidebar_label: "Federated Monorepo"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  { id: "ct",     position: { x: 0,   y: 0   }, data: { label: "comptech-platform/\n(platform-owned)" }, style: ctrlBox },
+  { id: "ocp",    position: { x: 0,   y: 130 }, data: { label: "openshift-ops/" }, style: dataBox },
+  { id: "infra",  position: { x: 220, y: 130 }, data: { label: "infra-ops/" }, style: dataBox },
+  { id: "ps",     position: { x: 440, y: 130 }, data: { label: "platform-services/" }, style: dataBox },
+  { id: "tr",     position: { x: 660, y: 130 }, data: { label: "tenant-registry/" }, style: dataBox },
+  { id: "div",    position: { x: 0,   y: 320 }, data: { label: "divisions/\n(app-team owned)" }, style: ctrlBox },
+  { id: "sb",     position: { x: 220, y: 320 }, data: { label: "sandbox/" }, style: agentBox },
+  { id: "pgo",    position: { x: 0,   y: 230 }, data: { label: "openshift-platform-gitops\n(project ID 12)" }, style: dataBox },
+  { id: "cb",     position: { x: 0,   y: 285 }, data: { label: "openshift-cluster-build" }, style: dataBox },
+  { id: "vpo",    position: { x: 220, y: 230 }, data: { label: "vm-platform-ops\n(planned)" }, style: dataBox },
+  { id: "apps",   position: { x: 220, y: 410 }, data: { label: "<division>-apps-monorepo" }, style: agentBox },
+  { id: "dgo",    position: { x: 440, y: 410 }, data: { label: "<division>-gitops" }, style: agentBox },
+];
+
+export const edges = [
+  { id: "c-o",  source: "ct",  target: "ocp",   ...muted },
+  { id: "c-i",  source: "ct",  target: "infra", ...muted },
+  { id: "c-p",  source: "ct",  target: "ps",    ...muted },
+  { id: "c-t",  source: "ct",  target: "tr",    ...muted },
+  { id: "o-p",  source: "ocp", target: "pgo",   ...muted },
+  { id: "o-c",  source: "ocp", target: "cb",    ...muted },
+  { id: "i-v",  source: "infra", target: "vpo", ...muted },
+  { id: "d-s",  source: "div", target: "sb",    ...muted },
+  { id: "s-a",  source: "sb",  target: "apps",  ...muted },
+  { id: "s-g",  source: "sb",  target: "dgo",   ...muted },
+];
+
+The lab's GitLab is organized as a **federated monorepo by ownership boundary**: two sibling group trees, one for platform-owned operational state, one for application-team state. The split is not stylistic. It exists to make the OpenShift GitOps pull model enforceable, and to keep application teams structurally unable to write to platform state.
+
+This page covers the architecture, the ownership matrix, the role-group model, and the CODEOWNERS baselines. ADR 0023 locks the design in.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={560} />
+
+The two trees:
+
+- `comptech-platform/` contains platform-owned operational state — OpenShift cluster GitOps, VM platform-ops, platform tools, tenant registry.
+- `divisions/` contains application-team state, organized one sub-group per division. The lab's current bootstrap division is `sandbox`.
+
+## Why two trees, not one
+
+Per ADR 0023 the alternatives considered include:
+
+| Alternative | Why rejected |
+| --- | --- |
+| **Single super-group** with role-groups distinguishing ownership | Easy to grant a role group too broadly; loses the visual boundary between platform-owned and division-owned state. |
+| **Flat repo model** under `comptech-platform/` | Forces all project shares per-repository; loses the sub-group-level share affordance. |
+| **Per-team ownership of everything** (give divisions maintainer on platform repos so their CI can do direct cluster changes) | Violates the ADR 0015 ownership boundary; makes the ADR 0018 GitOps pull model unenforceable. |
+| **Defer the formal model** until more divisions exist | Issue #68 explicitly required documenting the model **before** more teams onboard. |
+
+The two-tree split is cheap to operate and gives the OpenShift/platform team a defensible namespace boundary. It is the lock-in decision.
+
+## Group layout (live)
+
+The skeleton already exists in the live GitLab:
+
+```text
+comptech-platform/
+  openshift-ops/
+    openshift-platform-gitops   (project ID 12 — live)
+    openshift-cluster-build     (planned)
+  infra-ops/
+    vm-platform-ops             (planned)
+  platform-services/
+    platform-tools-iac          (deferred)
+    platform-tools-config       (deferred)
+  tenant-registry/
+    openshift-tenants           (deferred)
+
+divisions/
+  sandbox/
+    openliberty-readiness-probe (live source repo)
+    demo-smoke                  (live source repo)
+    sandbox-apps-monorepo       (planned)
+    sandbox-gitops              (planned)
+```
+
+The first live repo is `openshift-platform-gitops` (project ID `12`). It was migrated from `gitops/platform-gitops` to `comptech-platform/openshift-ops/openshift-platform-gitops` as part of the bootstrap. The local clone on operator workstations is at `/home/ze/platform-gitops` and points at the LAN endpoint.
+
+## Repository ownership matrix
+
+| Repo/domain | Purpose | Writers | Readers |
+| --- | --- | --- | --- |
+| `openshift-platform-gitops` | OpenShift cluster desired state, platform operators, policies, tenant boundaries | OpenShift/platform team only | platform, security, auditors |
+| `openshift-cluster-build` | Cluster install inputs, agent install automation, mirror references | OpenShift/platform team only | platform, auditors |
+| `vm-platform-ops` | HAProxy, PowerDNS, GitLab, Jenkins, Nexus, Docker runtime, runners, VM inventory | Infra/platform tools team | OpenShift read, security, auditors |
+| `platform-tools-iac` | Shared infra modules if split later | Infra/platform tools team | platform read |
+| `platform-tools-config` | Tool config through APIs/JCasC/Ansible if split later | Infra/platform tools team | platform read |
+| `openshift-tenants` | Approved tenant metadata if split later | OpenShift/platform team | tenant owners by approval |
+| `<division>-apps-monorepo` | Application source | Division app team | platform/CI/security as needed |
+| `<division>-gitops` | Application deployment intent and overlays | Division app team inside guardrails | OpenShift/platform retains maintainer for guardrails/emergency rollback |
+
+Application teams **must not** write to:
+
+- `openshift-platform-gitops`
+- `openshift-cluster-build`
+- `vm-platform-ops`
+- Platform runner or admin configuration repos
+
+## Creation order
+
+Not every repository above must exist immediately. The accepted creation order per ADR 0023:
+
+1. `openshift-platform-gitops` (live, project ID `12`).
+2. `vm-platform-ops` when ownership and first service adoption are ready.
+3. `openshift-cluster-build` when cluster-build artifacts are ready to split out of planning docs.
+4. `platform-tools-iac`, `platform-tools-config`, `openshift-tenants` only when their split proves useful.
+5. Division repositories as teams onboard.
+
+## Role groups (eleven `ct-*` groups)
+
+Individual users are added to **role groups**, not directly to projects, except for tightly scoped temporary exceptions recorded against an issue.
+
+| Role group | GitLab role | Scope |
+| --- | --- | --- |
+| `ct-gitlab-admins` | Owner | Top-level operational groups; very small admin group |
+| `ct-openshift-platform-maintainers` | Maintainer | `openshift-ops/*`, tenant boundaries |
+| `ct-openshift-platform-reviewers` | Reporter or Developer | OpenShift platform review/read |
+| `ct-infra-platform-maintainers` | Maintainer | `infra-ops/*`, selected `platform-services/*` |
+| `ct-infra-platform-reviewers` | Reporter or Developer | Infra review/read |
+| `ct-cicd-platform-maintainers` | Maintainer | CI templates, runner config, Jenkins shared libraries |
+| `ct-security-reviewers` | Reporter or Developer | Platform and app GitOps policy/security review |
+| `ct-auditors` | Reporter | Selected operational repos, read-only |
+| `ct-<division>-app-maintainers` | Maintainer | Division source and app GitOps repos only |
+| `ct-<division>-developers` | Developer | Division app source repos |
+| `ct-<division>-release-approvers` | Developer or Maintainer | Division app GitOps promotion paths |
+
+The bootstrap sandbox already has `ct-sandbox-app-maintainers`, `ct-sandbox-developers`, and `ct-sandbox-release-approvers` instantiated.
+
+## Initial project shares (`openshift-platform-gitops`)
+
+Project ID `12` is shared with:
+
+- `ct-openshift-platform-maintainers`: Maintainer
+- `ct-openshift-platform-reviewers`: Reporter
+- `ct-security-reviewers`: Reporter
+- `ct-auditors`: Reporter
+
+`ct-sandbox-*` groups have **no** access to platform GitOps. The same pattern is applied to each new operational repo as it's created.
+
+## CODEOWNERS baseline
+
+The CODEOWNERS files express path-level review ownership and complement project shares. The lab baseline:
+
+### `openshift-platform-gitops`
+
+```text
+/clusters/       @ct-openshift-platform-maintainers
+/components/     @ct-openshift-platform-maintainers
+/policies/       @ct-openshift-platform-maintainers @ct-security-reviewers
+/tenants/        @ct-openshift-platform-maintainers @ct-security-reviewers
+/bootstrap/      @ct-openshift-platform-maintainers
+```
+
+### Future `vm-platform-ops`
+
+```text
+/services/haproxy/        @ct-infra-platform-maintainers
+/services/pdns/           @ct-infra-platform-maintainers
+/services/gitlab/         @ct-infra-platform-maintainers
+/services/jenkins/        @ct-infra-platform-maintainers @ct-cicd-platform-maintainers
+/services/nexus/          @ct-infra-platform-maintainers @ct-cicd-platform-maintainers
+/services/docker-runtime/ @ct-infra-platform-maintainers
+/services/gitlab-runner/  @ct-infra-platform-maintainers @ct-cicd-platform-maintainers @ct-security-reviewers
+/terraform/               @ct-infra-platform-maintainers
+/ansible/                 @ct-infra-platform-maintainers
+/policies/                @ct-infra-platform-maintainers @ct-security-reviewers
+```
+
+### Division app GitOps
+
+```text
+/apps/*/dev/      @ct-<division>-app-maintainers
+/apps/*/uat/      @ct-<division>-release-approvers
+/apps/*/staging/  @ct-<division>-release-approvers
+/apps/*/prod/     @ct-<division>-release-approvers @ct-security-reviewers
+```
+
+## Review rules
+
+Per ADR 0023, the minimum approval expectations are fixed:
+
+| Change type | Required approvers |
+| --- | --- |
+| OpenShift cluster-wide operator/platform change | OpenShift maintainer + second platform reviewer |
+| Tenant onboarding or namespace policy change | OpenShift maintainer + tenant owner acknowledgement |
+| Production AppProject/RBAC/NetworkPolicy change | OpenShift maintainer + security reviewer |
+| VM platform tool change | Infra maintainer + service owner |
+| HAProxy or PowerDNS production-impacting change | Infra maintainer + affected service owner |
+| GitLab/Jenkins/Nexus admin/config change | Infra maintainer + CI/CD maintainer where relevant |
+| GitLab Runner privilege/tag change | Infra maintainer + CI/CD maintainer + security reviewer |
+| App build template change | CI/CD maintainer + app representative |
+| App production promotion | App release approver + required pipeline evidence |
+
+Where GitLab CE cannot enforce a rule natively, compensating controls — CODEOWNERS, protected branches, validation pipelines, MR evidence — must be recorded.
+
+## OpenShift GitOps boundary
+
+`openshift-platform-gitops` owns OpenShift operations only:
+
+- Cluster bootstrap paths
+- ACM/MCE and OpenShift GitOps control
+- Mirrored CatalogSources and ClusterCatalogs
+- IDMS/ITMS mirror configuration
+- Platform operators
+- Storage layer configuration
+- Tenant namespaces and AppProjects
+- Quotas, limit ranges, NetworkPolicies, RBAC, and policy guardrails
+
+It does **not** own:
+
+- Application source code
+- Routine application release manifests
+- VM-hosted platform tool configuration
+- Kafka or other middleware (unless explicitly introduced as an OpenShift platform workload through a tracked issue and ADR)
+- Generic Docker image catalogues
+
+## Onboarding a new division
+
+When the time comes:
+
+1. Create `divisions/<division>`.
+2. Create role groups: `ct-<division>-app-maintainers`, `ct-<division>-developers`, `ct-<division>-release-approvers`.
+3. Create `<division>-apps-monorepo`.
+4. Create `<division>-gitops`.
+5. Add README, CODEOWNERS, MR template, and validation pipeline.
+6. Grant app teams only to division repos.
+7. Register tenant boundaries in platform-owned OpenShift GitOps (namespaces, AppProjects, quotas, limit ranges, NetworkPolicies, RBAC, allowed source repos, allowed destination namespaces).
+8. Run negative access tests.
+9. Run a golden-path app smoke test before production onboarding.
+
+Stop and revisit the design if the division needs write access to `openshift-platform-gitops` for normal application deployment — that means the tenant/AppProject model is wrong or incomplete.
+
+## Residual decisions (still open)
+
+ADR 0023 explicitly leaves these open for separate tracking:
+
+- Final naming for the existing `ct-*` role groups if the eleven-group list proves too coarse or too fine in practice.
+- Whether `openshift-tenants` should be a separate repo or a folder inside `openshift-platform-gitops`.
+- Whether `platform-tools-iac` and `platform-tools-config` should be separate repos immediately or deferred.
+- Whether application GitOps repositories should be one per division or one per application for high-risk teams.
+- Whether production branches should require signed commits immediately or in a later hardening phase.
+- The GitLab CE merge-control and CODEOWNERS-enforcement decision under FG-1.
+
+## References
+
+- `codex-opp-agent/adr/0023-federated-gitlab-group-repo-ownership.md` — ownership model.
+- `codex-opp-agent/adr/0015-federated-gitops-repo-architecture.md` — parent architecture.
+- `codex-opp-agent/adr/0016-workspace-execution-governance.md` — operator workspace rules.
+- `codex-opp-agent/connection-details/gitlab-operator-guide.md` — operator runbook.
+- `codex-opp-agent/plans/federated-gitops-gitlab-access-matrix.md` — full access matrix (the source-of-truth design baseline).
+- `codex-opp-agent/plans/federated-gitops-gitlab-implementation-checklist.md` — execution sequence.

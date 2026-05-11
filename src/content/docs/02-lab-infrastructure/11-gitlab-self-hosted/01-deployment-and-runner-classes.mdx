@@ -1,8 +1,267 @@
 ---
-title: "Deployment and Runner Classes"
-description: "Section 02-lab-infrastructure/11-gitlab-self-hosted: Deployment and Runner Classes (placeholder)."
-sidebar_label: "Deployment and Runner Classes"
+title: "GitLab Deployment and Runner Classes"
+description: "GitLab CE 18.11.1 on a single VM behind HAProxy — internal LAN endpoint for automation, public route for browsers, eleven ct-* role groups, and the five planned runner classes."
+sidebar_label: "Deployment & Runners"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  { id: "ops",     position: { x: 0,   y: 0   }, data: { label: "Operator browser" }, style: extBox },
+  { id: "auto",    position: { x: 220, y: 0   }, data: { label: "Automation\n(Argo, Jenkins, runners, API)" }, style: extBox },
+  { id: "haproxy", position: { x: 0,   y: 130 }, data: { label: "HAProxy edge VM\n(LE wildcard)" }, style: ctrlBox },
+  { id: "lan",     position: { x: 220, y: 130 }, data: { label: "Internal LAN endpoint\n(direct port 80 in /24)" }, style: dataBox },
+  { id: "gitlab",  position: { x: 110, y: 280 }, data: { label: "GitLab CE 18.11.1\n(single VM)" }, style: ctrlBox },
+  { id: "repo",    position: { x: 0,   y: 430 }, data: { label: "platform-gitops repo\nproject ID 12" }, style: dataBox },
+  { id: "runners", position: { x: 220, y: 430 }, data: { label: "Runner classes (planned):\nvalidation, build, security,\nops, deploy" }, style: agentBox },
+];
+
+export const edges = [
+  { id: "o-h",  source: "ops",     target: "haproxy", label: "https://gitlab.apps.*", ...reqEdge },
+  { id: "h-g",  source: "haproxy", target: "gitlab",  ...muted },
+  { id: "a-l",  source: "auto",    target: "lan",     label: "http://lab-LAN-IP", ...reqEdge },
+  { id: "l-g",  source: "lan",     target: "gitlab",  ...muted },
+  { id: "g-r",  source: "gitlab",  target: "repo",    ...muted },
+  { id: "g-rn", source: "gitlab",  target: "runners", ...muted },
+];
+
+GitLab is the lab's **operational source for platform and application delivery**. It hosts the platform GitOps repository that hub and spoke Argo CD pull from; it hosts application source for division teams; it triggers Jenkins via webhook; and (planned) it hosts protected runner classes for in-GitLab CI.
+
+GitHub remains the **planning surface** for the codex-opp-agent workspace — issues, milestones, ADRs, reports, handoffs. GitLab and GitHub together split the "what we plan vs what we execute" axis cleanly.
+
+This page covers the GitLab VM deployment and the runner-class model. Sister pages cover the federated monorepo architecture ([page 2](./02-federated-monorepo-architecture)), the protected runner model ([page 3](./03-protected-runner-model)), and tokens/bots ([page 4](./04-tokens-and-bots)).
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={580} />
+
+Two distinct entry points by purpose:
+
+- **Operators in browsers** → `https://gitlab.apps.sub.comptech-lab.com` via HAProxy + LE wildcard.
+- **Automation** (Argo CD, Jenkins, future runners, platform API work) → the **internal LAN endpoint** directly on the lab `/24`, port `80`, no TLS termination by HAProxy.
+
+This split is non-negotiable per the operator guide.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| Internal LAN endpoint | `http://<lab-IP-for-gitlab>` |
+| Human browser route | `https://gitlab.apps.sub.comptech-lab.com` |
+| GitLab version | `18.11.1` |
+| Edition | GitLab CE (non-Enterprise) |
+| Current operational platform repo | `comptech-platform/openshift-ops/openshift-platform-gitops` (project ID `12`) |
+| Local clone for the platform GitOps repo | `/home/ze/platform-gitops` |
+| Bootstrap admin user | `zahid` |
+| Operator PAT custody | `secrets/gitlab-md-pat` (Git-ignored) |
+
+## Why a single VM CE
+
+Per the operator guide:
+
+- **CE is acceptable** for the lab's current scope — branch protection, merge requests, and approval rules at the CE feature level are enough.
+- **Single VM** matches the bootstrap pattern for all supporting services (Nexus, Jenkins, SigNoz, Trivy, DefectDojo, etc.).
+- **Internal LAN endpoint as the automation surface** keeps platform tools off the public path. Argo CD, Jenkins, GitLab Runner (future), and platform tooling use it; only humans use the public route.
+
+CE has limitations vs Premium/Ultimate — most relevantly, certain advanced merge-rule features. When the lab hits one, the compensating control is CODEOWNERS, protected branches, validation pipelines, and documented MR evidence rather than upgrading the GitLab edition.
+
+## Endpoints, one more time
+
+The two-endpoint distinction is the most-misused piece of the GitLab design. Repeating for clarity:
+
+| Use | Endpoint |
+| --- | --- |
+| `git clone` for automation (Argo CD, Jenkins, runners) | LAN endpoint, `http://`, port 80 |
+| `git clone` from a human operator workstation | LAN endpoint OR public route — both work |
+| Browser, MR review, issue tracking | Public route, `https://gitlab.apps.*` |
+| API calls from automation | LAN endpoint |
+| API calls from an operator's CLI | Either; prefer LAN endpoint for consistency |
+
+Configuring Argo CD or Jenkins to use the public route is a drift indicator — it breaks the assumption that automation lives on the LAN, complicates TLS trust setup, and pulls automation behind the HAProxy SNI plane unnecessarily.
+
+## Current group structure
+
+The federated group skeleton already exists (per the operator guide):
+
+```text
+comptech-platform/
+  openshift-ops/
+    openshift-platform-gitops   (project ID 12, migrated from gitops/platform-gitops)
+  infra-ops/
+  platform-services/
+  tenant-registry/
+
+divisions/
+  sandbox/
+    openliberty-readiness-probe
+    demo-smoke
+```
+
+Eleven `ct-*` role groups are already provisioned with bootstrap membership:
+
+```text
+ct-gitlab-admins
+ct-openshift-platform-maintainers
+ct-openshift-platform-reviewers
+ct-infra-platform-maintainers
+ct-infra-platform-reviewers
+ct-cicd-platform-maintainers
+ct-security-reviewers
+ct-auditors
+ct-sandbox-app-maintainers
+ct-sandbox-developers
+ct-sandbox-release-approvers
+```
+
+The full ownership matrix lives in [the federated monorepo page](./02-federated-monorepo-architecture).
+
+## Runner classes (planned)
+
+Per the operator guide, five runner classes are intended, each with a specific privilege bound:
+
+| Class | Purpose | What it must NOT have |
+| --- | --- | --- |
+| Validation runner | Render templates, lint, policy checks | live apply credentials |
+| Build runner | Build/test/scan app images | platform infra credentials |
+| Security runner | Trivy/SBOM/SCA checks | broad deploy credentials |
+| Ops runner | Terraform/OpenTofu, Ansible, platform API work | shared with app builds; protected, restricted to platform repos |
+| Deploy runner | VM runtime deployment | unrestricted target list; scoped to approved VM targets |
+
+The existing `gitlab-vm-docker` runner is project-scoped, unprotected, and runs untagged jobs — it is explicitly **not** the future trusted platform runner. Protected runner classes must be created under the GitLab Runner Operating Model milestone before production-like work.
+
+Runner rules (per operator guide):
+
+- Use the internal LAN endpoint.
+- Store runner tokens outside Git.
+- Use protected runners for protected branches.
+- Don't share ops runners with untrusted app builds.
+- Don't put platform kubeconfigs or admin tokens on build runners.
+- OpenShift deploys through Argo CD pull, not runner-side `oc apply`.
+
+Detailed runner privileges live on the [protected runner model page](./03-protected-runner-model).
+
+## Repository ownership
+
+The bootstrap-phase intent is captured fully on the [federated monorepo page](./02-federated-monorepo-architecture). The summary table:
+
+| GitLab path | Writers | Default readers |
+| --- | --- | --- |
+| `comptech-platform/openshift-ops/openshift-platform-gitops` | OpenShift/platform team only | platform, security, auditors |
+| `comptech-platform/infra-ops/vm-platform-ops` (planned) | Infra/platform tools team | OpenShift read, security, auditors |
+| `divisions/<division>/<division>-apps-monorepo` | Division app team | platform/CI/security as needed |
+| `divisions/<division>/<division>-gitops` | Division app team (inside guardrails) | OpenShift/platform retains maintainer for guardrails/emergency rollback |
+
+Application teams **must not** write to:
+
+- `openshift-platform-gitops`
+- `openshift-cluster-build`
+- `vm-platform-ops`
+- Platform runner or admin configuration repos
+
+## Branch protection baseline
+
+Every operational repository runs with:
+
+- Default branch `main`.
+- Protected `main`.
+- Force push disabled.
+- Direct push to `main` disabled except named break-glass maintainers.
+- Merge requests required for normal changes.
+- Approval required (one for non-production repos, two for production-impacting).
+- CODEOWNERS approval required for protected paths.
+- Pipeline required before merge where validation jobs exist.
+- Stale approval dismissal for production-impacting repos where the edition supports it.
+- MR templates for platform, infra, runner, and release repos.
+
+## Daily operator checks
+
+```bash
+# GitLab health
+curl -fsS "http://<lab-IP-for-gitlab>/-/readiness"
+curl -fsS "http://<lab-IP-for-gitlab>/-/liveness"
+
+# API check
+GITLAB_PAT="$(cat /home/ze/codex-opp-agent/secrets/gitlab-md-pat)"
+curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+  "http://<lab-IP-for-gitlab>/api/v4/version"
+unset GITLAB_PAT
+
+# Platform repo reachability
+git ls-remote \
+  http://<lab-IP-for-gitlab>/comptech-platform/openshift-ops/openshift-platform-gitops.git \
+  main
+```
+
+## OpenShift GitOps consumer
+
+The v6 OpenShift model is ACM plus OpenShift GitOps Basic pull. GitLab's role:
+
+1. `hub-dc-v6` Argo CD pulls from `openshift-platform-gitops` via the **internal LAN endpoint**.
+2. `spoke-dc-v6` Argo CD does the same.
+3. GitLab must therefore be reachable from hub Argo CD repo-server, spoke Argo CD repo-server, Jenkins, future GitLab runners, and platform operator workstations — all using the LAN endpoint.
+
+A platform repo Argo CD health check:
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+K_SPOKE=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+oc --kubeconfig "$K_HUB"   -n openshift-gitops get app hub-dc-v6-bootstrap         -o wide
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get app spoke-dc-v6-cluster-config -o wide
+```
+
+Expected: `Synced Healthy`.
+
+## Drift indicators
+
+Per the operator guide, watch for:
+
+- Users directly added to many projects (should be via role groups).
+- App-team group appearing on `openshift-platform-gitops`.
+- Public route appearing in Argo CD/Jenkins/runner config.
+- Unprotected runner executing protected-branch jobs.
+- Direct pushes to `main`.
+- Missing session report for a live GitLab mutation.
+- Platform GitOps containing VM service configuration or application source.
+- App GitOps repo containing platform cluster-scoped guardrails.
+
+## Roadmap
+
+Immediate:
+
+1. Finish FG-1 branch protection and merge controls for `openshift-platform-gitops`.
+2. Add CODEOWNERS to `openshift-platform-gitops`.
+3. Add validation-only pipeline (Kustomize render, YAML parse, no plaintext Secrets, no unmanaged public images, no app-team cluster-admin).
+4. Create `vm-platform-ops` once ownership and first service adoption are ready.
+5. Create sandbox division repos with negative access tests.
+6. Decide GitLab CE limitations for approval rules and CODEOWNERS enforcement.
+7. **Define protected GitLab Runner classes and tags** (covered on [protected runner model page](./03-protected-runner-model)).
+8. Move from bootstrap admin/PAT usage to named users, deploy tokens, and Vault-backed or protected variable custody.
+
+Longer:
+
+- Support future `hub-dr`, `spoke-dr`, dev, UAT, staging, production OCP clusters.
+- Onboard multiple BFSI divisions.
+- Adopt HAProxy, PowerDNS, GitLab, Jenkins, Nexus, Docker runtime, Vault, Trivy, SigNoz into Git-tracked VM/platform operations.
+- Add audit evidence retention for GitLab changes.
+- Add signed commits for production-impacting repos if feasible.
+- Add automated access drift checks against the matrix.
+
+## References
+
+- `codex-opp-agent/connection-details/gitlab-operator-guide.md` — canonical operator runbook.
+- `codex-opp-agent/adr/0023-federated-gitlab-group-repo-ownership.md` — ownership model.
+- `codex-opp-agent/adr/0015-federated-gitops-repo-architecture.md` — parent architecture decision.
+- `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md` — Argo CD pull-model consumer.
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md` — mirror ownership the platform GitOps owns.

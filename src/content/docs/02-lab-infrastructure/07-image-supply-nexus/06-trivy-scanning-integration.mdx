@@ -1,8 +1,155 @@
 ---
 title: "Trivy Scanning Integration"
-description: "Section 02-lab-infrastructure/07-image-supply-nexus: Trivy Scanning Integration (placeholder)."
-sidebar_label: "Trivy Scanning Integration"
+description: "How the Trivy VM sits in front of the app-registry push path — client/server mode, the enforced scan gate in Jenkins, severity thresholds, and DefectDojo handoff."
+sidebar_label: "Trivy Scanning"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Mermaid from "../../../../components/Mermaid";
+
+The Trivy VM is the security-scanning gate between a built image and the `app-registry` push. Every Jenkins job that produces an image runs a Trivy scan against the local image (or against the registry reference after a candidate push), interprets the result, and either pushes the immutable tag or fails the build. The same scan output is uploaded as evidence to MinIO and, in the future, imported into DefectDojo as the AppSec dashboard.
+
+This page is the integration view from the image-supply side. For the Trivy VM itself — installation, server config, token custody — see [the Trivy VM page](../08-ci-platform-vms/03-trivy-vm).
+
+## Why a scan gate
+
+The runtime allowlist in ADR 0019 says only approved registry prefixes can produce runtime images, but it does not, by itself, say anything about what's inside those images. A scan gate adds a second axis:
+
+- *Provenance:* the image came through the approved path.
+- *Content:* the image has been scanned for known vulnerabilities at a defined severity threshold, and the scan was within an acceptable freshness window.
+
+Without the gate, the image supply chain would publish provably-Nexus-sourced but possibly-trivially-CVE-laden images. The gate doesn't make the runtime invulnerable — Trivy detects known vulnerabilities, not novel ones — but it makes the floor much higher.
+
+## Where the scan sits in the build
+
+<Mermaid client:load chart={`flowchart LR
+  gitlab["GitLab repo\n(developer push)"] -->|webhook| jenkins["Jenkins job"]
+  jenkins -->|pull base| dgr["docker-group.apps.\nsub.comptech-lab.com"]
+  jenkins -->|build| local["Local image\non build agent"]
+  local -->|trivy --server| trivy["Trivy server VM"]
+  trivy -->|HIGH or CRITICAL gate| gate{{"Scan passes?"}}
+  gate -->|yes| push["podman push to\napp-registry.apps.*"]
+  gate -->|no| fail["fail build,\nreport to MinIO"]
+  push -->|evidence + report| minio["MinIO\ndeveloper-ci-evidence"]
+`} />
+
+The flow:
+
+1. GitLab push triggers a Jenkins job via `notifyCommit` webhook.
+2. Jenkins clones the source, derives the immutable tag, logs into `docker-group.*` for base-image pulls and `app-registry.*` for the eventual push.
+3. The build agent (`jenkins-agent-0`) builds the image with `podman build` (or `buildah`), producing a local image.
+4. The pipeline invokes `trivy --server` (client/server mode — the server holds the vuln DB and cache, the client streams the image).
+5. Trivy returns a report. Jenkins evaluates the severity threshold gate. The current threshold is **fail on HIGH or CRITICAL**.
+6. On pass, the pipeline pushes the immutable tag and archives the Trivy report + image digest as build evidence.
+7. On fail, the pipeline does not push, archives the failure evidence, and fails the build.
+
+## Client/server mode
+
+The Trivy VM runs `trivy server` under systemd. The server holds the vulnerability database (downloaded from Aqua Security's distribution) and the layer cache; clients connect over HTTP with a bearer token and stream image references for scan.
+
+```bash
+# Client invocation in Jenkins
+trivy image \
+  --server "https://trivy.apps.sub.comptech-lab.com" \
+  --token "$TRIVY_SERVER_TOKEN" \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  --format json \
+  --output trivy-report.json \
+  "$IMAGE_REF"
+```
+
+Why client/server:
+
+- **Vulnerability DB is held centrally.** Build agents don't each maintain a multi-gigabyte DB.
+- **Network latency dominates first scan.** With the server local on the lab network, scans complete in seconds rather than minutes.
+- **Token-scoped auth.** The build agents authenticate to the Trivy server with a token, not a long-lived API key.
+- **DB updates are centralized.** When Trivy DB updates land upstream, the server pulls them once.
+
+The Jenkins credential `trivy-server-token` (Secret Text type) holds the bearer token. It is the same token the server is configured to accept. Rotation is a coordinated operation: rotate the server's accepted token, then update the Jenkins credential.
+
+## Scan flavors
+
+Trivy can scan more than just image content. The supply-chain integration in this lab focuses on:
+
+| Scan type | Trigger | Output | Gate |
+| --- | --- | --- | --- |
+| `trivy image` | Every CI build | CVE list with severity, CVSS, fixed-in | Fail on HIGH/CRITICAL |
+| `trivy fs` (on Containerfile) | Optional pre-build | Misconfigurations | Soft (warn) |
+| `trivy fs` (on Compose files for `docker-runtime-vm`) | Optional pre-deploy | Misconfigurations | Soft (warn) |
+| `trivy repo` (on GitLab repo) | Optional, scheduled | Secret leaks, license issues | Soft (warn) |
+| SBOM generation | Per-build (CycloneDX or SPDX) | Artifact for compliance | None at gate; archived |
+
+The image gate is the hard one; the others are soft today (warn-only). Tightening the soft gates is roadmap.
+
+## Evidence storage
+
+Trivy reports are stored as build evidence:
+
+- Archived in the Jenkins build itself.
+- Uploaded to MinIO bucket `developer-ci-evidence` (per-build prefix) using the `minio-developer-ci-evidence` Jenkins credential.
+- Referenced from the build's release record alongside the image digest.
+
+The evidence schema follows `connection-details/ci-evidence-schema.md`: a build produces a directory with the Trivy report (JSON), the image digest, the source SHA, the immutable tag, the duration, the scanner version, and the DB date. That bundle is what DefectDojo will eventually ingest.
+
+## DefectDojo handoff
+
+DefectDojo (deployed as a separate VM — see [the DefectDojo page](../08-ci-platform-vms/04-defectdojo-dashboard)) accepts Trivy reports via API. The intended workflow:
+
+1. Jenkins finishes the image build, scan, and push.
+2. Jenkins posts the Trivy JSON report to DefectDojo's `/api/v2/import-scan` endpoint with a scan-type of `Trivy Operator Scan` or `Trivy Scan`.
+3. DefectDojo de-dupes findings against existing engagements and re-opens / closes findings based on the new scan.
+4. AppSec reviewers triage findings in the DefectDojo UI; the platform team sees aggregate trends.
+
+This handoff is not fully wired in the current state — a Trivy-format smoke import has been validated, but the production posting from Jenkins is part of the DefectDojo VM milestone closeout. The token custody for the DefectDojo API user lives in `secrets/defectdojo-vm/` and is consumed by Jenkins as a credential.
+
+## Failure modes
+
+### Symptom: build fails the scan even though no HIGH/CRITICAL is in the report
+
+**Root cause.** Either Trivy reported a severity score difference between the embedded DB version and the previous one (a CVE was reclassified), or the exit code is conflating with the report content (a `--exit-code 1` plus `--severity HIGH,CRITICAL` causes any HIGH/CRITICAL to fail — including newly-reclassified ones).
+
+**Fix.** Read the actual JSON report carefully. Verify the gate matches the team's intent. If a CVE is genuinely flagged, either pull a newer base image (likely fixed upstream), upgrade the affected library, or accept the risk via the documented exception path (which still records evidence).
+
+**Prevention.** Pull base images from `docker-group.*` with periodic refresh; don't pin base tags to ancient versions.
+
+### Symptom: build hangs in the scan step
+
+**Root cause.** Trivy server is unreachable, slow, or the DB is mid-update.
+
+**Fix.** Confirm the Trivy VM is healthy (`curl /healthz`). If the server is healthy but slow, check the VM's disk/network. If the DB is updating, wait — Trivy serializes scans during DB swap.
+
+**Prevention.** Monitor Trivy server response time and DB freshness. Update the DB during low-traffic windows.
+
+### Symptom: a tag was pushed to app-registry but no Trivy evidence exists
+
+**Root cause.** The pipeline was misconfigured to skip the scan, or the scan happened post-push and the build still passed.
+
+**Fix.** Audit the pipeline. The order must be: build → scan → push. Push-then-scan loses the gate's value.
+
+**Prevention.** Pipeline templates make build/scan/push order explicit. CI lint reject pipelines that push before scanning.
+
+### Symptom: Trivy DB is out of date
+
+**Root cause.** Trivy server's DB-update job hasn't run, or upstream distribution is throttling.
+
+**Fix.** Trigger a DB update on the Trivy server. If upstream is throttling, the server caches the previous DB; consult ADR 0011 for the offline-mirror posture.
+
+**Prevention.** Monitor DB age; alert if older than the threshold (e.g., 48 hours).
+
+## Operational guidance
+
+- Keep the Trivy gate strict (HIGH/CRITICAL fail). Loosening the gate slowly erodes the floor.
+- Document every exception. If a known CVE is accepted for runtime, the acceptance must be recorded and reviewed periodically.
+- Re-scan running images on a cadence. A tag that passed scan at push time can be discovered later to have a new HIGH-severity CVE in the embedded library; the cadence determines how long that window stays open.
+- Don't bypass the gate in MR pipelines and add it back later. Run the same gate in MR validation as in main builds, otherwise the dev-loop UX is wrong.
+
+## References
+
+- `codex-opp-agent/connection-details/jenkins.md` — `trivy-server-token`, starter-job evidence.
+- `codex-opp-agent/connection-details/nexus.md` — push contract on `app-registry`.
+- `codex-opp-agent/connection-details/ci-evidence-schema.md` — evidence layout for MinIO.
+- `codex-opp-agent/adr/0011-trivy-ubuntu-vm-scanner.md` — Trivy VM design.
+- `codex-opp-agent/adr/0013-defectdojo-vm-security-dashboard.md` — DefectDojo placement.
+- Live validation 2026-05-09: `openliberty-readiness-probe-image-build` build `#8` and `demo-smoke-image-build` build `#6` both passed the enforced Trivy scan gate and pushed to `app-registry`.

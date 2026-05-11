@@ -1,8 +1,199 @@
 ---
-title: "SigNoz Auth Quirk (v0.122)"
-description: "Section 02-lab-infrastructure/09-observability-vms: SigNoz Auth Quirk (v0.122) (placeholder)."
-sidebar_label: "SigNoz Auth Quirk (v0.122)"
+title: "SigNoz Auth Quirk (v0.122 EE)"
+description: "The v0.121 → v0.122 auth break — new login endpoint, new response shape, orgID UUID requirement, silent SPA-fallback failure mode, and the SQLite-snapshot procedure to recover the orgID."
+sidebar_label: "Auth Quirk (v0.122)"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+SigNoz v0.122.0 EE moved the login API in a way that breaks every CLI client written against v0.121. This page documents the break in detail because the failure mode is silent — a misconfigured client thinks it succeeded because the HTTP status is `200`, but it's reading the SPA `index.html`, not a JSON response.
+
+## What changed
+
+Three things changed simultaneously:
+
+1. **The login endpoint moved.** `POST /api/v1/login` and `POST /api/v1/loginPrecheck` were removed.
+2. **The response field renamed.** `accessJwt` → `accessToken`.
+3. **`orgID` became required input.** The login request body now requires the org's UUID, and no public/unauthenticated endpoint returns it.
+
+Combined, these make the failure mode silent: hit the old endpoint, get back the SPA `index.html` (HTTP 200 `text/html`), parse no JSON, return an empty/default token, then fail on every subsequent API call with 401 — looking like a credential problem rather than an endpoint problem.
+
+## What still works
+
+For diagnostic clarity, several v1 endpoints still work normally and return JSON:
+
+- `GET /api/v1/version` — version JSON.
+- `GET /api/v1/health` — health JSON.
+- `GET /api/v1/user` — proper unauthenticated JSON error (`401` with structured body).
+
+If those return JSON but `POST /api/v1/login` returns HTML, the issue is the endpoint move, not a service-wide problem.
+
+## The new login endpoint
+
+```bash
+curl -sS -X POST \
+  https://signoz.apps.sub.comptech-lab.com/api/v2/sessions/email_password \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "email": "<admin-email>",
+        "password": "<admin-password>",
+        "orgID": "<org-uuid>"
+      }'
+```
+
+Response shape:
+
+```json
+{
+  "data": {
+    "tokenType": "Bearer",
+    "accessToken": "<jwt>",
+    "refreshToken": "<jwt>",
+    "expiresIn": <seconds>
+  }
+}
+```
+
+The field is `accessToken` (not the old `accessJwt`). Code written against v0.121 will pull a missing key, get an empty string, and fail at the next request — silently if not checked.
+
+## The orgID problem
+
+The login request requires `orgID`. None of the unauthenticated endpoints return it:
+
+- `/api/v1/orgs` — SPA fallback.
+- `/api/v1/loginPrecheck` — SPA fallback (endpoint removed).
+- `/api/v2/orgs` — `401`.
+- `/api/v2/sessions/orgs` — `401`.
+
+The orgID must be **read from the embedded SQLite** on the VM. The connection-details runbook documents the snapshot-and-read procedure:
+
+```bash
+# Snapshot the SigNoz state directory (includes signoz.db and signoz.db-wal)
+ssh ze@signoz.sub.comptech-lab.com \
+  'sudo docker cp signoz:/var/lib/signoz/. /tmp/sn-snap/ \
+   && sudo tar czf /tmp/sn.tgz -C /tmp sn-snap \
+   && sudo chown ze:ze /tmp/sn.tgz'
+
+# Pull the tarball locally
+scp ze@signoz.sub.comptech-lab.com:/tmp/sn.tgz /tmp/
+tar xzf /tmp/sn.tgz -C /tmp
+
+# Read the organizations table
+python3 -c "
+import sqlite3
+c = sqlite3.connect('file:/tmp/sn-snap/signoz.db?mode=ro', uri=True)
+print(list(c.execute('SELECT id, display_name FROM organizations')))
+"
+
+# Clean up
+ssh ze@signoz.sub.comptech-lab.com 'sudo rm -rf /tmp/sn-snap /tmp/sn.tgz'
+rm -rf /tmp/sn-snap /tmp/sn.tgz
+```
+
+The DB uses WAL mode, so the `signoz.db-wal` file must be included in the snapshot for a complete read.
+
+The orgID is stable for the life of the SigNoz install. Once recorded, it can be stored as a non-secret config value alongside the admin email and password custody.
+
+## HEAD vs GET
+
+A related v0.122 trap: **`HEAD` requests against any API path return the SPA `index.html`** (`text/html 200`) rather than the handler's real response. This breaks naive `curl -I` probes that assume the body for a `HEAD` is suppressed but the status reflects the handler.
+
+Always use `GET` to probe API shape. Never `HEAD`.
+
+## Verified driving pattern (orgID → login → Bearer token)
+
+Once the orgID is in hand and the Bearer token is obtained, the following endpoints work normally:
+
+- `GET /api/v2/users/me`
+- `GET /api/v1/services?start=<ms>&end=<ms>`
+- `GET /api/v1/dashboards`
+- `GET /api/v1/channels`
+- `GET /api/v1/rules`
+
+A scripted client looks like:
+
+```bash
+ORG_ID="<uuid-from-sqlite>"
+EMAIL="<admin-email>"
+PASS="<admin-password>"
+
+TOKEN="$(curl -sS -X POST \
+  https://signoz.apps.sub.comptech-lab.com/api/v2/sessions/email_password \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\",\"orgID\":\"$ORG_ID\"}" \
+  | jq -r '.data.accessToken')"
+
+# Verify
+curl -fsS \
+  -H "Authorization: Bearer $TOKEN" \
+  https://signoz.apps.sub.comptech-lab.com/api/v2/users/me | jq .
+
+# List dashboards
+curl -fsS \
+  -H "Authorization: Bearer $TOKEN" \
+  https://signoz.apps.sub.comptech-lab.com/api/v1/dashboards | jq '.data | length'
+```
+
+## When SigNoz is upgraded past v0.122
+
+Re-discover the login contract before relying on this. The v0.121 → v0.122 break is precedent — future minor versions can also change auth surfaces. The runbook discipline is:
+
+1. Read the changelog for any auth-related items.
+2. Probe `GET /api/v1/version` and `/api/v1/health` to confirm the service is up.
+3. Probe the documented current login endpoint with a fresh client and verify the response field names.
+4. Update local automation accordingly before relying on the new version in CI or other consumers.
+
+## Failure modes
+
+### Symptom: login script returns "success" but every subsequent call returns 401
+
+**Root cause.** The login response was the SPA `index.html`, not the expected JSON. The script extracted a missing/empty token.
+
+**Fix.** Use the v0.122 endpoint (`/api/v2/sessions/email_password`); use the `accessToken` field name; include `orgID`.
+
+**Prevention.** Validate the response structure (presence of `data.accessToken`) before assuming success.
+
+### Symptom: login script returns 400 "orgID is required"
+
+**Root cause.** Body missing `orgID`. This is the explicit-error variant of the silent failure — at least it's loud.
+
+**Fix.** Fetch the orgID from SQLite as documented above; include it in the body.
+
+**Prevention.** Treat orgID as a required config value, alongside the admin email and password.
+
+### Symptom: cannot SSH to the SigNoz VM to read SQLite
+
+**Root cause.** Host key rotated during the v0.122 install window; `known_hosts` entry is stale.
+
+**Fix.**
+
+```bash
+ssh-keygen -R signoz.sub.comptech-lab.com
+ssh-keygen -R <lab-IP-for-signoz>
+# Or one-shot bypass:
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ze@signoz.sub.comptech-lab.com
+```
+
+**Prevention.** Clean stale known_hosts entries proactively after VM rebuilds.
+
+### Symptom: SQLite snapshot is read but no organizations row
+
+**Root cause.** Snapshot only copied `signoz.db` and missed `signoz.db-wal`. The org row was created in the WAL and not yet checkpointed.
+
+**Fix.** Re-snapshot including the WAL file (the procedure above does this via `docker cp /var/lib/signoz/.` which is a directory, not a single file).
+
+**Prevention.** Always include the WAL file in SQLite backups/snapshots.
+
+## Lessons
+
+- **HTTP 200 plus HTML body is a 404.** Don't trust status code alone; validate response content type or shape.
+- **API versioning is not just a polite suggestion.** A `/api/v1/login` that quietly redirects to a SPA is hostile to CLI clients.
+- **Embedded SQLite can become a required entry point** when the API doesn't expose its own metadata. Plan for this on any product that uses an embedded DB.
+
+## References
+
+- `codex-opp-agent/connection-details/signoz.md` — section "Known Gotchas" with the full reproduction.
+- `codex-opp-agent/adr/0010-signoz-standalone-vm-observability.md` — VM design.
+- Memory: `reference_lab_infrastructure.md` — auth quirk reference.
+- [SigNoz Overview](./01-signoz-overview)
+- [ClickHouse Storage](./02-signoz-clickhouse-storage)

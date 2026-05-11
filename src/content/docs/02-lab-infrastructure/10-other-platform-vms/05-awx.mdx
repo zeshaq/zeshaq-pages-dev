@@ -1,8 +1,64 @@
 ---
-title: "AWX"
-description: "Section 02-lab-infrastructure/10-other-platform-vms: AWX (placeholder)."
+title: "AWX (Planned)"
+description: "Placeholder for a future AWX (Ansible Tower upstream) VM — current Ansible posture in the lab, why a controller is on the radar, and what would have to be decided first."
 sidebar_label: "AWX"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+AWX (upstream of Ansible Automation Platform / Ansible Tower) is **planned but not yet stood up**. Ansible work in the lab today is operator-CLI driven; a controller has not been justified for the current scope. This page captures the current state and the decision space for when it will be.
+
+## Current state
+
+| Aspect | Today |
+| --- | --- |
+| Ansible Core version | `2.16.3` on operator workstation and `docker-runtime-vm` |
+| Where playbooks live | `codex-opp-agent/` paths plus operator-managed places |
+| Where inventory lives | Operator-managed (lab `br30` enumeration is informal) |
+| Execution | Ad-hoc, operator-driven |
+| Vault integration | None today; secrets passed via env or `--ask-pass` |
+| Multi-operator coordination | None |
+| Auditing of executions | Shell history only |
+
+This is consistent with the bootstrap-phase pattern. As with Terrakube, the controller solves coordination and audit problems that don't yet bite hard.
+
+## Why AWX
+
+AWX is the upstream community project behind Red Hat's Ansible Automation Platform. It gives the standard "controller for Ansible" features:
+
+- **Inventory management.** One canonical source for hosts/groups, with dynamic-inventory plugins.
+- **Job templates.** Reusable playbook+inventory+credential bindings.
+- **Surveys / form inputs.** Operators provide variables through a UI rather than CLI flags.
+- **Credentials management.** Per-job credential delivery, integrated with Vault.
+- **Scheduled jobs.** Periodic playbook runs (config drift, weekly reboots, etc.).
+- **Workflows.** Chaining of job templates into approval-gated pipelines.
+- **Audit log.** Who ran what, when, against which hosts, with what diffs.
+- **RBAC.** Different teams have different execution scopes.
+- **API.** GitLab CI can trigger AWX job templates through the AWX API.
+
+## Why deferred
+
+- Single-operator phase.
+- The playbook footprint is small (cloud-init customization, occasional bulk-changes across VMs).
+- Higher-priority platform services (Vault, Trivy, monitoring) are claiming the platform-team's attention.
+
+When the lab's Ansible footprint grows — many divisions onboarding apps, many VM operations, scheduled config drift work — AWX gets a tracker.
+
+## Decision space for when it lands
+
+1. **AWX on a VM** (mirror the other supporting services) or **AWX inside OpenShift** (via the AWX Operator, which is the upstream-supported path on Kubernetes).
+2. **AWX Operator vs upstream Helm chart vs manual Compose.** The AWX Operator is the supported upstream path today.
+3. **PostgreSQL backing store** — embedded or shared.
+4. **Vault integration** — AWX has a Vault credential source plugin; how is the AWX-Vault token managed.
+5. **GitLab integration** — playbooks in GitLab repos, AWX projects sync from there.
+6. **Custom execution environments** — AWX uses container EEs; build pipeline for those EEs lives where?
+7. **Operator allowlists** — who can run which job templates, against which inventories.
+
+## What this page is not
+
+A description of a running AWX. It's a deliberate placeholder so the docs cover the planned shape without claiming AWX is live.
+
+## References
+
+- AWX upstream documentation (Red Hat / Ansible community).
+- The GitLab operator guide — Ansible repository ownership goes to `comptech-platform/infra-ops/vm-platform-ops` when stood up.

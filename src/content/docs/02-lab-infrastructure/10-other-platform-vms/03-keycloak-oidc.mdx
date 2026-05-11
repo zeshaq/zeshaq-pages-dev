@@ -1,8 +1,72 @@
 ---
-title: "Keycloak / OIDC"
-description: "Section 02-lab-infrastructure/10-other-platform-vms: Keycloak / OIDC (placeholder)."
+title: "Keycloak / OIDC (Planned)"
+description: "Placeholder for a future Keycloak/OIDC identity-provider VM — current lab state, options on the table, and what would have to be decided before standing it up."
 sidebar_label: "Keycloak / OIDC"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+A dedicated Keycloak (or equivalent OIDC IdP) VM is **planned but not yet stood up** in the lab. This page captures the current state, where the IdP role is currently played, and what decisions would have to land before a Keycloak VM gets a tracker and an ADR.
+
+## Current state
+
+The lab does **not** run a Keycloak VM today. Identity flows for live services use:
+
+| Service | Current auth surface |
+| --- | --- |
+| Nexus | Local `NexusAuthenticatingRealm` (no LDAP/SAML/OIDC) |
+| Jenkins | Local Jenkins user database |
+| GitLab CE | Local GitLab user database |
+| SigNoz | Local SigNoz user database (per the auth-quirk page) |
+| DefectDojo | Local Django superuser + API tokens |
+| Grafana on monitoring-0 | Local Grafana admin |
+| WSO2 IS (planned) | WSO2 IS itself is the IdP for WSO2 APIM publisher/devportal/admin flows |
+| OpenShift `hub-dc-v6`/`spoke-dc-v6` | Local kubeadmin + ACM/MCE for identity flow |
+
+Every service has its own identity store. There is no central single-sign-on today.
+
+## Why this is intentional
+
+The lab's current phase is post-rebuild bootstrap. Each platform service is being stood up with the simplest acceptable auth model (local users) so the rebuild path stays short and recoverable. Centralizing identity is a real piece of work — it expands blast radius (an IdP outage takes down many services) and requires a clear federation model — and it's deliberately deferred to a tracked, ADR-backed decision.
+
+## When Keycloak would land
+
+Likely triggers for standing up a Keycloak VM:
+
+- **Onboarding multiple human operators** beyond the current single-operator + bootstrap-admin pattern.
+- **Cross-service SSO requirement** — when the cognitive load of N local user databases becomes a real blocker.
+- **OIDC federation for OpenShift workloads** — when applications need IdP-backed identity for runtime auth flows.
+- **WSO2 APIM consumer-side identity** — when the gateway needs to delegate identity to a non-WSO2 IdP for some flows.
+
+## Options on the table
+
+When (not if) a central IdP lands, candidate platforms:
+
+| Option | Pros | Cons |
+| --- | --- | --- |
+| **Keycloak as a VM** | Mature, OSS, OIDC/SAML/LDAP-capable, has Red Hat downstream (RH-SSO) | Stateful service; backup/restore story matters; JVM resource footprint |
+| **Keycloak as an OpenShift operator** | Aligns with platform direction (RH-SSO Operator); leverages OpenShift HA | Couples IdP availability to OpenShift cluster lifecycle |
+| **Reuse WSO2 IS** | Already in scope (ADR 0008); avoids a fourth platform IdP | Couples lab IdP to WSO2 — both deployment and lifecycle |
+| **Defer indefinitely** | No new platform service to operate | Local-user proliferation across N services |
+
+The decision will go through an ADR alongside the broader compliance work (PCI-DSS implementer track) because identity controls are central to that. The current intent is "evaluate Keycloak-as-OpenShift-operator after spoke-dc-v6 stabilizes."
+
+## What would need to be decided before standing it up
+
+1. **Topology.** VM or OpenShift operator. Single instance or HA pair.
+2. **Backing database.** Embedded H2 (development only), PostgreSQL VM (likely), or OpenShift-managed Postgres.
+3. **Realm strategy.** Single lab realm or per-tenant realms.
+4. **Federation sources.** LDAP/AD (likely not in lab today), GitHub for ops, social IdPs (probably no), other.
+5. **Client model.** How OpenShift OAuth proxy, GitLab, Jenkins, SigNoz, Grafana, Nexus integrate.
+6. **Token lifetimes** and refresh model.
+7. **Recovery posture.** Backup/restore for the database + realm export.
+8. **Custody for the bootstrap admin credential** — same `secrets/` pattern as other lab services.
+
+## What this page is not
+
+This is not an architecture page for a deployed Keycloak. It's a placeholder noting that the lab does **not** have a centralized IdP today, with sufficient context for a future operator to pick up the work without re-deriving the decision space.
+
+## References
+
+- `codex-opp-agent/adr/0008-wso2-apim-is-standalone-vms.md` — WSO2 IS as the closest existing IdP-shaped service.
+- The compliance implementor handbook (see Section 4 of these docs) — identity controls are in scope for PCI-DSS work.
