@@ -1,0 +1,149 @@
+---
+title: "Secrets Architecture (Vault + ESO)"
+description: "How secrets reach OpenShift workloads on the v6 fleet: HashiCorp Vault on a VM, External Secrets Operator on each cluster, a single platform ClusterSecretStore, per-tenant SecretStores, ExternalSecrets, and the kubernetes-provider bridge for OBC-backed operands."
+sidebar_label: "Architecture"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 210, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 190, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 190, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 190, textAlign: "center" };
+export const tenantBox = { background: "#dbeafe", border: "1px solid #2563eb", borderRadius: 8, padding: 8, color: "#1e3a8a", width: 190, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  { id: "vault",    position: { x: 0,   y: 0   }, data: { label: "HashiCorp Vault\n(VM, lab /24)" }, style: extBox },
+  { id: "k8sauth",  position: { x: 0,   y: 130 }, data: { label: "Kubernetes auth mount\nauth/kubernetes-<cluster>" }, style: extBox },
+
+  { id: "operator", position: { x: 280, y: 0   }, data: { label: "ESO operator\n(openshift-external-\nsecrets-operator)" }, style: ctrlBox },
+  { id: "operand",  position: { x: 280, y: 130 }, data: { label: "ESO operand\n(external-secrets ns)\nreconciler + webhook" }, style: ctrlBox },
+
+  { id: "css",      position: { x: 560, y: 0   }, data: { label: "ClusterSecretStore\nvault-platform" }, style: dataBox },
+  { id: "ss",       position: { x: 560, y: 130 }, data: { label: "SecretStore (per tenant)\nvault-apps" }, style: dataBox },
+
+  { id: "platES",   position: { x: 820, y: 0   }, data: { label: "Platform ExternalSecret\n(openshift-* ns)" }, style: dataBox },
+  { id: "tenES",    position: { x: 820, y: 130 }, data: { label: "Tenant ExternalSecret\n(apps-<division>-* ns)" }, style: dataBox },
+
+  { id: "platSec",  position: { x: 1080, y: 0  }, data: { label: "Platform Secret\n(operator, pull-secret)" }, style: tenantBox },
+  { id: "tenSec",   position: { x: 1080, y: 130}, data: { label: "Tenant Secret\n(app creds, robot tokens)" }, style: tenantBox },
+
+  { id: "obc",      position: { x: 280, y: 290 }, data: { label: "ObjectBucketClaim\n(NooBaa)" }, style: dataBox },
+  { id: "obcSec",   position: { x: 560, y: 290 }, data: { label: "OBC Secret + ConfigMap\n(AWS_*_KEY_*, BUCKET_*)" }, style: dataBox },
+  { id: "kSS",      position: { x: 820, y: 290 }, data: { label: "SecretStore\n(kubernetes provider)" }, style: dataBox },
+  { id: "bridge",   position: { x: 1080, y: 290}, data: { label: "Operand-shape Secret\n(endpoint/bucketnames/\naccess_key_id/secret)" }, style: tenantBox },
+  { id: "operand2", position: { x: 1080, y: 420}, data: { label: "LokiStack / TempoStack /\nQuayRegistry consumer" }, style: agentBox },
+];
+
+export const edges = [
+  { id: "a", source: "operand", target: "k8sauth", label: "TokenReview (SA JWT)", ...pullEdge },
+  { id: "b", source: "k8sauth", target: "vault",    label: "bind → policy → token", ...muted },
+  { id: "c", source: "operand", target: "vault",    label: "read kv-v2 (TCP/8200)",   ...reqEdge },
+  { id: "d", source: "css",     target: "operand",  label: "spec",                    ...muted },
+  { id: "e", source: "ss",      target: "operand",  label: "spec",                    ...muted },
+  { id: "f", source: "platES",  target: "css",      label: "secretStoreRef",          ...muted },
+  { id: "g", source: "tenES",   target: "ss",       label: "secretStoreRef",          ...muted },
+  { id: "h", source: "operand", target: "platSec",  label: "creates/updates",         ...reqEdge },
+  { id: "i", source: "operand", target: "tenSec",   label: "creates/updates",         ...reqEdge },
+  { id: "j", source: "obc",     target: "obcSec",   label: "NooBaa writes",           ...muted },
+  { id: "k", source: "obcSec",  target: "kSS",      label: "read (RBAC)",             ...muted },
+  { id: "l", source: "kSS",     target: "operand",  label: "spec",                    ...muted },
+  { id: "m", source: "operand", target: "bridge",   label: "templated Secret",        ...reqEdge },
+  { id: "n", source: "bridge",  target: "operand2", label: "mounted as storage cred", ...muted },
+];
+
+This page is the orientation map for everything else in §10. Read it once, then jump to the page covering the specific CR or flow you need (operator install, ClusterSecretStore, per-tenant SecretStore, ExternalSecret, OBC bridge, rotation). The wider §3 sections (image supply, GitOps, ACM) often touch secrets at the edges; the design point is that those sections never have to author Secret YAML — they reference what this layer materializes.
+
+## What this layer does
+
+External Secrets Operator (ESO) is the "secret delivery" plane for the v6 fleet. Its job is one sentence: take desired-state references to secrets stored in a system of record (HashiCorp Vault on a VM, or another Kubernetes Secret in the case of the OBC bridge), and materialize them as Kubernetes `Secret` objects in the namespaces that consume them — without ever putting the secret value into Git.
+
+The system of record is:
+
+- **Vault** (VM-based, lab /24 — addresses redacted) — the canonical store for tokens, passwords, robot accounts, pull credentials, certificates, and any opaque key/value that an operator or app needs. KV-v2 mount at `secret/`.
+- **NooBaa ObjectBucketClaim Secret + ConfigMap** — the local cluster-side store for in-cluster S3 access credentials produced by ODF. Loki, Tempo, and Quay consume these.
+
+The delivery plane is:
+
+- **External Secrets Operator** (Red Hat distribution, `openshift-external-secrets-operator` v1.1.0). Provides the controllers, the webhook, and the four CR kinds shown in the diagram.
+- **ClusterSecretStore** — exactly one, named `vault-platform`. Cluster-wide; used only by platform/operator namespaces. Defined under ADR 0019 conventions.
+- **SecretStore** (per tenant) — one per `apps-<division>-<app>` namespace, named `vault-apps`. Namespace-scoped; cannot read another division's Vault paths.
+- **ExternalSecret** — the request CR. References either a `ClusterSecretStore` or a tenant `SecretStore`, declares a target `Secret` shape, and (optionally) templates the value.
+- **ClusterExternalSecret** — used once, for the cluster-wide `app-registry-pull` Secret that needs to fan out to every namespace labelled `apps.platform/tenant=true`. Documented separately.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={620} />
+
+Reading the diagram:
+
+1. **Top row — platform path.** The ESO operand authenticates to Vault via the cluster's Kubernetes auth mount (`auth/kubernetes-<cluster>`). The `vault-platform` ClusterSecretStore is read by `ExternalSecret`s in operator namespaces (`openshift-cert-manager`, `openshift-pipelines`, `openshift-gitops`, `stackrox`, etc.); their materialized `Secret`s are the operator/system credentials.
+2. **Middle row — tenant path.** Each tenant namespace runs its own `app-eso` ServiceAccount and its own namespaced `SecretStore vault-apps`. The Vault role behind it is per-division (`apps-<cluster>-<division>`) with a namespace-glob bind of `apps-<division>-*`. Tenant `ExternalSecret`s materialize the actual app credentials, robot tokens, and DB passwords.
+3. **Bottom row — OBC bridge.** ODF/NooBaa creates an `ObjectBucketClaim`, which yields a Secret (with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) and a ConfigMap (with `BUCKET_HOST`/`BUCKET_NAME`/`BUCKET_PORT`). Loki/Tempo/Quay expect a Secret with different lowercase keys (`endpoint`, `bucketnames`, `access_key_id`, `access_key_secret`). An `ExternalSecret` using ESO's **kubernetes provider** templates the bridge Secret in the shape the operand expects.
+
+Three reasons this is one diagram, not three:
+
+- The same operand reconciler runs all three flows. Sizing, NetworkPolicy egress, and observability are shared.
+- The CR vocabulary is identical. A reviewer reading any `ExternalSecret` page can predict the others.
+- Failure modes overlap. The "Vault auth times out" symptom in the platform path is the same NetworkPolicy egress fix as the tenant path.
+
+## Why this design (and not the alternatives)
+
+| Alternative considered | Why we did not pick it |
+| --- | --- |
+| Vault Agent Injector | Pod-side sidecar that mounts secret files. Requires per-Pod annotations and reissues at restart only; conflicts with Argo-managed manifests and forces ServiceAccount-bound annotations into app repos. ESO keeps the indirection in CRs the platform owns. |
+| Sealed Secrets | The secret value is in Git (encrypted). Recovery, audit, and rotation are clumsy at fleet scale; an encrypted Secret blob in a public-ish-feeling repo still gives auditors heartburn. |
+| `oc apply` with a Secret out of band | Defeats GitOps. Breaks the "everything reconciles back" property under ADR 0025. |
+| Cluster-wide `ClusterSecretStore` for tenants | A single CSS would let any namespace's ESO request read any Vault path. We want a hard cross-tenant boundary, so tenants get a namespace-scoped `SecretStore` with a role that refuses to issue tokens for namespaces outside `apps-<division>-*`. |
+| Vault Kubernetes auth with one shared role | One leaked token would read every division. Per-division role + per-division policy keeps blast radius bounded. |
+
+ADR 0014 (developer-readiness contract) requires "approved pull-secret delivery"; ADR 0019 requires that image-pull credentials come from a controlled source rather than being committed; ADR 0025 forbids `oc apply` mutations of secrets in the live cluster. The Vault + ESO + per-tenant SecretStore composition satisfies all three.
+
+## Inventory at a glance
+
+| Concept | Identifier | Where it lives |
+| --- | --- | --- |
+| Vault auth method | `auth/kubernetes-<cluster>` | Vault VM |
+| Platform Vault policy | `ocp-<cluster>-eso` | Vault VM |
+| Platform Vault role | `ocp-<cluster>-eso` | `auth/kubernetes-<cluster>/role/...` |
+| Tenant Vault policy | `apps-<division>-read` | Vault VM (cluster-agnostic) |
+| Tenant Vault role | `apps-<cluster>-<division>` | `auth/kubernetes-<cluster>/role/...` |
+| ESO operator namespace | `openshift-external-secrets-operator` | OperatorHub install |
+| ESO operand namespace | `external-secrets` | created by ESO operator |
+| Platform ClusterSecretStore | `vault-platform` | per cluster, in `clusters/<cluster>/secrets/eso/` |
+| Tenant SecretStore | `vault-apps` (in each tenant ns) | per tenant overlay, from `tenants/_template/secretstore-vault-apps.yaml` |
+| Vault path tree (platform) | `secret/ocp/<cluster>/...`, `secret/ocp/platform/...` | KV-v2 |
+| Vault path tree (tenant) | `secret/apps/<division>/<app>/<env>/<key>` | KV-v2 |
+
+## What lives in each Vault subtree
+
+| Subtree | Owner | Example contents |
+| --- | --- | --- |
+| `secret/ocp/<cluster>/...` | platform admin | cluster-specific bootstrap secrets, ESO smoke-test data, ODF route credentials |
+| `secret/ocp/platform/rhacs-init-bundle` | platform admin | RHACS sensor init-bundle materials (delivered via §11) |
+| `secret/ocp/<cluster>/registries/app-registry-pull` | platform admin | cluster-wide app-registry dockerconfigjson (see §6) |
+| `secret/ocp/<cluster>/quay/config-bundle` | platform admin | Quay registry operand config bundle (consumed via OBC bridge sibling pattern) |
+| `secret/apps/<division>/<app>/<env>/<key>` | tenant team (write) / platform (audit) | app credentials, DB passwords, OIDC client secrets |
+| `secret/apps/<division>/<app>/ci/quay-robot` | platform admin (creates) / tenant (consumes) | Tekton Path B push-robot dockerconfigjson |
+
+## Cross-references
+
+- `02-eso-operator-and-policies.mdx` — install path, the operator/operand split, default-deny NetworkPolicy gotcha.
+- `03-vault-clustersecretstore.mdx` — the `vault-platform` shape, CA bundle, auth wiring.
+- `04-tenant-secretstore-pattern.mdx` — per-tenant `vault-apps` + role/policy/namespace-glob.
+- `05-externalsecret-and-templates.mdx` — request shapes, templating, refresh interval choices.
+- `06-obc-to-operand-bridge.mdx` — the kubernetes-provider Loki/Tempo/Quay bridge.
+- `07-rotation-and-revocation.mdx` — Vault-side rotation, ESO refresh semantics, revocation playbook.
+
+## References
+
+- `connection-details/vault-app-secrets.md` — tenant path convention (DEV-OCP-0.4 / #174).
+- `connection-details/app-registry-pullsecret.md` — `ClusterExternalSecret`-fanned pull credential (DEV-OCP-0.2 / #172).
+- ADRs: 0014 (developer readiness), 0019 (Nexus-only supply chain), 0025 (GitOps-only operations).
+- Memory: `project_eso_egress_to_vault.md`, `project_obc_to_operand_secret_bridge.md`, `reference_quay_robot_token_convention.md`.

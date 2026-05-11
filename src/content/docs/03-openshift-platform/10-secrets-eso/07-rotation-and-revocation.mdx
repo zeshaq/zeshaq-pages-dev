@@ -1,0 +1,224 @@
+---
+title: "Rotation and Revocation"
+description: "Vault-side rotation, ESO refresh interval semantics, Reloader for restart-on-Secret-change, and the revocation playbook when a credential is suspected leaked."
+sidebar_label: "Rotation & revocation"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Rotation is the steady-state half of secret management; revocation is the panic half. This page covers both, the differences between *value* rotation and *credential* rotation, and the workflow that gets a new value in front of running pods.
+
+## What "rotation" means in this system
+
+Three layers can rotate independently:
+
+| Layer | What rotates | Done by |
+| --- | --- | --- |
+| **Vault value** | the secret value at a kv-v2 path | platform admin (`vault kv put`) |
+| **Vault Kubernetes-auth token** | the ESO operand's authenticated session | Vault — TTL-driven, automatic |
+| **Vault role binding** | the policy/role/namespace-glob | platform admin (only if a tenant's scope changes) |
+
+The third is rare; the first two are routine. ESO surfaces both implicitly: a value rotation updates the materialized `Secret`, an auth-token rotation is invisible (ESO re-mints internally before TTL).
+
+## Vault-side value rotation
+
+Platform path (operator-owned credentials):
+
+```bash
+vault kv put secret/ocp/spoke-dc-v6/registries/app-registry-pull \
+  dockerconfigjson="$(cat new-pull-secret.json)"
+```
+
+Tenant path (app credentials):
+
+```bash
+vault kv put secret/apps/platform/checkout/prod/db \
+  password="<new-password>"
+```
+
+KV-v2 retains the prior version, so a rollback to the prior value is:
+
+```bash
+vault kv rollback -version=N secret/apps/platform/checkout/prod/db
+```
+
+ESO reads `data/` (always current) — there is no way to ask ESO to materialize an older version other than rolling back the kv-v2 entry.
+
+## ESO refresh interval — when the new value reaches the Secret
+
+`spec.refreshInterval` on each `ExternalSecret` controls how often ESO re-reads Vault:
+
+| Value | Behavior | Typical use |
+| --- | --- | --- |
+| `0` | once, at creation; never refresh | static bootstrap values |
+| `1m` | every minute | smoke/test paths |
+| `15m` | every 15 minutes | high-churn rotation drills |
+| `1h` | every hour | most production secrets |
+| `24h` | once a day | slow-moving robot tokens, CA bundles |
+
+A change pushed to Vault becomes visible in the Kubernetes Secret on the next refresh cycle. Lower intervals trade lag for Vault load — at fleet scale, prefer `1h` and use the manual force-refresh path (below) for emergencies.
+
+## Force refresh (without waiting)
+
+Sometimes you want the new value *now* — e.g., right after `vault kv put` during an incident. The clean way is to annotate the `ExternalSecret`:
+
+```bash
+oc -n apps-platform-checkout annotate externalsecret db-password \
+  force-sync=$(date +%s) --overwrite
+```
+
+ESO watches the `force-sync` annotation; any change triggers an immediate refresh. The `--overwrite` flag is required if you've used it before.
+
+The dirtier alternative is `oc rollout restart deploy/external-secrets -n external-secrets`, which forces every `ExternalSecret` on the cluster to re-read. Use it for cluster-wide incidents only.
+
+## Getting the new value into running pods
+
+ESO writes the new value into the `Secret`, but **the pod consuming it doesn't restart automatically**. Two consumption patterns, two outcomes:
+
+### Pattern A — mounted as volume (recommended)
+
+```yaml
+spec:
+  containers:
+    - name: app
+      volumeMounts:
+        - name: creds
+          mountPath: /etc/creds
+          readOnly: true
+  volumes:
+    - name: creds
+      secret:
+        secretName: db-password
+```
+
+Kubelet atomically rewrites the file in the volume within `syncFrequency × 2` (~1 minute). The app must re-read the file. Two ways apps cooperate:
+
+1. **App polls the file periodically** (some libraries do this — e.g., AWS SDK with file-based creds).
+2. **Sidecar/init-container watches and signals reload** (a `SIGHUP` to the app process is the classic pattern).
+
+### Pattern B — env vars (not recommended)
+
+```yaml
+spec:
+  containers:
+    - name: app
+      env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-password
+              key: password
+```
+
+Env vars are evaluated **at pod start**. Rotation in Vault → Secret update has *no effect* on the running pod. The pod must restart. Two options:
+
+1. **Reloader operator** — adds an annotation that triggers `Deployment` rollout when a referenced `Secret`'s `resourceVersion` changes:
+   ```yaml
+   metadata:
+     annotations:
+       reloader.stakater.com/auto: "true"
+   ```
+2. **Manual rollout** — `oc rollout restart deploy/<name>` after rotation.
+
+Convention: tenant apps mount as volume; if env-var consumption is unavoidable (legacy libraries), add the Reloader annotation. Bare env-var with no Reloader is a review-blocking smell.
+
+## Vault Kubernetes-auth token rotation
+
+The Vault role on each cluster has `token_ttl=1h, token_max_ttl=4h`. ESO mints a fresh token on every reconcile (or every `refreshInterval`, whichever is sooner). You shouldn't have to think about this — there's no operator action — but two diagnostic paths:
+
+- **Token TTL too short for the workload** — extend `token_ttl` in the Vault role. Re-run `vault-eso-wire.sh` to apply.
+- **Token rejected with "max_ttl reached"** — would require an SA token that is older than `token_max_ttl` and still being reused; ESO mints new tokens regularly, so this never happens in practice. If it ever does, restart the operand.
+
+## Revocation playbook (credential suspected leaked)
+
+When a credential might be leaked — robot token in a screenshot, an `.env` checked into Git, an exfiltrated Vault token — the priority is **revoke before rotate**.
+
+### Step 1 — revoke at the source
+
+For a Vault-stored credential (DB password, robot token, API key), the value itself is rotated at the *system that issued it* (the database, Quay, the API provider):
+
+```bash
+# Example: rotate Quay robot account "team-platform+ci"
+# (done in Quay's UI or via Quay API; out of scope for this page)
+```
+
+The leaked value is now useless even before Vault is updated.
+
+### Step 2 — push the new value to Vault
+
+```bash
+vault kv put secret/apps/platform/checkout/ci/quay-robot \
+  username="team-platform+ci" \
+  token="<new-token>"
+```
+
+### Step 3 — force-refresh the ExternalSecret
+
+```bash
+oc -n openshift-pipelines annotate externalsecret quay-robot-team-platform \
+  force-sync=$(date +%s) --overwrite
+```
+
+### Step 4 — rotate downstream consumers
+
+If the leaked credential was consumed as an env var, restart workloads:
+
+```bash
+oc rollout restart -n openshift-pipelines deploy/tekton-builder
+```
+
+If consumed as a volume file with file-watch reload, no action.
+
+### Step 5 — audit reads of the leaked value
+
+Vault audit logs (server-side) show every read of the kv-v2 path. After rotation, inspect:
+
+```bash
+vault read sys/audit
+# enable audit if not already on
+grep "secret/data/apps/platform/checkout/ci/quay-robot" /var/log/vault/audit.log
+```
+
+Cross-reference against expected ESO read intervals; anything reading the path from outside the cluster is suspect.
+
+### Step 6 — close the loop
+
+- Open a GitHub issue documenting the rotation: when leaked, when revoked, when rotated, downstream impact.
+- If the leak was via Git (unintentional commit), use `git-filter-repo` or BFG on the offending repo. Force-push is acceptable per the workspace boundary memo *for this case only*.
+- Update the `secrets-custody-drift-check.md` runbook if a new class of leak is encountered.
+
+## What we do NOT support
+
+- **Vault dynamic secrets** (auto-rotating DB creds via Vault DB engine) — not enabled in the lab. Database passwords are static in kv-v2; rotation is manual.
+- **PKI from Vault** — the cluster uses cert-manager for TLS; Vault stores opaque cert bundles where needed but doesn't issue certs.
+- **Transform engine / format-preserving encryption** — not in scope.
+
+## Rotation cadence guidance
+
+| Credential class | Cadence | Where the timer lives |
+| --- | --- | --- |
+| Bootstrap (cluster CA, Vault CA) | 1–3 years | manual reminder, not automated |
+| Operator pull secrets | 90 days | rotation drills (manual) |
+| App database passwords | 90 days | tenant team's responsibility |
+| Quay robot tokens | 180 days | platform owner, per-team |
+| RHACS init-bundle | ~1 year (Central-issued) | tracked by `expiresAt` in the bundle metadata |
+| Vault Kubernetes auth tokens | 1 hour (per ESO read) | automatic, no human in the loop |
+
+The cadences are guidelines. The platform does not enforce rotation today; the GitHub-first tracking pattern (open an issue for each rotation drill) is the audit trail.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Old value still in Secret after `vault kv put` | ES `refreshInterval` not yet elapsed | force-sync annotation |
+| Old value still in pod after Secret updated | env-var consumption, no Reloader | mount as file, or add Reloader annotation, or restart |
+| Vault `kv put` succeeds but `kv get` returns old data | reading from `metadata/` not `data/` | use `vault kv get secret/<path>` (KV-v2 helper) |
+| KV rollback succeeds, but ExternalSecret still shows the new value | refresh hasn't run yet | force-sync; ESO reads `data/` (current) |
+| Revoked credential still working at the API | rotation happened in Vault but not at the issuing system | step 1: rotate at the issuing system *first* |
+
+## References
+
+- `runbooks/secrets-custody-drift-check.md`.
+- `runbooks/break-glass-procedure.md`.
+- `reference_quay_robot_token_convention.md` (memory).
+- Reloader operator: `stakater/reloader` upstream.
