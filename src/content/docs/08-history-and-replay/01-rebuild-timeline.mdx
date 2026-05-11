@@ -1,8 +1,308 @@
 ---
 title: "Rebuild Timeline"
-description: "Section 08-history-and-replay: Rebuild Timeline (placeholder)."
+description: "A chronological account of the CompTech lab rebuild attempts — what was tried, when, what broke, and what the v6 fleet inherited from each pass."
 sidebar_label: "Rebuild Timeline"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const vmLane    = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const ocpLane   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const gitopsLane = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const lanelabel  = { background: "transparent", border: "none", color: "#374151", width: 140, textAlign: "right", fontWeight: 700, fontSize: 13 };
+
+export const milestoneEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const transitionEdge = { animated: true, style: { stroke: "#b45309", strokeDasharray: "4,4", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b45309" }, labelStyle: { fill: "#b45309", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const purgeEdge = { style: { stroke: "#b91c1c", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const timelineNodes = [
+  { id: "lane-vm",     position: { x: 0,   y: 0   }, data: { label: "VM platform lane" },   style: lanelabel },
+  { id: "lane-ocp",    position: { x: 0,   y: 130 }, data: { label: "OpenShift fleet lane" }, style: lanelabel },
+  { id: "lane-gitops", position: { x: 0,   y: 260 }, data: { label: "GitOps / governance" }, style: lanelabel },
+
+  { id: "vm-cloudinit",  position: { x: 170, y: 0   }, data: { label: "cloud-init era\n(pre-rebuild scrap)\n— credentials only" }, style: vmLane },
+  { id: "vm-edge",       position: { x: 410, y: 0   }, data: { label: "2026-05-08 morning\nPDNS + HAProxy reset\nGitLab + MinIO fresh start" }, style: vmLane },
+  { id: "vm-mirror",     position: { x: 660, y: 0   }, data: { label: "2026-05-08 afternoon\nNexus + oc-mirror VMs\nfull mirror started" }, style: vmLane },
+  { id: "vm-platform",   position: { x: 910, y: 0   }, data: { label: "2026-05-08 evening\nVault, Jenkins, SigNoz,\nTrivy, DefectDojo VMs" }, style: vmLane },
+  { id: "vm-dev",        position: { x: 1160, y: 0  }, data: { label: "2026-05-09\ndocker-runtime VM\n+ developer handbook" }, style: vmLane },
+
+  { id: "ocp-prev6",     position: { x: 170, y: 130 }, data: { label: "pre-v6 fleet\nhub-dc / spoke-dc\nhub-dr / spoke-dr" }, style: ocpLane },
+  { id: "ocp-descope",   position: { x: 410, y: 130 }, data: { label: "2026-05-08 09:05\nDR clusters de-scoped\nfrom active ops" }, style: ocpLane },
+  { id: "ocp-hubv6",     position: { x: 660, y: 130 }, data: { label: "2026-05-09 08:00\nhub-dc-v6 install\ncomplete (4.20.18)" }, style: ocpLane },
+  { id: "ocp-spokev6",   position: { x: 910, y: 130 }, data: { label: "2026-05-09 15:20\nspoke-dc-v6 install\ncomplete (3 VM + 3 phys)" }, style: ocpLane },
+  { id: "ocp-pci",       position: { x: 1160, y: 130}, data: { label: "2026-05-10 → 11\nPCI-DSS baseline +\n22-operator queue" }, style: ocpLane },
+
+  { id: "go-acm",        position: { x: 410, y: 260 }, data: { label: "Argo on hub-dc\n(pre-v6 push model)" }, style: gitopsLane },
+  { id: "go-pull",       position: { x: 660, y: 260 }, data: { label: "2026-05-09 16:49\npull-model baseline\n(ADR 0018)" }, style: gitopsLane },
+  { id: "go-fedgitlab",  position: { x: 910, y: 260 }, data: { label: "2026-05-09 → 10\nfederated GitLab\nplatform-gitops" }, style: gitopsLane },
+  { id: "go-v6purge",    position: { x: 1160, y: 260}, data: { label: "2026-05-10 v6 purge\n(ADR 0022)\nhub-dr/spoke-dr removed" }, style: gitopsLane },
+];
+
+export const timelineEdges = [
+  { id: "vm1", source: "vm-cloudinit",  target: "vm-edge",     ...transitionEdge, label: "fresh start" },
+  { id: "vm2", source: "vm-edge",       target: "vm-mirror",   ...milestoneEdge },
+  { id: "vm3", source: "vm-mirror",     target: "vm-platform", ...milestoneEdge },
+  { id: "vm4", source: "vm-platform",   target: "vm-dev",      ...milestoneEdge },
+
+  { id: "oc1", source: "ocp-prev6",     target: "ocp-descope", ...transitionEdge, label: "de-scope" },
+  { id: "oc2", source: "ocp-descope",   target: "ocp-hubv6",   ...milestoneEdge },
+  { id: "oc3", source: "ocp-hubv6",     target: "ocp-spokev6", ...milestoneEdge },
+  { id: "oc4", source: "ocp-spokev6",   target: "ocp-pci",     ...milestoneEdge },
+
+  { id: "go1", source: "go-acm",        target: "go-pull",     ...transitionEdge, label: "model swap" },
+  { id: "go2", source: "go-pull",       target: "go-fedgitlab", ...milestoneEdge },
+  { id: "go3", source: "go-fedgitlab",  target: "go-v6purge",  ...purgeEdge, label: "purge" },
+
+  // cross-lane dependencies
+  { id: "x1", source: "vm-mirror",  target: "ocp-hubv6",    ...milestoneEdge, label: "feeds install" },
+  { id: "x2", source: "ocp-hubv6",  target: "go-pull",      ...milestoneEdge, label: "hosts Argo" },
+  { id: "x3", source: "vm-platform", target: "go-fedgitlab", ...milestoneEdge, label: "GitLab CE 18.11.1" },
+];
+
+This page is the rolled-up history of the CompTech lab rebuild. It collects every significant rebuild attempt — what was tried, when, what came out of it, and what the next pass kept versus threw away. Use it to orient before reading any of the detailed history pages: cloud-init failure, pre-v6 → v6 transition, site-replication readiness, day-wrap archive.
+
+## The five eras at a glance
+
+| Era | Window | Headline | What survived |
+| --- | --- | --- | --- |
+| **E0 — cloud-init scrap** | pre-2026-05-08 | Earlier attempts that never reached a working OpenShift install; left credential blobs in `/home/ze/cloud-init/` | **Nothing operational.** Folder is now read-only historical evidence (see [cloud-init page](/docs/08-history-and-replay/02-failed-installs-and-cloud-init/)). |
+| **E1 — pre-v6 fleet** | 2026-05-04 → 2026-05-08 | `hub-dc` + `spoke-dc` + `hub-dr` + `spoke-dr`; ADR 0001 baseline; push-model GitOps from `lab-gitops` | Architectural lessons (cluster naming, Argo push pain), `lab-gitops-full` repo as desired-state reference |
+| **E2 — VM platform reset** | 2026-05-08 (single intensive day) | Edge (PDNS + HAProxy) re-set; GitLab + MinIO + Nexus + oc-mirror + Vault + Jenkins + SigNoz + Trivy + DefectDojo + Monitoring + Redis + Kafka + WSO2 + docker-runtime VMs deployed | Every VM listed in [Lab Infrastructure §2](/docs/02-lab-infrastructure/) |
+| **E3 — v6 install** | 2026-05-09 | `hub-dc-v6` then `spoke-dc-v6` installed on OCP 4.20.18 from the mirror; pull-model Argo bootstrap | The active fleet today |
+| **E4 — federation + compliance** | 2026-05-10 → 2026-05-11 | Federated GitLab content model; pre-v6 purge (ADR 0022); 22-operator queue + ACM + ODF + ESO + RHACS + OADP; PCI-DSS v4 baseline ran end-to-end | Current operating state — see [CURRENT_STATE.md](https://github.com/zeshaq/codex-opp-agent/blob/main/CURRENT_STATE.md) |
+
+The rest of this page is the same story with dates, scope, outcomes, and lessons per major attempt.
+
+## Whiteboard
+
+<Whiteboard client:load data={{ nodes: timelineNodes, edges: timelineEdges }} height={420} />
+
+Three horizontal lanes — **VM platform** (amber), **OpenShift fleet** (gray, bold), **GitOps / governance** (dashed green) — read left to right by date. Solid arrows are sequential milestones within a lane; dashed amber arrows are transitions where the model changed (`fresh start`, `de-scope`, `model swap`); red `purge` is the destructive removal of pre-v6 names from active inventory. Cross-lane arrows show the load-bearing dependencies — the mirror VM feeding the OCP install, `hub-dc-v6` hosting Argo, and the platform VMs hosting GitLab content.
+
+## E0 — cloud-init scrap (pre-2026-05-08)
+
+**Scope.** Earlier rebuild attempts whose only surviving artifact is `/home/ze/cloud-init/` — a folder of ~117 files including admin passwords, deploy keys, OIDC client secrets, and RKE2 join tokens.
+
+**Outcome.** Never reached a working OpenShift fleet. The artifacts are not authoritative for current state. The workspace boundary rule (see [feedback memory entry](https://github.com/zeshaq/codex-opp-agent/issues/150) — REP-6 migrated this to runbooks) forbids writing to `/home/ze/cloud-init/`; reading is allowed but every value found there is treated as historical, not current truth.
+
+**Lesson kept.** Secrets sprawl across cloud-init files is exactly what later led to:
+
+- **ADR 0019 — Nexus-only image supply chain.** Single tracked registry path, not registry credentials scattered through VM cloud-init.
+- **Vault on a dedicated VM (ADR not numbered, see `connection-details/vault-app-secrets.md`).** Centralized credential custody; per-tenant app-secret namespaces; ESO bridges to OpenShift.
+- **Secrets custody runbook** (`runbooks/secrets-custody-drift-check.md`, REP-6 output): the convention that every credential has exactly one authoritative location.
+
+See the dedicated [cloud-init scrap page](/docs/08-history-and-replay/02-failed-installs-and-cloud-init/) for the failure classes and the boundary rule's exact text.
+
+## E1 — pre-v6 fleet (2026-05-04 → 2026-05-08)
+
+**Scope.** Four-cluster OpenShift fleet defined in ADR 0001:
+
+| Cluster | Role | Status at end of E1 |
+| --- | --- | --- |
+| `hub-dc` | active management hub | running but on push-mode GitOps; storage and operator drift accumulating |
+| `spoke-dc` | active workload cluster | running |
+| `hub-dr` | management standby | running; DR drill exercises stalled with prune regressions |
+| `spoke-dr` | workload standby | running; ACM governance crashloops |
+
+**Outcome.** This fleet got the lab to "a working hub + a working spoke + a working DR pair." But fundamentals were brittle:
+
+- **DR drills uncovered prune regressions** (`reports/sessions/20260505-093816-hub-dr-pull-gitops-prune-regression.md` then `20260505-102325-hub-dr-pull-gitops-prune-recovery.md`).
+- **Storage on hub clusters was a permanent pain point** — the 05-05 sessions ran a chain of *keep hub LVMS, remove hub storage consumers* → *hub storage-light live apply* → *hub-dc LVMS repair*.
+- **`spoke-dr` ACM governance was crashlooping** until manual cleanup (`20260506-223558-spoke-dr-acm-governance-fix.md`).
+- The push-model GitOps placement made the four-cluster scope a permanent registration overhead.
+
+**Decision: de-scope DR.** On **2026-05-08 09:05 UTC** the user instructed that `hub-dr` and `spoke-dr` be de-scoped from active operations. The session report at `reports/sessions/20260508-090555-descope-dr-clusters.md` records the safe (non-destructive) GitOps placement narrowing to `env=dc, role=spoke`; the DR clusters were left running but stopped receiving active work.
+
+**Lessons kept.**
+
+- **ADR 0001 was preserved as the historical anchor** when the cluster list was later superseded by ADR 0022. The workspace concept survived even though the cluster names didn't.
+- The push-model pain motivated **ADR 0018 — ACM + OpenShift GitOps pull model for v6**.
+- The DR storage pain motivated the **management-only hub design** (`20260505-153113-management-only-hub-dr-design.md`) — hub clusters keep LVMS but do not host ODF/storage consumers. This carried into `hub-dc-v6`.
+- `lab-gitops-full` repo (the full desired-state reference) survived and was used as the seed for the federated `platform-gitops` repo on internal GitLab.
+
+## E2 — VM platform reset (2026-05-08)
+
+**Scope.** A single intensive day where the entire VM-platform tier was rebuilt or re-validated. Every VM that supports the v6 fleet was either deployed or hardened on this day.
+
+**Chronological log (UTC):**
+
+| Time | Event |
+| --- | --- |
+| 10:29 | GitLab and MinIO fresh-start reset |
+| 11:01 | Rebuild script import — `scripts/rebuild/*` moved into the workspace |
+| 11:39 | Network/ingress PKI decision recorded (ADR 0005) |
+| 11:42 | Gateway CIDR correction in the rebuild plan |
+| 11:59 | PowerDNS readiness check |
+| 12:06 | Roadmap PDNS + DNS gates added |
+| 12:14 | GitHub planning pack + tracker created |
+| 12:25 | Repeatable rebuild documentation model adopted |
+| 12:34 | Cluster names approved: `hub-dc-v6`, `spoke-dc-v6` (base domain `sub.comptech-lab.com`) |
+| 12:46 | PDNS resolver + API cleanup |
+| 12:57 | Hub topology decision: compact 3-master, no separate workers |
+| 13:05 | NIC source rule + iLO MAC check |
+| 13:14 | Allocation accepted, DNS records applied |
+| 13:28 | Disconnected mirror baseline (ADR 0019 emerging) |
+| 13:44 | Standalone Nexus + oc-mirror VMs decided |
+| 14:09 | Mirror TLS, pull secret, dry-run |
+| 15:10 | Pinned fast mirror image set |
+| 15:44 | Expanded previous-platform mirror dry-run |
+| 15:55 | **Full mirror download started** |
+| 16:39 | `hub-dc-v6` install inputs prepared |
+| 17:11 | Vault memory reset and VM plan |
+| 17:35 | Kafka KRaft tracker created |
+| 17:46 | Vault OSS VM deployed |
+| 18:07 | Redis Sentinel VM deployed |
+| 18:13 | Kafka KRaft VM deployed |
+| 18:17 | Redis hardening ADR + roadmap (ADR 0006) |
+| 18:24 | Kafka ADR + production readiness milestone (ADR 0007) |
+| 18:40 | Jenkins single-VM deployed (ADR 0009) |
+| 18:41 | SigNoz ADR + VM observability milestone (ADR 0010) |
+| 18:45 | Trivy ADR + VM scanner milestone (ADR 0011) |
+| 18:55 | WSO2 APIM/Identity VM deployed (ADR 0008) |
+| 18:58 | Monitoring observability VM ADR + milestone (ADR 0012) |
+| 19:18 | SigNoz VM deployed |
+| 19:24 | Trivy VM deployed |
+| 19:31 | SigNoz P1 hardening milestone |
+| 19:43 | Monitoring observability VM deployed |
+| 19:45 | Redis/Kafka WAL utility VM deployed |
+| 20:09 | DefectDojo VM deployed (ADR 0013) |
+| 20:18 | Trivy/DefectDojo import contracts milestone |
+
+**Outcome.** End of 2026-05-08 the lab had:
+
+- A **fresh GitLab CE 18.11.1** instance with the user's admin account restored.
+- A **MinIO VM** with buckets reserved for OADP backup, Loki logs, and Tempo traces.
+- A **standalone Nexus VM** acting as the docker-group dev mirror and the app-registry push target.
+- A **standalone `oc-mirror` VM** with the full OCP 4.20 platform mirror starting to download.
+- **HashiCorp Vault** (Raft, integrated storage, three nodes + transit seal).
+- **Jenkins** for the developer build path (single VM by ADR 0009).
+- **SigNoz** for VM-tier observability (OTLP traces + logs).
+- **Trivy + DefectDojo** for the security scan path.
+- **Monitoring** VM (Prometheus + Grafana for the VM tier).
+- **WSO2 APIM + Identity** VMs.
+- **Redis Sentinel** and **Kafka KRaft** VMs (out-of-scope for the OpenShift workload, retained as supporting infra).
+
+**Lessons kept.**
+
+- The **per-VM ADR convention** (ADRs 0006–0013, one per VM tier) made each VM's purpose, sizing, and config decision traceable. This pattern persisted; later ADRs (0014–0026) are all single-decision documents.
+- **HAProxy edge serves VM hosts only** (memory `feedback_haproxy_scope.md`): never put OpenShift routes behind it. This rule was set on 2026-05-08 and has held.
+- **oc-mirror is reserved for OpenShift install only**; all application image work goes through Nexus (memory `feedback_oc_mirror_off_limits.md`). This separation became ADR 0019.
+- **GitHub-first tracking** (memory `feedback_github_first_tracking.md`) — every non-trivial change opens an issue first. This pattern was set on 2026-05-08 and is the source-of-truth governance to today.
+
+## E3 — v6 install (2026-05-09)
+
+**Scope.** The two-cluster v6 install ran inside a single 24-hour window:
+
+| Time (UTC) | Event |
+| --- | --- |
+| 06:37 | OCP mirror partial completion recorded |
+| 06:45 | `hub-dc-v6` install preflight |
+| 06:53 | `hub-dc-v6` install workdir prep |
+| 07:11 | `hub-dc-v6` ISO + VM definitions |
+| 08:00 | **`hub-dc-v6` boot and install complete — OCP `4.20.18`** |
+| 08:15 | Local connection cleanup |
+| 08:23 | day-1 checkpoint + baseline |
+| 08:43 | Disconnected catalog baseline (mirrored Red Hat + certified catalogs only, default sources disabled) |
+| 08:47 | Vault readiness recheck |
+| 08:55 | Developer readiness track + ADR 0014 |
+| 08:57 | OpenShift GitOps installed (`openshift-gitops-operator.v1.20.3`) |
+| 09:01 | Developer handbook scaffold |
+| 09:12 | hub-dc-v6 minimal GitLab GitOps bootstrap (Application `hub-dc-v6-bootstrap` Synced/Healthy) |
+| 09:28 | GitOps AppProject hardening |
+| 09:34 | docker-runtime VM deployed |
+| 09:39 | hub-dc-v6 bootstrap namespace baseline |
+| 10:08 | Federated GitOps architecture ADR (0015) + milestones |
+| 10:17 | Federated GitOps readiness gates |
+| 10:23 | GitLab repo group access matrix |
+| 10:35 → 10:58 | GitLab FG-1: preflight → group skeleton → project migration → access grants |
+| 11:17 → 11:54 | `spoke-dc-v6` install preflight → inputs → workdir prep |
+| 13:02 | `spoke-dc-v6` ISO and VM definitions |
+| 13:15 | spoke-dc-v6 PCI-DSS tracking initialized |
+| 13:25 | spoke-dc-v6 physical worker boot safety gate |
+| 15:20 | **`spoke-dc-v6` base install complete (3 VM masters + 3 physical workers)** |
+| 15:34 → 16:27 | spoke-dc-v6 ODF preflight blocked → disk remediation → drift audit → manual ODF/LSO removal |
+| 16:32 | hub-dc-v6 management GitOps reset |
+| 16:49 | management GitOps pull-model baseline (ADR 0018) |
+| 20:10 | spoke-dc-v6 ACM registration |
+| 22:13 | spoke-dc-v6 ODF StorageConsumer cleanup |
+| 22:47 | spoke-dc-v6 ODF CSI mirror fix |
+| 23:27 | Nexus-only image supply baseline (ADR 0019) |
+
+**Outcome.** End of 2026-05-09 the v6 fleet was live:
+
+- `hub-dc-v6` — 3-node compact cluster, all-in-one masters (control-plane + worker roles), OCP `4.20.18`, kubelet `v1.33.9`.
+- `spoke-dc-v6` — 3 VM masters + 3 physical workers (`gold-1`, `gold-2`, `gpu-01`), ACM-registered to `hub-dc-v6`, ODF data plane healthy.
+- OpenShift GitOps installed on both, pull-model registered (Argo on hub orchestrates, spoke Argo applies).
+- Nexus is the single image supply path for both clusters.
+
+**Lessons kept.**
+
+- **The ISO/agent-install path was the right choice** over IPI/UPI for the rebuild — repeatable from input package, no PXE infra required.
+- **Compact 3-master clusters for both hub and spoke** (workers are control-plane + worker on hub; physical workers on spoke). Reduces node count without losing the role-separation that 4.x enforces.
+- **First Argo application must be tiny** — `hub-dc-v6-bootstrap` only manages namespace `platform-bootstrap`. Validates the GitOps rail before any real workload.
+- **Disconnected catalog baseline before any operator install** — IDMS/ITMS, mirrored catalog, `disableAllDefaultSources: true`, validated before the operator queue starts.
+
+**Failure modes that surfaced.**
+
+- **IPv6 vs OVN-K** — `ipv6.disable=1` kernel arg AND `net.ipv6.conf.all.disable_ipv6=1` sysctl both break OVN-K (geneve uses IPv6 link-local even on IPv4-only clusters). Discovered during the v6 install; ADR 0026 amended ADR 0005 to record the correct posture. Runbook: `runbooks/openshift-ipv6-disable-correct-approach.md`.
+- **ODF CSI image mirror gap** — `spoke-dc-v6` had only the release-payload IDMS, not the oc-mirror operator/operand IDMS. CSI pods failed external pulls. Fix: applied `ImageDigestMirrorSet/idms-operator-0`, mirrored missing digests into Nexus. Tracked under issue #120.
+- **ACM `gitops-addon` ships a `routes.route.openshift.io` CRD** that collides with the aggregated Route APIService and breaks `/openapi/v2` on real OpenShift clusters. Quick fix: `oc delete crd routes.route.openshift.io`. Tracked under issue #153.
+
+## E4 — federation + compliance (2026-05-10 → 2026-05-11)
+
+**Scope.** With the v6 fleet running, the focus moved to federated content, the 22-operator queue, and the PCI-DSS baseline. Two ADRs accepted: **0020 (PCI-DSS baseline)** and **0022 (v6 fleet membership)**.
+
+**2026-05-10 day-wrap (issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159)) — headline numbers:**
+
+| Metric | Count |
+| --- | --- |
+| Operators installed end-to-end | 7 (Compliance, OADP, cert-manager × 2 clusters, FIO, SPO, CSO) |
+| MRs merged to `platform-gitops` `main` | 16 |
+| MRs merged to `codex-opp-agent` `main` | 2 |
+| Issues closed | 15 |
+| ADRs accepted | 0020, 0022 |
+| Project board #10 cards moved to Validated | 6 of 22 |
+| Cluster-breaking incidents (reverted) | 2 (both IPv6 forms vs OVN-K) |
+
+**Issues closed on 2026-05-10:** #109 PCI-1 day-zero · #110 PCI-2 Compliance Operator + GitOps · #125 IMG-SUPPLY2 ODF dep coverage · #129 SPOKE-GUARD1 · #130 PCI-HANDBOOK · #132 ADR-0020 review · #133 PCI-1.10 etcd encryption · #134 PCI-1.12 OAuth tokenConfig · #136 IMG-REVIEW1 · #138 IMG-CLEAN1 · #139 IMG-CNV1 OpenShift Virtualization mirror · #152 BACKUP-1 OADP Phase A · #156 OPS-V6-FLEET-1 pre-v6 purge · #157 CERT-MGR-1 cert-manager (both clusters) · #158 PCI-3.A operator-presence batch.
+
+**2026-05-11 milestones:**
+
+- **PCI-DSS baseline closed end-to-end** on `spoke-dc-v6` — PCI-0 through PCI-5 plus PCI-1.13 closed; sanitized auditor-facing evidence pack published at `reports/pci-dss/spoke-dc-v6-pci-dss-v4-baseline-2026-05-11.md`.
+- **MR !53** merged the hardening manifests + TailoredProfile; **MR !54** unblocked the spoke `argocd-platform-extensions` ClusterRole; **MR !55** added the TailoredProfile exclusion for CSO + ingress-ciphers rules.
+- **Final PCI-DSS counts:** `ocp4-pci-dss-4-0` FAILs dropped 17 → 10 → **8**; node-master scan stayed at 3 FAILs; node-worker scan stayed at 0 FAILs. All 11 remaining FAILs map to follow-up sub-issues #246–#252.
+- **RHOAI direct mirror retry** running through the night; 572 successful image copies, 1 failed image copy at last check.
+
+**Lessons kept.**
+
+- **GitHub-first tracking + MR-first delivery is the durable record.** Chat is ephemeral, GitHub issues + MR history are the auditable trail.
+- **Compliance Operator XCCDF rules have hardcoded namespace/operand expectations** — TailoredProfile is how you reconcile lab reality with the rule baseline.
+- **Federation needs ADRs as much as it needs code** — 0015 (federated GitOps repo architecture), 0018 (pull model), 0023 (GitLab group ownership), 0024 (OpenShift-only platform-gitops boundary), 0025 (GitOps-only operations + break-glass) each closed one ambiguity that would otherwise leak into runtime drift.
+
+## What carried through every rebuild
+
+Three things never broke and never had to be re-decided:
+
+1. **Network plane.** The `30.30.0.0/16` lab subnet allocation pattern, PDNS as the lab resolver, HAProxy as the edge for VM hosts (not for OpenShift), and the `*.sub.comptech-lab.com` DNS plane. Set in E2 and unchanged since.
+2. **Image supply chain.** Nexus for everything except OCP install mirrors (which go through `oc-mirror`). ADR 0019 codified this; ADR 0024 reinforced it; the rule has held through every rebuild attempt.
+3. **Workspace at `/home/ze/codex-opp-agent`.** The decision in ADR 0001 to maintain a local operator workspace with AGENTS.md, CLUSTERS.md, plans/, scripts/rebuild/, ADRs, and reports/sessions/ is the reason this timeline exists. Without the workspace, every rebuild attempt would have been amnesic.
+
+## References
+
+- ADR 0001 — operator workspace (historical anchor; cluster list portion superseded by 0022)
+- ADR 0005 — OpenShift rebuild network ingress PKI
+- ADR 0014 — developer readiness platform contract
+- ADR 0015 — federated GitOps repo architecture
+- ADR 0018 — ACM + OpenShift GitOps pull model (v6)
+- ADR 0019 — Nexus-only image supply chain
+- ADR 0020 — PCI-DSS profile compliance baseline
+- ADR 0022 — v6 fleet membership (pre-v6 purge)
+- ADR 0023 — federated GitLab group/repo ownership
+- ADR 0024 — OpenShift-only platform-gitops boundary
+- ADR 0026 — IPv6 baseline for OVN-Kubernetes
+- `codex-opp-agent/SESSION_LOG.md` — 229 entries from 2026-05-05 to 2026-05-11
+- `codex-opp-agent/reports/sessions/` — 244 timestamped session reports
+- Day-wrap issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159) — 2026-05-10 closeout
+- Site Replication Readiness milestone (REP-0..REP-7) — see [/docs/08-history-and-replay/04-site-replication-readiness/](/docs/08-history-and-replay/04-site-replication-readiness/)

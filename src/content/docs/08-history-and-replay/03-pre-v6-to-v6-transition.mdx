@@ -1,8 +1,257 @@
 ---
 title: "Pre-v6 to v6 Transition"
-description: "Section 08-history-and-replay: Pre-v6 to v6 Transition (placeholder)."
+description: "What the pre-v6 fleet looked like, why it was reset to v6, what survived and what was scrapped, and the ADR 0022 purge that closed the loop."
 sidebar_label: "Pre-v6 to v6 Transition"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const prev6Active = { background: "#fee2e2", border: "1px solid #b91c1c", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const prev6Stand  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const v6Active    = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const v6Reserved  = { background: "#fafafa", border: "1.5px dashed #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const labelBox    = { background: "transparent", border: "none", color: "#374151", width: 200, textAlign: "center", fontWeight: 700, fontSize: 14 };
+
+export const supersedeEdge = { animated: true, style: { stroke: "#b91c1c", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const carryEdge     = { style: { stroke: "#15803d", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const transitionNodes = [
+  { id: "beforeLabel", position: { x: 100, y: 0 }, data: { label: "BEFORE — pre-v6 (ADR 0001)" }, style: labelBox },
+  { id: "afterLabel",  position: { x: 700, y: 0 }, data: { label: "AFTER — v6 (ADR 0022)" }, style: labelBox },
+
+  // Before column
+  { id: "hubdc",   position: { x: 30,  y: 70  }, data: { label: "hub-dc\nactive mgmt\n(ODF + push GitOps)" }, style: prev6Active },
+  { id: "spokedc", position: { x: 30,  y: 200 }, data: { label: "spoke-dc\nactive workload" }, style: prev6Active },
+  { id: "hubdr",   position: { x: 230, y: 70  }, data: { label: "hub-dr\nmgmt standby\n(DR drill failing)" }, style: prev6Stand },
+  { id: "spokedr", position: { x: 230, y: 200 }, data: { label: "spoke-dr\nworkload standby\n(ACM crashloop)" }, style: prev6Stand },
+
+  // After column
+  { id: "hubv6",   position: { x: 640, y: 70  }, data: { label: "hub-dc-v6\ncompact 3-AIO\nstorage-light" }, style: v6Active },
+  { id: "spokev6", position: { x: 640, y: 200 }, data: { label: "spoke-dc-v6\n3 VM + 3 phys workers\nODF data plane" }, style: v6Active },
+  { id: "hubdrv6", position: { x: 840, y: 70  }, data: { label: "hub-dr-v6\nreserved name\n(not built)" }, style: v6Reserved },
+  { id: "spokedrv6", position: { x: 840, y: 200 }, data: { label: "spoke-dr-v6\nreserved name\n(not built)" }, style: v6Reserved },
+];
+
+export const transitionEdges = [
+  { id: "h1", source: "hubdc",   target: "hubv6",   ...carryEdge,     label: "rebuilt as" },
+  { id: "s1", source: "spokedc", target: "spokev6", ...carryEdge,     label: "rebuilt as" },
+  { id: "h2", source: "hubdr",   target: "hubdrv6", ...supersedeEdge, label: "decommissioned; name reserved" },
+  { id: "s2", source: "spokedr", target: "spokedrv6", ...supersedeEdge, label: "decommissioned; name reserved" },
+];
+
+The CompTech v6 fleet is the second-generation OpenShift inventory at this lab. The first generation — pre-v6 — was four clusters (`hub-dc` + `spoke-dc` + `hub-dr` + `spoke-dr`) defined in ADR 0001. v6 is two clusters (`hub-dc-v6` + `spoke-dc-v6`) with the DR pair reserved as names but not built, defined in ADR 0022. This page documents what the pre-v6 fleet looked like, why it was reset, what was retained vs scrapped, and how the supersession was formalized.
+
+## Before / after
+
+<Whiteboard client:load data={{ nodes: transitionNodes, edges: transitionEdges }} height={320} />
+
+The diagram reads left → right by ADR. Red (active) and amber (standby) on the left are the pre-v6 fleet; green (active) and gray-dashed (reserved name) on the right are v6. Solid green arrows are "rebuilt as" — the active role survived but the cluster was rebuilt fresh. Dashed red arrows are "decommissioned; name reserved" — the old DR pair was retired, the v6-naming successor exists as a placeholder but is not built and is not in scope for active work.
+
+## Pre-v6: the four-cluster fleet (ADR 0001)
+
+ADR 0001 was accepted **2026-05-04**. It defined the operator workspace at `/home/ze/codex-opp-agent` and named the fleet:
+
+| Cluster | Role | Notes |
+| --- | --- | --- |
+| `hub-dc` | active management hub | RHACM hub; push-model OpenShift GitOps; ODF on the management side |
+| `spoke-dc` | active workload cluster | running apps; CSI / ODF storage |
+| `hub-dr` | management standby | DR pair for `hub-dc`; restore-hub procedure under test |
+| `spoke-dr` | workload standby | DR pair for `spoke-dc`; ACM-governed |
+
+**What pre-v6 got right.** The names were descriptive and the topology was symmetric — easy to reason about. The workspace concept (ADR 0001) was sound; assessment scripts, ADR conventions, and the session-report cadence all originated here and carried forward unchanged.
+
+**What pre-v6 got wrong** (or, more precisely, what surfaced as the lab grew):
+
+- **Push-model GitOps was hub-centric.** Argo on `hub-dc` needed kubeconfigs for every other cluster, including DR. Credential blast radius was wide; spoke onboarding required hub-side work.
+- **Hub clusters carried storage consumers.** ODF on `hub-dc` and `hub-dr` was expensive (sizing, repair cycles, drift). 2026-05-05 sessions ran a cascade: *keep hub LVMS, remove hub storage consumers* → *hub storage-light live apply* → *hub-dc LVMS repair*.
+- **DR pair was high-maintenance, low-confidence.** Drills surfaced prune regressions (`reports/sessions/20260505-093816-hub-dr-pull-gitops-prune-regression.md`); `spoke-dr` ACM governance was crashlooping (`20260506-223558-spoke-dr-acm-governance-fix.md`). Maintaining DR-pair correctness consumed time that wasn't producing forward progress.
+- **Image-supply path was implicit.** No ADR pinned "everything from Nexus"; clusters had a mix of mirrors, direct pulls, and `quay.io` lookups depending on which operator was being installed.
+
+## Why the reset (the operational diagnosis)
+
+There were two viable paths once the user decided the pre-v6 fleet had to change:
+
+| Path | Cost | Risk |
+| --- | --- | --- |
+| **In-place fix** — keep `hub-dc`/`spoke-dc` running, migrate to pull-model GitOps, refactor storage on hub, re-stabilize DR | High — every change had to happen on a live cluster with workload | High — partial migrations leave hybrid state that is hard to reason about |
+| **Rebuild as v6** — fresh install, new cluster names (`hub-dc-v6`/`spoke-dc-v6`), apply lessons from the start | Medium — single concentrated install window | Low — clean slate, no hybrid state |
+
+The user chose **rebuild as v6**, and the lab still had `spoke-dc-v6` operational time in the budget to validate the approach end-to-end before retiring the pre-v6 fleet.
+
+The de-scope of DR happened first. On **2026-05-08 09:05 UTC** the session `20260508-090555-descope-dr-clusters.md` narrowed the active GitOps Placement to `env=dc, role=spoke` — `hub-dr` and `spoke-dr` stopped receiving active work but were left running for handoff. The ACM `ManagedCluster` inventory still listed them; the Placement just excluded them.
+
+This phased the work:
+
+1. **DR off (2026-05-08).** Active scope narrowed to `hub-dc` + `spoke-dc`. No destructive teardown.
+2. **VM platform rebuilt (2026-05-08).** Edge (PDNS + HAProxy), GitLab, MinIO, Nexus, oc-mirror, Vault, Jenkins, SigNoz, Trivy, DefectDojo, Monitoring, Redis, Kafka, WSO2, docker-runtime — all rebuilt or stood up on this day. See [Rebuild Timeline E2](/docs/08-history-and-replay/01-rebuild-timeline/#e2--vm-platform-reset-2026-05-08).
+3. **v6 fleet built (2026-05-09).** `hub-dc-v6` installed and Day-1 baseline; `spoke-dc-v6` installed and ACM-registered. The two clusters ran in parallel with the pre-v6 fleet for less than a day.
+4. **Pre-v6 purge (2026-05-10).** Issue [#156](https://github.com/zeshaq/codex-opp-agent/issues/156) OPS-V6-FLEET-1 + ADR 0022 formalized that pre-v6 names are decommissioned. `CLUSTERS.md` updated, plans updated, memory updated.
+
+## ADR 0022: the formal supersession
+
+ADR 0022 was accepted **2026-05-10**. It supersedes only the *cluster-list portion* of ADR 0001 — the rest of 0001 (workspace, AGENTS.md, CLUSTERS.md, ADRs, reports, scripts) remains in force. The supersession table:
+
+| Cluster name | Pre-v6 status (ADR 0001) | v6 status (ADR 0022) |
+| --- | --- | --- |
+| `hub-dc` | active management hub | transitional; allowed in historical context only |
+| `spoke-dc` | active workload cluster | transitional; allowed in historical context only |
+| `hub-dr` | management standby | **decommissioned**; name must not appear in new manifests/plans/scripts/runbooks/session reports |
+| `spoke-dr` | workload standby | **decommissioned**; same rule as `hub-dr` |
+| `hub-dc-v6` | n/a | **active management hub** (3-node compact, all-in-one masters) |
+| `spoke-dc-v6` | n/a | **active workload cluster** (3 VM masters + 3 physical workers; ODF) |
+| `hub-dr-v6` | n/a | **reserved name** for future v6 management DR (not built; no manifests) |
+| `spoke-dr-v6` | n/a | **reserved name** for future v6 workload DR (not built; no manifests) |
+
+The rule-of-thumb for the operator workspace and any operator-authored content:
+
+- **"Active management"** or **"the hub"** = `hub-dc-v6`.
+- **"Active workload"** or **"the spoke"** = `spoke-dc-v6`.
+- Pre-v6 DR names (`hub-dr`, `spoke-dr`) are forbidden in new content.
+- Pre-v6 active names (`hub-dc`, `spoke-dc`) are allowed only in historical/transitional context.
+- v6 DR names (`hub-dr-v6`, `spoke-dr-v6`) may appear in forward-looking planning text only; no live work targets them.
+
+## What survived the transition
+
+The transition was **architectural reset, not workspace reset**. The following carried forward unchanged:
+
+### Workspace
+
+- `codex-opp-agent` workspace structure — every file under `adr/`, `plans/`, `scripts/rebuild/`, `connection-details/`, `runbooks/`, `reports/sessions/` was kept and is still authoritative.
+- ADR 0001 itself — not modified. It is the historical anchor; only its cluster list was superseded.
+- Session-report cadence — every session under v6 still produces a timestamped report in `reports/sessions/`.
+- ASSESSMENT/CURRENT_STATE/TODO/RUNBOOK/SESSION_LOG markdown convention.
+
+### Desired state
+
+- `lab-gitops-full` repo — kept as a historical/desired-state reference for pre-v6 manifests.
+- The federated `platform-gitops` repo on internal GitLab is the active source-of-truth for v6 (see [federated GitOps section](/docs/03-openshift-platform/) and ADR 0015).
+- Argo CD operator was preserved as the GitOps reconciler — version moved forward to `openshift-gitops-operator.v1.20.3` on `hub-dc-v6`.
+
+### Concepts and ADRs
+
+- ADRs 0001 (workspace), 0002 (subagent-first), 0003 (basic pull model), 0004 (management-only hubs), 0005 (rebuild network/PKI), 0006–0013 (per-VM ADRs), 0014 (developer readiness) — all in force.
+- The "management-only hub" idea from pre-v6 (no storage consumers on the hub) directly informed the `hub-dc-v6` design — compact 3-master, no ODF.
+
+### VM tier
+
+- The supporting VM platform was rebuilt fresh, **but the VM-tier responsibilities are unchanged**:
+  - HAProxy at the edge for VM hosts (not for OpenShift routes — memory `feedback_haproxy_scope.md`).
+  - PDNS as the lab resolver, with auth + recursor on one host (memory `reference_pdns_vm.md`).
+  - MinIO for OADP backup + observability buckets.
+  - Nexus + oc-mirror split (memory `reference_lab_infrastructure.md`).
+  - Vault as the credential custody store.
+
+## What was scrapped
+
+### Cluster runtimes
+
+- `hub-dc` VM domains — decommissioned.
+- `spoke-dc` VM domains — decommissioned.
+- `hub-dr` VM domains and DR-drill infrastructure — decommissioned.
+- `spoke-dr` VM domains — decommissioned.
+- Pre-v6 kubeconfigs, generated install artifacts, agent ISOs — all dropped. The `/home/ze/ocp-clusters/` location only contains v6 workdirs now (`hub-dc-v6/`, `spoke-dc-v6/`).
+
+### Push-model GitOps wiring
+
+- Argo on `hub-dc` had to be re-credentialled for every spoke via `seed-managed-gitops-credentials.sh`. That script is preserved in history but is no-op under v6 — the pull model means each spoke runs its own Argo CD and reconciles its own cluster directory in `platform-gitops`.
+- ACM `Placement` resources that fanned out manifests via hub-issued kubeconfigs — gone. Under v6, `Placement` selects clusters and `ManifestWork` delivers a tiny bootstrap (essentially "install OpenShift GitOps and a repo credential pointing at internal GitLab"); the spoke's local Argo CD does the rest.
+
+### Push-model RBAC
+
+- Hub-side ServiceAccount and ClusterRoleBindings that granted `hub-dc` cluster-admin-equivalent access on `spoke-dc`/`spoke-dr` — replaced by the spoke-side `argocd-platform-extensions` ClusterRole convention (memory `reference_spoke_argo_extension_rbac.md`).
+
+### DR-drill state
+
+- `hub-dr restore-hub` runbook content was retained as ADR/runbook history; the cluster and its state are gone.
+- The pre-v6 DR prune regressions and the recovery cycle are part of the historical record (session reports under 2026-05-05) but no live system reproduces that path today.
+
+### Cluster-names-as-policy
+
+- Any manifest that referenced `hub-dr` or `spoke-dr` by name was either deleted or moved to historical context. ADR 0022 explicitly forbids those names appearing in new content.
+
+## Pull-model GitOps: the architectural change at the heart of the reset
+
+The single largest difference between pre-v6 and v6 is the **GitOps model**.
+
+| Aspect | Pre-v6 (push) | v6 (pull) |
+| --- | --- | --- |
+| Argo CD instances | One, on `hub-dc` | One per cluster — `hub-dc-v6` and `spoke-dc-v6` each run OpenShift GitOps locally |
+| Manifest delivery | Hub Argo applied directly to spoke API servers using stored kubeconfigs | Hub `ApplicationSet` creates `ManifestWork`; klusterlet on spoke pulls; spoke's local Argo CD reconciles the spoke's cluster directory in `platform-gitops` |
+| Credential blast radius | Hub holds kubeconfigs for every cluster | Hub holds zero spoke kubeconfigs; klusterlet uses its outbound connection |
+| Network requirements | Hub must reach each spoke's API server | Spoke initiates outbound to hub; no reverse-direction connection |
+| Spoke onboarding | Hub-side credential plumbing required | Spoke runs join command; klusterlet handshakes; Argo CD reconciles |
+| Drift recovery | Hub-side reconciliation, hub-side state | Per-cluster Argo state; per-cluster recovery |
+
+ADR 0018 (ACM + OpenShift GitOps pull model for v6) is the formal record of this change. Memory `feedback_acm_gitops_pull_pattern.md` flags it: the pull model is *the* Red Hat reference pattern for hub-spoke fleets, not drift.
+
+The pull model also implies:
+
+- `project=default` is acceptable in the `ApplicationSet` because the spoke's local Argo handles policy enforcement, not the hub.
+- The `gitops-addon` Deployment runs on each spoke and is the bridge between ACM's `ManagedCluster` and the spoke's Argo CD.
+- The hub's Argo CD has cluster-admin on the hub only (it manages the hub's own cluster directory and creates `ManifestWork`); it does not have credentials on any spoke.
+- The hub is **storage-light** — no ODF on the hub, no application persistent state on the hub. This was a direct lesson from pre-v6.
+
+## Federation: the second architectural change
+
+The reset wasn't only about clusters; it was also about how content is organized in GitLab.
+
+**Pre-v6:** one giant `lab-gitops` repo with every cluster's manifests under one root. Argo on `hub-dc` reconciled against subpaths.
+
+**v6:** federated structure under `comptech-platform/` on internal GitLab (ADR 0015, ADR 0023). Top-level groups:
+
+- `comptech-platform/openshift-ops/openshift-platform-gitops` — platform-tier GitOps repo (the file `platform-gitops` referenced in runbooks)
+- `comptech-platform/infra-ops/*` — VM-tier infrastructure repos
+- `comptech-platform/platform-services/*` — shared services (logging, monitoring, RHACS, tracing)
+- `comptech-platform/tenant-registry/*` — tenant onboarding metadata
+- `comptech-platform/divisions/<division>/*` — per-division tenant content
+
+Role-groups (`ct-*` naming) and CODEOWNERS govern who can merge what. The full pattern is documented in `gitlab-operator-guide.md` and tracked under [#83](https://github.com/zeshaq/codex-opp-agent/issues/83) "federated GitOps architecture readiness."
+
+## Compliance and PCI-DSS: a feature of v6, not pre-v6
+
+Pre-v6 had no PCI-DSS baseline. The Compliance Operator and TailoredProfile machinery, the OADP backup baseline, the SPO/CSO operators — all are v6-era additions:
+
+- ADR 0020 (PCI-DSS profile compliance baseline for `spoke-dc-v6`)
+- Compliance handbook at `connection-details/compliance-implementor-handbook.md`
+- Milestone "spoke-dc-v6 PCI-DSS Compliance Baseline" #30
+- Phase issues PCI-0 through PCI-5 + PCI-1.13
+
+PCI-DSS work consumed most of 2026-05-10 and closed on 2026-05-11 — see [Rebuild Timeline E4](/docs/08-history-and-replay/01-rebuild-timeline/#e4--federation--compliance-2026-05-10--2026-05-11).
+
+## Validation that the transition closed cleanly
+
+ADR 0022 lists the validation items. Each one was performed and is checked:
+
+- `codex-opp-agent/CLUSTERS.md` — `hub-dr` and `spoke-dr` sections removed; Active Scope updated to name `hub-dc-v6` / `spoke-dc-v6`. ✓
+- `codex-opp-agent/plans/federated-gitops-readiness-gates.md` — references to "future `hub-dr`" / "future `spoke-dr`" updated to "future `hub-dr-v6`" / "future `spoke-dr-v6`". ✓
+- ADR Index issue [#131](https://github.com/zeshaq/codex-opp-agent/issues/131) — ADR 0022 added; note on ADR 0001 that the cluster list is superseded by 0022. ✓
+- Workspace memory at `/home/ze/.claude/projects/-home-ze-claude-agent/memory/` updated to v6-only scope with explicit decommissioned-DR guard (`project_workspace_scope.md`). ✓
+- ADR 0001 itself **not** modified — historical record preserved. ✓
+
+The day-wrap issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159) (2026-05-10) records both ADRs accepted that day: 0020 (PCI-DSS baseline) and 0022 (v6 fleet membership). Counter: 16 MRs merged to `platform-gitops` `main`, 2 MRs merged to `codex-opp-agent` `main`, 15 issues closed.
+
+## What the transition cost
+
+Some practical residue is worth being explicit about:
+
+- **The pre-v6 `cluster-config` Application** on `hub-dc` was `OutOfSync/Progressing` for several days while being de-scoped. The session sequence 2026-05-08 09:05 → 2026-05-09 16:32 (hub-dc-v6 management GitOps reset) was the route from "deal with `spoke-dc` drift" to "stop dealing with the pre-v6 fleet."
+- **Some manifest references to pre-v6 names persist in historical commits.** ADR 0022 explicitly notes "Documents and code that still mention old `hub-dr` / `spoke-dr` are flagged as drift-from-current-state and should be updated when touched."
+- **DR is not currently in the fleet.** The reserved names `hub-dr-v6` / `spoke-dr-v6` are honest placeholders; no manifests target them; no MinIO replication / Vault DR pairing is currently active for v6. Forward-looking DR work is tracked under Site Replication Readiness (see [page 4](/docs/08-history-and-replay/04-site-replication-readiness/)).
+
+## References
+
+- ADR 0001 — operator workspace (historical anchor)
+- ADR 0018 — ACM + OpenShift GitOps pull model for v6
+- ADR 0022 — v6 fleet membership (the formal supersession)
+- ADR 0023 — federated GitLab group/repo ownership
+- ADR 0024 — OpenShift-only platform-gitops boundary
+- Issue [#156](https://github.com/zeshaq/codex-opp-agent/issues/156) OPS-V6-FLEET-1 — the purge work
+- Issue [#131](https://github.com/zeshaq/codex-opp-agent/issues/131) — ADR Index (carries the supersession note on 0001)
+- Issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159) — 2026-05-10 day wrap (records both ADRs accepted that day)
+- `reports/sessions/20260508-090555-descope-dr-clusters.md` — DR de-scope record
+- `reports/sessions/20260509-080024-hub-dc-v6-boot-install-complete.md` — v6 hub install
+- `reports/sessions/20260509-152004-developer-handbook-dh9-refresh.md` (and the spoke install report from the same day) — v6 spoke install
+- Memory `project_workspace_scope.md` — v6-only scope; pre-v6 DR decommissioned
+- `codex-opp-agent/CLUSTERS.md` — current fleet inventory
