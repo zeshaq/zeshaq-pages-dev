@@ -1,8 +1,267 @@
 ---
-title: "Runner Classes and Tags"
-description: "Section 04-application-delivery/02-federated-gitlab: Runner Classes and Tags (placeholder)."
-sidebar_label: "Runner Classes and Tags"
+title: "Runner Classes, Role Groups, Webhooks, and Credentials"
+description: "The five GitLab Runner classes the platform plans to run, the eleven ct-* role groups that scope GitLab access, the webhook surface that triggers Path A and Path B, and the credential policy that keeps tokens out of Git."
+sidebar_label: "Runners, Roles, Webhooks, Credentials"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page is the access-and-trust side of the federated GitLab model. It covers:
+
+- the five GitLab Runner classes the platform plans to operate, with their trust boundaries and tags
+- the eleven `ct-*` role groups that scope GitLab access for humans
+- the webhook surface that links GitLab → Jenkins (Path A) and GitLab → Tekton (Path B)
+- the credential policy: what may live in Vault, what may live in the Jenkins/GitLab credential stores, and what must never be committed
+
+It pulls together material that is otherwise split across ADR 0015, ADR 0023, the GitLab operator guide, the Jenkins connection details, and per-path runbooks. If you are setting up a new runner, registering a webhook, or auditing access, this is the consolidated reference.
+
+## Runner classes
+
+GitLab Runner is a platform tool and belongs under `vm-platform-ops` (ADR 0015). The runners are dedicated private VMs on the internal `30.30.0.0/16` network. **Do not** co-locate runners on GitLab, Jenkins, Nexus, HAProxy, PowerDNS, OpenShift masters, or other critical service nodes — that mixes trust levels in a single host.
+
+The accepted runner class set:
+
+| Class | Tags | Purpose | Notes |
+|---|---|---|---|
+| validation runner | `validate`, `render`, `lint` | Kustomize render, YAML parse, no-plaintext-Secrets check, policy validation | No live apply credentials. Safe for any operational repo. |
+| build runner | `build`, `java`, `nodejs`, `openliberty`, `jboss`, `springboot` | App build, unit tests, image build, image push | No platform infra credentials. |
+| security runner | `trivy`, `sbom`, `evidence` | Trivy/SBOM/SCA checks, MinIO evidence upload | No broad deploy credentials. |
+| ops runner | `infra`, `terraform`, `ansible`, `platform` | Terraform/OpenTofu, Ansible, platform API work (HAProxy, PDNS, GitLab, Jenkins, Nexus, VMs) | Protected, restricted to platform repos. |
+| deploy runner | `vm-deploy` | VM runtime deployment via Ansible | Scoped to approved VM targets only. |
+
+The mapping of repo → allowed runner class:
+
+| Repo/domain | Allowed runner class |
+|---|---|
+| `openshift-platform-gitops` | validation runner only |
+| `openshift-cluster-build` | ops runner by approval |
+| `vm-platform-ops` | ops runner |
+| `<division>-apps-monorepo` | build runner + security runner |
+| `<division>-gitops` | validation runner + security runner |
+| VM runtime deployment paths | deploy runner |
+
+Hard rules for every runner:
+
+- Use the internal GitLab LAN endpoint. Never the public route.
+- Store runner registration tokens outside Git.
+- Use protected runners for protected branches.
+- Do not share ops runners with untrusted app builds.
+- Do not put platform kubeconfigs or admin tokens on build runners.
+- OpenShift deploys via Argo CD pull — never runner-side `oc apply`.
+
+### Current state vs target
+
+As of 2026-05-11, exactly one runner exists in the live instance: `gitlab-vm-docker`. It is:
+
+- project-scoped (not group-scoped)
+- unprotected (runs untagged jobs)
+- on a non-dedicated VM
+
+This is the bootstrap runner and explicitly **not** the future trusted platform runner. The runner side of the access model is enforced by convention only until the five-class set is created. Tracked under the `GitLab Runner Operating Model` milestone in the codex-opp-agent repo.
+
+### Why five classes (vs one big runner)
+
+A single runner running all jobs would:
+
+- expose Nexus push credentials to lint jobs and vice versa,
+- let an untrusted app build write to platform-gitops via runner-side `oc apply`,
+- collapse five different trust boundaries into one host's blast radius.
+
+Each class has a credential set and tag combination scoped exactly to one job shape. The cost is operational: five VMs instead of one, five runner registrations instead of one. The benefit is the privilege separation that the federated repo model assumes.
+
+### Path A (Jenkins) and runners
+
+Path A uses a Jenkins agent (`jenkins-agent-0`) as the build executor, not a GitLab Runner. The GitLab Runner classes above describe GitLab CI executors; the Jenkins agent is its own pool with its own credential store. The two pools never share credentials.
+
+When a GitLab project is configured for Path A, its GitLab CI is typically minimal (a stub `.gitlab-ci.yml` that runs validation only) and the real build runs on the Jenkins agent. The GitLab Runner the project uses, if any, is the **validation** class.
+
+### Path B (Tekton) and runners
+
+Path B runs entirely inside OpenShift Pipelines on `spoke-dc-v6`. No GitLab Runner is involved in the build itself. The trigger arrives through a Tekton `EventListener` (see Webhooks, below). If the tenant repo has GitLab CI defined for upstream validation, it uses the **validation** class same as Path A.
+
+The implication: the GitLab Runner classes are real for tenant CI **outside** the build (validation, lint, security scans) and for operational repos. The build itself is on Jenkins or Tekton, neither of which is a GitLab Runner.
+
+## Role groups
+
+The unit of GitLab access is the role group, not the individual user. Eleven `ct-*` groups exist in the live GitLab instance with bootstrap membership only.
+
+| Role group | GitLab role | Scope |
+|---|---|---|
+| `ct-gitlab-admins` | Owner | Top-level operational groups; very small admin group |
+| `ct-openshift-platform-maintainers` | Maintainer | `openshift-ops/*`, tenant boundaries |
+| `ct-openshift-platform-reviewers` | Reporter or Developer | OpenShift platform review/read |
+| `ct-infra-platform-maintainers` | Maintainer | `infra-ops/*`, selected `platform-services/*` |
+| `ct-infra-platform-reviewers` | Reporter or Developer | Infra review/read |
+| `ct-cicd-platform-maintainers` | Maintainer | CI templates, runner config, Jenkins shared libraries |
+| `ct-security-reviewers` | Reporter or Developer | Platform and app GitOps policy/security review |
+| `ct-auditors` | Reporter | Selected operational repos, read-only |
+| `ct-<division>-app-maintainers` | Maintainer | Division source and app GitOps repos only |
+| `ct-<division>-developers` | Developer | Division app source repos |
+| `ct-<division>-release-approvers` | Developer or Maintainer | Division app GitOps promotion paths |
+
+Drift indicators:
+
+- A user appears directly on many projects (instead of via a role group).
+- An app-team `ct-<division>-*` group appears on `openshift-platform-gitops`.
+- A role group is granted on a sub-group that doesn't match its scope (e.g. `ct-sandbox-developers` on `comptech-platform/`).
+
+Onboarding a new platform admin is a `ct-*` group membership change, not a per-project grant. Onboarding a new division is the creation of three `ct-<division>-*` groups + a `<division>` sub-group + the two division repos (see Section 5 on tenant onboarding).
+
+### How role groups map onto project shares
+
+When `openshift-platform-gitops` (project ID 12) was created, the initial shares applied were:
+
+- `ct-openshift-platform-maintainers`: Maintainer
+- `ct-openshift-platform-reviewers`: Reporter
+- `ct-security-reviewers`: Reporter
+- `ct-auditors`: Reporter
+
+`ct-sandbox-*` groups do **not** have platform GitOps access. The same pattern is applied to every new operational repo as it is created.
+
+For `<division>-apps-monorepo` and `<division>-gitops`, the shares are:
+
+- `ct-<division>-app-maintainers`: Maintainer
+- `ct-<division>-developers`: Developer
+- `ct-<division>-release-approvers`: Developer or Maintainer
+- `ct-security-reviewers`: Reporter (review-only)
+- `ct-auditors`: Reporter (review-only)
+
+The platform team retains Maintainer on `<division>-gitops` for emergency rollback (ADR 0023). The platform team does **not** have Maintainer on `<division>-apps-monorepo`.
+
+## Webhooks
+
+The trigger surface between GitLab and the two build paths is webhook-based. The platform runs two webhook flavours.
+
+### Path A — Jenkins `notifyCommit`
+
+When a developer pushes to a project configured for Path A, GitLab fires a push webhook at:
+
+```text
+http://<jenkins-vm>/git/notifyCommit?url=<repo-clone-url>
+```
+
+The webhook URL points at the **internal LAN** Jenkins endpoint (the public route is for browser access). The `?url=` query parameter is the canonical clone URL of the project so Jenkins can identify which job(s) to trigger.
+
+The webhook is gated by an HMAC secret token. The token is stored:
+
+- in the GitLab project's webhook configuration (Project → Settings → Webhooks → Secret token)
+- in the Jenkins credential store under `git-notifycommit-<project>-token`
+- in local custody under `/home/ze/codex-opp-agent/secrets/jenkins/git-notifycommit-<project>-token.json` (Git-ignored)
+
+Verification on the Jenkins side is by the Git Plugin's `notifyCommit` handler; on a mismatch the request is rejected and no build runs.
+
+The webhook configuration in GitLab (verified against `divisions/sandbox/demo-smoke` on 2026-05-09):
+
+```text
+URL:           http://<jenkins-vm>/git/notifyCommit?url=<repo-clone-url>
+Push events:   yes  (Wildcard: main)
+Tag events:    no
+MR events:     no
+Issue events:  no
+Pipeline events: no
+Secret token:  <set; stored in Jenkins credential store>
+Enable SSL verification: not applicable (LAN endpoint, HTTP)
+```
+
+### Path B — Tekton `EventListener`
+
+When a developer pushes to a project configured for Path B, GitLab fires a push webhook at:
+
+```text
+https://tekton-listener.apps.sub.comptech-lab.com/
+```
+
+The webhook URL points at an OpenShift Route on `spoke-dc-v6` that exposes a Tekton `EventListener`. The listener:
+
+- validates the `X-Gitlab-Token` HMAC header against a Secret materialised by ExternalSecret from Vault (`secret/ocp/spoke-dc-v6/tekton/gitlab-webhook`)
+- maps the webhook payload to Pipeline parameters via a `TriggerBinding` (git revision, branch, project path)
+- creates a `PipelineRun` from a `PipelineTemplate`
+
+The webhook configuration in GitLab is the same shape as Path A except for the URL and the secret token source. The secret never lives on a runner or a VM filesystem — it is materialised into a Secret in the `openshift-pipelines` namespace by ExternalSecret and consumed by the EventListener at runtime.
+
+### Webhook hygiene
+
+| Practice | Why |
+|---|---|
+| One HMAC secret per project (not shared across many projects) | Compromise of one project's webhook does not unlock others. |
+| Webhook secret rotation on suspected leak | Standard incident response; both Jenkins token and EventListener secret support rotation. |
+| Webhook delivery logged | GitLab project's webhook delivery log is the first place to look when a push doesn't trigger a build. |
+| Webhooks fire on `main` push only (for build paths) | MR events and tag events are not used by Path A or Path B; firing them is wasted load. |
+
+## Credentials
+
+The credential policy is the firmest part of the access model: secrets do not live in Git, ever, and tokens have explicit custody locations.
+
+### Allowed
+
+- **Vault-backed secret delivery.** Applications consume secrets via `ExternalSecret` referencing `secret/apps/<division>/<app>/<env>/*` (path convention DEV-OCP-0.4 / #174).
+- **Protected and masked GitLab variables** for CI bootstrap credentials. Project- or group-scoped; least privilege.
+- **External Secrets references by name** in tenant repos. The reference is committed; the value is not.
+- **Local-only secret custody** during lab bootstrap. The standard path is `/home/ze/codex-opp-agent/secrets/`, Git-ignored, mode-restricted.
+- **Jenkins credential store** for current Jenkins CI jobs until Vault migration completes.
+
+### Forbidden
+
+- Plaintext secrets in Git.
+- Credentials in issues, wiki pages, MR text, or session reports.
+- Kubeconfigs in repos.
+- Runner registration tokens in repos.
+- Nexus / Jenkins / GitLab / Vault tokens in unprotected or unmasked GitLab variables.
+- Rendered Kubernetes Secret manifests in GitOps repos.
+
+### Custody locations
+
+| Secret | Custody | Notes |
+|---|---|---|
+| Bootstrap GitLab admin PAT | `/home/ze/codex-opp-agent/secrets/gitlab-md-pat` | Local-only, Git-ignored; used by operator scripts. |
+| Operator GitLab PAT | `/home/ze/codex-opp-agent/secrets/gitlab-zahid-pat` | Local-only, Git-ignored; used for platform-gitops MR creation. |
+| Jenkins admin credential | `/home/ze/codex-opp-agent/secrets/jenkins/admin.env` | Local-only, Git-ignored. |
+| Jenkins-side Nexus push credential | Jenkins credential store ID `nexus-jenkinsbot` | Username + password. |
+| Jenkins-side Trivy token | Jenkins credential store ID `trivy-server-token` | Secret text. |
+| Jenkins-side MinIO evidence credential | Jenkins credential store ID `minio-developer-ci-evidence` | Username + password. |
+| Jenkins-side GitLab PAT (overlay-bot) | Jenkins credential store ID `gitlab-mavenbot-pat` | Username + password; scope = `write_repository` on app monorepo. |
+| Tekton-side Quay robot token | Vault `secret/apps/<division>/<app>/ci/quay-robot` → ESO materialised Secret `quay-robot-team-<team>` in `openshift-pipelines` ns | Per-tenant. |
+| Tekton-side GitLab bot PAT | Vault `secret/apps/<division>/<team>/gitlab-bot` → ESO materialised Secret in `openshift-pipelines` ns | Per-tenant; used for overlay-patch push. |
+| Tekton webhook HMAC secret | Vault `secret/ocp/spoke-dc-v6/tekton/gitlab-webhook` → ESO materialised Secret consumed by EventListener | Per-cluster. |
+
+The pattern: **Vault is the future home for everything**. Jenkins credential store and local custody are interim phases until Vault/ESO migration completes for all paths.
+
+### Before adding a GitLab variable
+
+1. Confirm the target project/group and environment scope.
+2. Use masked and protected flags where possible.
+3. Prefer project-specific or group-specific least privilege.
+4. Record variable names and purpose (not values).
+5. Validate the pipeline can use the variable without printing it.
+
+### Token rotation
+
+Routine rotation:
+
+- Bootstrap admin PATs: rotate at quarter boundaries; never share across operators.
+- Jenkins job-scoped credentials (Nexus, GitLab, Trivy, MinIO): rotate when an operator leaves the team or when suspected leakage occurs.
+- Runner registration tokens: rotate when a runner VM is rebuilt or when a runner is suspected compromised.
+- Tekton webhook HMAC: rotate when an EventListener Route changes hostname or when suspected leakage.
+
+Emergency rotation (on suspected leakage): always pair with revocation of the leaked token at the source (GitLab Settings, Vault revoke, Jenkins credential delete) before issuing a new one.
+
+## Failure modes and gotchas
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Push to a Path A project does nothing | Webhook not configured, or HMAC secret mismatch, or wrong Jenkins URL | Check GitLab project Webhooks delivery log; verify URL is internal LAN; rotate HMAC secret if value drifted. |
+| Push to a Path B project does nothing | EventListener Route 404, or HMAC secret mismatch | `curl -fsS https://tekton-listener.apps.sub.comptech-lab.com/healthz`; check Route status; verify ExternalSecret materialised the webhook Secret. |
+| Unprotected runner runs a protected-branch job | Runner is not flagged "Protected" in GitLab | Mark runner as protected; re-trigger job. |
+| Build runner has access to platform Vault paths | Runner registered with too-broad role group token | Re-register runner with project-scoped token; revoke old token. |
+| Operator copies a secret into chat | Old habit from pre-Vault era | Rotate the secret immediately; record incident in session report; reinforce the no-secrets-in-chat rule. |
+| Webhook secret committed in a `.gitlab-ci.yml` | Misconfigured CI bootstrap | Remove the secret from history (force-rewrite via filter-repo); rotate the secret; train owner. |
+
+## References
+
+- `connection-details/gitlab-operator-guide.md` — runner classes + role groups + credential policy
+- `connection-details/jenkins.md` — Jenkins credential store and webhook URL
+- `connection-details/jenkins-ocp-path.md` — Path A webhook + credential custody table
+- `connection-details/vault-app-secrets.md` — Vault path convention and ExternalSecret wiring
+- `adr/0015-federated-gitops-repo-architecture.md` — runner placement
+- `adr/0023-federated-gitlab-group-repo-ownership.md` — role groups
+- DEV-OCP issues: #174 (Vault path), #186 (registry allowlist), #190 (EventListener + webhook secret), #193 (per-team Quay robot tokens)

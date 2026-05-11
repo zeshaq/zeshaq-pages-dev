@@ -1,8 +1,255 @@
 ---
 title: "Branch and MR Conventions"
-description: "Section 04-application-delivery/02-federated-gitlab: Branch and MR Conventions (placeholder)."
+description: "Default branch, protected-branch rules, MR templates, approval matrix, CODEOWNERS expectations, and the CI-bot branch naming used by Path A and Path B."
 sidebar_label: "Branch and MR Conventions"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page captures the GitLab branching, merging, and approval conventions that every operational and tenant repo on the platform runs against. They are formalised in ADR 0023, codified in the `gitlab-operator-guide.md` runbook, and enforced by branch-protection rules in GitLab plus CODEOWNERS files in each repo.
+
+## Defaults
+
+- **Default branch**: `main`. No exceptions.
+- **Branch model**: trunk-based. Short-lived feature branches → MR → merge to `main`. No long-lived `develop` or `release/*` branches.
+- **MR scope**: small. A digest patch MR is one line; a tenant onboarding MR is one new directory tree; a platform change is one issue.
+- **Force push**: disabled on every operational repo.
+- **Direct push to `main`**: disabled except for named break-glass maintainers, who must record any use in the relevant issue or session report.
+
+## Branch protection baseline
+
+Every operational repository (and every tenant repo onboarded by the platform) runs with the same baseline:
+
+| Setting | Value | Rationale |
+|---|---|---|
+| Default branch | `main` | Trunk-based; one branch is the source of truth. |
+| Protected `main` | yes | Prevents force-push and direct push by non-maintainers. |
+| Force push | disabled | History rewrites are not allowed; mistakes are fixed forward. |
+| Direct push to `main` | disabled except for named break-glass maintainers | Normal change flow is MR-based. |
+| MR required for normal changes | yes | Review + pipeline run before merge. |
+| Approval required | 1 (non-prod) or 2 (production-impacting) | Two eyes on anything that touches prod. |
+| Code-owner approval on protected paths | yes | CODEOWNERS overrides "any approver". |
+| Pipeline required before merge (where validation exists) | yes | A red pipeline blocks merge. |
+| Stale approval dismissal (for production-impacting repos) | yes where GitLab CE supports | Re-approval after material changes. |
+| MR templates | yes (platform / infra / runner / release) | Captures evidence and intent. |
+
+Production-impacting repositories under this rule are:
+
+- `openshift-platform-gitops`
+- `openshift-cluster-build`
+- `vm-platform-ops`
+- production application GitOps paths (e.g. `<division>-gitops` overlays for `prd/`)
+
+GitLab CE may not support every approval-rule feature that the matrix assumes (for example, fine-grained per-path required-approval counts). Where a rule cannot be enforced natively, compensating controls (CODEOWNERS, protected branches, validation pipelines, MR evidence) must be recorded against the repo.
+
+## CODEOWNERS baselines
+
+CODEOWNERS expresses path-level review ownership. Reviewers must include at least one CODEOWNER for any file touched by the MR.
+
+### `openshift-platform-gitops`
+
+```text
+/clusters/       @ct-openshift-platform-maintainers
+/components/     @ct-openshift-platform-maintainers
+/policies/       @ct-openshift-platform-maintainers @ct-security-reviewers
+/tenants/        @ct-openshift-platform-maintainers @ct-security-reviewers
+/bootstrap/      @ct-openshift-platform-maintainers
+```
+
+### `vm-platform-ops` (planned)
+
+```text
+/services/haproxy/        @ct-infra-platform-maintainers
+/services/pdns/           @ct-infra-platform-maintainers
+/services/gitlab/         @ct-infra-platform-maintainers
+/services/jenkins/        @ct-infra-platform-maintainers @ct-cicd-platform-maintainers
+/services/nexus/          @ct-infra-platform-maintainers @ct-cicd-platform-maintainers
+/services/docker-runtime/ @ct-infra-platform-maintainers
+/services/gitlab-runner/  @ct-infra-platform-maintainers @ct-cicd-platform-maintainers @ct-security-reviewers
+/terraform/               @ct-infra-platform-maintainers
+/ansible/                 @ct-infra-platform-maintainers
+/policies/                @ct-infra-platform-maintainers @ct-security-reviewers
+```
+
+### Division app GitOps repos
+
+```text
+/apps/*/dev/      @ct-<division>-app-maintainers
+/apps/*/stg/      @ct-<division>-release-approvers
+/apps/*/prd/      @ct-<division>-release-approvers @ct-security-reviewers
+```
+
+The `dev/` overlay is owned by the app maintainers (digest bumps are routine). `stg/` and `prd/` overlays require a release-approver — the same person/group that signs off the promotion MR.
+
+## Approval matrix
+
+Minimum approver expectations across all repos:
+
+| Change type | Required approvers |
+|---|---|
+| OpenShift cluster-wide operator/platform change | OpenShift maintainer + second platform reviewer |
+| Tenant onboarding or namespace policy change | OpenShift maintainer + tenant owner acknowledgement |
+| Production AppProject / RBAC / NetworkPolicy change | OpenShift maintainer + security reviewer |
+| VM platform tool change | Infra maintainer + service owner |
+| HAProxy or PowerDNS production-impacting change | Infra maintainer + affected service owner |
+| GitLab / Jenkins / Nexus admin or config change | Infra maintainer + CI/CD maintainer where relevant |
+| GitLab Runner privilege / tag change | Infra maintainer + CI/CD maintainer + security reviewer |
+| App build template change | CI/CD maintainer + app representative |
+| App production promotion | App release approver + required pipeline evidence |
+
+## Branch naming
+
+There is no platform-imposed naming convention for feature branches except for two recurring patterns from automation:
+
+### CI bot branches (Path A and Path B)
+
+When Jenkins or Tekton opens a digest-patch MR, the branch is named:
+
+```text
+ci/<env>/<short-sha>
+```
+
+Example: `ci/dev/3f4781f2`. The `<env>` is the overlay being patched (always `dev` for build-driven patches; `stg` / `prd` are promotion-driven, not build-driven). The `<short-sha>` is the first 8 characters of the application source commit.
+
+The same branch name is reused across paths (an A→B migration produces identical branch names), which is intentional: the auditor walking history sees a continuous stream of `ci/dev/<sha>` commits regardless of which build pipeline produced them.
+
+### Promotion branches
+
+The `promote.sh` script in `claude-agent/scripts/` opens promotion branches named:
+
+```text
+promote/<team>-<app>-<from>-to-<to>-<short-sha>
+```
+
+Example: `promote/payments-checkout-dev-to-stg-3f4781f2`. The branch is short-lived: it carries exactly one commit that copies the digest from one overlay to another.
+
+## Commit message convention
+
+CI commits and promotion commits have deterministic messages.
+
+### Digest patch commit
+
+```text
+bump: <team>/<app> <env> @<sha256-short>
+```
+
+Example: `bump: team-payments/checkout dev @sha256:abc12345`. The `<sha256-short>` is the first 8 hex characters of the new image digest, for human readability; the actual `digest:` field in the overlay carries the full 64-character form.
+
+### Promotion commit
+
+```text
+promote: <team>/<app> <from-env> @<sha256-short> -> <to-env>
+```
+
+Example: `promote: team-payments/checkout dev @sha256:abc12345 -> stg`. Same `<sha256-short>` shape.
+
+These messages are queryable: `git log --grep '^bump: team-payments/checkout'` is a release history for an app.
+
+## MR templates
+
+Operational repos ship MR templates that capture evidence, link to the governing issue, and remind reviewers what to check.
+
+Minimum template content for an operational MR:
+
+```markdown
+## What and why
+
+(one paragraph: what this change is, what tracker issue it implements)
+
+## Risk
+
+(low / medium / high; what's the blast radius if this is wrong?)
+
+## Evidence
+
+- Tracker issue: codex-opp-agent #...
+- Pre-merge validation: `kubectl kustomize ...` output attached / inline
+- Live test plan: ...
+
+## Rollback plan
+
+(how do you revert?)
+```
+
+Tenant-facing MR templates are lighter:
+
+```markdown
+## What's changing
+
+(plain English; what does this app change do?)
+
+## How was it tested
+
+(unit tests, smoke run, screenshot, etc.)
+
+## Deployment
+
+(Argo will pick this up automatically? Or does it need a follow-up promotion?)
+```
+
+## Sign-off conventions
+
+The platform does not require signed commits in phase 1 (ADR 0023 explicitly lists this as an open decision). When signed commits are introduced for production-impacting repos in a later hardening phase, the change will be tracked in a new ADR and the production application GitOps paths will be the first to opt in.
+
+Until then, MR approver identity is the audit trail: the GitLab MR record names the approver, time, and approved revision, and the same approver appears in the merge commit message that GitLab generates.
+
+## Stale-approval dismissal
+
+For production-impacting repos, an approval is dismissed when a material change lands on the MR after the approval was given. Material changes include any file touched, not just files in protected paths. This forces a re-approval and prevents "approve early, push more, merge late" patterns.
+
+GitLab CE supports this on the `main` protected branch through the standard "Require new approvals when new commits are added" toggle. Repos that need it have it enabled at creation.
+
+## Break-glass
+
+Break-glass operations that bypass normal MR flow must be recorded against an issue (or a session report if no issue is open). Recorded fields:
+
+- reason
+- approver
+- actor
+- time
+- target group/project/user/runner
+- exact API/UI action summary
+- validation result
+- rollback path
+- Git backport commit or expiry date
+
+If a manual GitLab UI change becomes permanent, the relevant plan, checklist, and future automation must be updated to match.
+
+## Failure modes and gotchas
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Force push accidentally went through | Force push left enabled on a new repo | Disable force push under Project Settings -> Repository -> Protected branches; record incident. |
+| Approval-rule enforcement not present | GitLab CE doesn't support the rule | Switch to CODEOWNERS + protected branches + validation pipelines; record the compensating control on the repo. |
+| MR merged without pipeline | Validation pipeline wasn't required | Update branch protection to require pipeline before merge. |
+| Promote MR has no approver | Promotion path wasn't added to CODEOWNERS | Add `/apps/*/prd/` to CODEOWNERS with the release approvers group; re-protect. |
+| `ci/dev/<sha>` branches accumulate | CI bot doesn't delete its merged branches | Configure GitLab Project Settings -> Repository -> "Auto-delete merged branches". |
+
+## Daily checks
+
+A weekly "branch hygiene" check that a platform admin can run by hand:
+
+```bash
+GITLAB_URL=http://<gitlab-vm>
+GITLAB_PAT="$(cat /home/ze/codex-opp-agent/secrets/gitlab-md-pat)"
+
+# Protected branch state on the platform repo
+curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+  "$GITLAB_URL/api/v4/projects/12/protected_branches" \
+  | jq '.[] | {name, push_access_levels: .push_access_levels[].access_level_description, merge_access_levels: .merge_access_levels[].access_level_description}'
+
+# Recent unmerged ci/dev branches across a tenant repo
+curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+  "$GITLAB_URL/api/v4/projects/<id>/repository/branches?search=^ci/" \
+  | jq '.[] | {name, merged}'
+
+unset GITLAB_PAT
+```
+
+## References
+
+- `connection-details/gitlab-operator-guide.md` — branch protection + approval baseline
+- `adr/0023-federated-gitlab-group-repo-ownership.md` — formalised model
+- `connection-details/promotion-model.md` (#184) — commit message convention
+- `connection-details/jenkins-ocp-path.md` (#187/#188) — Path A branch and commit shape
+- `connection-details/image-digest-overlay.md` (#185) — digest patch convention

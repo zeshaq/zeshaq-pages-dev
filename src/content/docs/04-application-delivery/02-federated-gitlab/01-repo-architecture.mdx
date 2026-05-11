@@ -1,8 +1,268 @@
 ---
-title: "Repo Architecture"
-description: "Section 04-application-delivery/02-federated-gitlab: Repo Architecture (placeholder)."
+title: "Federated GitLab — Repo Architecture"
+description: "How the platform splits operational state across GitLab groups: comptech-platform/* for platform-owned repos, divisions/<division>/* for tenant repos, and the strict no-write-across-the-boundary rule between them."
 sidebar_label: "Repo Architecture"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const groupBox  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const repoBox   = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8,  color: "#1f2937", width: 220, textAlign: "center" };
+export const tenantBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8,  color: "#1f2937", width: 220, textAlign: "center" };
+export const platBox   = { background: "#fde68a", border: "1px solid #b45309", borderRadius: 8, padding: 8,  color: "#1f2937", width: 220, textAlign: "center" };
+export const noWriteEdge = { style: { stroke: "#b91c1c", strokeWidth: 1.5, strokeDasharray: "2,4" }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const ownsEdge    = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const repoNodes = [
+  { id: "ctp",    position: { x:   0, y:   0 }, data: { label: "comptech-platform/" },               style: groupBox },
+  { id: "div",    position: { x: 540, y:   0 }, data: { label: "divisions/" },                       style: groupBox },
+
+  { id: "ops",    position: { x:   0, y: 110 }, data: { label: "openshift-ops/" },                   style: groupBox },
+  { id: "infra",  position: { x: 260, y: 110 }, data: { label: "infra-ops/" },                       style: groupBox },
+  { id: "svc",    position: { x:   0, y: 360 }, data: { label: "platform-services/" },               style: groupBox },
+  { id: "treg",   position: { x: 260, y: 360 }, data: { label: "tenant-registry/" },                 style: groupBox },
+
+  { id: "divx",   position: { x: 540, y: 110 }, data: { label: "divisions/<division>/" },            style: groupBox },
+
+  { id: "opgit",  position: { x:   0, y: 220 }, data: { label: "openshift-platform-gitops" },        style: platBox },
+  { id: "ocbu",   position: { x:   0, y: 290 }, data: { label: "openshift-cluster-build" },          style: platBox },
+  { id: "vmops",  position: { x: 260, y: 220 }, data: { label: "vm-platform-ops" },                  style: platBox },
+  { id: "iac",    position: { x:   0, y: 460 }, data: { label: "platform-tools-iac" },               style: repoBox },
+  { id: "cfg",    position: { x:   0, y: 530 }, data: { label: "platform-tools-config" },            style: repoBox },
+  { id: "tnts",   position: { x: 260, y: 460 }, data: { label: "openshift-tenants" },                style: repoBox },
+
+  { id: "appmono",position: { x: 540, y: 220 }, data: { label: "<division>-apps-monorepo" },          style: tenantBox },
+  { id: "appgit", position: { x: 540, y: 290 }, data: { label: "<division>-gitops" },                 style: tenantBox },
+];
+
+export const repoEdges = [
+  { id: "g1",  source: "ctp",    target: "ops",     ...ownsEdge },
+  { id: "g2",  source: "ctp",    target: "infra",   ...ownsEdge },
+  { id: "g3",  source: "ctp",    target: "svc",     ...ownsEdge },
+  { id: "g4",  source: "ctp",    target: "treg",    ...ownsEdge },
+  { id: "g5",  source: "div",    target: "divx",    ...ownsEdge },
+
+  { id: "r1",  source: "ops",    target: "opgit",   ...ownsEdge },
+  { id: "r2",  source: "ops",    target: "ocbu",    ...ownsEdge },
+  { id: "r3",  source: "infra",  target: "vmops",   ...ownsEdge },
+  { id: "r4",  source: "svc",    target: "iac",     ...ownsEdge },
+  { id: "r5",  source: "svc",    target: "cfg",     ...ownsEdge },
+  { id: "r6",  source: "treg",   target: "tnts",    ...ownsEdge },
+
+  { id: "r7",  source: "divx",   target: "appmono", ...ownsEdge },
+  { id: "r8",  source: "divx",   target: "appgit",  ...ownsEdge },
+
+  { id: "x1",  source: "appmono",target: "opgit",   label: "WRITE FORBIDDEN", ...noWriteEdge },
+  { id: "x2",  source: "appgit", target: "vmops",   label: "WRITE FORBIDDEN", ...noWriteEdge },
+];
+
+This page is the GitLab-side map of where everything lives. It is for anyone deciding which repo to commit to, where to open an MR, or whether a given access grant is allowed at all. The shape changes rarely; the names of `<division>` and individual tenant repos change as teams onboard.
+
+## What and why
+
+The platform runs on GitLab CE 18.11.1 at the internal LAN endpoint (`http://<gitlab-vm>`), with the human browser route at `gitlab.apps.sub.comptech-lab.com`. GitOps automation (Argo CD, Jenkins, runners) always uses the LAN endpoint; the public route is for browser/dashboard access only.
+
+The federated layout (ADR 0015 + ADR 0023) splits state by **ownership boundary** rather than packaging it all into a single monorepo:
+
+- `comptech-platform/` is the platform team's tree. OpenShift cluster state, VM platform tools, shared service infrastructure, tenant registry.
+- `divisions/` is the application teams' tree. One sub-group per division (`sandbox`, `payments`, `risk`, etc.), and inside each division: an app source repo (`<division>-apps-monorepo`) and an app GitOps repo (`<division>-gitops`).
+
+The reason this is two trees, not one super-group:
+
+1. **A single group makes accidental over-grant easy.** Adding a role group at the top level reaches every project under it; a two-tree split puts a visual and policy boundary between platform and tenant state.
+2. **`openshift-platform-gitops` (project ID 12 in the live instance) must be writable by the platform team only.** ADR 0015 calls this out explicitly: application teams must not have write access. The two-tree split lets the platform team grant maintainer to `comptech-platform/` without bleed-over into `divisions/`.
+3. **Audit reviews scan eleven `ct-*` role groups, not per-project user lists.** A flat repo model would force per-repo shares and remove that affordance.
+
+The alternatives considered and rejected in ADR 0023:
+
+| Rejected | Why rejected |
+|---|---|
+| Single super-group + role groups | Too easy to grant broadly; no visual boundary between platform and tenant. |
+| Flat repo model under `comptech-platform/` | Forces per-repo shares; removes sub-group share affordance. |
+| Per-team Maintainer on platform repos | Violates ADR 0015 ownership boundary; breaks the ADR 0018 pull-model enforcement contract. |
+| Defer ADR until second division onboards | Issue #68 acceptance requires the model is documented *before* more teams onboard. |
+
+## The group tree, whiteboarded
+
+<Whiteboard client:load data={{ nodes: repoNodes, edges: repoEdges }} height={620} />
+
+Yellow boxes are platform-owned repos; blue boxes are tenant-owned. The red dashed edges call out write directions that are explicitly forbidden by the access model.
+
+## The full project inventory
+
+| GitLab path | Write owner | Default readers | Status (2026-05-11) |
+|---|---|---|---|
+| `comptech-platform/openshift-ops/openshift-platform-gitops` | OpenShift/platform team only | platform, security reviewers, auditors | **Live** (project ID 12) |
+| `comptech-platform/openshift-ops/openshift-cluster-build` | OpenShift/platform team only | platform, auditors | Planned |
+| `comptech-platform/infra-ops/vm-platform-ops` | Infra/platform tools team | OpenShift/platform read, security reviewers, auditors | Planned |
+| `comptech-platform/platform-services/platform-tools-iac` | Infra/platform tools team | platform read | Deferred until split proves useful |
+| `comptech-platform/platform-services/platform-tools-config` | Infra/platform tools team | platform read | Deferred until split proves useful |
+| `comptech-platform/tenant-registry/openshift-tenants` | OpenShift/platform team | tenant owners by approval | Optional; folder inside `openshift-platform-gitops` for phase 1 |
+| `divisions/<division>/<division>-apps-monorepo` | Division app team | platform/CI/security as needed | Per division onboarding |
+| `divisions/<division>/<division>-gitops` | Division app team inside guardrails | OpenShift/platform retains maintainer for emergency rollback | Per division onboarding |
+
+Application teams do not have write access to:
+
+- `openshift-platform-gitops`
+- `openshift-cluster-build`
+- `vm-platform-ops`
+- `platform-tools-iac`, `platform-tools-config`, `openshift-tenants`
+- any platform runner or admin configuration repo
+
+Drift indicator: an app-team `ct-*` group appears on `openshift-platform-gitops`. Treat as a configuration incident, remove the share, record in the access log.
+
+## Creation order
+
+Not every repository in the inventory exists immediately. The accepted creation order (ADR 0023) is:
+
+1. `openshift-platform-gitops` — live, project ID 12.
+2. `vm-platform-ops` — once ownership and first service adoption are ready.
+3. `openshift-cluster-build` — once cluster-build artifacts are ready to split out of planning docs.
+4. `platform-tools-iac` / `platform-tools-config` / `openshift-tenants` — only when their split proves useful; defer otherwise.
+5. Division repositories — one pair (`<division>-apps-monorepo` + `<division>-gitops`) per onboarding event.
+
+This is why the live instance today shows only `openshift-platform-gitops`, the `comptech-platform/{openshift-ops,infra-ops,platform-services,tenant-registry}` sub-groups, and `divisions/sandbox/` — everything else exists in the access matrix but has not been instantiated yet.
+
+## What lives in `openshift-platform-gitops`
+
+The boundary of this repo matters: it is the single platform team's defensible namespace and it must not contain application source, VM tool configuration, or routine app release manifests.
+
+```text
+openshift-platform-gitops/
+  clusters/
+    hub-dc-v6/
+    hub-dr-v6/
+    spoke-dc-v6/
+    spoke-dr-v6/
+    dev-ocp-01/
+    uat-ocp-01/
+    staging-ocp-01/
+
+  components/
+    gitops/
+    acm/
+    odf/
+    ingress/
+    cert-manager/
+    external-secrets/
+    compliance/
+    logging/
+    monitoring/
+    image-registry/
+    operator-catalogs/
+
+  policies/
+    rbac/
+    quotas/
+    networkpolicies/
+    pod-security/
+    appprojects/
+
+  tenants/
+    <tenant>/
+
+  bootstrap/
+    root-apps/
+    appsets/
+```
+
+`tenants/<tenant>/` is the platform's view of a tenant — `Namespace`, `AppProject`, `ResourceQuota`, `LimitRange`, baseline `NetworkPolicy`, `RoleBinding` for the team's OIDC group, allowed source repos, allowed destination namespaces. It is **not** the tenant's release manifests.
+
+## What lives in `<division>-apps-monorepo`
+
+The application source. Example for a hypothetical `payments` division:
+
+```text
+divisions/payments/
+  payments-apps-monorepo/
+    openliberty/customer-api/
+    jboss/payment-service/
+    nodejs/payment-ui/
+    springboot/ledger-api/
+```
+
+Build paths (Jenkins or Tekton) clone from this repo, build images, scan, push, and produce CI evidence.
+
+## What lives in `<division>-gitops`
+
+The overlay tree that Argo CD reconciles. Same example:
+
+```text
+divisions/payments/
+  payments-gitops/
+    apps/
+      customer-api/
+        base/
+          kustomization.yaml
+          deployment.yaml
+          service.yaml
+          route.yaml
+        overlays/
+          dev/
+            kustomization.yaml
+          stg/
+            kustomization.yaml
+          prd/
+            kustomization.yaml
+      payment-service/
+        base/...
+        overlays/...
+```
+
+The detailed layout rules are in section 04 (`gitops-consume`) and in `app-repo-contract.md` (#182). The relevant fact here is the **separation**: the source lives in `<division>-apps-monorepo`, the deployment intent lives in `<division>-gitops`, and the CI step that bridges the two is a digest patch MR.
+
+Some teams may choose to keep both inside `<division>-apps-monorepo` if they prefer a single repo; the contract supports both shapes, as long as the directory structure under `apps/<team>/<app>/` is honoured. Defaulting to two repos is the ADR-recommended shape because it gives a cleaner audit trail (image build vs deploy intent are two MRs in two repos, not one MR in one repo).
+
+## Endpoints
+
+| Endpoint | Used by | Notes |
+|---|---|---|
+| `http://<gitlab-vm>` (LAN) | Argo CD, Jenkins, GitLab Runner, platform tooling, API clients | Internal-only; all automation. |
+| `https://gitlab.apps.sub.comptech-lab.com` | Human browser | Public route, dashboards and MR review. |
+
+The boundary is enforced by access control on the public route's automation use: any Argo CD source URL, Jenkins SCM URL, or runner config that points at the public route is drift and must be migrated to the LAN endpoint.
+
+> Internal-only specifics (LAN IP, runner tokens, PAT custody locations) are kept in `codex-opp-agent/connection-details/gitlab-operator-guide.md`.
+
+## Failure modes and gotchas
+
+| Symptom | Root cause | Fix | Prevention |
+|---|---|---|---|
+| App team can push to `openshift-platform-gitops` | A `ct-<division>-*` group was added to the project | Remove the share from project Settings -> Members; record in access log. | Apply initial shares from a single template; review group shares monthly. |
+| Argo CD source URL is the public route | Automation was configured at console-tour time | Edit the Argo `Application` source URL to the LAN endpoint; restart `openshift-gitops-repo-server`. | Always copy clone URLs from the LAN endpoint in the operator guide. |
+| `git ls-remote` from a runner returns `401` against the LAN endpoint | Runner's GitLab token is project-scoped to a different project | Re-register the runner with a project-scoped or group-scoped token aligned with the matrix. | Document each runner's allowed scope in `gitlab-operator-guide.md`. |
+| Public-route automation breaks behind a captive portal | Egress routing assumed direct LAN | Move the automation to the LAN endpoint; do not punch firewall holes for the public route. | Never permit automation on the public route. |
+| Migrating a project from old path leaves stale Argo URLs | Project ID stays the same but path-with-namespace changes | Update `repoURL` in every Argo `Application` (live example: ID 12 was moved from `gitops/platform-gitops` to `comptech-platform/openshift-ops/openshift-platform-gitops`). | Prefer project-ID-based lookups in automation where possible. |
+
+## Daily checks
+
+```bash
+# GitLab readiness (any LAN client)
+GITLAB_URL=http://<gitlab-vm>
+curl -fsS "$GITLAB_URL/-/readiness"
+curl -fsS "$GITLAB_URL/-/liveness"
+
+# Platform repo reachable from the LAN endpoint?
+git ls-remote \
+  http://<gitlab-vm>/comptech-platform/openshift-ops/openshift-platform-gitops.git \
+  main
+
+# Hub Argo CD sees the platform repo?
+oc --kubeconfig "$K_HUB" -n openshift-gitops get app hub-dc-v6-bootstrap -o wide
+# Expected: Synced Healthy
+```
+
+The first command answers "is GitLab healthy", the second answers "does the federated tree still resolve", and the third answers "does the platform actually see it".
+
+## References
+
+- `connection-details/gitlab-operator-guide.md` — operator handoff (#128)
+- `adr/0015-federated-gitops-repo-architecture.md` — parent architecture
+- `adr/0023-federated-gitlab-group-repo-ownership.md` — formalised ownership model
+- `plans/federated-gitops-gitlab-access-matrix.md` — access matrix this ADR locks in
+- `plans/federated-gitops-gitlab-implementation-checklist.md` — execution checklist
+- GitHub issue #68 — `architecture: define federated GitLab group and repo ownership model` (closed by ADR 0023)
+- GitHub issue #83 — FG-1 implementation gate (open)
+- GitHub issue #128 — `GITLAB-HANDOFF1` (closed)
