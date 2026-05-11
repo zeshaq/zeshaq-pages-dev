@@ -1,0 +1,177 @@
+---
+title: "Control Plane and Machine Sets"
+description: "Why the v6 fleet does not use MachineSet-based scaling, what the control planes look like in practice, and the upgrade and maintenance posture on each cluster."
+sidebar_label: "Control Plane and Machine Sets"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Both v6 clusters were installed agent-based, which means the control plane and worker nodes are real `Node` objects but **not** managed by `MachineSet`. There is no Machine API provider (no vSphere, no AWS, no OpenStack, no metal3 baremetal provider) backing them. That has consequences for scaling, upgrade, and maintenance. This page explains the shape and what to do instead of `oc scale machineset`.
+
+## Why no MachineSet
+
+OpenShift's Machine API and the `MachineSet` controller scale by talking to a cloud or hypervisor provider that can provision more `Machine` objects. The v6 clusters are agent-based installed onto:
+
+- libvirt VMs that the operator created by hand (hub + spoke masters)
+- physical HPE servers booted via iLO virtual media (spoke workers)
+
+Neither path has a Machine API provider plumbed in. The cluster therefore has zero `MachineSet`, zero `MachineClass`, zero auto-scaling. The `Machine` objects that do exist were created by the agent installer for bookkeeping and reflect the actual node inventory; the `machine-api-operator` is `Available=True` only because there is no work for it to do.
+
+Verify:
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-machine-api get machine
+oc --kubeconfig "$K" -n openshift-machine-api get machineset
+oc --kubeconfig "$K" get co machine-api -o wide
+```
+
+Expected on both clusters:
+
+- `Machine` objects: one per actual node (3 on hub, 6 on spoke), all `Running`.
+- `MachineSet` objects: none.
+- ClusterOperator `machine-api`: `Available=True, Progressing=False, Degraded=False`.
+
+## Control-plane masters
+
+Both clusters have three masters running etcd, kube-apiserver, kube-controller-manager, kube-scheduler, openshift-apiserver, and the OpenShift operator stack. The compact `hub-dc-v6` masters also run worker workloads (`node-role.kubernetes.io/worker` label is set); the `spoke-dc-v6` masters are dedicated control-plane (no worker workloads scheduled on them in practice).
+
+| Item | Hub | Spoke |
+| --- | --- | --- |
+| Master count | 3 | 3 |
+| Master form factor | libvirt VM, vTPM | libvirt VM, vTPM |
+| Master roles | `master` + `worker` (compact) | `master` only |
+| Network | `br30`, deterministic MAC | `br30`, deterministic MAC |
+| Disk | qcow2 root, TPM2-backed LUKS | qcow2 root, TPM2-backed LUKS |
+| FIPS | Enabled | Enabled |
+| etcd encryption | Enabled at rest | Enabled at rest |
+
+The `99-master-tpm2-encryption.bu` Butane source renders into a MachineConfig that configures `Clevis` + `Tang`-less TPM2-backed LUKS for the boot device. The MachineConfig is rolled out by `machine-config-operator` and the `master` MachineConfigPool — the same controller that handles all node configuration changes.
+
+## Worker nodes (spoke only)
+
+`spoke-dc-v6` has three physical workers (`gold-1`, `gold-2`, `gpu-01`). They are not managed by Machine API — they exist as `Node` objects only. The `worker` MachineConfigPool tracks them and is the unit of rolling reboot for any `MachineConfig` update.
+
+| Item | Value |
+| --- | --- |
+| Worker count | 3 |
+| Form factor | HPE physical, iLO Redfish boot |
+| Boot device | NS204i RAID1, `0.48TB` NVMe SSD pair, `/dev/nvme0n1` |
+| Data devices | MR408i single-disk JBOD; `gold-1` and `gold-2` have 8 × `2.40TB`; `gpu-01` has 4 × `1.92TB` |
+| Network | private `30.30.0.0/16` `30.30.75.36`-`.38` |
+| Failure-domain labels | `rack=<server-name>`, `zone=dc-lab` |
+| FIPS | Enabled |
+| Disk encryption | TPM2-backed LUKS via `99-worker-tpm2-encryption.bu` |
+
+The `gpu-01` worker has GPU hardware but the GPU operator is deferred — `gpu-operator-certified` is in the planned ImageSet but not in the current mirror. No GPU workload runs on `gpu-01` today; it operates as a CPU worker only.
+
+## Adding a new master or worker
+
+Without `MachineSet`, the path to add a node is the same path that installed the cluster originally — agent-based:
+
+1. Update the allocation table with the new IP / MAC / hostname.
+2. Apply the new DNS A record.
+3. For a VM: create the libvirt domain with deterministic MAC, vTPM, `br30` attachment.
+   For a physical worker: confirm iLO Redfish MAC and physical NIC.
+4. Generate a new `nodes.yaml` (or use the existing agent installer flow's "add node" workflow).
+5. Boot the new node from agent media.
+6. Approve the resulting CSR.
+
+Concretely, the `oc adm node-image create` flow generates an add-on agent ISO for an existing cluster; this is the agent-based equivalent of `MachineSet` scale-up. The operator must approve the new node's CSRs before the kubelet can register.
+
+```bash
+# Add a node post-install (example shape; not yet exercised in this fleet)
+oc --kubeconfig "$K" adm node-image create --output=node.iso \
+  --node-config=node-config.yaml
+```
+
+This path is **slow and manual** compared to a cloud `MachineSet`. The fleet's small, fixed size is a deliberate trade.
+
+## MachineConfig operator
+
+`machine-config-operator` is the rolling-update controller for node-level configuration. Every change that touches `/etc/`, `kernelArguments`, container runtime config, or kubelet config goes through:
+
+1. A `MachineConfig` object is created or updated.
+2. The MachineConfigPool aggregates all MachineConfigs that match its label selector and produces a "rendered" config.
+3. The `rendered-master-<hash>` (or `rendered-worker-<hash>`) is the target config.
+4. Nodes roll one at a time — drain, reboot, apply, uncordon — until the whole pool reaches the new rendered hash.
+
+Watch a rollout:
+
+```bash
+oc --kubeconfig "$K" get mcp -w
+```
+
+Steady-state expected: `master` pool `UPDATED=True, UPDATING=False, DEGRADED=False`, same for `worker`. Anything else is a rollout in progress or a stuck node.
+
+### Stuck node recovery
+
+The incident #135 IPv6-disable MR attempt left masters in `Ready=False` and the MachineConfigPool stuck. The recovery procedure lives in `runbooks/mco-stuck-node-recovery.md`; in short: manually patch the node's `machineconfiguration.openshift.io/desiredConfig` annotation back to the last-good rendered config and let MCO re-roll.
+
+This is one of the few break-glass exceptions permitted by [ADR 0025](/docs/06-architecture-decisions/) — it requires a tracked incident issue, read-only state capture before the patch, and a backport (the MachineConfig that *caused* the failure must be reverted in GitOps within 24 hours).
+
+## etcd posture
+
+etcd runs as a static pod on each master, managed by the `etcd-operator` (cluster-etcd-operator). It is **not** a separate VM, and there is no external etcd. The data lives on the master's local LUKS-encrypted root volume.
+
+Expected:
+
+- 3 voting members on each cluster, one per master.
+- etcd encryption at rest enabled (`APIServer/cluster.spec.encryption.type: aescbc`).
+- backup via `oc adm etcd-backup` (not automated yet — planned under [§13 backup](/docs/03-openshift-platform/13-backup-oadp/)).
+
+Check membership:
+
+```bash
+oc --kubeconfig "$K" -n openshift-etcd get pods -l app=etcd
+oc --kubeconfig "$K" -n openshift-etcd rsh -c etcd \
+  $(oc --kubeconfig "$K" -n openshift-etcd get pod -l app=etcd -o name | head -1) \
+  etcdctl --cacert /etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt \
+          --cert  /etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-$(hostname).crt \
+          --key   /etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-$(hostname).key \
+          --endpoints https://localhost:2379 \
+          member list
+```
+
+## Upgrade posture
+
+The fleet runs `4.20.18` with **no upgrade graph mirrored**. `ClusterVersion` shows no upgrade availability; the `oc adm upgrade` channel is effectively empty.
+
+To upgrade to `4.20.19` or a future minor:
+
+1. Mirror the new release through `oc mirror --v2` (target version in the ImageSet).
+2. Mirror the upgrade graph metadata (`graph-data` image).
+3. Apply the new IDMS / ITMS / signature configmaps to the cluster.
+4. Patch `ClusterVersion.spec.desiredUpdate.image` to the digest-pinned new release.
+5. Watch `oc adm upgrade` for progress.
+
+This is the "release pinning, no float" pattern from [§2.4 version and channel pinning](/docs/03-openshift-platform/02-cluster-install/04-version-and-channel-pinning/). An upgrade is always an explicit Git change with reviewable manifests, never an auto-pickup of whatever Red Hat published yesterday.
+
+## Maintenance posture
+
+Routine maintenance — drain a node, reboot a master, replace a worker disk — does **not** go through GitOps. These are live operations:
+
+```bash
+# Drain a node
+oc --kubeconfig "$K" adm cordon spoke-dc-v6-worker-0
+oc --kubeconfig "$K" adm drain spoke-dc-v6-worker-0 --ignore-daemonsets --delete-emptydir-data
+
+# Reboot (from KVM host for VMs; iLO for physical)
+# ...
+
+# Uncordon
+oc --kubeconfig "$K" adm uncordon spoke-dc-v6-worker-0
+```
+
+These are not break-glass under [ADR 0025](/docs/06-architecture-decisions/) — they don't mutate Argo-managed state. The cluster reaches the same desired state after the maintenance window.
+
+What **is** break-glass: patching a `MachineConfig` rendered object, editing `KubeletConfig`, or manually changing `machineconfiguration.openshift.io/desiredConfig` annotations. Those bypass the rolling-update controller and require the full incident-record-and-backport ritual.
+
+## References
+
+- `connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md` — node and master inventory, validation commands.
+- `connection-details/platform-admin-handoff.md` — operator install workflow + break-glass rules.
+- `plans/disconnected-rebuild/environments/dc-lab/hub-dc-v6/vm-plan.yaml`, `spoke-dc-v6/vm-plan.yaml`, `physical-worker-boot-plan.md`.
+- `runbooks/mco-stuck-node-recovery.md` (incident #135 recovery).
+- `adr/0005-openshift-rebuild-network-ingress-pki.md`, `adr/0025-gitops-only-operations-break-glass.md`, `adr/0026-ipv6-baseline-for-ovn-kubernetes.md`.

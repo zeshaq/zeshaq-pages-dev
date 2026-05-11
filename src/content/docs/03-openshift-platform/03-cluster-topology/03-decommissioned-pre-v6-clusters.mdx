@@ -1,8 +1,63 @@
 ---
 title: "Decommissioned Pre-v6 Clusters"
-description: "Section 03-openshift-platform/03-cluster-topology: Decommissioned Pre-v6 Clusters (placeholder)."
+description: "Historical context: the four pre-v6 clusters (hub-dc, spoke-dc, hub-dr, spoke-dr) and what replaced them in the v6 rebuild."
 sidebar_label: "Decommissioned Pre-v6 Clusters"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Before the v6 rebuild the lab ran a four-cluster fleet: `hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr`. [ADR 0022](/docs/06-architecture-decisions/) decommissioned that membership in favour of `hub-dc-v6` and `spoke-dc-v6`. This page is the historical anchor — what was there, why it was retired, and where the equivalent capability lives now.
+
+## What the pre-v6 fleet looked like
+
+| Cluster | Role | Status |
+| --- | --- | --- |
+| `hub-dc` | Active management hub | Decommissioned 2026-05; planning context only |
+| `spoke-dc` | Active workload cluster | Decommissioned 2026-05; planning context only |
+| `hub-dr` | Management DR (passive ACM restore hub) | Decommissioned 2026-05 |
+| `spoke-dr` | Workload DR (passive standby) | Decommissioned 2026-05 |
+
+## Why the rebuild
+
+The rebuild was driven by a combination of:
+
+- accumulated drift between live state and the prior `lab-gitops-full` desired-state repo
+- network plan changes (separation of `30.30.0.0/16` machine network from `160.30.63.x` public routed segment) that needed clean install-time addressing per [ADR 0005](/docs/06-architecture-decisions/)
+- a switch to disconnected install with `oc mirror --v2` and Nexus-only image supply per [ADR 0019](/docs/06-architecture-decisions/)
+- a federated GitLab-backed GitOps model per [ADR 0015](/docs/06-architecture-decisions/), replacing the previous monorepo `lab-gitops-full`
+- IPv6 baseline correction per [ADR 0026](/docs/06-architecture-decisions/), surfaced during the rebuild
+
+The decision was that incremental remediation would be more expensive (and more error-prone) than a clean rebuild against a reviewed plan.
+
+## Where the equivalents live now
+
+| Pre-v6 cluster | v6 replacement |
+| --- | --- |
+| `hub-dc` | [`hub-dc-v6`](/docs/03-openshift-platform/03-cluster-topology/01-hub-dc-v6/) — compact 3-master management cluster, same role |
+| `spoke-dc` | [`spoke-dc-v6`](/docs/03-openshift-platform/03-cluster-topology/02-spoke-dc-v6/) — workload cluster, 3 VM masters + 3 physical workers, same role |
+| `hub-dr` | Not built. Reserved name `hub-dr-v6`. |
+| `spoke-dr` | Not built. Reserved name `spoke-dr-v6`. |
+
+The pre-v6 cluster names should not appear in new manifests, plans, scripts, runbooks, or session reports. They are acceptable only when referring to historical or transitional context. `hub-dr-v6` and `spoke-dr-v6` are forward-looking placeholders — they are not a license to build DR clusters without a new tracked ADR.
+
+## What from pre-v6 is reference-only
+
+- `/home/ze/codex-opp-agent/lab-gitops-full/` — the pre-v6 desired-state monorepo. Contains stale topology, version assumptions, and decommissioned cluster references. Do not copy from here without updating cluster names, operator versions, channels, image-supply rules, and ownership metadata to match v6.
+- `/home/ze/codex-opp-agent/lab-gitops/` — pre-v6 bootstrap context. Same caveats.
+- `/home/ze/cloud-init/` — the failed-install scrap directory. Workspace-boundary memory marks it read-only and historical.
+
+The v6 runtime GitOps source of truth is `comptech-platform/openshift-ops/openshift-platform-gitops` on internal GitLab (see [§5 GitOps operating model](/docs/03-openshift-platform/05-gitops-operating-model/01-architecture/)).
+
+## Lessons from the pre-v6 fleet that shape v6
+
+- **Storage-light hubs** — pre-v6 `hub-dr` storage recovery was the most painful operational episode. The v6 hub deliberately runs LVMS only, no ODF ([ADR 0004](/docs/06-architecture-decisions/)).
+- **Pull model over hub-push** — pre-v6 hub-push delivery put too much pressure on the management cluster and made spoke recovery dependent on hub health. [ADR 0018](/docs/06-architecture-decisions/) commits the v6 fleet to ACM + OpenShift GitOps Basic pull.
+- **Nexus-only image supply** — pre-v6 mirror config was incomplete; the ODF rollout on `spoke-dc` proved that operator pulls would still hit upstream registries. [ADR 0019](/docs/06-architecture-decisions/) makes Nexus the sole approved source.
+- **IPv6 baseline corrected** — pre-v6 didn't have OVN-K-safe IPv6 handling documented. [ADR 0026](/docs/06-architecture-decisions/) supersedes [ADR 0005](/docs/06-architecture-decisions/) §IPv6 for any OVN-K cluster.
+
+## References
+
+- `adr/0022-v6-fleet-membership.md` — the decommissioning decision.
+- `adr/0001-operator-workspace.md` — the original four-cluster fleet definition (cluster-list portion superseded by 0022).
+- `adr/0004-management-only-hubs.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0026-ipv6-baseline-for-ovn-kubernetes.md`.
+- `codex-opp-agent/CLUSTERS.md` — current fleet inventory (`hub-dc-v6` + `spoke-dc-v6` only).

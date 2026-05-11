@@ -1,8 +1,220 @@
 ---
-title: "spoke-dc-v6"
-description: "Section 03-openshift-platform/03-cluster-topology: spoke-dc-v6 (placeholder)."
+title: "spoke-dc-v6 — Workload Cluster Topology"
+description: "Hybrid 3 VM-master + 3 physical-worker workload cluster with ODF, the spoke pull-model Argo CD, ACS Sensor, OADP, Loki/Tempo, Quay, Tekton, and applications."
 sidebar_label: "spoke-dc-v6"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const spokeBox = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const spokeNodes = [
+  { id: "cluster", position: { x: 350, y: 0 }, data: { label: "spoke-dc-v6\n3 VM masters + 3 physical workers\nOCP 4.20.18 FIPS=on" }, style: spokeBox },
+
+  { id: "m0", position: { x: 60,  y: 130 }, data: { label: "master-0 (rendezvous)\n.33" }, style: ctrlBox },
+  { id: "m1", position: { x: 250, y: 130 }, data: { label: "master-1\n.34" }, style: ctrlBox },
+  { id: "m2", position: { x: 440, y: 130 }, data: { label: "master-2\n.35" }, style: ctrlBox },
+  { id: "w0", position: { x: 630, y: 130 }, data: { label: "worker-0\ngold-1, .36" }, style: dataBox },
+  { id: "w1", position: { x: 810, y: 130 }, data: { label: "worker-1\ngold-2, .37" }, style: dataBox },
+  { id: "w2", position: { x: 990, y: 130 }, data: { label: "worker-2\ngpu-01, .38" }, style: dataBox },
+
+  { id: "lso",   position: { x: 60,  y: 280 }, data: { label: "LSO 4.20\n+ LocalVolumeSet\n(MR408i devices)" }, style: dataBox },
+  { id: "odf",   position: { x: 250, y: 280 }, data: { label: "ODF 4.20.10-rhodf\nStorageCluster + NooBaa\n+ MCG" }, style: dataBox },
+  { id: "argo",  position: { x: 440, y: 280 }, data: { label: "OpenShift GitOps\n(gitops-addon Deployment)\nspoke Argo CD" }, style: agentBox },
+  { id: "rhacs", position: { x: 630, y: 280 }, data: { label: "RHACS SecuredCluster\nSensor + Collector\n(init-bundle from Vault)" }, style: dataBox },
+  { id: "oadp",  position: { x: 810, y: 280 }, data: { label: "OADP 1.5.5\n+ DataProtectionApplication\n(MinIO backup target)" }, style: dataBox },
+  { id: "eso",   position: { x: 990, y: 280 }, data: { label: "ESO 1.1.0\n(Vault kube-auth)" }, style: dataBox },
+
+  { id: "loki",   position: { x: 60,  y: 410 }, data: { label: "LokiStack\n+ Cluster Logging\n(ObjectBucketClaim → NooBaa)" }, style: dataBox },
+  { id: "tempo",  position: { x: 250, y: 410 }, data: { label: "TempoStack\n+ OpenTelemetry\n(ObjectBucketClaim)" }, style: dataBox },
+  { id: "ossm",   position: { x: 440, y: 410 }, data: { label: "OSSM 3 + Kiali\nIstios / IstioCNI / ztunnel" }, style: dataBox },
+  { id: "tekton", position: { x: 630, y: 410 }, data: { label: "OpenShift Pipelines\n(Tekton) +\nTektonConfig" }, style: dataBox },
+  { id: "quay",   position: { x: 810, y: 410 }, data: { label: "Quay Registry\nQuayRegistry CR\nMCG-backed object storage" }, style: dataBox },
+  { id: "apps",   position: { x: 990, y: 410 }, data: { label: "Application tenants\nOpen Liberty / CNPG\n(per AppProject)" }, style: dataBox },
+];
+
+export const spokeEdges = [
+  { id: "e-c-m0", source: "cluster", target: "m0", ...muted },
+  { id: "e-c-m1", source: "cluster", target: "m1", ...muted },
+  { id: "e-c-m2", source: "cluster", target: "m2", ...muted },
+  { id: "e-c-w0", source: "cluster", target: "w0", ...muted },
+  { id: "e-c-w1", source: "cluster", target: "w1", ...muted },
+  { id: "e-c-w2", source: "cluster", target: "w2", ...muted },
+  { id: "e-w-lso", source: "w0", target: "lso", label: "data devices", ...muted },
+  { id: "e-lso-odf", source: "lso", target: "odf", label: "PV → OSD", ...reqEdge },
+  { id: "e-odf-loki", source: "odf", target: "loki", label: "OBC backing", ...reqEdge },
+  { id: "e-odf-tempo", source: "odf", target: "tempo", label: "OBC backing", ...reqEdge },
+  { id: "e-odf-quay", source: "odf", target: "quay", label: "OBC backing", ...reqEdge },
+  { id: "e-argo-all", source: "argo", target: "rhacs", label: "applies operators+CRs", ...muted },
+];
+
+`spoke-dc-v6` is the workload cluster — three VM masters and three physical workers backed by OpenShift Data Foundation. It runs every operator that needs Ceph-backed storage, an object-storage bucket, or workload compute: ODF/LSO, the spoke pull-model Argo CD, RHACS Sensor, OADP, ESO, Loki/Tempo/OpenTelemetry, OSSM/Kiali, Tekton, Quay, and the application tenants.
+
+## What's on the cluster
+
+<Whiteboard client:load data={{ nodes: spokeNodes, edges: spokeEdges }} height={620} />
+
+## Cluster shape
+
+| Item | Value |
+| --- | --- |
+| Cluster name | `spoke-dc-v6` |
+| Base domain | `sub.comptech-lab.com` |
+| OCP version | `4.20.18` |
+| Topology | 3 VM masters + 3 physical workers |
+| Install method | Agent-based, disconnected |
+| FIPS | Enabled |
+| etcd encryption | Enabled |
+| Disk encryption | TPM2-backed LUKS via `99-master-tpm2-encryption.bu` (masters) + `99-worker-tpm2-encryption.bu` (workers) |
+| Network | `OVNKubernetes`, `clusterNetwork=10.128.0.0/14`, `serviceNetwork=172.30.0.0/16`, `machineNetwork=30.30.0.0/16` |
+| API VIP | `30.30.75.30` |
+| Ingress VIP | `30.30.75.31` |
+| Masters | `30.30.75.33` / `.34` / `.35` |
+| Workers | `30.30.75.36` (`gold-1`) / `.37` (`gold-2`) / `.38` (`gpu-01`) |
+| API | `https://api.spoke-dc-v6.sub.comptech-lab.com:6443` |
+| Console | `https://console-openshift-console.apps.spoke-dc-v6.sub.comptech-lab.com` |
+
+## VM masters vs physical workers
+
+The split is deliberate:
+
+- **VM masters** live on the same KVM hypervisor as the hub. They are deterministic-MAC libvirt domains with vTPM and `br30` attachment. Master upgrades are quick (snapshot, reboot).
+- **Physical workers** are HPE servers with iLO Redfish-controlled boot, NS204i RAID1 boot volumes (NVMe), and MR408i single-disk data volumes for ODF OSDs. They carry the application workload, ODF Ceph daemons, and the heavy operands (Loki, Tempo, Quay, ScannerV4).
+
+Worker hardware inventory:
+
+| Worker | Hardware | Boot device | Data devices |
+| --- | --- | --- | --- |
+| `worker-0` (`gold-1`) | HPE | 1 × NS204i RAID1, `0.48TB` SSD pair | 8 × `2.40TB` MR408i single-disk |
+| `worker-1` (`gold-2`) | HPE | 1 × NS204i RAID1, `0.48TB` SSD pair | 8 × `2.40TB` MR408i single-disk |
+| `worker-2` (`gpu-01`) | HPE | 1 × NS204i RAID1, `0.48TB` SSD pair | 4 × `1.92TB` MR408i single-disk |
+
+Total data device capacity: 20 disks. After issue #117's destructive cleanup, all 20 were clean by `wipefs -n`.
+
+## Failure-domain labels
+
+Workers are labeled with rack + zone so ODF can place OSDs / MONs across failure domains:
+
+```bash
+oc --kubeconfig "$K_SPOKE" label node spoke-dc-v6-worker-0 \
+  topology.kubernetes.io/rack=gold-1 topology.kubernetes.io/zone=dc-lab --overwrite
+oc --kubeconfig "$K_SPOKE" label node spoke-dc-v6-worker-1 \
+  topology.kubernetes.io/rack=gold-2 topology.kubernetes.io/zone=dc-lab --overwrite
+oc --kubeconfig "$K_SPOKE" label node spoke-dc-v6-worker-2 \
+  topology.kubernetes.io/rack=gpu-01 topology.kubernetes.io/zone=dc-lab --overwrite
+```
+
+ODF `StorageCluster.spec.placement` (covered in [§8 storage / ODF on spoke](/docs/03-openshift-platform/08-storage/03-odf-on-spoke/)) uses `rack` as the failure domain — one OSD per rack, MON quorum spread across all three racks.
+
+## Storage stack — LSO + ODF
+
+[ADR 0004](/docs/06-architecture-decisions/) says storage lives on the spoke. The stack is:
+
+1. **Local Storage Operator** (`local-storage-operator.v4.20.0-202604140241`) installed in `openshift-local-storage`. It runs a `LocalVolumeSet` that discovers MR408i devices via path/size filters (excluding NS204i boot disks).
+2. **OpenShift Data Foundation** (`odf-operator.v4.20.10-rhodf`) installed in `openshift-storage` with the full dependency operator set (CephCSI, MCG/NooBaa, ODF dependencies, Rook). The `StorageCluster` consumes the LSO-provided PVs as OSDs.
+3. **StorageClasses** exposed cluster-wide:
+   - `ocs-storagecluster-ceph-rbd` — block, RWO (default for new workload PVCs)
+   - `ocs-storagecluster-cephfs` — filesystem, RWX
+   - `ocs-storagecluster-ceph-rgw` — S3-compatible object via RGW
+4. **NooBaa (MCG)** — Multi-Cloud Gateway, exposed via the `objectbucket.io` API. Tenants request buckets through `ObjectBucketClaim` resources; the OBC controller materializes an S3 bucket plus an `AWS_*_KEY_*` Secret.
+
+The NooBaa OBC → operand storage-Secret bridge (for Loki, Tempo, Quay) uses External Secrets Operator's kubernetes-provider with a template to rewrite the OBC-emitted Secret keys into the lowercase variants the LokiStack and TempoStack expect (memory: `project_obc_to_operand_secret_bridge.md`). Pattern lives at `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml`.
+
+## Spoke pull-model Argo CD
+
+The spoke runs OpenShift GitOps differently from the hub. The ACM `gitops-addon` (enabled via `GitOpsCluster.spec.gitopsAddon.enabled: true` on the hub) installs OpenShift GitOps on the spoke as a **Deployment**, not as an OLM CSV. The namespace on the spoke is `openshift-gitops`, but the controller is named `acm-openshift-gitops-argocd-application-controller` (per the addon's naming convention).
+
+This is intentional — Red Hat's reference pull-model installs the spoke Argo via the addon Deployment so the hub can manage its lifecycle through ACM. It is **not** drift; the memory `feedback_acm_gitops_pull_pattern.md` explicitly notes this.
+
+The spoke Argo CD's `serviceaccount: acm-openshift-gitops-argocd-application-controller` has a **least-privilege ClusterRole** that grants get/list/watch on everything plus full verbs on a fixed allowlist of API groups. Anything outside the allowlist hits `forbidden: cannot patch ...`. The single home for RBAC extensions is `clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml` — see [§5.7 spoke extension RBAC](/docs/03-openshift-platform/05-gitops-operating-model/07-spoke-extension-rbac/) for the full list.
+
+## Installed operators (as of 2026-05-11)
+
+| Operator | CSV |
+| --- | --- |
+| OpenShift GitOps (addon) | image-digest only |
+| Local Storage Operator | `local-storage-operator.v4.20.0-202604140241` |
+| OpenShift Data Foundation | `odf-operator.v4.20.10-rhodf` + dependency set |
+| External Secrets Operator | `external-secrets-operator.v1.1.0` |
+| RHACS Operator | `rhacs-operator.v4.10.2` (SecuredCluster on spoke) |
+| OADP Operator | `oadp-operator.v1.5.5` |
+| OpenShift cert-manager Operator | `cert-manager-operator.v1.19.0` |
+| OpenShift Pipelines | `openshift-pipelines-operator-rh.v1.22.0` |
+| Compliance Operator | `compliance-operator.v1.9.0` |
+| File Integrity Operator | `file-integrity-operator.v1.3.8` |
+| Container Security Operator | `container-security-operator.v3.16.3` |
+| Security Profiles Operator | `security-profiles-operator.v0.10.0` |
+| Cluster Observability Operator | `cluster-observability-operator.v1.4.0` |
+| Loki Operator | `loki-operator.v6.5.0` |
+| Cluster Logging | `cluster-logging.v6.5.0` |
+| Tempo Operator | `tempo-operator.v0.20.0-3` |
+| OpenTelemetry Operator | `opentelemetry-operator.v0.144.0-3` |
+| NetObserv Operator | `netobserv-operator.v1.11.1` |
+| Service Mesh 3 | `servicemeshoperator3.v3.3.2` |
+| Kiali (OSSM) | `kiali-operator.v2.22.2` |
+| Quay Operator | `quay-operator.v3.17.1` |
+| Gatekeeper | `gatekeeper-operator-product.v3.21.0` |
+| Kube Descheduler | `cluster-kube-descheduler-operator.v5.3.2` |
+| CloudNative-PG | `cloudnative-pg.v1.29.0` |
+| Open Liberty Operator | `open-liberty-certified.v1.6.1` |
+
+The Subscriptions live in `clusters/spoke-dc-v6/operators/*` (per operator).
+
+## Workload tenants
+
+Per [ADR 0024](/docs/06-architecture-decisions/), tenant boundary registration lives in the platform repo under `clusters/spoke-dc-v6/tenants/<tenant>/` — namespace, AppProject scope, quotas, baseline NetworkPolicies, base ServiceAccounts. Per-release Deployment/Route/Service manifests belong in the tenant's `*-gitops` repo, not in the platform repo.
+
+The current tenant directory `apps-platform-sample/` is the placeholder tenant used for testing the Open Liberty operator path and the Tekton pipeline templates. Future tenants (Open Liberty applications, JBoss/EAP services, Spring Boot APIs, Node.js APIs) onboard through the same `_template/` pattern.
+
+## Health snapshot commands
+
+```bash
+K_SPOKE=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Cluster baseline
+oc --kubeconfig "$K_SPOKE" get nodes -o wide
+oc --kubeconfig "$K_SPOKE" get clusterversion version
+oc --kubeconfig "$K_SPOKE" get co | awk \
+  'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+
+# ODF + LSO
+oc --kubeconfig "$K_SPOKE" -n openshift-storage get storagecluster,noobaa
+oc --kubeconfig "$K_SPOKE" -n openshift-storage get cephcluster \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.ceph.health}{"\n"}{end}'
+oc --kubeconfig "$K_SPOKE" get storageclass | egrep 'ocs-storagecluster|NAME'
+
+# Spoke Argo
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get applications.argoproj.io -o wide
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get app spoke-dc-v6-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+
+# Operator sets
+oc --kubeconfig "$K_SPOKE" get csv -A | awk \
+  '/Succeeded/ {print $1, $2}' | sort -u
+```
+
+Expected steady state:
+
+- All 6 nodes `Ready`.
+- ClusterVersion `4.20.18`, `Available=True`, `Progressing=False`.
+- ODF `StorageCluster` `Ready`; Ceph `HEALTH_OK`; NooBaa `Ready`; storage classes present.
+- `spoke-dc-v6-cluster-config` Application `Synced Healthy`.
+- All listed operator CSVs `Succeeded`.
+
+## References
+
+- `connection-details/openshift-spoke-dc-v6.md` — endpoints, node inventory, install notes (including physical-worker MAC correction).
+- `connection-details/platform-admin-handoff.md` — installed-operator baseline, ODF expected state, validation commands.
+- `plans/disconnected-rebuild/environments/dc-lab/spoke-dc-v6/README.md`, `physical-worker-boot-plan.md`, `validation.md`.
+- `plans/disconnected-rebuild/environments/dc-lab/odf-storage-inventory.md`.
+- `adr/0004-management-only-hubs.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0024-openshift-only-platform-gitops-boundary.md`.
+- platform-gitops `clusters/spoke-dc-v6/` tree (operators, storage, security, platform-services, tenants).
+- Memory: `feedback_acm_gitops_pull_pattern.md`, `reference_spoke_argo_extension_rbac.md`, `project_obc_to_operand_secret_bridge.md`.
