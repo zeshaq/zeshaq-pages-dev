@@ -1,8 +1,86 @@
 ---
-title: "ADR 0009 — Jenkins Single VM"
-description: "Section 06-architecture-decisions: ADR 0009 — Jenkins Single VM (placeholder)."
-sidebar_label: "ADR 0009 — Jenkins Single VM"
+title: "ADR 0009 — Jenkins single-VM controller"
+description: "One Ubuntu 24.04 VM running Jenkins LTS on OpenJDK 21, with HAProxy as the TLS termination point and Jenkins itself reachable only from the HAProxy edge."
+sidebar_label: "0009 — Jenkins single VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-08
+**Status:** Accepted.
+
+## Context
+
+The operator explicitly requested a Jenkins installation on an Ubuntu cloud-init VM, exposed through the existing PowerDNS / HAProxy / Let's Encrypt edge path defined by [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki).
+
+This workspace remains **OpenShift-first**. Jenkins is accepted here only as a supporting lab automation service for build and platform workflows. It is **not** a general application-catalogue entry, and it does not get OpenShift-platform GitOps treatment. The federated GitOps architecture ([ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)) places Jenkins under `vm-platform-ops`, not under `openshift-platform-gitops`.
+
+The reason for choosing Jenkins specifically — over GitLab CI, Tekton, or GitHub Actions — is build-path muscle memory. The teams the lab will serve already know Jenkins, the operator wants to be able to use Jenkins job-config as part of the developer-readiness contract ([ADR 0014](#references)), and the lab needs a CI executor that isn't tied to a hosted SaaS for disconnected operation.
+
+## Decision
+
+Deploy Jenkins as **one standalone Ubuntu 24.04 cloud-init VM** on `br30`.
+
+| Property | Value |
+|---|---|
+| VM name | `jenkins-0` |
+| IP | internal-only (see `connection-details/jenkins.md`) — `30.30.30.x/16` in the lab service range |
+| MAC | internal-only |
+| Private DNS | `jenkins-0.sub.comptech-lab.com`, `jenkins.sub.comptech-lab.com` |
+| Public edge DNS | `jenkins.apps.sub.comptech-lab.com` |
+| Public edge TLS | existing HAProxy wildcard certificate for `*.apps.sub.comptech-lab.com` |
+| Jenkins package source | upstream Jenkins LTS `debian-stable` APT repository |
+| Runtime | OpenJDK 21 |
+| Jenkins home | dedicated data disk mounted at `/var/lib/jenkins` |
+| Local-only admin credentials | `secrets/jenkins/admin.env` |
+
+### Edge wiring
+
+HAProxy terminates TLS on `jenkins.apps.sub.comptech-lab.com` and forwards HTTP to the Jenkins VM port `8080`.
+
+The Jenkins VM firewall:
+
+- allows SSH from the lab `/16` network;
+- allows Jenkins port `8080` **only from the HAProxy private address**.
+
+Direct Jenkins port access is intentionally not open to the whole lab network. Users reach Jenkins through HAProxy; operators reach Jenkins through SSH or the same edge route.
+
+## Alternatives considered
+
+**Run Jenkins on OpenShift (Helm chart or Jenkins Operator).** Attractive because it would give Jenkins HA, OpenShift RBAC integration, and PVC-backed `JENKINS_HOME`. Rejected because:
+
+- Storage-light hubs ([ADR 0004](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs)) push storage onto workload clusters, but the workload cluster's ODF readiness state was not yet stable enough to depend on for CI.
+- A VM Jenkins is straightforward to back up (file-system snapshots of `/var/lib/jenkins` to MinIO).
+- The lab wants **one fewer thing inside OpenShift** for the first developer-readiness milestone.
+
+**GitLab CI as the only CI executor.** Attractive because GitLab CI is already in the federated architecture. Rejected because:
+
+- The operator wants Jenkins for the historical-pattern reason above.
+- GitLab CI **is also** in scope — the build-path matrix in `codex-opp-agent/connection-details/build-path-matrix.md` defines when each is used. Jenkins isn't replacing GitLab CI; they cover different paths.
+- Having two independent build executors means **Jenkins can be repaired by GitLab Runner** when Jenkins itself is broken, per [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops). One executor that depends only on itself for repair is a single point of failure.
+
+**Tekton Pipelines on OpenShift.** Rejected because the storage-light hub policy removed Tekton from hub desired state ([ADR 0004](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs)), and Tekton-on-spoke for general CI was not the operator's preference. Tekton can still appear inside specific spoke namespaces for OpenShift-native build paths, but it is not the default CI executor.
+
+**Bypass HAProxy and put Jenkins on the public internet directly.** Rejected because the lab does not want Jenkins exposed without a TLS-terminating reverse proxy that the lab controls, and HAProxy is already the lab's edge TLS terminator for VM services.
+
+## Consequences
+
+- **Jenkins is reachable at `https://jenkins.apps.sub.comptech-lab.com/`** via HAProxy + Let's Encrypt wildcard. The same URL serves users and the Jenkins API.
+- **Direct Jenkins port access is intentionally not open to the lab network.** Everything that talks to Jenkins goes through HAProxy.
+- **Jenkins credentials must never be printed, committed, copied to GitHub issues / wiki, or included in session reports.** Local-only custody under `secrets/jenkins/admin.env`.
+- **The first deployment is single-controller lab infrastructure**, not a production CI dependency. Before Jenkins is treated as a production CI dependency, define:
+  - backup / restore for `JENKINS_HOME` to MinIO with restore-drill evidence,
+  - plugin governance (pinned versions, vulnerability scan),
+  - job-as-code (JCasC + shared libraries, jobs in Git not in the UI),
+  - Vault-backed credential handling (no plaintext credentials in Jenkins, fetch at job start from Vault),
+  - upgrade rehearsal (LTS → next-LTS on a clone of the VM before doing it for real).
+- **GitLab Runner is the independent fallback executor.** Per [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops), GitLab Runner can run Ansible/Terraform against the Jenkins VM to repair it; Jenkins is not the only thing that can repair Jenkins.
+
+## References
+
+- Source: `codex-opp-agent/adr/0009-jenkins-single-vm.md`
+- Edge wiring rules: [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
+- Federation context: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- Developer-readiness contract: `codex-opp-agent/adr/0014-developer-readiness-platform-contract.md`
+- Jenkins operator notes: `codex-opp-agent/connection-details/jenkins.md`, `jenkins-ocp-path.md`
+- Build-path matrix: `codex-opp-agent/connection-details/build-path-matrix.md`

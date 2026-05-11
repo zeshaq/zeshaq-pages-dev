@@ -1,8 +1,122 @@
 ---
-title: "ADR 0020 — PCI-DSS Baseline"
-description: "Section 06-architecture-decisions: ADR 0020 — PCI-DSS Baseline (placeholder)."
-sidebar_label: "ADR 0020 — PCI-DSS Baseline"
+title: "ADR 0020 — PCI-DSS profile compliance baseline for spoke-dc-v6"
+description: "Compliance Operator v1.9.0, ocp4-pci-dss-4-0 + ocp4-pci-dss-node-4-0, custom workers-storage ScanSetting, GitOps-managed scan desired state, evidence to MinIO."
+sidebar_label: "0020 — PCI-DSS baseline"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-10
+**Status:** Accepted.
+
+## Context
+
+The active workload cluster `spoke-dc-v6` must be able to produce **reproducible PCI-DSS-aligned compliance evidence** that supports — but does not replace — a formal PCI assessment. The prior `spoke-dc` cluster reached `DONE/COMPLIANT` on the PCI-DSS v4 Compliance Operator suite after hardening and remediation; those lessons must be carried into the v6 baseline before any scan runs.
+
+State at the time of acceptance (2026-05-10):
+
+- The Compliance Operator was installed on `spoke-dc-v6` under issue #110 (PCI-2 Phase A) with `compliance-operator.v1.9.0` from the mirrored `cs-redhat-operator-index-v4-20` catalog source.
+- ProfileBundles `ocp4` and `rhcos4` are VALID.
+- The PCI-DSS profile CRs (`ocp4-pci-dss-{3-2,4-0}`, `ocp4-pci-dss-node-{3-2,4-0}`) are materialized.
+- PCI-1 day-zero validation (issue #109) found **11 prerequisites passing**, **2 warnings** (recovery-passphrase policy, kubeadmin presence), and **3 hard gaps** requiring remediation before Phase B: etcd encryption unset, OAuth inactivity timeout unset, IPv6 not disabled at the host kernel.
+
+The fleet operates **disconnected** per [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops); the GitOps model is the **ACM + OpenShift GitOps Basic pull pattern** per [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull); governance is per [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror). There is no current ADR specific to the PCI-DSS approach on v6 — the historical reference (`/home/ze/cloud-init/adr/0015-spoke-dc-pci-dss-rebuild.md`) applied to the now-retired `spoke-dc` cluster and is not in force.
+
+## Decision
+
+The PCI-DSS compliance baseline for `spoke-dc-v6` is:
+
+1. **Tool:** Red Hat OpenShift Compliance Operator. Catalog source: mirrored `cs-redhat-operator-index-v4-20`. **Pin to `compliance-operator.v1.9.0`** until the rebuild operator-lock is updated.
+2. **Primary profiles:** Run both **`ocp4-pci-dss-4-0`** and **`ocp4-pci-dss-node-4-0`** as the primary target profiles. Run `ocp4-pci-dss-3-2` and `ocp4-pci-dss-node-3-2` as **secondary references** for context, not as production gates.
+3. **ProfileBundles:** Use the default `ocp4` and `rhcos4` shipped by the operator. Do not introduce a custom ProfileBundle for the baseline.
+4. **Custom `workers-storage` ScanSetting:** Place the result server and its raw-result PVC on **worker nodes**, not master nodes. Default master placement caused RBD attach failures on the prior `spoke-dc`.
+5. **All PCI scan desired state in GitOps**, not via `oc apply` from CI or the console. Desired state covers ScanSetting, ScanSettingBindings, TailoredProfiles (if introduced), and any ODF route tailoring required by the suite.
+6. **Tailor the ODF object-store route TLS rule via TailoredProfile.** ODF reconciles one of its routes back to `Allow` while production S3 access uses the secure route; the suite must be tailored to that reality.
+7. **No scans against `hub-dc-v6`.** Hub provides ACM, GitOps, and fleet governance evidence only; PCI scan target is the workload cluster.
+8. **Day-zero prerequisites are non-negotiable:** FIPS from install, vTPM on VM masters, TPM2-backed LUKS on physical worker root disks with recovery custody **outside Git**, ODF cluster-wide encryption, etcd encryption (`aesgcm`), OAuth inactivity timeout configured, IPv6 not used for cluster traffic per [ADR 0026](#references) (4 verifiable invariants — host-kernel disable is incompatible with OVN-K and intentionally NOT pursued), `ssh-rsa` only (no `ssh-ed25519`), `kubeadmin` removed after a real IdP is wired and verified.
+9. **Raw scan results on ODF Ceph RBD storage.** Export sanitized evidence to MinIO `developer-ci-evidence` under a `pci-dss/` prefix with the same lifecycle policy as other evidence buckets.
+10. **Follow the phase chain PCI-0 → PCI-1 → PCI-2 → PCI-3 → PCI-4 → PCI-5 without skipping.** Each phase closes only when its acceptance criteria are demonstrably met and recorded.
+
+### Carried-forward lessons from the old spoke-dc
+
+These are facts the prior PCI-DSS effort proved, recorded so they are not re-litigated:
+
+- **The historical outcome was Compliance Operator profile compliance** — not a formal Report on Compliance, not an Attestation of Compliance, not a QSA sign-off.
+- **FIPS must be set during install** (`fips: true` in install-config + butane `openshift.fips: true`). It is **not** a viable day-2 toggle.
+- **VM masters require vTPM.** Without it, LUKS unlock and TPM2-bound clevis schemes do not function for masters.
+- **Physical workers require TPM2-backed LUKS** on root disks. Recovery passphrase custody must exist outside Git, or an explicit reinstall-only policy must be recorded.
+- **ODF must be encrypted cluster-wide from cluster initialization** (`storagecluster.spec.encryption.clusterWide=true`).
+- **etcd at-rest encryption must be configured** (`apiserver.spec.encryption`). The old `spoke-dc` baseline used `aescbc`; OCP 4.20 prefers `aesgcm`.
+- **`kubeadmin` removal/rotation is a hard requirement** for the relevant rule to pass. A real IdP must be in place first.
+- **OAuth inactivity must be configured at both layers:** cluster `oauth.config.spec.tokenConfig.accessTokenInactivityTimeout` AND per-client `OAuthClient.accessTokenInactivityTimeoutSeconds`.
+- **The default ScanSetting places the result server on master nodes; this caused RBD attach failures.** A custom `workers-storage` ScanSetting fixed it on `spoke-dc` and is mandatory on `v6`.
+- **ODF reconciles one of its object-store routes back to `Allow`**, while production S3 access uses the secure route. The PCI suite must be tailored to acknowledge this reality rather than fight ODF.
+- **Do not store** rendered install-config, kubeadmin password, or any LUKS passphrase in Git. Do not paste into issues, MRs, wiki, or chat.
+- **IPv6 disablement on OVN-Kubernetes clusters means "IPv6 not used for cluster traffic"** per [ADR 0026](#references) (4 verifiable invariants), NOT host-kernel disable. The #135 incident on 2026-05-10 proved both kernel-arg and sysctl drop-in mechanisms break OVN-K; further attempts are forbidden.
+
+## Out of scope
+
+This ADR does **not** provide:
+
+- a formal PCI DSS Report on Compliance;
+- an Attestation of Compliance;
+- a QSA sign-off;
+- proof that any application running on the cluster is PCI-DSS compliant;
+- proof that the full Cardholder Data Environment is correctly scoped or that the cluster is the only system in scope.
+
+The output is **OpenShift platform evidence and Compliance Operator profile results** that an auditor can use as inputs to a formal PCI assessment.
+
+## Alternatives considered
+
+**Use only `ocp4-pci-dss-3-2` (v3.2.1 profile).** Older but well-known. Rejected as primary because PCI DSS v4 is the current standard. v3.2 still runs as a secondary reference for context.
+
+**Use a custom ProfileBundle from day one.** Tailoring everything in advance via TailoredProfile. Rejected because:
+
+- The default `ocp4` and `rhcos4` ProfileBundles cover most rules correctly.
+- Custom ProfileBundles add operational burden that should be reserved for rules that *require* tailoring (the ODF object-store route TLS rule is the only current case).
+- A future PCI v4.1 release will require its own tailoring review; doing it pre-emptively wastes effort.
+
+**Run scans against both hub and spoke.** Attractive for symmetry. Rejected because the hub is management-only ([ADR 0004](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs)); PCI scope is the workload cluster, and forcing PCI-relevant rules onto the hub would either pass trivially (no in-scope workloads) or fail loudly on hub-specific exemptions that are not relevant.
+
+**`oc apply` scans from CI.** Faster iteration. Rejected because workspace governance ([ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror)) and the GitOps-only operations rule require scan desired state to be in Git. The evidence chain that an auditor will eventually trust depends on "the scan was approved in this MR, ran from this commit SHA, produced this result."
+
+**Disable IPv6 at host kernel to make the PCI rule pass.** Tried during the #135 incident on 2026-05-10. Both kernel-arg and sysctl drop-in mechanisms broke OVN-Kubernetes. Rejected and [ADR 0026](#references) was written to formalize the correct rule (4 verifiable invariants for "IPv6 not used for cluster traffic," not host-kernel disable).
+
+## Validation
+
+For each scan cycle the workspace must produce:
+
+- the **Git commit SHA** of the platform-gitops state under which the scan ran;
+- **ScanSettingBinding name and timestamp**;
+- **ComplianceSuite name, status, and check-result counts** (PASS / FAIL / MANUAL / NOT-APPLICABLE / INCONSISTENT);
+- **raw-result PVC names and storage class**;
+- **sanitized export path** in MinIO `developer-ci-evidence/pci-dss/`;
+- the **phase issue under which the cycle ran** (PCI-2 / PCI-3 / PCI-4 / PCI-5);
+- **residual-risk list** for FAIL and MANUAL findings.
+
+The image-supply check (`scripts/openshift-image-supply-check.sh`, see [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)) must report **0 uncovered references** on `spoke-dc-v6` for every PCI-relevant scan.
+
+## Consequences
+
+- **PCI scan deployment and re-runs go through GitOps MRs**, not `oc apply` from operator workstations.
+- **Day-zero prerequisite gaps block scan deployment**, not scan-result review. The phase chain absorbs this in PCI-1.
+- **ODF capacity reservation for raw scan results** is part of the storage baseline; storage planning issues must consider the PCI overhead (raw result PVCs grow with each scan generation).
+- **Adding a new PCI-DSS profile version (e.g. v4.1 when published)** requires a tailoring review and may require an ADR update if the assumptions change.
+- **Adding a second PCI-target cluster (e.g. an `app-dc-v6`)** requires its own ADR or an explicit citation of this one with the cluster-specific prerequisites verified.
+- **Compliance evidence has the same lifecycle as other CI evidence** — MinIO `developer-ci-evidence/pci-dss/` with the same retention and access policy.
+
+## Implementer's reference
+
+The compliance implementor handbook (`codex-opp-agent/connection-details/compliance-implementor-handbook.md`, issue #130) is the operator's runbook for executing PCI-0 → PCI-5. It pairs with `platform-admin-handoff.md` and `gitlab-operator-guide.md`. This ADR sets the rules; the handbook says how to follow them.
+
+## References
+
+- Source: `codex-opp-agent/adr/0020-pci-dss-profile-compliance-spoke-dc-v6.md`
+- v6 pull-model GitOps: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Nexus-only supply chain: [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)
+- Workspace governance: [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror)
+- IPv6 on OVN-K: `codex-opp-agent/adr/0026-ipv6-baseline-for-ovn-kubernetes.md`
+- v6 fleet membership: [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge)
+- Compliance implementor handbook: `codex-opp-agent/connection-details/compliance-implementor-handbook.md`
+- Phase issues: #109 (PCI-1 day-zero), #110 (PCI-2 Phase A), forward chain PCI-3 → PCI-5 under milestone #30
+- Image-supply check: `scripts/openshift-image-supply-check.sh`

@@ -1,8 +1,101 @@
 ---
-title: "ADR 0006 — Redis Sentinel Hardening"
-description: "Section 06-architecture-decisions: ADR 0006 — Redis Sentinel Hardening (placeholder)."
-sidebar_label: "ADR 0006 — Redis Sentinel Hardening"
+title: "ADR 0006 — Redis Sentinel hardening before application onboarding"
+description: "Redis as a private VM service with a six-gate hardening checklist (TLS, ACL/Vault, network, backups, observability, operational resilience) before BFSI apps treat it as a production dependency."
+sidebar_label: "0006 — Redis hardening"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-08
+**Status:** Accepted.
+
+## Context
+
+Redis is deployed as a standalone private VM service for the v6 rebuild:
+
+- A three-node Sentinel-quorum cluster (`redis-0`, `redis-1`, `redis-2`) on dedicated private IPs in `30.30.30.0/24` (internal-only specifics in `codex-opp-agent/connection-details/`).
+- Public-DNS Sentinel endpoint list at `redis-sentinel.sub.comptech-lab.com:26379`.
+- A debug / non-Sentinel discovery helper at `redis.sub.comptech-lab.com:6379`.
+- Redis currently uses ACLs, host firewalling, AOF persistence, and Sentinel quorum.
+- Controlled failover from the initial master to the third node has been validated.
+
+This is **good enough for private lab and platform smoke testing**, but it is **not good enough for onboarding BFSI applications** or any workload that treats Redis as a production dependency. The gap is the usual one for a "we got it running" deployment: no TLS on the wire, the shared ACL user (`app-default`) is a smoke-test convenience not an isolation boundary, backups exist only as Redis's own AOF/RDB files on the same VMs, monitoring is whatever the operator types into a terminal, and no upgrade or restart drill has been recorded.
+
+The lab will need Redis as a real dependency soon — applications under the federated GitOps model ([ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)) include several that want a Redis cache or session store. The ADR's job is to make explicit what "production-ready Redis" means before that point.
+
+## Decision
+
+Redis remains a VM-based private platform service, but it is **not production-ready** until the six hardening gates below close.
+
+Operating rules that apply *now*:
+
+- **Production clients must use Sentinel-aware libraries** and must connect through the Sentinel endpoint list `redis-sentinel.sub.comptech-lab.com:26379`. The `redis.sub.comptech-lab.com` DNS round-robin is allowed for diagnostics and break-glass access only; it is not the production client contract.
+- **Redis must not be exposed publicly** and must not be placed behind the HAProxy app wildcard. Access stays private on `30.30.0.0/16` until a more specific source allowlist is approved.
+- **TLS is required before BFSI onboarding.** TLS may use the lab internal CA (see [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)) first, then Vault PKI later once Vault PKI is accepted as an online intermediate. Redis package TLS support must be validated before changing listeners.
+- **Application credentials must move from local custody into Vault** before real workloads consume Redis. The shared `app-default` user is a smoke-test user only. Production uses **one ACL user per application or per trust boundary**, with least privilege and rotation ownership recorded.
+- **Backups are a required gate.** Redis persistence alone is not a backup strategy. Backups must include checksum validation, encrypted copy to MinIO or another approved object store, an offline / export copy, and an isolated restore drill.
+- **Monitoring is a required gate.** Redis and Sentinel health must be visible (metrics, alerts, log shipping) before application onboarding.
+
+### Six hardening gates
+
+1. **TLS and listener hardening.**
+   - Validate Redis package TLS support.
+   - Issue Redis node certificates from the approved internal CA.
+   - Enable TLS for Redis client traffic, replication, and Sentinel traffic where supported by the packaged Redis version.
+   - Keep cleartext listeners disabled or limited to local break-glass only.
+   - Validate Sentinel discovery and failover through TLS.
+2. **Credential and ACL hardening.**
+   - Store Redis application credentials in Vault.
+   - Replace `app-default` with workload-scoped ACL users.
+   - Keep admin, replication, and Sentinel users separate.
+   - Deny dangerous / admin command categories to application users (e.g. `FLUSHALL`, `CONFIG`, `DEBUG`, `SCRIPT LOAD` to non-trusted users).
+   - Document rotation and revocation steps before onboarding applications.
+3. **Network hardening.**
+   - Keep Redis private; no public IPs, no public DNS, no HAProxy wildcard.
+   - Narrow firewall source ranges from `30.30.0.0/16` to approved client networks once OpenShift consumer nodes and app namespaces are known.
+   - Validate access from the rebuilt clusters and deny access from non-approved sources.
+4. **Backup and restore hardening.**
+   - Define a current-master backup script that does not print credentials.
+   - Capture RDB / AOF backup artifacts with checksums.
+   - Encrypt backups before object-storage upload.
+   - Store backups in MinIO or another approved object store plus an offline copy.
+   - Run an isolated restore drill and record evidence before production use.
+5. **Observability hardening.**
+   - Export Redis and Sentinel metrics to the chosen observability stack (Prometheus on the monitoring VM, see [ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm); SigNoz if applicable, see [ADR 0010](/docs/06-architecture-decisions/09-adr-0010-signoz-standalone)).
+   - Alert on master changes, Sentinel quorum loss, replica link failure, replication lag, rejected connections, evictions, memory pressure, persistence failures, and disk saturation.
+   - Capture logs centrally without leaking credentials.
+6. **Operational resilience.**
+   - Re-run controlled failover after TLS and ACL hardening (a successful pre-hardening failover doesn't carry over).
+   - Test single-node restart for each Redis VM.
+   - Test current-master restart and client reconnect behavior.
+   - Document upgrade, rollback, and package pinning behavior.
+
+## Alternatives considered
+
+**Run Redis on OpenShift (e.g. Redis Operator or Bitnami Helm chart).** Attractive because it puts Redis next to the workloads that will consume it and uses OpenShift PVCs for persistence. Rejected because:
+
+- The lab's storage-light hub policy ([ADR 0004](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs)) and the ODF readiness state for workload clusters means Redis would have a non-trivial storage dependency that the lab isn't yet ready to back.
+- Sentinel and Redis in-cluster networking adds complexity that operators wanted to defer.
+- A standalone VM Sentinel cluster is operationally well-understood and easy to back up.
+
+**Use a managed Redis service.** Not available — the lab is on-premises, disconnected.
+
+**Declare the smoke-test deployment as "production-good-enough" and onboard apps now.** Rejected. The Sentinel deployment runs, but the lack of TLS, the shared `app-default` user, the absence of backups, and the absence of monitoring all add up to: "if one application misbehaves, it will be able to take down the whole Redis cluster, and the operators will not see it until users complain." That's not acceptable for a service that BFSI apps will rely on.
+
+## Consequences
+
+- **Redis can be used for lab / platform smoke testing now.** Development workloads that don't promise availability can connect.
+- **Redis must not be declared production-ready for BFSI applications** until the six hardening gates close and evidence is recorded (run the restore drill, capture the Sentinel-failover screenshots, attach to the closing issue).
+- **OpenShift workloads that need Redis must wait** for Vault-delivered credentials (ESO + Vault SecretStore) and for Sentinel-aware client configuration. The default behavior of "stuff `REDIS_URL` into the env" via a hard-coded password is forbidden.
+- **Any request to expose Redis publicly or through HAProxy needs a new ADR.** The current decision is private-only, and an "Redis open on the internet" path is far enough off-design that it has to go through review, not be merged silently.
+- **The hardening gates are sequential by readiness, not strictly ordered.** TLS can happen before backups; the lab just needs both to close before BFSI onboarding.
+- **Production-readiness evidence lives in `codex-opp-agent/connection-details/redis.md`** (and its dated session reports). The closure of each gate is recorded with an `oc`/`redis-cli` output snippet showing the verified state.
+
+## References
+
+- Source: `codex-opp-agent/adr/0006-redis-sentinel-hardening.md`
+- Related VM-service ADRs: [ADR 0007 — Kafka KRaft production readiness](#) (similar structure, source `adr/0007-kafka-kraft-production-readiness.md`)
+- Day-zero PKI rules: [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
+- Observability targets: [ADR 0010](/docs/06-architecture-decisions/09-adr-0010-signoz-standalone), [ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)
+- Vault secret-delivery pattern: §4 of this site (`vault-app-secrets.md`)
+- Operating notes: `codex-opp-agent/connection-details/redis.md` (when published; internal-only specifics meanwhile)

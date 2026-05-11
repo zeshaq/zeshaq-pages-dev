@@ -1,8 +1,149 @@
 ---
-title: "ADR 0005 — Network / Ingress / PKI"
-description: "Section 06-architecture-decisions: ADR 0005 — Network / Ingress / PKI (placeholder)."
-sidebar_label: "ADR 0005 — Network / Ingress / PKI"
+title: "ADR 0005 — OpenShift rebuild network, ingress, PKI, IPv6 baseline"
+description: "The disconnected-rebuild network design: a /16 machine network, a reserved /24 for OpenShift nodes and VIPs, PowerDNS authority, HAProxy out of the cluster ingress path, offline OpenSSL day-zero CA, and IPv4-only OVN-K."
+sidebar_label: "0005 — Network / Ingress / PKI"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+**Date:** 2026-05-08
+**Status:** Accepted. *§IPv6 amended by [ADR 0026](#references) for OVN-Kubernetes clusters.*
+
+## Context
+
+The clean v6 rebuild preserves the lab's existing hybrid OpenShift pattern: **three VM control-plane nodes plus physical worker nodes**, installed in **disconnected mode** because external internet access is slow and unreliable in this lab. Several repeatable risks from the previous lab cycle had to be designed out before the first install command ran:
+
+- **Public and private lab addressing kept colliding.** The same `/24` range had been used for "OpenShift VIPs" and for "lab helpers" (proxies, ingress, ad-hoc test VMs). Reusing the same range meant any new lab service had a non-zero chance of stealing an OpenShift VIP at the worst possible moment.
+- **Helper ingress / proxy addresses overlapped node and VIP addresses.** When the helper proxy was added after the OpenShift install, IP allocation was ad hoc; collisions happened.
+- **OpenShift route and console exposure had been chained through HAProxy.** This created two HAProxy frontends doing the same thing (HAProxy → OpenShift ingress → cluster route → app) and made console outages worse, because HAProxy reconfigurations could break the console while operators tried to fix the cluster.
+- **DNS records were created post-install** when operators noticed they were missing. Bootstrap controllers depend on `api`, `api-int`, `*.apps`, and node hostnames resolving correctly during install; doing this lazy fails the install.
+- **Internal certificates were needed before Vault was a dependable service.** Day-zero needs a CA that already exists, not one that needs to be built from a not-yet-running Vault.
+- **IPv6 had been left half-enabled** on the previous baseline. Some interfaces had link-local addresses, the default IPv6 route was unset, and OpenShift install inputs didn't say "v4-only." Half-enabled IPv6 caused intermittent reachability problems.
+
+This ADR fixes those choices before any install media is built.
+
+## Decision
+
+### Topology
+
+<Whiteboard client:load data={{ nodes: [
+  { id: "wan",   position: { x: 360, y: 0   }, data: { label: "WAN /\npublic DNS" }, style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" } },
+  { id: "edge",  position: { x: 360, y: 130 }, data: { label: "HAProxy edge VM\n(VM-services only)" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 } },
+  { id: "pdns",  position: { x: 120, y: 130 }, data: { label: "PowerDNS\nauth + recursor" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 } },
+  { id: "lab",   position: { x: 360, y: 280 }, data: { label: "Private lab L3\n30.30.0.0/16" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "ocp",   position: { x: 360, y: 420 }, data: { label: "OpenShift allocation\n30.30.75.0/24\n(nodes + VIPs + bootstrap)" }, style: { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" } },
+  { id: "api",   position: { x: 80,  y: 560 }, data: { label: "api / api-int VIP" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" } },
+  { id: "ing",   position: { x: 280, y: 560 }, data: { label: "ingress VIP\n(*.apps internal)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" } },
+  { id: "router",position: { x: 480, y: 560 }, data: { label: "OpenShift router\n(no HAProxy in front)" }, style: { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "pub",   position: { x: 680, y: 560 }, data: { label: "Public IngressController\n(optional, separate VIP)" }, style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+], edges: [
+  { id: "e1", source: "wan", target: "edge",  label: "TLS termination for VM services", style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "e2", source: "edge", target: "lab", label: "backend → VM-hosted apps only", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "e3", source: "pdns", target: "lab", label: "authoritative for sub.comptech-lab.com", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "e4", source: "lab", target: "ocp",  label: "machineNetwork = /16", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "e5", source: "ocp", target: "api",  style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "e6", source: "ocp", target: "ing",  style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "e7", source: "ing", target: "router", label: "VIP terminates at router", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "e8", source: "router", target: "pub", label: "separate public ingress (opt-in)", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+] }} height={720} />
+
+The HAProxy edge VM **does not sit in front of the OpenShift router**. It serves the VM-hosted services (Jenkins, SigNoz, Nexus, Grafana, DefectDojo). OpenShift console and OpenShift application routes terminate at the cluster ingress VIP and the OpenShift router directly.
+
+### Addressing
+
+OpenShift cluster addressing uses the existing private lab L3 network `30.30.0.0/16`, with **`30.30.75.0/24` reserved as the OpenShift address allocation range**.
+
+- Configure OpenShift node interfaces as `30.30.75.x` with mask `/16` and gateway `30.30.0.1` (the lab router).
+- In `install-config.yaml`, set `machineNetwork` to `30.30.0.0/16` (the routed network), not `30.30.75.0/24`. The `/24` is an *allocation* range within the larger machine network.
+- Reserve per-cluster allocations from the `30.30.75.0/24` range for OpenShift nodes, API VIPs, ingress VIPs, and bootstrap/install-time addresses. Write the allocation table into a plan file before any install starts.
+- **Do not place GitLab, MinIO, Nexus, RKE2, helper proxies, or unrelated lab services in `30.30.75.0/24`.** Those services have their own allocations in `30.30.0.0/16` outside the OpenShift range.
+- Do not overlap two OpenShift clusters on the same IPs. If `30.30.75.0/24` cannot hold all required node and VIP allocations for an additional cluster, reserve another allocation range inside `30.30.0.0/16` or introduce a routed/VLAN subnet before install.
+- Do not describe the design as "`30.30.75.0/16`." With a `/16` mask the actual network is `30.30.0.0/16`. The `/24` is the allocation range, not a separate routed subnet.
+
+### DNS
+
+DNS is platform-owned and explicit, not best-effort:
+
+- **PowerDNS is the primary lab DNS authority** for OpenShift records. The PowerDNS VM serves both authoritative (the auth zone for `sub.comptech-lab.com`) and recursive (forwarder for the lab) on a single host.
+- PowerDNS forwarders point at `8.8.8.8` (and equivalents) for external lookups. Internal zone lookups are resolved authoritatively without leaving the lab.
+- Before any install, create and validate the following records for each cluster:
+  - `api.<cluster>.<base-domain>` (API VIP)
+  - `api-int.<cluster>.<base-domain>` (API internal VIP)
+  - `*.apps.<cluster>.<base-domain>` (ingress wildcard → ingress VIP)
+  - bootstrap host name
+  - per-node hostnames
+- Validate the records **from the places controllers will run**, not just from the operator's workstation. Bootstrap controllers do their own lookups.
+- Do not rely on public DNS alone for cluster internal install and operations.
+
+### HAProxy
+
+**HAProxy is not part of the OpenShift console or route exposure design.**
+
+- Do not use HAProxy for OpenShift console access.
+- Do not use HAProxy to expose OpenShift application routes.
+- Console access uses the OpenShift router through the cluster ingress VIP and the internal apps domain.
+- Application routes use OpenShift IngressController / router directly.
+- If public route exposure is required, create a **separate public IngressController** and a **separate public apps domain**, with a dedicated public address / VIP routed from the lab bridge to OpenShift ingress. Route admission and selectors should control which workloads can use that public ingress path.
+
+### PKI
+
+Certificate management starts simple and disconnected-friendly:
+
+- Use an **offline OpenSSL root CA plus an intermediate CA** for day-zero internal lab certificates. The root key is offline; the intermediate signs everything in the lab.
+- Commit **public CA certificates and metadata only**. Never commit CA private keys, service private keys, kubeconfigs, pull secrets, tokens, or PATs.
+- **Vault PKI is acceptable later** as an online intermediate automation layer — after Vault itself is stable, backed up, and recoverable.
+- **Do not make Vault PKI a day-zero dependency** for installing or recovering the first OpenShift cluster. The lab needs to be able to bring up a cluster without Vault.
+
+Public TLS uses DNS-validated automation:
+
+- Use **Let's Encrypt DNS-01** for the public OpenShift ingress domain when public routes are enabled.
+- Prefer wildcard or default ingress certificates managed through a DNS API automation flow.
+- Keep DNS API tokens in GitHub secrets, Vault, or another approved secret store. Never in Git, wiki pages, issues, or session reports.
+
+### IPv6 (amended by ADR 0026)
+
+The original decision was **IPv4-only at install**, with host IPv6 disabled at the kernel level. After the #135 incident on 2026-05-10 — where both kernel-arg and sysctl drop-in mechanisms broke OVN-Kubernetes — that approach is no longer correct.
+
+The current (post-0026) rule for OVN-Kubernetes clusters is:
+
+- IPv6 stays enabled on hosts. **OVN-K needs the kernel IPv6 stack present.**
+- The four verifiable invariants are framed as *"IPv6 not used for cluster traffic"* rather than *"IPv6 not present on hosts."*
+- See [ADR 0026](#references) for the full invariant set.
+
+For non-OVN-K nodes (the HAProxy edge VM, PowerDNS, Jenkins, the cluster of standalone lab service VMs), the original IPv4-only host baseline can still apply.
+
+## Alternatives considered
+
+**Put everything behind HAProxy, including OpenShift console.** Operationally simpler in the moment — one ingress to manage. Rejected because:
+
+- Two HAProxy frontends for the same path doubled the chances of a misconfigured frontend taking the console down.
+- During a cluster ingress issue, operators had to debug both HAProxy and the cluster router; this often masked the actual problem.
+- Public exposure for the OpenShift console is rare; most operators use the internal `*.apps` domain. The cost of a separate public IngressController for the few routes that need it is small.
+
+**Use a single `/24` for both `machineNetwork` and node/VIP allocation.** Mathematically simpler — `30.30.75.0/24` is both the routed network and the OpenShift range. Rejected because the lab has other services in `30.30.0.0/16` (MinIO host, Vault VM, the bridge router, the PowerDNS host, the HAProxy edge, the various VM lab services) that need to route to OpenShift, and the lab router serves `30.30.0.0/16` as one L3 segment. Splitting OpenShift into its own `/24` routed-subnet would require additional L3 hops and a router-config change the lab doesn't currently want.
+
+**Skip PowerDNS, use a `/etc/hosts` overlay or use public DNS for `*.apps`.** Cheapest setup. Rejected because the cluster install can't write `/etc/hosts` on bootstrap controllers, and public DNS is unreliable for an air-gapped install. PowerDNS authoritative + recursor on one VM is the minimum acceptable DNS authority.
+
+**Use cert-manager + ACME (HTTP-01) for the internal CA from day zero.** Convenient if everything is already running. Rejected because cert-manager needs cluster-up-and-running before it can issue certificates, and the install needs certs at bootstrap. Day-zero must use a pre-existing offline OpenSSL CA. cert-manager becomes the operational layer for renewals and rotations *after* the cluster is up.
+
+## Consequences
+
+- **The rebuild plan must include an IP / MAC / VIP allocation table** before any OpenShift install starts. The table is the single source of truth for which addresses go to which node, VIP, and standalone service.
+- **`install-config.yaml`, DNS seed scripts, VM provisioning scripts, and validation checks** must use `30.30.0.0/16` as the actual machine network, `30.30.75.0/24` as the reserved OpenShift allocation, and `30.30.0.1` as the gateway.
+- **PowerDNS zone setup is a rebuild prerequisite, not a post-install cleanup task.** The DNS validation script (`validate-records-from-bootstrap.sh` in the rebuild plan) must run successfully before any install media boots.
+- **Any old HAProxy console/route exposure snippets in imported scripts are historical helpers only.** They must be deleted or explicitly rewritten for non-OpenShift lab services before they ship in any current playbook.
+- **Internal OpenSSL CA material must have an offline backup and a documented rotation process** before it is used broadly. The lab does not yet have a periodic rotation drill; that drill is a separate piece of work.
+- **Public ingress requires a separate design gate** for address ownership, firewall/NAT policy, route selectors, Let's Encrypt DNS-01 automation, and certificate validation. Don't enable public exposure ad hoc.
+- **IPv6 disablement on hosts is no longer the rule for OVN-K nodes.** The OVN-K baseline (per [ADR 0026](#references)) replaces the original "disable IPv6 in host networking" line. For non-OVN-K VMs the original IPv4-only host baseline still applies.
+- **Lab memory has a guardrail** noting "HAProxy is for platform VM edge exposure only" (`feedback_haproxy_scope.md` in operator memory). Any agent or operator who proposes putting an OpenShift route behind HAProxy is reminded of this ADR.
+
+## References
+
+- Source: `codex-opp-agent/adr/0005-openshift-rebuild-network-ingress-pki.md`
+- IPv6 amendment: `codex-opp-agent/adr/0026-ipv6-baseline-for-ovn-kubernetes.md`
+- HAProxy edge VM operating notes: see §4 of this site
+- PowerDNS VM operating notes: see §4 of this site
+- Rebuild plan: `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/`
+- HAProxy-scope memory entry: `feedback_haproxy_scope.md`

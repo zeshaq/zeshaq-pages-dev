@@ -1,8 +1,102 @@
 ---
-title: "ADR 0008 — WSO2 Standalone"
-description: "Section 06-architecture-decisions: ADR 0008 — WSO2 Standalone (placeholder)."
-sidebar_label: "ADR 0008 — WSO2 Standalone"
+title: "ADR 0008 — WSO2 APIM and Identity Server as standalone VMs"
+description: "Reintroduce WSO2 IS 7.2.0.26 and APIM 4.7.0 as two standalone Ubuntu cloud-init VMs, exposed through HAProxy and PowerDNS, with explicit OIDC nonce-cookie and check-session handling for split portal hosts."
+sidebar_label: "0008 — WSO2 standalone"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-08
+**Status:** Accepted.
+
+## Context
+
+The old WSO2 Identity Server and distributed WSO2 API Manager VM stack — historical VMs, PostgreSQL master/replica pairs, distributed-deployment scripts, OpenShift identity links — was **intentionally decommissioned** during the v6 rebuild preparation. Those artifacts are not active target state. They can be read for troubleshooting lessons but not copied forward.
+
+The operator has now explicitly **reintroduced** WSO2 APIM and WSO2 Identity Server as a new standalone VM requirement, and has provided local all-in-one product packages under `/home/ze/Software`:
+
+- `wso2am-4.7.0.zip` (WSO2 API Manager all-in-one)
+- `wso2is-7.2.0.26.zip` (WSO2 Identity Server)
+
+This work must not overlap with the core disconnected OpenShift rebuild, the Kafka KRaft VM track, the Vault OSS VM track, or the Redis/Sentinel hardening track ([ADR 0006](/docs/06-architecture-decisions/06-adr-0006-redis-sentinel-hardening)). It is its own side-track with its own milestone and its own VM allocations.
+
+## Decision
+
+Create a dedicated WSO2 APIM / Identity VM milestone and tracker before any live execution.
+
+Deploy WSO2 APIM and WSO2 Identity Server as **two standalone Ubuntu cloud-init VMs** on the lab `br30` bridge:
+
+- `wso2-is-0` — WSO2 Identity Server.
+- `wso2-apim-0` — WSO2 API Manager (all-in-one profile).
+
+Use the local product packages from `/home/ze/Software`. Do not depend on RKE2, OpenShift-hosted charts, the old distributed APIM scripts, or retired PostgreSQL nodes for the initial deployment.
+
+VM allocations are deterministic and recorded in the WSO2 VM plan before VM creation (specific IPs and MAC addresses kept in `codex-opp-agent/connection-details/` because they are internal-only). The intended public DNS names are:
+
+- `wso2-is-0.sub.comptech-lab.com` — IS direct VM name.
+- `wso2-apim-0.sub.comptech-lab.com` — APIM direct VM name.
+- `is.apps.sub.comptech-lab.com` — WSO2 IS user-facing.
+- `apim.apps.sub.comptech-lab.com` — APIM management / carbon endpoint.
+- `publisher.apps.sub.comptech-lab.com` — APIM publisher portal.
+- `devportal.apps.sub.comptech-lab.com` — APIM developer portal.
+- `admin.apps.sub.comptech-lab.com` — APIM admin portal.
+- `gateway.apps.sub.comptech-lab.com` — APIM gateway.
+
+All `*.apps.sub.comptech-lab.com` names go through the lab HAProxy edge VM, terminating TLS on the Let's Encrypt wildcard certificate and forwarding HTTP to the WSO2 VM.
+
+### OIDC / session handling for split portal hosts
+
+WSO2 APIM 4.x serves the publisher and developer portals on separate hostnames from the carbon management endpoint, and that means the OIDC session machinery needs explicit help to work. Two specific HAProxy / WSO2 settings:
+
+- **APIM management/portal session nonce cookies.** `sessionNonceCookie-*` cookies set in responses from the APIM management backend (carbon) must carry `Domain=.apps.sub.comptech-lab.com`. WSO2's nonce check fails otherwise when Publisher starts OAuth on `publisher.apps.sub.comptech-lab.com` and continues authentication on `apim.apps.sub.comptech-lab.com`. HAProxy rewrites the `Set-Cookie` header to add the parent domain attribute.
+- **OIDC check-session origin.** For APIM Publisher and Developer Portal browser settings, keep login redirect/callback URLs on their portal hostnames, but **keep OIDC check-session origin and endpoint on the configured APIM IdP hostname**: `https://apim.apps.sub.comptech-lab.com/oidc/checksession`. The OP browser-session cookies are scoped to the APIM management hostname; using the portal vanity hostnames for the hidden OIDC check-session iframe causes a successful login to be followed by a "session changed" response and a return to the login page.
+
+These two settings are not optional. They are the result of debugging a multi-host OAuth flow that worked on single-host setups but broke on the split-portal hostname pattern this lab wants.
+
+### Super-admin
+
+The requested lab super-admin username is `zahid`. The lab password is stored in **local-only ignored secret custody** under `secrets/` and must not be copied into Git, GitHub, wiki pages, or session reports. The convention enforces operator memory: never echo super-admin credentials to the chat log.
+
+## Alternatives considered
+
+**Put WSO2 back on OpenShift / RKE2 as a Helm install.** The historical pattern. Rejected because:
+
+- The old OpenShift identity-provider link was a long-running source of issues, and the lab does not want to re-couple OpenShift OAuth to WSO2 in the rebuild.
+- WSO2's recommended deployment pattern for these two products on a small footprint is VM-based all-in-one — the Kubernetes Helm charts are designed for larger, distributed deployments.
+- Disconnected OpenShift adds another layer (mirror, ImageDigestMirrorSet, operator subscription) that's not justified for a two-VM lab service.
+
+**Distributed APIM (gateway, key manager, publisher, devportal on separate VMs).** WSO2's reference architecture for production. Rejected for the initial deployment because the lab needs functionality first; distributed APIM can come later if and when traffic demands it. The all-in-one product profile is officially supported for smaller footprints.
+
+**Skip Identity Server, use APIM's built-in user store.** Possible. Rejected because IS is the larger lesson the lab wants to learn — federation, claims mapping, SCIM, OIDC discovery — and APIM-only would leave the OAuth provider half-formed. Two VMs is acceptable cost.
+
+## Phase gates
+
+1. **Scope and milestone.** Accept this ADR. Create the WSO2 milestone and phase issues. Record intended VM allocations and endpoint names.
+2. **Prerequisite validation.** Confirm `/home/ze/Software` package names and checksums. Confirm `br30`, Ubuntu base image, SSH keys, available IPs/MACs, PowerDNS, and HAProxy are ready. Confirm no live VM already uses the proposed names or MACs.
+3. **VM provisioning.** Create the two Ubuntu cloud-init VMs with deterministic names, IPs, MACs. Keep local-only super-admin secret custody under `secrets/`. Install Java and required OS packages.
+4. **WSO2 installation and runtime.** Install WSO2 IS from `wso2is-7.2.0.26.zip`, APIM from `wso2am-4.7.0.zip`. Configure systemd services. Configure the lab super-admin without printing the password.
+5. **Edge exposure.** Add / validate PowerDNS records for direct VM names and the user-facing `*.apps.sub.comptech-lab.com` names. Add narrow HAProxy routes for WSO2 IS, APIM portals, and APIM gateway. Apply the nonce-cookie domain rewrite. Validate endpoint reachability.
+6. **Handoff validation.** Record service status, listening ports, HTTP status checks, and login reachability. Record residual production-readiness risks.
+
+## Guardrails
+
+- This is a standalone WSO2 VM track, not OpenShift desired state.
+- Do not re-enable the old `wso2is` OpenShift identity provider unless the operator explicitly asks for OpenShift OAuth integration.
+- Do not reuse the old distributed APIM DC/DR scripts as authoritative target state.
+- Do not create or depend on old `pg-is-*` or `pg-apim-*` PostgreSQL nodes for the first all-in-one deployment.
+- Do not store WSO2 super-admin passwords, private keys, keystore passwords, client secrets, or generated token material in Git.
+- Keep HAProxy / PowerDNS changes narrowly scoped to the WSO2 hostnames listed above.
+- Keep this milestone independent from Kafka, Vault, Redis, and OpenShift rebuild milestones.
+
+## Consequences
+
+- **WSO2 APIM and WSO2 IS can be rebuilt without colliding with the old retired WSO2 topology.** Hostnames, VM names, and MAC addresses are new; old DR scripts can stay read-only for lessons.
+- **The first deployment is lab / bootstrap oriented** because it uses all-in-one product profiles, internal-CA TLS, and local secret custody.
+- **Production readiness still requires:** external database decisions (move off the bundled H2/embedded stores), keystore / TLS custody (move into Vault), backup / restore (currently nothing), monitoring (Prometheus/SigNoz scrape; see [ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)), identity integration (federate from a real IdP), and upgrade rehearsal — all before dependent OpenShift workloads treat WSO2 as a durable platform dependency.
+
+## References
+
+- Source: `codex-opp-agent/adr/0008-wso2-apim-is-standalone-vms.md`
+- HAProxy and DNS layout: [ADR 0005 — Network / Ingress / PKI](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
+- Day-zero PKI: [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
+- HAProxy edge VM operating notes: §4 of this site

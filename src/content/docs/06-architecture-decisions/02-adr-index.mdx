@@ -1,8 +1,132 @@
 ---
 title: "ADR Index"
-description: "Section 06-architecture-decisions: ADR Index (placeholder)."
+description: "Chronological index of every architecture decision record, with status, one-line summary, and the supersession/refinement graph that ties them together."
 sidebar_label: "ADR Index"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+This page is the flat, chronological list of every accepted ADR in the workspace. The 15 ADRs that have their own pages in this section are linked inline; the rest (tactical workspace policy ADRs that don't get a full public treatment) are noted with a short one-liner and a pointer to the source file.
+
+## Status legend
+
+| Status | Meaning |
+|---|---|
+| **Accepted** | In force. Operating decisions and code must comply. |
+| **Superseded** | An older accepted ADR whose decision has been replaced by a newer accepted ADR. Body remains for historical context. |
+| **Refined by** | Older ADR still in force, but a newer ADR amends a specific section of it. |
+| **Proposed** | Drafted but not yet accepted. Reviewers are still commenting. |
+
+## ADR dependency graph
+
+The graph below shows only the ADRs that constrain or supersede each other. Standalone VM-service ADRs (Redis, WSO2, Jenkins, SigNoz, monitoring, DefectDojo) are independent of each other and are not drawn — they all sit at the same level as "VM-hosted lab platform services."
+
+export const root = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const node = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const superseded = { background: "#fef3c7", border: "1px dashed #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const solid = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const refines = { style: { stroke: "#15803d", strokeWidth: 1.5, strokeDasharray: "5,5" }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const supersedes = { style: { stroke: "#b45309", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b45309" }, labelStyle: { fill: "#b45309", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const graphNodes = [
+  { id: "a0001", position: { x: 0,   y: 0   }, data: { label: "ADR 0001\nOperator workspace\n(cluster list superseded)" }, style: superseded },
+  { id: "a0022", position: { x: 280, y: 0   }, data: { label: "ADR 0022\nv6 fleet membership" }, style: root },
+  { id: "a0004", position: { x: 560, y: 0   }, data: { label: "ADR 0004\nHubs stay storage-light" }, style: node },
+  { id: "a0005", position: { x: 0,   y: 140 }, data: { label: "ADR 0005\nNetwork / ingress / PKI" }, style: node },
+  { id: "a0026", position: { x: 280, y: 140 }, data: { label: "ADR 0026\nIPv6 on OVN-K\n(amends 0005 §IPv6)" }, style: node },
+  { id: "a0003", position: { x: 0,   y: 280 }, data: { label: "ADR 0003\nGitOps basic pull\n(historical)" }, style: superseded },
+  { id: "a0018", position: { x: 280, y: 280 }, data: { label: "ADR 0018\nACM + OpenShift GitOps\npull model v6" }, style: root },
+  { id: "a0015", position: { x: 560, y: 280 }, data: { label: "ADR 0015\nFederated GitOps\nrepo architecture" }, style: root },
+  { id: "a0019", position: { x: 280, y: 420 }, data: { label: "ADR 0019\nNexus-only supply chain" }, style: root },
+  { id: "a0016", position: { x: 560, y: 420 }, data: { label: "ADR 0016\nWorkspace execution\ngovernance" }, style: node },
+  { id: "a0020", position: { x: 280, y: 560 }, data: { label: "ADR 0020\nPCI-DSS baseline\nspoke-dc-v6" }, style: node },
+];
+
+export const graphEdges = [
+  { id: "e22-1",  source: "a0022", target: "a0001", label: "supersedes cluster list", ...supersedes },
+  { id: "e26-5",  source: "a0026", target: "a0005", label: "amends §IPv6",            ...refines },
+  { id: "e18-3",  source: "a0018", target: "a0003", label: "supersedes",              ...supersedes },
+  { id: "e18-15", source: "a0018", target: "a0015", label: "constrains",              ...solid },
+  { id: "e20-18", source: "a0020", target: "a0018", label: "depends on",              ...solid },
+  { id: "e20-19", source: "a0020", target: "a0019", label: "depends on",              ...solid },
+  { id: "e20-16", source: "a0020", target: "a0016", label: "governed by",             ...solid },
+  { id: "e15-16", source: "a0015", target: "a0016", label: "governed by",             ...solid },
+  { id: "e19-18", source: "a0019", target: "a0018", label: "lands via",               ...solid },
+];
+
+<Whiteboard client:load data={{ nodes: graphNodes, edges: graphEdges }} height={720} />
+
+Read the graph as: solid black arrow = "this ADR depends on / constrains that ADR," dashed green = "this ADR refines (amends a section of) that ADR," solid amber = "this ADR supersedes that ADR." The two amber-bordered nodes (ADR 0001 cluster-list portion, ADR 0003) are the parts of older ADRs that have been formally superseded.
+
+## Chronological list
+
+### 2026-05-04 — Workspace foundations
+
+- **ADR 0001 — Maintain a local operator workspace.** Status: Accepted (cluster-list portion **superseded by 0022**). Establishes `/home/ze/codex-opp-agent` as the operator's local workspace with `AGENTS.md`, `CLUSTERS.md`, `ASSESSMENT.md`, `RUNBOOK.md`, `TODO.md`, `lab-gitops-full/`, `secrets/`. → [Section page](/docs/06-architecture-decisions/03-adr-0001-cluster-list).
+- **ADR 0002 — Subagent-first workflow.** Status: Accepted. Tactical: when work spans multiple subsystems, multiple clusters, or more than two files, delegate to a subagent rather than execute serially in the main thread. Not a public section page; source: `adr/0002-subagent-first-workflow.md`.
+- **ADR 0003 — GitOps basic pull model.** Status: **Superseded by 0018**. Historical reference for the original `hub-dc` / `spoke-dc` pull model design. Not a public section page; source: `adr/0003-gitops-basic-pull-model.md`.
+
+### 2026-05-05 — Hub design
+
+- **ADR 0004 — Management hubs stay storage-light.** Status: Accepted. Keep LVMS on hubs, remove ODF/NooBaa/OpenShift Pipelines/Tekton-Results/logging/tracing/MinIO/Loki/Tempo from hub desired state. ACM backup goes to external MinIO. → [Section page](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs).
+
+### 2026-05-08 — Rebuild network plus standalone platform services
+
+- **ADR 0005 — OpenShift rebuild network, ingress, PKI, IPv6 baseline.** Status: Accepted; §IPv6 **refined by 0026**. `30.30.0.0/16` machine network, `30.30.75.0/24` reserved for OpenShift addressing, PowerDNS authoritative, no HAProxy in OpenShift ingress, offline OpenSSL CA day-zero, Vault PKI later, IPv4-only at install. → [Section page](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki).
+- **ADR 0006 — Redis Sentinel hardening before application onboarding.** Status: Accepted. Redis stays a VM service; six hardening gates (TLS, ACL/Vault, network, backups, observability, operational resilience) must close before BFSI apps treat Redis as production. → [Section page](/docs/06-architecture-decisions/06-adr-0006-redis-sentinel-hardening).
+- **ADR 0007 — Kafka KRaft production readiness.** Status: Accepted. Parallel structure to Redis: Kafka KRaft VM cluster is lab-ready, not production-ready, until hardening gates close. Not a public section page; source: `adr/0007-kafka-kraft-production-readiness.md`.
+- **ADR 0008 — WSO2 APIM and Identity standalone VMs.** Status: Accepted. Reintroduce WSO2 IS 7.2.0.26 and APIM 4.7.0 as two standalone Ubuntu cloud-init VMs (`wso2-is-0`, `wso2-apim-0`), not on RKE2 or OpenShift. → [Section page](/docs/06-architecture-decisions/07-adr-0008-wso2-standalone).
+- **ADR 0009 — Jenkins single VM controller.** Status: Accepted. One Ubuntu 24.04 VM (`jenkins-0`), OpenJDK 21, Jenkins LTS APT repo, HAProxy terminates TLS, Jenkins port 8080 reachable only from HAProxy. → [Section page](/docs/06-architecture-decisions/08-adr-0009-jenkins-single-vm).
+- **ADR 0010 — SigNoz standalone VM observability service.** Status: Accepted. Self-hosted SigNoz v0.122.0 via Docker Compose on a standalone Ubuntu VM (`signoz-0`). OTLP ingestion stays private; only the UI is HAProxy-exposed. → [Section page](/docs/06-architecture-decisions/09-adr-0010-signoz-standalone).
+- **ADR 0011 — Trivy Ubuntu VM scanner service.** Status: Accepted. Standalone Trivy scanner VM, supports DefectDojo (0013) and the federated build path (0015). Not a public section page; source: `adr/0011-trivy-ubuntu-vm-scanner.md`.
+- **ADR 0012 — Monitoring observability learning VM.** Status: Accepted. A second observability stack alongside SigNoz, built component-by-component (Grafana, Prometheus, Alertmanager, Loki, Tempo, Pyroscope, Grafana Alloy, Blackbox Exporter) for learning the primitives. → [Section page](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm).
+- **ADR 0013 — DefectDojo VM security dashboard.** Status: Accepted. DefectDojo 2.58.1 Docker Compose on a standalone Ubuntu VM (`defectdojo-0`), replacing a stale RKE2 backend. Imports Trivy results via API. → [Section page](/docs/06-architecture-decisions/11-adr-0013-defectdojo).
+
+### 2026-05-09 — Federated architecture and v6 management
+
+- **ADR 0014 — Developer readiness platform contract.** Status: Accepted. Defines the contract the platform must offer to application teams (golden paths, image promotion, evidence). Not a public section page; source: `adr/0014-developer-readiness-platform-contract.md`.
+- **ADR 0015 — Federated GitOps repository architecture.** Status: Accepted; constrained by 0018 on OpenShift platform ops. Splits ownership across `openshift-platform-gitops`, `vm-platform-ops`, division app monorepos, division GitOps repos; defines build-once-promote-by-digest model. → [Section page](/docs/06-architecture-decisions/12-adr-0015-federated-gitops).
+- **ADR 0016 — Workspace execution governance.** Status: Accepted. Every task that executes commands, edits files, or touches live systems must have an issue, milestone, phase/gate, and ADR before work begins; every completion gets a closeout in GitHub and local session memory. → [Section page](/docs/06-architecture-decisions/13-adr-0016-oc-mirror) (filename retained for URL stability; content is workspace execution governance).
+- **ADR 0017 — Parallel agent worktree isolation policy.** Status: Accepted. When more than one parallel subagent commits to the same repo, use `isolation: worktree`. Tactical workspace policy; source: `adr/0017-parallel-agent-worktree-isolation.md`.
+- **ADR 0018 — ACM + OpenShift GitOps pull model for v6 management.** Status: Accepted; **supersedes 0003**; constrains 0015. Hub coordinates ACM placement + ApplicationSet; each spoke runs its own Argo CD that pulls from internal GitLab. → [Section page](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull).
+- **ADR 0019 — Nexus-only image supply chain for OpenShift.** Status: Accepted. Three Nexus endpoints — `mirror-registry.*` (oc-mirror only), `docker-group.*` (build pulls), `app-registry.*` (CI pushes). Runtime allowlist, IDMS/ITMS in GitOps. → [Section page](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops) (filename retained for URL stability; content is Nexus-only supply chain).
+
+### 2026-05-10 — Compliance baseline and fleet purge
+
+- **ADR 0020 — PCI-DSS profile compliance baseline for spoke-dc-v6.** Status: Accepted. Compliance Operator `v1.9.0`, `ocp4-pci-dss-4-0` + `ocp4-pci-dss-node-4-0` as primary profiles, custom `workers-storage` ScanSetting, scan desired state in GitOps. → [Section page](/docs/06-architecture-decisions/16-adr-0020-pci-dss-baseline).
+- **ADR 0022 — v6 fleet membership.** Status: Accepted; **supersedes cluster-list portion of 0001**. Active fleet is `hub-dc-v6` + `spoke-dc-v6` only; pre-v6 `hub-dr` / `spoke-dr` decommissioned; `hub-dr-v6` / `spoke-dr-v6` reserved names but not built. → [Section page](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge).
+- **ADR 0023 — Federated GitLab group and repository ownership model.** Status: Accepted. Implementation detail of 0015 on the GitLab side. Source: `adr/0023-federated-gitlab-group-repo-ownership.md`.
+- **ADR 0024 — OpenShift-only platform GitOps repo boundary.** Status: Accepted. Reinforces that `openshift-platform-gitops` contains OpenShift platform state only; VM ops live in `vm-platform-ops`. Source: `adr/0024-openshift-only-platform-gitops-boundary.md`.
+- **ADR 0025 — GitOps-only operations and break-glass policy.** Status: Accepted. Normal OpenShift changes flow through GitOps; `oc`, console, SSH, direct API are break-glass with audit and backport. Source: `adr/0025-gitops-only-operations-break-glass.md`.
+
+### 2026-05-11 — IPv6 reality
+
+- **ADR 0026 — IPv6 baseline for OVN-Kubernetes.** Status: Accepted; **refines 0005 §IPv6**. Host-kernel IPv6 disable breaks OVN-K; the 4 verifiable invariants are "IPv6 not used for cluster traffic" instead of "IPv6 not present on hosts." Source: `adr/0026-ipv6-baseline-for-ovn-kubernetes.md`. The #135 incident on 2026-05-10 — both kernel-arg and sysctl drop-in mechanisms broke OVN-K — drove this revision.
+
+## Supersession and refinement table
+
+| Newer ADR | Older ADR | Relationship | Scope |
+|---|---|---|---|
+| 0018 | 0003 | Supersedes | Whole ADR (pull model for v6) |
+| 0022 | 0001 | Supersedes | Cluster-list portion only; rest of 0001 remains in force |
+| 0026 | 0005 | Refines | §IPv6 only; rest of 0005 (`30.30.0.0/16`, PowerDNS, no HAProxy in OpenShift ingress, OpenSSL CA day-zero) remains in force |
+
+## How to add a new ADR
+
+1. Pick the next monotonic number (`ls codex-opp-agent/adr/ | tail -1`).
+2. Copy the template from this section's [overview page](/docs/06-architecture-decisions/01-overview-how-adrs-work).
+3. Open the review issue in `zeshaq/codex-opp-agent`. Title: "adr: review NNNN <slug>".
+4. Set `## Status: Proposed`. Push to a branch; link the file in the review issue.
+5. Address reviewer comments. When the issue closes "Accepted," edit the file to `## Status: Accepted`, append to the ADR Index issue (`#131`), and merge.
+6. Update `codex-opp-agent/CURRENT_STATE.md`, `SESSION_LOG.md`, and any affected runbook/handbook.
+7. If the new ADR supersedes or refines an older one, append the supersession to the older ADR's `## Status` block and update this index page.
+
+## References
+
+- Every ADR file: `codex-opp-agent/adr/0001-*.md` through `0026-*.md`.
+- ADR Index issue: `zeshaq/codex-opp-agent#131`.
+- Workspace governance rules: ADR 0016.
+- This section's overview page: [Overview: How ADRs Work](/docs/06-architecture-decisions/01-overview-how-adrs-work).

@@ -1,8 +1,64 @@
 ---
-title: "ADR 0004 — Management-only Hubs"
-description: "Section 06-architecture-decisions: ADR 0004 — Management-only Hubs (placeholder)."
-sidebar_label: "ADR 0004 — Management-only Hubs"
+title: "ADR 0004 — Management hubs stay storage-light"
+description: "Why the management hubs keep LVMS only and push ODF, observability stacks, Pipelines, and Tekton Results onto workload clusters."
+sidebar_label: "0004 — Storage-light hubs"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-05
+**Status:** Accepted.
+
+## Context
+
+The fleet has two management hubs in design — an active hub and a passive standby hub for ACM restore. (See [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge): the standby hub has since been decommissioned, but the storage posture decision still binds the active `hub-dc-v6` and any future v6 management hub that re-enters scope.)
+
+During recovery of the standby hub, local LVMS/ODF state turned out to be the dominant operational risk. Several specific failure modes recurred:
+
+- **Stale storage finalizers blocked reconciliation.** Deleted PVCs or StorageClasses hung on namespace/CRD finalizers and stalled storage operators.
+- **LVMS initialized against the wrong device set** before a device selector was added. The operator claimed disks the operator did not own, which then required disruptive cleanup before re-init.
+- **Node-local LVM commands hung** when the master node hosting the LVMS volume group went unresponsive, and the VM itself had to be recovered before LVM commands returned.
+- **NooBaa initialization blocked** on a stuck RBD PVC and a stale `Released` PV that wouldn't reclaim.
+
+The pattern was consistent: hub-local storage operators add a long, fragile chain of dependencies whose primary purpose — backing ACM and a few cluster-local services — does not actually require hub-local block or object storage. ACM backup and restore (`lab-dpa` for general OADP, `acm-dpa` for ACM-specific) write to **external MinIO** with per-cluster buckets and local-only credentials. The hub doesn't need to host the bucket.
+
+After the recovery, an additional check on the active hub found that **RHACS Central depends on LVMS-backed PVCs**. Keeping RHACS Central on the hub therefore requires LVMS on the active hub. The operator preference is to keep LVMS available on *both* hubs for symmetry and to avoid making RHACS migration a precondition for hub rebuilds.
+
+## Decision
+
+Management hubs stay **storage-light, not storage-free**.
+
+The desired-state shape of any v6 management hub is:
+
+- **Keep LVMS** on both `hub-dc-v6` and any future v6 standby. LVMS is the minimum storage operator needed to host RHACS Central PVCs and a few small system PVCs.
+- **Remove ODF/NooBaa** from hub desired state. No Ceph, no object-storage gateway, no RBD/CephFS storage classes on hubs.
+- **Remove OpenShift Pipelines / Tekton Results** from hub desired state. CI runs in Jenkins / GitLab CI on VM runners (see [ADR 0009](/docs/06-architecture-decisions/08-adr-0009-jenkins-single-vm) and [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)); the hub does not need to host Tekton.
+- **Remove logging, tracing, MinIO, Loki, Tempo, observability-test stacks** from hub desired state. These belong on workload clusters or on dedicated VM observability hosts (see [ADR 0010](/docs/06-architecture-decisions/09-adr-0010-signoz-standalone) and [ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)).
+- **Keep RHACS Central as-is on the active hub** using its existing LVMS-backed storage. A future migration may move it, but that migration is not a precondition for the storage-light decision.
+
+Storage-backed observability, demo workloads, ODF, and anything that wants a `ReadWriteMany` PVC belongs on workload clusters (`spoke-dc-v6` and any future workload cluster) unless a future ADR explicitly accepts a hub-local dependency.
+
+## Alternatives considered
+
+**Keep hubs as full-stack OpenShift with ODF, Pipelines, and observability.** The original `hub-dc` baseline. Attractive because it keeps the management surface uniform across hubs and workloads. Rejected because the cost during recovery was material — every storage-operator quirk became a hub-recovery quirk, and `hub-dr` rebuilds were blocked on NooBaa and ODF readiness that didn't actually serve hub function.
+
+**Strip hubs to zero storage operators.** Push RHACS Central onto a workload cluster too. Attractive because it would leave hubs as pure control-plane (ACM, GitOps, RBAC, cert-manager) with no PVCs. Rejected because RHACS Central currently uses LVMS-backed storage on the active hub, and moving it is a separate piece of work with its own evidence requirement — and because LVMS is much cheaper to run than ODF. The "storage-light" middle ground keeps LVMS but removes the heavy storage stacks.
+
+**External NFS or external Ceph mounted into the hub.** Use a network share for all hub-side persistence. Rejected because the lab does not run external NFS or external Ceph for OpenShift mounts; the closest equivalent is the dedicated MinIO host for ACM/OADP backups, which uses an S3 API and is already what `lab-dpa` and `acm-dpa` target.
+
+## Consequences
+
+- **Passive hub recovery is much simpler.** A rebuild focuses on GitOps, ACM/MCE, ACM backup/restore, external backup object storage (MinIO), certificates (cert-manager + internal CA + Let's Encrypt for public routes), RBAC, and security agents (RHACS-secured cluster posture, not Central). Nothing has to wait for NooBaa init or ODF cluster bring-up.
+- **`hub-dr` rebuild no longer requires NooBaa or ODF as a readiness gate.** (Moot now that the standby has been decommissioned per [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge), but the precedent stands for `hub-dr-v6` if/when DR is reintroduced.)
+- **An immediate live prune was applied on 2026-05-05.** Existing hub ODF, OpenShift Pipelines, Tekton Results, logging, tracing, and observability resources were removed. Future reintroduction of any of these on a hub requires a new ADR.
+- **LVMS remains a hub dependency.** It is the one storage operator with which hubs interact, and its operator-side care (selectors, device groups, monitoring) must stay current.
+- **RHACS Central can stay on the active hub without a storage migration.** This is the explicit trade — keep LVMS, don't move RHACS, accept the small ongoing maintenance.
+- **ACM backups, OADP backups, and any "store this externally" use case go to the external MinIO lab service.** Each cluster gets its own bucket; credentials live in operator-only custody under `secrets/`. See [§5](/docs/05-fleet-management) for the ACM backup operating manual.
+
+## References
+
+- Source: `codex-opp-agent/adr/0004-management-only-hubs.md`
+- Active fleet membership: [ADR 0022 — v6 fleet membership](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge)
+- VM observability replacement: [ADR 0010 — SigNoz standalone VM](/docs/06-architecture-decisions/09-adr-0010-signoz-standalone), [ADR 0012 — Monitoring observability learning VM](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)
+- Pipelines / Tekton replacement: [ADR 0009 — Jenkins single VM](/docs/06-architecture-decisions/08-adr-0009-jenkins-single-vm), [ADR 0015 — Federated GitOps](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- Hub operating notes: `codex-opp-agent/connection-details/openshift-hub-dc-v6.md`
