@@ -1,8 +1,203 @@
 ---
 title: "Jenkins Agents"
-description: "Section 02-lab-infrastructure/08-ci-platform-vms: Jenkins Agents (placeholder)."
+description: "The dedicated jenkins-agent-0 build host — tools installed, agent label, inbound WebSocket connection model, and what builds actually run there."
 sidebar_label: "Jenkins Agents"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Jenkins runs CI steps on **build agents**, not on the controller. The lab today has one dedicated agent VM: `jenkins-agent-0`. Every Pipeline that builds an image, runs a Trivy scan, pushes to Nexus, or uploads evidence to MinIO does so on this host. The controller schedules; the agent executes.
+
+This page documents the agent VM, the tool inventory, the agent-label model, and the failure modes that come from building on the controller by accident.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `jenkins-agent-0` |
+| Private FQDN | `jenkins-agent-0.sub.comptech-lab.com` |
+| Agent label | `developer-build` |
+| Connection model | Inbound WebSocket to Jenkins controller |
+| Working directory | Standard Jenkins agent workspace under `/home/jenkins/agent` |
+| Tools (verified 2026-05-09) | Podman `4.9.3`, Buildah `1.33.7`, Skopeo `1.13.3`, Trivy `0.70.0`, MinIO client |
+
+`skopeo` was rechecked on 2026-05-09 and is present at `/usr/bin/skopeo` (this matters because some Pipelines use it for image inspection between build and push). Other standard system tools (`curl`, `jq`, `git`, `tar`, `gzip`) are present from the base Ubuntu install.
+
+## Why a dedicated agent
+
+The controller's JVM is for orchestration — scheduling, UI, plugin reconciliation, REST API, build history. Doing image builds on the controller would:
+
+- Pin its heap during builds and block UI/API responsiveness for everyone.
+- Couple build-tool installs to the controller's package set (and to plugin compatibility).
+- Make the controller's filesystem a noisy neighbor for `/var/lib/jenkins`.
+- Make the controller restart-blast-radius include in-flight builds.
+
+A separate agent isolates all of that. The agent can be reinstalled, upgraded, or replaced without touching the controller.
+
+## Inbound WebSocket model
+
+Modern Jenkins agents connect to the controller over WebSocket — the agent dials out, the controller does not dial in:
+
+```text
+jenkins-agent-0
+   ↓ HTTPS (outbound)
+https://jenkins.apps.sub.comptech-lab.com/
+   ↓ WebSocket upgrade
+Jenkins controller (jenkins-0)
+```
+
+Practical consequences:
+
+- **No public inbound port on the agent.** The agent's firewall doesn't need to open a Jenkins port to the wider lab. Agents can sit behind any number of NAT / firewall hops as long as outbound HTTPS to the controller works.
+- **Same path as browser traffic.** The connection rides the same HAProxy edge that human browsers use. One TLS path to manage, one cert.
+- **Agent comes back automatically.** If the controller restarts, the agent retries; the connection re-establishes when the controller is up. Builds queued at the controller resume.
+
+The agent runs the standard Jenkins agent JAR under a `systemd` service (or, in some setups, as a long-lived `inbound-agent.jar` invocation). Authentication is by per-agent secret, configured in the controller and embedded in the agent's connection command.
+
+## The `developer-build` label
+
+Every Pipeline that should run on this agent declares it explicitly:
+
+```groovy
+pipeline {
+  agent { label 'developer-build' }
+  stages {
+    stage('build') { steps { sh 'podman build -t $IMAGE_REF .' } }
+    stage('scan')  { steps { sh 'trivy image --server $TRIVY_URL $IMAGE_REF' } }
+    stage('push')  { steps { sh 'podman push $IMAGE_REF' } }
+  }
+}
+```
+
+Or in scripted Pipeline:
+
+```groovy
+node('developer-build') {
+  checkout scm
+  // build, scan, push, evidence
+}
+```
+
+The label is what binds a build to this agent. Without it, the Pipeline can fall through to executing on the controller (a common footgun when `agent any` is used and the controller is configured with executors).
+
+The recommended baseline:
+
+- **Disable executors on the controller** (`Manage Jenkins → Configure System → # of executors = 0` on the built-in node).
+- **Every Pipeline declares an agent label.** Templates encode this; code review rejects `agent any`.
+- **Add new agent labels for new build classes.** If a future build needs different toolchain pinning (different Java version, different language stack), add a new label and new agent rather than overloading `developer-build`.
+
+## Tool details
+
+| Tool | Version | Role |
+| --- | --- | --- |
+| Podman | `4.9.3` | OCI build runtime; rootless or rootful depending on cgroup setup |
+| Buildah | `1.33.7` | Fine-grained OCI image construction; used by some Pipelines instead of `podman build` |
+| Skopeo | `1.13.3` | Image copy/inspect between registries; metadata queries |
+| Trivy | `0.70.0` (client) | Scan client; talks to the Trivy server VM in client/server mode |
+| MinIO client | (`mc` from the standard distribution) | Upload Trivy reports + release evidence to the developer evidence bucket |
+
+The Trivy client version on the agent should track the Trivy server's compatible client window. If the server is upgraded, recheck the agent. Same applies to Podman/Buildah/Skopeo: keeping them within the lifecycle window of the Ubuntu LTS base is the operational discipline.
+
+## What an actual build looks like
+
+A representative `openliberty-readiness-probe-image-build` execution, agent-side:
+
+1. **Workspace prep.** Agent receives the build request; workspace dir under `/home/jenkins/agent` is initialized.
+2. **SCM checkout.** Git clone of the GitLab project via the per-project read-only deploy token credential.
+3. **Build tag computation.** Pipeline sets `IMAGE_TAG=build-$(env.BUILD_NUMBER)` (or a Git SHA variant).
+4. **Login.** `podman login docker-group.apps.sub.comptech-lab.com` and `podman login app-registry.apps.sub.comptech-lab.com` using `nexus-jenkinsbot`.
+5. **Build.** `podman build` runs the Containerfile, pulling base layers from `docker-group.*`.
+6. **Scan.** `trivy image --server https://trivy.apps... --token $TRIVY_SERVER_TOKEN --severity HIGH,CRITICAL --exit-code 1 $IMAGE_REF`. If non-zero, stop and fail.
+7. **Push.** `podman push $IMAGE_REF` to `app-registry.*`. Capture digest.
+8. **Evidence upload.** `mc cp` the Trivy report, the digest record, and the build metadata to MinIO `developer-ci-evidence/<job>/<build-N>/`.
+9. **Status update.** Pipeline reports back to the controller; controller updates GitLab commit status.
+
+This is what's verified end-to-end on 2026-05-09 for both starter jobs.
+
+## Validation
+
+```bash
+# SSH to the agent
+ssh ze@jenkins-agent-0.sub.comptech-lab.com
+
+# Verify tool versions
+podman version --format '{{.Client.Version}}'
+buildah --version
+skopeo --version
+trivy --version
+mc --version
+
+# Verify the Jenkins agent service is running
+systemctl status jenkins-agent
+```
+
+The Jenkins UI also exposes per-agent health under `Manage Jenkins → Nodes`. The agent should show Online with the `developer-build` label attached. If it shows Offline, that's the WebSocket connection — investigate from the agent side (`systemctl status`, controller URL reachable, secret correct).
+
+## Operational guidance
+
+- **Don't install random tools on the agent.** Every addition expands the build attack surface and the version-pinning matrix. New tool requests go through the CI/CD maintainer group.
+- **Keep agent host firewall narrow.** Outbound HTTPS to the controller, the lab Nexus, the Trivy server, and MinIO; inbound limited to SSH from the lab `/16`. Nothing else.
+- **Use rootless Podman where possible.** Tradeoff: some Containerfile patterns (cgroup-sensitive setups, certain `RUN` invocations needing root capabilities) require rootful. The lab default is whatever the upstream Podman package configures by default for Ubuntu 24.04 LTS.
+- **Cache layers, don't share them.** Pull-through caching via `docker-group.*` is the layer cache; don't sync workspace layers between agents.
+- **Monitor disk on the agent.** Podman's storage grows during builds. The agent's workspace partition needs cleanup if it fills (built images can be garbage-collected with `podman system prune` on a schedule).
+
+## Failure modes
+
+### Symptom: agent shows Offline in Jenkins UI
+
+**Root cause.** WebSocket connection from agent to controller is broken — TLS error, controller restart not completing, agent secret rotated without updating the agent.
+
+**Fix.** `systemctl status jenkins-agent` on the agent. Check the agent's log for the actual error. Reach the controller URL from the agent host. Re-fetch the agent secret if rotation happened.
+
+**Prevention.** Don't rotate the agent secret without updating the agent.
+
+### Symptom: build runs but slowly; controller dashboard shows the build's stage live but with long pauses
+
+**Root cause.** Network throughput between the agent and the registry, or the Trivy server, is bottlenecked. Sometimes a NIC flap or a transient lab network issue.
+
+**Fix.** Time the long step manually (`podman pull` from the agent shell). If consistently slow, escalate to network.
+
+**Prevention.** Baseline build durations; alert on outliers.
+
+### Symptom: build runs on the controller instead of the agent
+
+**Root cause.** Pipeline uses `agent any` or doesn't declare an agent block; controller has executors enabled.
+
+**Fix.** Add `agent { label 'developer-build' }`. Disable executors on the controller.
+
+**Prevention.** Enforce template usage; code review for new Pipelines.
+
+### Symptom: `podman build` fails with "no space left on device" mid-build
+
+**Root cause.** Agent workspace partition full or Podman storage driver hit a limit.
+
+**Fix.** SSH to the agent, `podman system prune --force` to reclaim unused build caches, retry the build.
+
+**Prevention.** Schedule `podman system prune --force --filter "until=24h"` weekly on the agent.
+
+### Symptom: Trivy scan from the agent times out
+
+**Root cause.** Trivy server is busy (DB update in progress) or unreachable.
+
+**Fix.** Check Trivy server health. Pause builds during the DB refresh window if persistent.
+
+**Prevention.** Monitor Trivy server response time.
+
+## Future agents
+
+The current single agent suffices for the current build cadence. Conditions that would justify additional agents:
+
+- **Concurrency.** Multiple apps building in parallel and queuing waits become noticeable.
+- **Tool divergence.** A build class needs a fundamentally different toolchain (e.g., a Node.js LTS not aligned with the Ubuntu LTS the current agent runs).
+- **Trust boundaries.** Builds from untrusted sources should not share a host with builds that have access to platform credentials (the future "protected runner classes" model in GitLab applies here too).
+- **Hardware affinity.** GPU-using builds (rare in this lab) need separate hosts.
+
+When that day comes, add a new agent VM with a new label and bind specific Pipelines to it; don't add executors to the controller.
+
+## References
+
+- `codex-opp-agent/connection-details/jenkins.md` — current service, agent details, validation.
+- `codex-opp-agent/adr/0009-jenkins-single-vm.md` — single-VM controller decision.
+- `codex-opp-agent/runbooks/jenkins-gitlab-webhook-pollscm.md` — Pipeline trigger gotcha (relevant because misconfigured triggers re-route to controller).
+- [Jenkins controller page](./01-jenkins-single-vm) — the host side of the relationship.
+- [Trivy VM page](./03-trivy-vm) — the scan target.

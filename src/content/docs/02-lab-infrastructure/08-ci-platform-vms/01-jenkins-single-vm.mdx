@@ -1,8 +1,257 @@
 ---
-title: "Jenkins (single VM)"
-description: "Section 02-lab-infrastructure/08-ci-platform-vms: Jenkins (single VM) (placeholder)."
-sidebar_label: "Jenkins (single VM)"
+title: "Jenkins (Single VM Controller)"
+description: "The lab Jenkins controller — single-VM design, exposure via HAProxy, version, runtime, credential store, and where it sits in the build → scan → push pipeline."
+sidebar_label: "Jenkins VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  { id: "dev",       position: { x: 0,   y: 0   }, data: { label: "Developer" }, style: extBox },
+  { id: "gitlab",    position: { x: 220, y: 0   }, data: { label: "GitLab CE\n(internal LAN endpoint)" }, style: ctrlBox },
+  { id: "jenkins",   position: { x: 440, y: 0   }, data: { label: "Jenkins controller\njenkins-0 (single VM)" }, style: ctrlBox },
+  { id: "agent",     position: { x: 440, y: 150 }, data: { label: "Build agent\njenkins-agent-0\nlabel: developer-build" }, style: agentBox },
+  { id: "group",     position: { x: 220, y: 300 }, data: { label: "docker-group.apps.*\n(base-image pulls)" }, style: dataBox },
+  { id: "trivy",     position: { x: 440, y: 300 }, data: { label: "Trivy server VM\n(scan gate)" }, style: ctrlBox },
+  { id: "appreg",    position: { x: 660, y: 300 }, data: { label: "app-registry.apps.*\n(immutable push)" }, style: dataBox },
+  { id: "minio",     position: { x: 440, y: 450 }, data: { label: "MinIO\ndeveloper-ci-evidence" }, style: dataBox },
+];
+
+export const edges = [
+  { id: "d-g",  source: "dev",     target: "gitlab",  label: "push", ...reqEdge },
+  { id: "g-j",  source: "gitlab",  target: "jenkins", label: "notifyCommit webhook", ...reqEdge },
+  { id: "j-a",  source: "jenkins", target: "agent",   label: "schedules build", ...muted },
+  { id: "a-gr", source: "agent",   target: "group",   label: "pull base", ...pullEdge },
+  { id: "a-t",  source: "agent",   target: "trivy",   label: "client/server scan", ...reqEdge },
+  { id: "a-r",  source: "agent",   target: "appreg",  label: "push :build-N", ...reqEdge },
+  { id: "a-m",  source: "agent",   target: "minio",   label: "evidence", ...muted },
+];
+
+Jenkins is the lab's CI controller. It is deliberately a **single VM** today (ADR 0009): one Ubuntu cloud-init host, one Jenkins controller process under systemd, one dedicated build agent. The design is "minimum supporting automation," not "production CI dependency." Several gates separate the current state from production-ready CI — backup/restore, plugin governance, Vault-backed credential delivery, and job-as-code — and those are tracked as discrete hardening items.
+
+This page covers the controller VM, its exposure, its runtime, and its place in the build pipeline. Agent-specific content lives on the [agents page](./02-jenkins-agents).
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={620} />
+
+The path a build follows:
+
+1. A developer pushes to GitLab.
+2. GitLab's webhook fires `notifyCommit` at Jenkins.
+3. Jenkins schedules a build on the `developer-build`-labelled agent.
+4. The agent pulls base images via `docker-group.*`, builds the image locally, scans it via Trivy client/server mode, pushes the immutable tag to `app-registry.*`, and uploads evidence to MinIO.
+5. Status flows back to GitLab via the build's commit-status update.
+
+The controller itself does not execute build steps in the controller JVM — they run on the agent — which is why this is a single-controller design but not a single-process design.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `jenkins-0` |
+| Private FQDN | `jenkins-0.sub.comptech-lab.com` |
+| Private alias | `jenkins.sub.comptech-lab.com` |
+| Public hostname | `https://jenkins.apps.sub.comptech-lab.com/` |
+| Direct debug URL | `http://jenkins-0.sub.comptech-lab.com:8080/` |
+| HAProxy backend | `jenkins-vm-be` → Jenkins VM `:8080` (private bind in lab `/24`) |
+| TLS terminator | HAProxy edge VM, LE wildcard `*.apps.sub.comptech-lab.com` |
+| Jenkins version | `2.555.1` (LTS) |
+| Runtime | OpenJDK 21 |
+| Jenkins home | `/var/lib/jenkins` on dedicated data disk |
+| Package source | Upstream Jenkins LTS `debian-stable` apt repo |
+| Default admin user | bootstrap account in local custody, **not** for routine jobs |
+
+## Why a single VM
+
+Per ADR 0009: the user requested a single Ubuntu cloud-init VM, exposed through the usual PowerDNS/HAProxy/LE pattern. Jenkins is a supporting service, not the platform. The decision deliberately rejects:
+
+- **Jenkins-as-Pod inside OpenShift.** That would couple Jenkins's availability to the cluster, double-bind credentials, and complicate the case where Jenkins must build images destined for that same cluster.
+- **Jenkins HA (controller-pair + shared filesystem).** Out of scope for the lab; backup/restore is the resilience model rather than active HA. Roadmap item.
+- **Jenkins-managed Kubernetes agents.** The current single dedicated VM agent is enough for the current build cadence; Kubernetes agents add complexity not yet justified.
+
+## Exposure model
+
+```text
+Developer browser
+   ↓ HTTPS
+https://jenkins.apps.sub.comptech-lab.com/
+   ↓ HAProxy 443 (LE wildcard, SNI route on hostname)
+HAProxy private bind → jenkins-0 in lab /24 :8080
+   ↓ plain HTTP inside the lab /24
+Jenkins controller (8080)
+```
+
+HAProxy's `jenkins-vm-be` backend points at the Jenkins VM's port `8080`. The VM's firewall allows `8080` only from the HAProxy private bind address; the broader lab `/24` cannot reach Jenkins port `8080` directly. SSH on the VM is open to the lab `/16`.
+
+Agents use **inbound WebSocket** to reach the controller. This means no public inbound agent port is needed and no firewall hole has to be punched specifically for agent connections — the agent dials the controller over the same HTTPS path.
+
+## Credential store
+
+Jenkins's built-in credential store holds the credentials CI jobs need. Current contents (as of 2026-05-09):
+
+| Credential ID | Type | Purpose |
+| --- | --- | --- |
+| `nexus-jenkinsbot` | Username/password | Pull base images from `docker-group.*`; push to `app-registry.*` |
+| `gitlab-openliberty-readiness-probe-read` | Username/password | Read-only deploy token for the starter GitLab project |
+| `gitlab-demo-smoke-read` | Username/password | Read-only deploy token for the `demo-smoke` GitLab project |
+| `trivy-server-token` | Secret text | Bearer token for Trivy server scan calls |
+| `minio-developer-ci-evidence` | Username/password | Scoped writer for the developer CI evidence bucket |
+
+The bootstrap admin credential is in local custody (Git-ignored, mode-restricted) and is reserved for administration and recovery. Routine jobs use named, least-privilege credentials.
+
+Move-to-Vault is a roadmap item per ADR 0009. The intent is to keep durable secrets in Vault and use the Vault Jenkins plugin (or ESO-like patterns) for delivery. Until then, the credential store is the system of record.
+
+## Jenkins job inventory (current state)
+
+The active validated jobs as of 2026-05-09:
+
+| Job | Source repo | Builds an image of | Target |
+| --- | --- | --- | --- |
+| `openliberty-readiness-probe-image-build` | `divisions/sandbox/openliberty-readiness-probe` | Open Liberty readiness probe | `app-registry.*/smoke/readiness-probe` |
+| `demo-smoke-image-build` | `divisions/sandbox/demo-smoke` | Generic demo smoke service | `app-registry.*/demo/demo-smoke` |
+
+Both jobs pull from `docker-group.*`, build, run Trivy scan (`HIGH,CRITICAL` fail), push to `app-registry.*`, and upload Trivy + release evidence to MinIO bucket `developer-ci-evidence`.
+
+The starter Pipeline template lives at `codex-opp-agent/examples/jenkins/Jenkinsfile.nexus-app` and is the recommended starting point for new app jobs.
+
+## Webhook model (GitLab → Jenkins)
+
+GitLab pushes to `main` trigger Jenkins via the Git plugin's `notifyCommit` endpoint:
+
+```text
+http://jenkins.apps.sub.comptech-lab.com/git/notifyCommit?url=<repo-url>
+```
+
+The webhook is **un-authenticated** by URL but requires the configured project access token at the Jenkins job level. Each app has a per-job `notifyCommit` access token (custody under `secrets/jenkins/git-notifycommit-demo-smoke-token.json` and similar). The token is what proves the webhook came from the right side.
+
+The validated flow (2026-05-09):
+
+- GitLab project `divisions/sandbox/demo-smoke` has a `main` push webhook to Jenkins.
+- Jenkins job `demo-smoke-image-build` has the effective Pipeline SCM trigger property.
+- A GitLab commit triggers Jenkins build without a manual build call.
+- The job runs end-to-end on `jenkins-agent-0`.
+
+The webhook runbook (`runbooks/jenkins-gitlab-webhook-pollscm.md`) documents how to set the trigger correctly with Pipeline SCM jobs in particular — the trigger property must be on the Pipeline-from-SCM definition, not on the job's parent properties, or the webhook will not fire.
+
+## Quick validation
+
+```bash
+# DNS
+dig @<lab-dns> jenkins-0.sub.comptech-lab.com A +short
+dig @<lab-dns> jenkins.sub.comptech-lab.com A +short
+dig @<lab-dns> jenkins.apps.sub.comptech-lab.com A +short
+
+# /login reachable (returns 200)
+curl -sSI https://jenkins.apps.sub.comptech-lab.com/login | head -1
+
+# Authenticated who-am-i
+curl --netrc-file ~/.netrc-jenkins -fsS \
+  https://jenkins.apps.sub.comptech-lab.com/whoAmI/api/json | jq .
+
+# Confirm nexus-jenkinsbot credential exists
+curl --netrc-file ~/.netrc-jenkins -fsS \
+  'https://jenkins.apps.sub.comptech-lab.com/credentials/store/system/domain/_/api/json?tree=credentials[id,typeName]' \
+  | jq -r '.credentials[]? | select(.id == "nexus-jenkinsbot") | [.id,.typeName] | @tsv'
+```
+
+Expected:
+
+- All DNS queries succeed.
+- `/login` returns `HTTP/2 200`.
+- `whoAmI` returns the authenticated identity JSON.
+- The credentials API lists `nexus-jenkinsbot` as a username/password credential.
+
+## CLI access
+
+```bash
+curl -fsS -o jenkins-cli.jar \
+  https://jenkins.apps.sub.comptech-lab.com/jnlpJars/jenkins-cli.jar
+
+java -jar jenkins-cli.jar \
+  -s https://jenkins.apps.sub.comptech-lab.com/ \
+  -auth <jenkins-username>:<jenkins-api-token> \
+  who-am-i
+```
+
+Prefer API tokens for CLI use. Passwords on the command line leak through shell history and process listings.
+
+For mutating REST API requests, fetch a crumb first:
+
+```bash
+CRUMB="$(curl --netrc-file ~/.netrc-jenkins -fsS \
+  https://jenkins.apps.sub.comptech-lab.com/crumbIssuer/api/json | jq -r '.crumbRequestField + ":" + .crumb')"
+curl --netrc-file ~/.netrc-jenkins -H "$CRUMB" -X POST \
+  https://jenkins.apps.sub.comptech-lab.com/<path>
+```
+
+## Operational guardrails
+
+Per ADR 0009 + the Jenkins connection-details runbook:
+
+- **Backup/restore is unresolved.** `/var/lib/jenkins` content (jobs, credentials store, plugin state) must be backed up with a tested restore procedure before treating Jenkins as a production dependency. This is a roadmap gate.
+- **Plugin governance is explicit.** Uncontrolled plugin drift can break CI; document plugin install/upgrade decisions; pin versions.
+- **Job-as-code is the goal.** Currently jobs are configured in the UI. Move to JCasC + Pipeline-as-code, or at minimum JobDSL-driven definitions, before scale.
+- **Vault migration of credentials** is the medium-term target. The Jenkins credential store is fine for the lab; production-grade dependency wants delivery from Vault.
+- **Upgrade rehearsal** must be defined before mass-onboarding apps. LTS releases land regularly.
+
+## Failure modes
+
+### Symptom: webhook doesn't trigger a build
+
+**Root cause.** Pipeline SCM trigger property not set on the job, or the webhook URL is missing the access token, or the token is wrong.
+
+**Fix.** Reset the Pipeline SCM trigger property per `runbooks/jenkins-gitlab-webhook-pollscm.md`. Verify the access token in the webhook URL matches the per-job token in Jenkins. Validate with a small commit to the target repo.
+
+**Prevention.** Test the webhook end-to-end as part of new job onboarding.
+
+### Symptom: build runs but cannot pull from docker-group.\*
+
+**Root cause.** `nexus-jenkinsbot` credential missing, expired, or scoped wrong (read-only on the wrong repo).
+
+**Fix.** Verify the credential exists in Jenkins. Verify Nexus user is active. Rotate if needed.
+
+**Prevention.** Credential rotation is a tracked operation; monitor credential age.
+
+### Symptom: build runs but Jenkins controller becomes slow during it
+
+**Root cause.** Build is executing on the controller JVM rather than on the agent. The Jenkins UI accepts running steps on the controller node by default; agent labels must be specified explicitly.
+
+**Fix.** Confirm the Pipeline / job has `agent { label 'developer-build' }` (Declarative) or `node('developer-build') { ... }` (Scripted). Restrict the built-in node to no executors.
+
+**Prevention.** Disable executors on the built-in (controller) node. Make the agent label mandatory in template jobs.
+
+### Symptom: cannot reach Jenkins after a power cycle
+
+**Root cause.** Jenkins service didn't start (Java OOM during startup, plugin failure, or filesystem issue).
+
+**Fix.** SSH to `jenkins-0`, `systemctl status jenkins`, check `/var/log/jenkins`, fix and restart. If a plugin is broken, move it aside and restart.
+
+**Prevention.** Monitor Jenkins startup time; alert on systemd-level failures.
+
+### Symptom: backup question — can we recover Jenkins after a disk failure?
+
+**Root cause.** Today: only by rebuilding the VM and re-onboarding jobs by hand. The backup roadmap is open.
+
+**Fix.** Until backup is wired, keep jobs minimal; put job definitions in source control; rebuild from there if needed.
+
+**Prevention.** Close the backup roadmap item.
+
+## References
+
+- `codex-opp-agent/connection-details/jenkins.md` — current service, credentials, validation.
+- `codex-opp-agent/adr/0009-jenkins-single-vm.md` — single-VM decision.
+- `codex-opp-agent/runbooks/jenkins-gitlab-webhook-pollscm.md` — webhook setup gotcha.
+- `codex-opp-agent/examples/jenkins/Jenkinsfile.nexus-app` — starter pipeline template.
+- [`docker-group` endpoint](../07-image-supply-nexus/03-docker-group-pull-endpoint) and [`app-registry` endpoint](../07-image-supply-nexus/04-app-registry-push-endpoint) — what Jenkins builds against.

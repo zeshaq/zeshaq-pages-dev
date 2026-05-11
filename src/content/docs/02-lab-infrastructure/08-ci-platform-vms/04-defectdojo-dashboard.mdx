@@ -1,8 +1,218 @@
 ---
-title: "DefectDojo Dashboard"
-description: "Section 02-lab-infrastructure/08-ci-platform-vms: DefectDojo Dashboard (placeholder)."
-sidebar_label: "DefectDojo Dashboard"
+title: "DefectDojo (AppSec Dashboard VM)"
+description: "The lab DefectDojo VM — Docker Compose deployment, role as the vulnerability-management UI in front of Trivy reports, secrets hygiene, and the stale RKE2 route it replaces."
+sidebar_label: "DefectDojo"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+DefectDojo is the lab's **AppSec dashboard** — the place where Trivy reports, SBOM findings, and other scan evidence aggregate into engagements, findings get triaged, and trends become visible. Trivy is the scanner; DefectDojo is the way humans (security reviewers, app teams, auditors) consume those scans. They are intentionally separate VMs.
+
+This page covers the DefectDojo VM, the Docker Compose deployment model, the exposure boundary, and the integration contract with Trivy/Jenkins.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `defectdojo-0` |
+| Private FQDN | `defectdojo-0.sub.comptech-lab.com` |
+| Private alias | `defectdojo.sub.comptech-lab.com` |
+| Public hostname | `https://defectdojo.apps.sub.comptech-lab.com` |
+| HAProxy backend | `defectdojo-vm-be` → DefectDojo VM `:8080` (replaces stale RKE2 backend) |
+| TLS terminator | HAProxy edge VM, LE wildcard `*.apps.sub.comptech-lab.com` |
+| OS | Ubuntu 24.04 LTS cloud-init |
+| Runtime | DefectDojo Open Source via Docker Compose, pinned to `2.58.1` |
+| Container variant | Upstream Debian AMD64 images |
+| Data path | Docker volumes on dedicated disk at `/var/lib/docker` |
+| Default admin user | `zahid` (superuser) |
+| Custody | `secrets/defectdojo-vm/auth.env` (admin password + API token, local-only) |
+
+The decision to run DefectDojo as a VM-hosted Docker Compose stack (not the old RKE2 path) is captured in ADR 0013. The historical RKE2 DefectDojo route still had a stale `defectdojo.apps.sub.comptech-lab.com` HAProxy backend pointing at the (decommissioned) RKE2 ingress; that backend returns 503 and is superseded by the VM-backed `defectdojo-vm-be`.
+
+## Why Docker Compose, not Kubernetes
+
+Per ADR 0013 the official upstream installation guidance for DefectDojo Open Source uses Docker Compose. The pinned `docker-compose.yml` from upstream gives a clean, repeatable install that works on a single VM. The project explicitly warns that the stock Compose file is *not production-ready without customization*, which the lab installer overrides:
+
+- Override `DD_SECRET_KEY`, `DD_CREDENTIAL_AES_256_KEY`, database password, admin password.
+- Set external site URL to the lab public hostname.
+- Configure allowed hosts and CSRF trusted origins for the lab edge.
+- Configure proxy/TLS cookie settings to match HAProxy fronting.
+- JIRA webhook secret if/when JIRA integration is wired.
+
+Running it as a VM keeps DefectDojo decoupled from OpenShift cluster state. The vulnerability-management dashboard should not depend on the platform it's auditing.
+
+## Why DefectDojo at all
+
+Trivy is great at producing scan reports. It is not a vulnerability-management product:
+
+- **No de-duplication across scans.** Trivy reports a CVE every time, regardless of whether it's been triaged before.
+- **No engagement model.** A CVE is just a finding; there's no concept of "this is being worked on by team X with target date Y."
+- **No history.** Each scan is a snapshot; trends across scans are the consumer's problem.
+- **No multi-tool aggregation.** SAST tools, SCA tools, dependency scanners, container scanners all produce different formats; somebody has to consolidate.
+
+DefectDojo gives:
+
+- **Findings de-duplication** based on configurable hash semantics.
+- **Engagements** that group scans across time for an asset.
+- **Status tracking** (active, verified, false-positive, mitigated, risk-accepted) with audit trail.
+- **Multi-tool import.** Trivy, Snyk, Anchore, Twistlock, SonarQube, Bandit, Semgrep, plus dozens more.
+- **Dashboards and trend metrics** for AppSec teams and management.
+- **API access** for CI integration.
+
+## Integration with Jenkins/Trivy
+
+The intended pipeline integration:
+
+1. Jenkins finishes the build, scan, and push.
+2. The pipeline POSTs the Trivy JSON report to DefectDojo's import API.
+3. DefectDojo de-duplicates against existing engagements and updates status.
+4. AppSec triages in the DefectDojo UI.
+
+API usage looks like:
+
+```bash
+# Authenticate (one-time token; live token stored as Jenkins credential)
+TOKEN="$(curl -fsS -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"username":"<api-user>","password":"<api-pass>"}' \
+  https://defectdojo.apps.sub.comptech-lab.com/api/v2/api-token-auth/ \
+  | jq -r '.token')"
+
+# Import a Trivy scan report into an engagement
+curl -fsS -X POST \
+  -H "Authorization: Token $TOKEN" \
+  -F "scan_type=Trivy Scan" \
+  -F "file=@trivy-report.json" \
+  -F "engagement=<engagement-id>" \
+  -F "active=true" \
+  -F "verified=false" \
+  https://defectdojo.apps.sub.comptech-lab.com/api/v2/import-scan/
+```
+
+The Jenkins credential holding the API token is created via the standard credential store, never written to job definitions. Per ADR 0013 the token is in local custody under `secrets/defectdojo-vm/`.
+
+This integration is **wired in concept** as of 2026-05-09 (a Trivy-format smoke import has been validated via the API), but the live posting from production Jenkins jobs is part of the DefectDojo VM milestone closeout. The current state has the gate enforced at Jenkins/Trivy and reports archived to MinIO; DefectDojo is the next aggregation layer.
+
+## What gets imported
+
+- **Trivy image scans** (primary): one report per image build, mapped to an engagement per app.
+- **Trivy SBOM imports** (optional): if Jenkins generates a CycloneDX SBOM, DefectDojo can also import that.
+- **Future:** ad-hoc Trivy `fs` and `repo` scans for misconfig/secrets findings.
+
+The DefectDojo data model:
+
+- A **Product** represents an app (e.g., `openliberty-readiness-probe`).
+- A **Product Type** groups products (e.g., `sandbox-apps`).
+- An **Engagement** is a time-bounded scope of testing on a product (per-release or continuous).
+- **Tests** within an engagement come from individual scan imports.
+- **Findings** are the deduplicated CVEs/vulns/issues, with metadata (severity, CVE, CWE, file, line).
+
+## Exposure model
+
+```text
+Browser
+   ↓ HTTPS
+https://defectdojo.apps.sub.comptech-lab.com
+   ↓ HAProxy 443 (LE wildcard, host-specific backend)
+HAProxy → defectdojo-0 in lab /24 :8080
+   ↓ plain HTTP inside the lab /24
+nginx (from Docker Compose)
+   ↓ proxy
+DefectDojo Django app
+   ↓
+PostgreSQL (Docker volume) + Redis (Docker volume)
+```
+
+The stack is Docker Compose: nginx, uwsgi, the Django app, PostgreSQL, Redis, and an async worker. The DefectDojo upstream Compose file lays this out — the lab keeps the topology and overrides only the security-sensitive settings.
+
+## Secrets hygiene
+
+Per ADR 0013 the lab installer overrides:
+
+- `DD_SECRET_KEY` — Django session/CSRF signing.
+- `DD_CREDENTIAL_AES_256_KEY` — DefectDojo's credential-encryption key.
+- Database password.
+- Admin password.
+- JIRA webhook secret (when applicable).
+- External site URL: `https://defectdojo.apps.sub.comptech-lab.com`.
+- Allowed hosts and CSRF trusted origins.
+- Proxy/TLS cookie settings.
+
+Generated values never leave the VM and the `secrets/defectdojo-vm/` custody directory. They are not in tracker, MR text, session reports, or chat. Imported scan reports themselves can be sensitive (they list exploitable CVEs in your apps) — DefectDojo's content is treated as confidential evidence; raw reports do not go in Git unless scrubbed.
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> defectdojo-0.sub.comptech-lab.com A +short
+dig @<lab-dns> defectdojo.apps.sub.comptech-lab.com A +short
+
+# Login page
+curl -sSI https://defectdojo.apps.sub.comptech-lab.com/login/ | head -1
+
+# API health
+curl -sS https://defectdojo.apps.sub.comptech-lab.com/api/v2/
+
+# Authenticated user check
+curl -fsS -H "Authorization: Token $DEFECTDOJO_API_TOKEN" \
+  https://defectdojo.apps.sub.comptech-lab.com/api/v2/users/ | jq '.results | length'
+```
+
+## Operational guidance
+
+- **Pin the DefectDojo Compose release.** Don't auto-upgrade. DefectDojo has a regular release cadence; upgrade only after reviewing the changelog for API/UI changes.
+- **Back up PostgreSQL and the Docker volumes.** This data is the system of record for AppSec evidence; without backup, a disk failure is total loss. The backup story is a roadmap item — until it's wired, treat the data as recoverable but not guaranteed.
+- **Don't import raw secret-bearing scan reports.** If Trivy's secret scan caught a secret in a Git repo, the report has the secret value verbatim. Scrub before import, or use Trivy's `--ignore-policy` to skip the offending file.
+- **Audit imported scan retention.** Old scans should be archived; engagements should close. DefectDojo's retention story is operator-driven.
+
+## Failure modes
+
+### Symptom: imports fail with 401 from the API
+
+**Root cause.** Token rotated; client's stored token is stale.
+
+**Fix.** Generate a new token in DefectDojo UI; update the Jenkins credential.
+
+**Prevention.** Track token rotations.
+
+### Symptom: imports succeed but findings don't show up in the dashboard
+
+**Root cause.** The engagement/product mapping is wrong; scans land in the wrong engagement; or DefectDojo's de-dup grouping is hiding new findings as duplicates of older closed findings.
+
+**Fix.** Verify the engagement ID used in the import call. Check the dedup hash configuration. Adjust if needed.
+
+**Prevention.** Use named engagement IDs per app, not auto-discovered ones.
+
+### Symptom: dashboard is slow
+
+**Root cause.** Long history of findings; missing PostgreSQL indexes for ad-hoc queries the dashboard generates.
+
+**Fix.** Apply DefectDojo's upgrade migrations; vacuum/analyze PostgreSQL.
+
+**Prevention.** Schedule periodic PostgreSQL maintenance.
+
+### Symptom: route returns 503 (stale RKE2 backend)
+
+**Root cause.** HAProxy is still routing `defectdojo.apps.*` to the old RKE2 ingress backend instead of the VM backend.
+
+**Fix.** Replace `defectdojo-rke2-be` with the VM-backed `defectdojo-vm-be` in the HAProxy config. Per ADR 0013 this replacement is part of edge exposure phase 6.
+
+**Prevention.** Audit HAProxy backends for any other stale RKE2 references; remove them.
+
+## Stale RKE2 route replacement
+
+Historical RKE2 DefectDojo material exists in old GitOps paths. The HAProxy still had a stale `defectdojo.apps.sub.comptech-lab.com` backend pointing at the old RKE2 ingress. That path returns 503 and is not the active target. The fix per ADR 0013 phase 6 is to:
+
+1. Add PowerDNS records for direct VM, private alias, and edge hostnames.
+2. Replace stale HAProxy RKE2 routing with `defectdojo-vm-be`.
+3. Validate HTTPS edge login, API access, explicit public-IP route, backend health, and wildcard certificate.
+
+This is a one-time HAProxy migration, not a recurring task.
+
+## References
+
+- `codex-opp-agent/adr/0013-defectdojo-vm-security-dashboard.md` — VM decision and override list.
+- `codex-opp-agent/adr/0011-trivy-ubuntu-vm-scanner.md` — Trivy scanner, the report source.
+- [Trivy VM page](./03-trivy-vm) — scanner-side context.
+- [Trivy scanning integration](../07-image-supply-nexus/06-trivy-scanning-integration) — pipeline view including DefectDojo handoff.
+- Upstream DefectDojo Open Source documentation (consulted 2026-05-08 per ADR 0013).

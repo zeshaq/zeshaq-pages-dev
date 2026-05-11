@@ -1,8 +1,223 @@
 ---
-title: "Trivy VM"
-description: "Section 02-lab-infrastructure/08-ci-platform-vms: Trivy VM (placeholder)."
+title: "Trivy VM (Scanner Server)"
+description: "The lab Trivy server VM — Ubuntu cloud-init host running trivy server under systemd, fronted by HAProxy, with token-authenticated scans from Jenkins build agents."
 sidebar_label: "Trivy VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The Trivy VM hosts the lab's central vulnerability scanner. It runs Aqua Security's `trivy` in **client/server mode**: the server holds the vulnerability database, the layer cache, and accepts authenticated scan requests; clients (Jenkins build agents, developer workstations, future GitLab runners) stream image references and get back a structured report. The server is exposed via HAProxy on `trivy.apps.sub.comptech-lab.com`; scan calls use a bearer token.
+
+This page covers the VM itself, the installation and runtime model, the exposure boundary, and the token-custody contract. For the integration with the Nexus push path, see [Trivy scanning integration](../07-image-supply-nexus/06-trivy-scanning-integration).
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `trivy-0` |
+| Private FQDN | `trivy-0.sub.comptech-lab.com` |
+| Private alias | `trivy.sub.comptech-lab.com` |
+| Public hostname | `https://trivy.apps.sub.comptech-lab.com` |
+| Direct debug URL | private VM port for local-network debugging only |
+| HAProxy backend | host-specific route to Trivy server listener |
+| TLS terminator | HAProxy edge VM, LE wildcard `*.apps.sub.comptech-lab.com` |
+| OS | Ubuntu 24.04 LTS cloud-init |
+| Package source | Aqua Security Trivy apt repository |
+| Runtime | Trivy CLI + `trivy server` under systemd |
+| Service user | locked local `trivy` system user |
+| Cache/data path | `/var/lib/trivy` (preferably on a dedicated data disk) |
+| Local admin user | `zahid` (lab convention) |
+| Token custody | Local-only, ignored, under `secrets/trivy-vm/` |
+
+The VM is intentionally minimal: one VM, one process, one Aqua-distributed binary. Per ADR 0011 it is accepted as a supporting security-scanning service for OpenShift, GitOps, VM, container-image, SBOM, and CI validation workflows — not as a general application-catalogue entry.
+
+## Why client/server mode
+
+`trivy image <ref>` works standalone — the CLI alone can scan an image. But in client/server mode:
+
+- **The DB is held centrally.** Build agents don't each download and maintain a multi-gigabyte vulnerability database.
+- **DB updates are coordinated.** When the database lands a new release upstream, the server pulls once; clients pick up the new findings transparently.
+- **Cache deduplication.** Layer scan results are cached; the same Open Liberty base image being scanned across many builds is parsed once and reused.
+- **Authentication.** Scan calls are bearer-token-authenticated; rotating the token revokes all clients in one operation.
+- **Performance.** First-scan time on a build agent drops from minutes to seconds; the bottleneck moves to network throughput between agent and server.
+
+## Why a single VM (not OpenShift Operator)
+
+Per ADR 0011 the decision is explicitly a single Ubuntu VM, not the OpenShift-native Trivy Operator. Reasons:
+
+- The scanner must be **reachable from the build agents** (Jenkins) which live outside any OpenShift cluster.
+- The lab's CI flow is **VM-centric for now** (`project_app_dev_direction.md`): builds happen on `jenkins-agent-0`, scans go to the Trivy VM, pushes go to Nexus, deployments go to `docker-runtime-vm`. An OpenShift-resident scanner would create cross-network dependencies.
+- The OpenShift Trivy Operator is a different posture — it's for image admission inside the cluster, which is a separate concern that the runtime allowlist + IDMS/ITMS handles.
+
+If OpenShift admission-time scanning becomes a requirement, the OpenShift Trivy Operator can be deployed in parallel — it does not compete with this VM's role.
+
+## Exposure model
+
+```text
+Jenkins build agent (jenkins-agent-0)
+   ↓ HTTPS (outbound)
+https://trivy.apps.sub.comptech-lab.com
+   ↓ HAProxy 443 (LE wildcard, host-specific backend)
+HAProxy private bind → trivy-0 in lab /24, server listener port
+   ↓ plain HTTP inside the lab /24
+Trivy server (listener port)
+```
+
+The HAProxy `trivy-vm-be` backend is host-specific (one Trivy VM, one backend, narrow scope). The Trivy VM firewall restricts the listener port to HAProxy plus a small allowlist of private scanner clients if needed.
+
+Health and version endpoints (`/healthz`, `/version`) are accessible without authentication because they're unauthenticated by Trivy's product behavior. **Scan operations require the token.**
+
+## Scan request shape
+
+A build-agent invocation looks like:
+
+```bash
+trivy image \
+  --server "https://trivy.apps.sub.comptech-lab.com" \
+  --token "$TRIVY_SERVER_TOKEN" \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  --format json \
+  --output trivy-report.json \
+  app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8
+```
+
+What happens on the server side:
+
+1. Receive the scan request with a bearer token; validate.
+2. Resolve the image reference. If the layers are already in the server cache, skip the registry round trip; otherwise, fetch via the lab Nexus.
+3. Parse manifest, identify OS, identify language ecosystems present.
+4. Match against the vulnerability database (Trivy DB + Java DB + secret-scan rules + misconfig rules as configured).
+5. Apply the severity filter (`--severity HIGH,CRITICAL`) at result-emission time.
+6. Stream JSON back to the client.
+7. Client emits exit code based on `--exit-code` flag.
+
+The server itself does not push results anywhere. Evidence storage (MinIO) is the client's responsibility.
+
+## Vulnerability database management
+
+`trivy server` downloads its vulnerability database from Aqua Security's public distribution endpoint. In the lab:
+
+- **First start** downloads the full DB (typically a few hundred MB compressed).
+- **Periodic refresh** fetches diffs (twice daily by default; can be tuned).
+- **Disk usage** for the DB and cache is the dominant data-path consumer; sizing of `/var/lib/trivy` matters.
+
+In disconnected scenarios, Trivy supports offline DB mirroring — pulling the DB to an air-gapped host and serving it via Trivy's own air-gap mode. This is a roadmap item (ADR 0011 explicitly leaves offline mirroring for a later prerequisite phase).
+
+## Token model
+
+Trivy server token authentication:
+
+- The server is configured with one or more accepted tokens at startup (env or config file).
+- Clients pass the token via `--token` or via env var `TRIVY_TOKEN`.
+- Token rotation: update the server's accepted token, restart `trivy server`, update the Jenkins credential `trivy-server-token`. No client besides Jenkins (and operators using it for ad-hoc scans) currently holds the token.
+
+Custody:
+
+- Server-side: under `/etc/trivy/` on the VM (root-owned, mode-restricted), or via systemd `EnvironmentFile=`.
+- Workstation custody: `secrets/trivy-vm/` (Git-ignored, mode-restricted).
+- Jenkins: credential ID `trivy-server-token` (Secret Text type).
+
+Never:
+
+- Echo the token in shell history.
+- Include it in Containerfiles or Jenkinsfiles directly.
+- Print it in build logs.
+- Paste it into issues, MR comments, or chat output.
+
+## What Trivy can scan
+
+- **Container images** — by registry reference or by local archive (tarball).
+- **Filesystem** — local directory, including SBOM extraction, misconfiguration scans against IaC files (Terraform, Kubernetes manifests, Dockerfiles).
+- **Git repositories** — for secret leaks, license issues, dependency-file CVEs.
+- **SBOM** — accept a CycloneDX or SPDX SBOM and scan it against the DB.
+- **Kubernetes cluster** (via `trivy k8s`) — survey running pods and report CVEs. Not currently wired in the lab.
+
+The Jenkins integration uses `trivy image`. Other modes (`fs`, `repo`, SBOM) are available for ad-hoc use; they don't yet have enforced gates.
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> trivy-0.sub.comptech-lab.com A +short
+dig @<lab-dns> trivy.sub.comptech-lab.com A +short
+dig @<lab-dns> trivy.apps.sub.comptech-lab.com A +short
+
+# Health (unauthenticated)
+curl -sS https://trivy.apps.sub.comptech-lab.com/healthz
+
+# Version (unauthenticated)
+curl -sS https://trivy.apps.sub.comptech-lab.com/version
+
+# Authenticated scan from a workstation
+trivy image \
+  --server https://trivy.apps.sub.comptech-lab.com \
+  --token "$TRIVY_SERVER_TOKEN" \
+  --severity HIGH,CRITICAL \
+  ubi9/ubi-minimal:9.4
+```
+
+Expected:
+
+- DNS resolves.
+- `/healthz` returns `OK`.
+- `/version` returns the running Trivy version JSON.
+- Authenticated scan returns a report.
+
+## Operational guidance
+
+- **Pin the Trivy version.** Don't auto-upgrade Trivy server out of band. Coordinate server + client version updates because the client/server API can change between major releases.
+- **Monitor DB freshness.** Alert if the DB hasn't refreshed in the SLA window (e.g., 48 hours).
+- **Plan disk growth.** `/var/lib/trivy` grows with cache and DB history. Size for headroom.
+- **Set scan-timeout defaults.** A pathological build (huge multi-arch manifest) can hang a scan; cap it.
+- **Audit token use.** Rotate the token periodically and audit who's using it (current state: Jenkins only).
+
+## Failure modes
+
+### Symptom: scan returns 401 from the server
+
+**Root cause.** Token missing, wrong, or expired.
+
+**Fix.** Update the client's `--token` or `TRIVY_TOKEN` env. Restart Jenkins credential `trivy-server-token` if rotated.
+
+**Prevention.** Track token rotations; coordinate server + client updates.
+
+### Symptom: scan reports HIGH/CRITICAL for a base image that's brand-new
+
+**Root cause.** Vulnerability DB is up to date; the base image actually has a fresh CVE. Or the base image is older than expected (cache staleness in `docker-group.*`).
+
+**Fix.** Verify the base image digest is what you expect; pull a newer base image if available; if the CVE is genuine and unfixed upstream, route to the documented exception path.
+
+**Prevention.** Pull from `docker-group.*` and pull mutable tags through the cache to pick up upstream fixes; pin base by digest with periodic refresh review.
+
+### Symptom: scan hangs
+
+**Root cause.** Server is busy with a DB update, or the image is huge and the server's per-scan timeout is hit, or a network hiccup.
+
+**Fix.** Server-side: check `systemctl status trivy-server`. Client-side: retry with a higher timeout or after DB refresh.
+
+**Prevention.** Schedule DB refresh during low-traffic windows.
+
+### Symptom: scan returns 500 unexpectedly
+
+**Root cause.** Server panic, corrupted DB cache, or upstream DB distribution issue.
+
+**Fix.** Restart `trivy server`. If a single image is reproducibly failing scan, rebuild the DB from scratch (`trivy --reset` on the server).
+
+**Prevention.** Monitor scan-success rate; alert on 5xx-rate spikes.
+
+### Symptom: a scan that previously passed now fails on the same image digest
+
+**Root cause.** The vulnerability DB updated; a CVE got reclassified or a new one was added affecting an embedded library. **This is the intended behavior** — yesterday's pass isn't tomorrow's pass.
+
+**Fix.** Rebuild the image with patched dependencies, or route the new finding through the documented exception path with evidence.
+
+**Prevention.** Re-scan running images on a cadence so that drift in findings is caught proactively rather than at next build.
+
+## References
+
+- `codex-opp-agent/adr/0011-trivy-ubuntu-vm-scanner.md` — VM design and guardrails.
+- `codex-opp-agent/connection-details/jenkins.md` — `trivy-server-token` Jenkins credential.
+- [Trivy scanning integration](../07-image-supply-nexus/06-trivy-scanning-integration) — Jenkins pipeline view.
+- [DefectDojo page](./04-defectdojo-dashboard) — the AppSec consumer of Trivy reports.
+- Aqua Security Trivy docs — public reference for client/server config, DB refresh, scan flags.
