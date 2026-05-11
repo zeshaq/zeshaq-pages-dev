@@ -1,8 +1,101 @@
 ---
 title: "Overview: How ADRs Work"
-description: "Section 06-architecture-decisions: Overview: How ADRs Work (placeholder)."
-sidebar_label: "Overview: How ADRs Work"
+description: "How architecture decisions are captured in this workspace — the template, the review-issue pair convention, and how they connect to GitHub issues, milestones, and memory."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This section publishes the **Architecture Decision Records** (ADRs) that govern the lab platform. Each page below mirrors a source ADR file in `codex-opp-agent/adr/` and follows the same template: Context → Decision → Alternatives considered → Consequences → References. Readers who want the operating manual for *how* the platform is run should start at sections 2-5; this section explains *why* the operating manual looks the way it does.
+
+## What an ADR is
+
+An Architecture Decision Record is a short, dated, immutable note that captures a single non-trivial design choice. It records what was true at the time the decision was made — the constraints, the alternatives, the chosen direction, the trade-offs — so future operators can reconstruct the reasoning without re-litigating the choice from scratch. ADRs are accepted, not appealed: when the platform evolves and an old decision no longer holds, a **new** ADR is written that explicitly supersedes or refines the old one. The old ADR stays in the repo as historical record.
+
+In this workspace, ADRs are written in plain Markdown under `codex-opp-agent/adr/NNNN-short-slug.md`. Numbering is monotonic. The accepted set as of 2026-05-11 runs from `0001` to `0026`, with gaps allowed when a draft is abandoned before acceptance (none currently). Each ADR opens with a date and a `## Status` block — `Accepted`, `Superseded`, or `Proposed`. Bodies are dense paragraph prose, not bullet-only summaries, because the *why* is what readers need years later.
+
+## How this project uses them
+
+Three rules govern when an ADR is required, derived from ADR 0016 (Workspace Execution Governance):
+
+1. **No implementation without tracking.** Every non-trivial task gets a GitHub issue first, the issue is assigned to a milestone, and either an existing ADR is cited or a new one is drafted before commands execute against live systems.
+2. **Architecture-class decisions get their own ADR.** A new cluster, a new VM-hosted platform service, a change to the GitOps boundary, a new compliance baseline, a new operating model — all of these warrant ADRs. Routine config tweaks, one-off remediations, or operator runbook edits do not.
+3. **ADR + review-issue pair.** When an ADR is drafted, a matching review issue is opened against the `codex-opp-agent` repo. The review issue is where reviewers (the operator role, the platform lead, the auditor — sometimes the same person across sessions) leave comments before the ADR moves to `Accepted`. The ADR file in `adr/` then references the review issue number.
+
+The ADR Index issue (`codex-opp-agent` #131) maintains a flat list of every accepted ADR. When a new ADR supersedes an old one, the index issue records the supersession explicitly so the relationship is discoverable without grep.
+
+## The template
+
+Every ADR in this section follows the same shape, copied verbatim from `adr/0001-operator-workspace.md`'s convention:
+
+```markdown
+# ADR NNNN: <short imperative title>
+
+Date: YYYY-MM-DD
+
+## Status
+
+Accepted | Superseded by ADR NNNN | Proposed
+
+## Context
+
+<3-6 paragraphs that establish the situation, the constraints, and the
+specific problem that triggered the decision. Often references prior
+sessions, incidents, or memory entries. The goal is that a reader who has
+never met the platform can understand why this decision had to be made.>
+
+## Decision
+
+<The chosen approach, stated declaratively. Concrete enough that an
+implementor can act on it: specific tools, specific endpoints, specific
+boundary conditions. Often contains a short code or YAML block when the
+canonical pattern is structural.>
+
+## Alternatives considered
+
+<Two or more alternatives, each in its own paragraph. State what the
+alternative was, why it was attractive, and the specific reason it was
+rejected. Avoid straw-man alternatives; an ADR earns its keep by
+documenting real trade-offs.>
+
+## Consequences
+
+<Both positive and negative. What this decision unlocks, what it costs,
+what other ADRs it constrains or supersedes, what becomes mandatory and
+what becomes forbidden. This section also names the guardrails and any
+"do not do X without a new ADR" boundaries.>
+
+## References
+
+<Bulleted list: source files in connection-details/, related ADRs by
+number, relevant GitHub issues and milestones, memory entries.>
+```
+
+A few source ADRs use richer subheadings — `## Hardening Gates`, `## Phase Gates`, `## Implementation Milestones`, `## Carried-Forward Lessons` — when the decision is large enough that the consequences need their own enumerated structure. Those richer sections survive into this public version when they carry signal that a future operator would need.
+
+## The review-issue pair convention
+
+For every ADR `NNNN-slug.md` there is an issue in `codex-opp-agent` titled along the lines of "adr: review NNNN <slug>" (or with the `WG`, `FG-`, `PCI-` phase prefix that triggered the work). The review issue holds:
+
+- Reviewer comments and resolutions.
+- Links to the session log entries that proposed the decision.
+- The "Accepted" milestone (typically the milestone whose work motivated the ADR).
+- The closeout note that flips `## Status: Proposed` to `## Status: Accepted` in the ADR file.
+
+Once accepted, the review issue closes. The ADR file becomes the durable artifact; the GitHub issue is the audit trail showing how it was reviewed.
+
+## How ADRs interact with memory
+
+The operator agent (Claude Code) maintains a small set of long-lived memory entries under `~/.claude/projects/-home-ze-claude-agent/memory/`. Memory entries are tactical reminders ("don't use `oc-mirror` for app images", "v6 fleet is hub-dc-v6 + spoke-dc-v6 only", "HAProxy is for VM-edge only"). Many of those reminders are one-line summaries of an ADR's decision. When the two disagree, the ADR wins — memory entries are convenience caches, not source of truth.
+
+## How ADRs interact with the connection-details handbook
+
+The `codex-opp-agent/connection-details/` directory is the operator handbook — `platform-admin-handoff.md`, `gitlab-operator-guide.md`, `nexus.md`, `vault-app-secrets.md`, and so on. These are the operating manuals; the ADRs are the constitution. Operating manuals follow the constitution. When a handbook says "do X this way" and an ADR says "X must work this way," the ADR is the binding statement and the handbook is the explanation of how to execute it.
+
+## Reading order for this section
+
+Page 2 is the **ADR Index** — every public ADR with a one-line summary, current status, and a small dependency graph so you can see which decisions supersede or refine which. Pages 3 through 17 are the individual ADRs in chronological order, sanitized for public publication. Where an ADR's content is highly operational (specific IPs, MAC addresses, passwords, internal-only hostnames), this site redacts to descriptive labels and points at the source file in `codex-opp-agent/connection-details/` for the internal-only specifics.
+
+## What this section deliberately omits
+
+A handful of ADRs in the source repo are tactical workspace policy — `0002 Subagent-First Workflow`, `0014 Developer Readiness Contract`, `0017 Parallel Agent Worktree Isolation`, `0023 Federated GitLab Group Ownership`, `0024 OpenShift-Only Platform GitOps Boundary`, `0025 GitOps-Only Operations Break-Glass Policy`, `0026 IPv6 Baseline For OVN-Kubernetes`. They are referenced from the index page and from the body of related ADRs, but they do not get a full per-page treatment here. The 15 ADRs that *do* get full pages are the ones that shape the published architecture: workspace boundary, hub design, network/ingress/PKI, VM-hosted platform services, the federated GitOps repo architecture, the ACM pull model, the Nexus-only supply chain, the PCI-DSS baseline, and the v6 fleet membership decision.
