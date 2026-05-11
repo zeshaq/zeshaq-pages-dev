@@ -1,8 +1,192 @@
 ---
-title: "Fleet Overview"
-description: "Section 03-openshift-platform: Fleet Overview (placeholder)."
+title: "OpenShift Fleet Overview"
+description: "Topology of the active v6 OpenShift fleet — hub-dc-v6 plus spoke-dc-v6 — the supporting platform VMs, and how ACM plus OpenShift GitOps move config from internal GitLab onto each cluster."
 sidebar_label: "Fleet Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const hubBox  = { background: "#dbeafe", border: "1.5px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1e3a8a", width: 200, textAlign: "center", fontWeight: 600 };
+export const spokeBox = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataEdge = { style: { stroke: "#1d4ed8", strokeWidth: 1.3 }, markerEnd: { type: "arrowclosed", color: "#1d4ed8" }, labelStyle: { fill: "#1d4ed8", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const fleetNodes = [
+  // Top row: source-of-truth + supporting platform VMs
+  { id: "gitlab", position: { x: 40,  y: 0 }, data: { label: "Internal GitLab\nplatform-gitops repo\n(LAN endpoint)" }, style: extBox },
+  { id: "nexus",  position: { x: 240, y: 0 }, data: { label: "Nexus\nmirror-registry\n+ docker-group\n+ app-registry" }, style: extBox },
+  { id: "vault",  position: { x: 440, y: 0 }, data: { label: "Vault VMs\n(3-node Raft + seal)\nKubernetes-auth" }, style: extBox },
+  { id: "minio",  position: { x: 640, y: 0 }, data: { label: "MinIO\n(OADP / ACM backup\nobject storage)" }, style: extBox },
+  { id: "dns",    position: { x: 840, y: 0 }, data: { label: "PowerDNS\nauth + recursor\n(lab base domain)" }, style: extBox },
+
+  // hub row
+  { id: "hub", position: { x: 200, y: 170 }, data: { label: "hub-dc-v6\ncompact 3-master VM\nmanagement cluster" }, style: hubBox },
+  { id: "hubGitops", position: { x: 40,  y: 320 }, data: { label: "OpenShift GitOps\n(OLM operator)\nhub Argo CD" }, style: ctrlBox },
+  { id: "hubAcm",    position: { x: 250, y: 320 }, data: { label: "ACM MultiClusterHub\n+ MCE\nplacement / registration" }, style: ctrlBox },
+  { id: "hubLvms",   position: { x: 460, y: 320 }, data: { label: "LVMS\n(RHACS Central\nstorage)" }, style: dataBox },
+  { id: "hubAppset", position: { x: 250, y: 440 }, data: { label: "ApplicationSet\nspoke-cluster-config-pull\n(generates Applications)" }, style: ctrlBox },
+
+  // spoke row
+  { id: "spoke", position: { x: 760, y: 170 }, data: { label: "spoke-dc-v6\n3 VM masters\n+ 3 physical workers" }, style: spokeBox },
+  { id: "klusterlet", position: { x: 620, y: 320 }, data: { label: "klusterlet\nregistration +\nwork agent" }, style: agentBox },
+  { id: "spokeArgo",  position: { x: 800, y: 320 }, data: { label: "OpenShift GitOps\n(gitops-addon\nDeployment)\nspoke Argo CD" }, style: agentBox },
+  { id: "spokeOps",   position: { x: 980, y: 320 }, data: { label: "ESO / RHACS Sensor\nOADP / Tekton\nLoki / Tempo / Quay" }, style: dataBox },
+  { id: "spokeOdf",   position: { x: 800, y: 440 }, data: { label: "ODF + LSO\n(physical workers,\nMR408i data devices)" }, style: dataBox },
+];
+
+export const fleetEdges = [
+  // hub Argo pulls from GitLab
+  { id: "e-hg-gl", source: "hubGitops", target: "gitlab", label: "pulls clusters/hub-dc-v6/", ...pullEdge },
+  // hub Argo applies to hub itself via local Application
+  { id: "e-hg-hub", source: "hubGitops", target: "hub", label: "applies (local)", ...reqEdge },
+  // ACM owns placement + AppSet
+  { id: "e-acm-aps", source: "hubAcm", target: "hubAppset", label: "Placement + GitOpsCluster", ...muted },
+  // AppSet generates Applications labeled pull-to-ocm
+  { id: "e-aps-klust", source: "hubAppset", target: "klusterlet", label: "ManifestWork: Application", ...pullEdge },
+  // spoke klusterlet → hub ACM (registration + work pull, outbound from spoke)
+  { id: "e-klust-acm", source: "klusterlet", target: "hubAcm", label: "register + pull (outbound)", ...pullEdge },
+  // klusterlet hands Application to spoke Argo
+  { id: "e-klust-argo", source: "klusterlet", target: "spokeArgo", label: "Application landed", ...muted },
+  // spoke Argo pulls from GitLab
+  { id: "e-sa-gl", source: "spokeArgo", target: "gitlab", label: "pulls clusters/spoke-dc-v6/", ...pullEdge },
+  // spoke Argo applies to spoke itself
+  { id: "e-sa-spoke", source: "spokeArgo", target: "spoke", label: "applies (local)", ...reqEdge },
+  { id: "e-sa-ops",   source: "spokeArgo", target: "spokeOps", label: "operators / operands", ...muted },
+  { id: "e-sa-odf",   source: "spokeArgo", target: "spokeOdf", label: "ODF desired state", ...muted },
+  // image pulls hub + spoke → Nexus
+  { id: "e-hub-nexus", source: "hub", target: "nexus", label: "image pulls (IDMS/ITMS)", ...dataEdge },
+  { id: "e-spoke-nexus", source: "spoke", target: "nexus", label: "image pulls (IDMS/ITMS)", ...dataEdge },
+  // ESO → Vault
+  { id: "e-spoke-vault", source: "spokeOps", target: "vault", label: "ESO read", ...dataEdge },
+  // backups → MinIO
+  { id: "e-spoke-minio", source: "spokeOps", target: "minio", label: "OADP / ACM backup", ...dataEdge },
+  // DNS used everywhere (representative)
+  { id: "e-hub-dns", source: "hub", target: "dns", label: "DNS lookup", ...muted },
+  { id: "e-spoke-dns", source: "spoke", target: "dns", ...muted },
+  // hub LVMS feeds RHACS Central on hub
+  { id: "e-hub-lvms", source: "hub", target: "hubLvms", label: "PVC for RHACS Central", ...muted },
+];
+
+The active OpenShift fleet is two clusters: `hub-dc-v6` — a compact three-master VM management cluster — and `spoke-dc-v6` — three VM masters with three physical workers and Red Hat OpenShift Data Foundation. They run alongside a small set of supporting VMs that provide DNS, image mirror, secrets, and object storage. Everything on the clusters is reconciled from one internal GitLab repository, `comptech-platform/openshift-ops/openshift-platform-gitops`, through the Red Hat ACM plus OpenShift GitOps pull model. This page is the map for the rest of section 3.
+
+## What's in the fleet, in one diagram
+
+<Whiteboard client:load data={{ nodes: fleetNodes, edges: fleetEdges }} height={620} />
+
+Solid arrows are control or apply paths. Dashed green arrows are pull-mode connections initiated from the inside out — the spoke calls the hub, the hub Argo and spoke Argo call GitLab, but nothing calls into the spoke from the outside. Blue arrows are data-plane dependencies (image pulls, Vault reads, backup uploads, DNS).
+
+## The active fleet, by name
+
+| Cluster | Role | Topology | OCP | Storage posture |
+| --- | --- | --- | --- | --- |
+| `hub-dc-v6` | Management | Compact 3-master VM-only | `4.20.18` | LVMS only (RHACS Central PVCs); no ODF |
+| `spoke-dc-v6` | Workload | 3 VM masters + 3 physical workers | `4.20.18` | ODF on physical workers + LSO |
+
+`hub-dr-v6` and `spoke-dr-v6` are reserved names for a future DR fleet. They are not built. The pre-v6 cluster names `hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr` are decommissioned per [ADR 0022](/docs/06-architecture-decisions/) and should not appear in new manifests, plans, or runbooks.
+
+## Supporting platform VMs
+
+The cluster-side architecture only makes sense in the context of the lab VMs it leans on:
+
+| Service | Role for the fleet | Lab DNS name |
+| --- | --- | --- |
+| PowerDNS auth + recursor | Cluster API/ingress/node DNS; base domain `sub.comptech-lab.com` | `pdns.local` |
+| Internal GitLab | Runtime GitOps source of truth — `comptech-platform/openshift-ops/openshift-platform-gitops` | `gitlab.apps.sub.comptech-lab.com` (browser); LAN endpoint for automation |
+| Nexus (3 endpoints) | OpenShift platform mirror, dev pull-through, app push registry | `mirror-registry.apps.sub.comptech-lab.com`, `docker-group.apps.sub.comptech-lab.com`, `app-registry.apps.sub.comptech-lab.com` |
+| Vault (3-node Raft + seal VM) | Kubernetes-auth-backed secret source for ESO | `vault.sub.comptech-lab.com` (DNS RR over Raft) |
+| MinIO | OADP backup target + ACM cluster-backup target | the MinIO VM (lab `/24`) |
+| `oc-mirror` worker VM | `oc mirror --v2` runner pushing into Nexus mirror-registry | `oc-mirror.sub.comptech-lab.com` |
+| HAProxy edge | TLS termination for VM-hosted tools (Jenkins, SigNoz, Trivy, etc.); not used for OpenShift routes | the HAProxy VM (lab `/24`) |
+
+Specific lab `/24` host addresses for these VMs are kept in `codex-opp-agent/connection-details/` and not republished here.
+
+> Internal-only specifics are kept in `codex-opp-agent/connection-details/`.
+
+## The control flow, in words
+
+1. A platform admin opens a merge request against `platform-gitops` (the canonical clone lives at `/home/ze/platform-gitops` for human operators and `/home/ze/claude-agent/clones/platform-gitops/` for agent work). The repo has one directory per cluster: `clusters/hub-dc-v6/` and `clusters/spoke-dc-v6/`. There is also a `clusters/hub-dc-v6/gitops-control/` directory that owns the Argo CD AppProjects, the cluster-admin binding, and the ApplicationSet definition.
+2. On `hub-dc-v6`, the OLM-installed OpenShift GitOps operator runs an Argo CD instance in the `openshift-gitops` namespace. Its `hub-dc-v6-bootstrap` Application reconciles `clusters/hub-dc-v6/bootstrap/` and `gitops-control/`, then everything else listed in the cluster's root `kustomization.yaml`. That instance is bound to `cluster-admin` per [ADR 0019](/docs/06-architecture-decisions/) so it can install operators and write cluster-scope resources on the hub itself.
+3. The hub also installs **ACM** (MultiClusterHub) and **MCE** (Multicluster Engine). MCE provides the registration controllers; ACM adds policy, governance, applications, and console. The hub manifests live under `clusters/hub-dc-v6/platform/acm/` and `clusters/hub-dc-v6/platform/fleet-registration/`.
+4. ACM `ManagedCluster/spoke-dc-v6`, `KlusterletAddonConfig`, and a `Placement` (selecting `env=dc, role=spoke, gitops-managed=true`) wire the spoke into the hub. A `GitOpsCluster` resource with `gitopsAddon.enabled: true` tells ACM to also install OpenShift GitOps on the spoke — as a Deployment (the "gitops-addon" install pattern), not as an OLM CSV.
+5. An `ApplicationSet` named `spoke-cluster-config-pull` reads the placement decision (via a `clusterDecisionResource` generator and the `acm-placement` ConfigMap) and emits one `Application` per matched spoke. The Applications are labeled `apps.open-cluster-management.io/pull-to-ocm-managed-cluster=true` and annotated `argocd.argoproj.io/skip-reconcile=true` — the hub Argo CD does not reconcile them; ACM wraps each one as `ManifestWork` and ships it to the spoke.
+6. On `spoke-dc-v6`, the **klusterlet** (two pods: a registration agent and a work agent) initiated the original outbound connection to the hub and continues to pull `ManifestWork`. The work agent applies the wrapped `Application` resource into the spoke's `openshift-gitops` (technically `acm-openshift-gitops`) namespace.
+7. The **spoke Argo CD** reconciles `clusters/spoke-dc-v6/` from internal GitLab against `destination.server: https://kubernetes.default.svc` — that is, against the local API. It installs operators (LSO, ODF, ESO, RHACS, OADP, cert-manager, Loki, Tempo, OpenTelemetry, Tekton, Quay, etc.), then operands (`LVMCluster`, `StorageCluster`, `ClusterSecretStore`, `Central`/`SecuredCluster`, `DataProtectionApplication`, …) per sync-wave ordering.
+8. Images for everything come from Nexus. Cluster-side `ImageDigestMirrorSet` / `ImageTagMirrorSet` resources rewrite upstream registry references at node runtime so any pod that says `registry.redhat.io/foo@sha256:...` actually pulls from `mirror-registry.apps.sub.comptech-lab.com/foo@sha256:...`. The default OperatorHub sources are disabled; only the mirrored `cs-redhat-operator-index-v4-20` and `cs-certified-operator-index-v4-20` catalog sources are active.
+
+This is exactly the Red Hat reference architecture for ACM + OpenShift GitOps Basic pull (ADR 0018). Several things that look unusual at first glance — the spoke Argo running as a Deployment, the ApplicationSet template emitting `project: default`, hub Argo bound to `cluster-admin`, the hub having no `StorageClass` — are intentional features of the pattern, not drift. The memory entry `feedback_acm_gitops_pull_pattern.md` calls these out explicitly.
+
+## Cluster endpoints
+
+| Cluster | API | Console | API VIP (lab /24) | Ingress VIP (lab /24) |
+| --- | --- | --- | --- | --- |
+| `hub-dc-v6` | `https://api.hub-dc-v6.sub.comptech-lab.com:6443` | `https://console-openshift-console.apps.hub-dc-v6.sub.comptech-lab.com` | `30.30.75.10` | `30.30.75.11` |
+| `spoke-dc-v6` | `https://api.spoke-dc-v6.sub.comptech-lab.com:6443` | `https://console-openshift-console.apps.spoke-dc-v6.sub.comptech-lab.com` | `30.30.75.30` | `30.30.75.31` |
+
+Both clusters live in machine network `30.30.0.0/16`. The OpenShift node and VIP allocation range is `30.30.75.0/24`, with the hub using `.10` (API VIP), `.11` (ingress VIP), `.13-.15` (masters) and the spoke using `.30` (API VIP), `.31` (ingress VIP), `.33-.35` (VM masters), `.36-.38` (physical workers). Gateway is `30.30.0.1`. Internal DNS resolver is the lab DNS VM on the `30.30.30.0/24` plane. These specifics belong to one well-defined lab and are published here only because the user explicitly named them as publishable in [section 7](/docs/07-references/).
+
+## Installed operator baseline (as of 2026-05-11)
+
+`hub-dc-v6`:
+
+- OpenShift GitOps `1.20.3`
+- Advanced Cluster Management `2.16.1`
+- Multicluster Engine `2.11.1`
+- LVMS `4.20.0-202604140241` (for RHACS Central PVCs)
+- RHACS Operator `4.10.2` (Central on hub)
+- External Secrets Operator `1.1.0`
+- cert-manager Operator `1.19.0`
+
+`spoke-dc-v6`:
+
+- OpenShift GitOps `1.20.3` (via ACM gitops-addon Deployment)
+- Local Storage Operator `4.20.0-202604140241`
+- OpenShift Data Foundation `4.20.10-rhodf` + its full dependency operator set (`cephcsi-operator`, `mcg-operator`, `ocs-client-operator`, `ocs-operator`, `odf-csi-addons-operator`, `odf-dependencies`, `odf-external-snapshotter-operator`, `odf-prometheus-operator`, `recipe`, `rook-ceph-operator`)
+- External Secrets Operator `1.1.0`
+- RHACS Operator `4.10.2` (SecuredCluster on spoke)
+- OADP `1.5.5`
+- cert-manager Operator `1.19.0`
+- OpenShift Pipelines (Tekton) `1.22.0`
+- Compliance Operator `1.9.0`
+- File Integrity Operator `1.3.8`
+- Container Security Operator `3.16.3`
+- Security Profiles Operator `0.10.0`
+- Cluster Observability Operator `1.4.0`
+- Loki Operator `6.5.0` + Cluster Logging `6.5.0`
+- Tempo Operator `0.20.0-3` + OpenTelemetry `0.144.0-3`
+- NetObserv `1.11.1`
+- Service Mesh 3 `3.3.2` + Kiali `2.22.2`
+- Quay Operator `3.17.1`
+- Gatekeeper `3.21.0`
+- Kube Descheduler `5.3.2`
+- CloudNative-PG `1.29.0`
+- Open Liberty Operator `1.6.1`
+
+All these are pinned to versions present in the mirrored ImageSet `plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`. The corresponding `Subscription` skeleton is documented in [§7 operator-lifecycle](/docs/03-openshift-platform/07-operator-lifecycle/02-subscription-install-pattern/).
+
+## Where in this section to go next
+
+- [Cluster install](/docs/03-openshift-platform/02-cluster-install/01-prerequisites/) — agent-based disconnected install: prereqs, bootstrap VM, network CIDRs, channel pinning, post-install tasks.
+- [Cluster topology](/docs/03-openshift-platform/03-cluster-topology/01-hub-dc-v6/) — what's on each cluster, why those choices.
+- [ACM multicluster](/docs/03-openshift-platform/04-acm-multicluster/01-multiclusterhub/) — MultiClusterHub components, `ManagedCluster` registration, governance policies, ACM cluster backup.
+- [GitOps operating model](/docs/03-openshift-platform/05-gitops-operating-model/01-architecture/) — the pull-model architecture in detail, why pull over hub-render, the platform-gitops repo layout, ApplicationSet template, sync-wave conventions, hub RBAC, spoke RBAC extensions.
+
+The rest of the section (image supply, operator lifecycle, storage, networking, ESO, security, compliance, backup, platform services) reuses the rails described here.
+
+## References
+
+- `connection-details/openshift-hub-dc-v6.md` — hub endpoints, OCP version, credential custody.
+- `connection-details/openshift-spoke-dc-v6.md` — spoke endpoints, node inventory, physical-worker NIC corrections.
+- `connection-details/openshift-gitops-hub-dc-v6.md` — hub Argo CD instance details, repo + AppProject + Application.
+- `connection-details/platform-admin-handoff.md` — admin runbook covering credentials, GitOps boundary, operator install workflow, Nexus layout, image-supply rules.
+- `adr/0001-operator-workspace.md`, `adr/0003-gitops-basic-pull-model.md`, `adr/0004-management-only-hubs.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0022-v6-fleet-membership.md`, `adr/0024-openshift-only-platform-gitops-boundary.md`, `adr/0025-gitops-only-operations-break-glass.md`.
+- Memory: `project_workspace_scope.md`, `feedback_acm_gitops_pull_pattern.md`, `reference_gitops_sources.md`, `reference_platform_gitops_mr_path.md`.
+- Tracker: codex-opp-agent issue #227.

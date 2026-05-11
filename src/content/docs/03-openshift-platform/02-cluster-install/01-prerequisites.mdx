@@ -1,8 +1,240 @@
 ---
-title: "Prerequisites"
-description: "Section 03-openshift-platform/02-cluster-install: Prerequisites (placeholder)."
+title: "Cluster Install Prerequisites"
+description: "What has to be ready before agent-based disconnected install can run on the v6 lab fleet: DNS records, mirrored release payload, allocation table, bootstrap VM, FIPS posture, IPv6 baseline, and pull-secret custody."
 sidebar_label: "Prerequisites"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const gateBox = { background: "#fee2e2", border: "1.5px solid #b91c1c", borderRadius: 8, padding: 8, color: "#7f1d1d", width: 180, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const preNodes = [
+  { id: "alloc", position: { x: 0,   y: 0 }, data: { label: "Allocation table\nIP / MAC / VIP\n(approved)" }, style: gateBox },
+  { id: "dns",   position: { x: 220, y: 0 }, data: { label: "PowerDNS records\napi / api-int / *.apps\n+ node hostnames" }, style: gateBox },
+  { id: "mirror",position: { x: 440, y: 0 }, data: { label: "Mirrored release +\noperator catalogs\nin Nexus" }, style: gateBox },
+  { id: "pull",  position: { x: 660, y: 0 }, data: { label: "Merged pull-secret\non ocp-bootstrap\n(local-only)" }, style: gateBox },
+
+  { id: "vms",   position: { x: 110, y: 130 }, data: { label: "VM masters defined\nwith deterministic MACs\n(virsh domiflist)" }, style: ctrlBox },
+  { id: "phys",  position: { x: 330, y: 130 }, data: { label: "Physical workers:\niLO Redfish MAC verified\n(spoke only)" }, style: ctrlBox },
+  { id: "fips",  position: { x: 550, y: 130 }, data: { label: "FIPS / etcd / disk\nencryption posture\nset in install-config" }, style: ctrlBox },
+
+  { id: "render",position: { x: 220, y: 260 }, data: { label: "Render final\ninstall-config + agent-config\non ocp-bootstrap (local-only)" }, style: ctrlBox },
+  { id: "iso",   position: { x: 440, y: 260 }, data: { label: "Agent ISO generated\n+ staged on KVM host\n/ HTTP server" }, style: dataBox },
+
+  { id: "install", position: { x: 330, y: 380 }, data: { label: "openshift-install\nagent wait-for\nbootstrap-complete" }, style: ctrlBox },
+];
+
+export const preEdges = [
+  { id: "e-a-r", source: "alloc",  target: "render", label: "feeds VM/agent inputs", ...muted },
+  { id: "e-d-r", source: "dns",    target: "render", label: "verified resolvable", ...muted },
+  { id: "e-m-r", source: "mirror", target: "render", label: "imageDigestSources block", ...muted },
+  { id: "e-p-r", source: "pull",   target: "render", label: "real pull secret", ...muted },
+  { id: "e-v-r", source: "vms",    target: "render", ...muted },
+  { id: "e-ph-r",source: "phys",   target: "render", ...muted },
+  { id: "e-f-r", source: "fips",   target: "render", ...muted },
+  { id: "e-r-i", source: "render", target: "iso", label: "openshift-install agent create image", ...reqEdge },
+  { id: "e-i-in",source: "iso",    target: "install", label: "iLO virtual-media boot", ...reqEdge },
+];
+
+Agent-based disconnected install runs on `ocp-bootstrap` and KVM, not from a public CDN. Before the install can start, four gates have to pass: an approved allocation table, applied DNS records, a usable mirrored release in Nexus, and a merged pull-secret on the install host. If any one of them is missing the install will fail in a way that is much harder to diagnose than just stopping.
+
+## Install pipeline at a glance
+
+<Whiteboard client:load data={{ nodes: preNodes, edges: preEdges }} height={500} />
+
+Red boxes are the four gate-checks that must be green before render begins. The rest is mechanical.
+
+## Allocation table
+
+Before any DNS record or VM definition lands, fill `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md` with deterministic IP/MAC/VIP/hostname assignments. The active table reserves `30.30.75.0/24` inside machine network `30.30.0.0/16` for OpenShift nodes and VIPs:
+
+| Cluster | Slot | Hostname | Address |
+| --- | --- | --- | --- |
+| `hub-dc-v6` | API VIP | `api` | `30.30.75.10` |
+| `hub-dc-v6` | Ingress VIP | `apps` | `30.30.75.11` |
+| `hub-dc-v6` | Reserved bootstrap | `hub-dc-v6-bootstrap` | `30.30.75.12` (not provisioned for compact agent flow) |
+| `hub-dc-v6` | Master 0 (rendezvous) | `hub-dc-v6-master-0` | `30.30.75.13` |
+| `hub-dc-v6` | Master 1 | `hub-dc-v6-master-1` | `30.30.75.14` |
+| `hub-dc-v6` | Master 2 | `hub-dc-v6-master-2` | `30.30.75.15` |
+| `spoke-dc-v6` | API VIP | `api` | `30.30.75.30` |
+| `spoke-dc-v6` | Ingress VIP | `apps` | `30.30.75.31` |
+| `spoke-dc-v6` | Reserved bootstrap | `spoke-dc-v6-bootstrap` | `30.30.75.32` |
+| `spoke-dc-v6` | Master 0 (rendezvous) | `spoke-dc-v6-master-0` | `30.30.75.33` |
+| `spoke-dc-v6` | Master 1 | `spoke-dc-v6-master-1` | `30.30.75.34` |
+| `spoke-dc-v6` | Master 2 | `spoke-dc-v6-master-2` | `30.30.75.35` |
+| `spoke-dc-v6` | Worker 0 | `spoke-dc-v6-worker-0` (`gold-1`) | `30.30.75.36` |
+| `spoke-dc-v6` | Worker 1 | `spoke-dc-v6-worker-1` (`gold-2`) | `30.30.75.37` |
+| `spoke-dc-v6` | Worker 2 | `spoke-dc-v6-worker-2` (`gpu-01`) | `30.30.75.38` |
+
+Spoke worker MAC addresses (`40:5b:7f:67:aa:c1`, `40:5b:7f:67:af:01`, `04:32:01:5b:61:d9`) were corrected during issue #93 after the first boot attempt proved the original ports were on the old public `160.30.63.x` cluster path. The corrected MACs and Redfish NIC IDs (14, 14, 12) live in iLO and the allocation table; do not copy them from the older `spoke-dc` plan.
+
+Collision check before approving the table:
+
+```bash
+rg -n "30\\.30\\.75\\." /home/ze/cloud-init/ip-allocations.yaml /etc/hosts
+virsh list --all
+virsh domiflist <vm-name>
+scripts/rebuild/tools/collect-ilo-macs.sh /home/ze/cloud-init/scripts/secrets
+ip neigh show | rg "30\\.30\\.75\\."
+```
+
+The 2026-05-08 run found no live ARP for `30.30.75.1-.80`, no libvirt MAC conflicts, and confirmed all spoke physical worker MACs against iLO Redfish.
+
+## DNS records
+
+PowerDNS is the authoritative source for everything under `sub.comptech-lab.com`. The records have to be applied and resolvable from the install host *and* from the eventual cluster nodes' DNS resolver before the install starts:
+
+| Record | Target |
+| --- | --- |
+| `api.hub-dc-v6.sub.comptech-lab.com` A | `30.30.75.10` |
+| `api-int.hub-dc-v6.sub.comptech-lab.com` A | `30.30.75.10` |
+| `*.apps.hub-dc-v6.sub.comptech-lab.com` A | `30.30.75.11` |
+| `hub-dc-v6-master-{0,1,2}.sub.comptech-lab.com` A | `30.30.75.{13,14,15}` |
+| `api.spoke-dc-v6.sub.comptech-lab.com` A | `30.30.75.30` |
+| `api-int.spoke-dc-v6.sub.comptech-lab.com` A | `30.30.75.30` |
+| `*.apps.spoke-dc-v6.sub.comptech-lab.com` A | `30.30.75.31` |
+| `spoke-dc-v6-master-{0,1,2}.sub.comptech-lab.com` A | `30.30.75.{33,34,35}` |
+| `spoke-dc-v6-worker-{0,1,2}.sub.comptech-lab.com` A | `30.30.75.{36,37,38}` |
+
+Validate from the bootstrap host:
+
+```bash
+for c in hub-dc-v6 spoke-dc-v6; do
+  dig @30.30.30.53 api.$c.sub.comptech-lab.com +short
+  dig @30.30.30.53 api-int.$c.sub.comptech-lab.com +short
+  dig @30.30.30.53 foo.apps.$c.sub.comptech-lab.com +short
+done
+```
+
+Public DNS is not consulted for these records — the lab DNS recursor resolves them locally and forwards anything outside the local zone upstream.
+
+## Mirrored release + operator catalogs in Nexus
+
+The active OpenShift release for both clusters is `4.20.18`. `oc mirror --v2` runs on `oc-mirror.sub.comptech-lab.com` against the ImageSet at `plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml` and pushes into:
+
+```text
+docker://mirror-registry.apps.sub.comptech-lab.com
+```
+
+Before render, confirm:
+
+```bash
+# mirror endpoint healthy
+curl -ksSI https://mirror-registry.apps.sub.comptech-lab.com/v2/ | head -1
+# 401 Unauthorized is the expected unauthenticated response.
+
+# release is inspectable from ocp-bootstrap with the merged pull-secret
+oc adm release info \
+  --registry-config /home/ze/ocp-clusters/hub-dc-v6/pull-secret.merged.json \
+  $(cat /home/ze/ocp-clusters/hub-dc-v6/release-image)
+```
+
+oc-mirror's generated cluster resources land under `/home/ze/ocp-mirror-workspaces/dc-lab/full-workspace/working-dir/cluster-resources/`:
+
+- `idms-oc-mirror.yaml` — `ImageDigestMirrorSet` covering the release/operator/operand image refs
+- `itms-oc-mirror.yaml` — `ImageTagMirrorSet` for any tag-pinned refs
+- `cs-redhat-operator-index-v4-20.yaml` — `CatalogSource` for the mirrored Red Hat operator catalog
+- `cs-certified-operator-index-v4-20.yaml` — `CatalogSource` for the certified catalog
+- `clustercatalog-*.yaml` — OLM v1 `ClusterCatalog` equivalents for the same catalogs
+- signature ConfigMaps for verified payload pull
+
+The install-config has to embed an `imageDigestSources` block that points at the mirrored release path. Do not paste in `oc mirror`'s output verbatim — review it, then commit the durable IDMS/ITMS/CatalogSource manifests into `platform-gitops` under `clusters/<cluster>/platform/image-mirrors/` and `clusters/<cluster>/platform/catalogs/` (covered in [§6 disconnected image supply](/docs/03-openshift-platform/06-disconnected-image-supply/01-oc-mirror-workspace/)).
+
+## Pull-secret custody
+
+The merged pull-secret combines Red Hat customer pull-secret with the local Nexus mirror-registry credential. It lives **only** under:
+
+```text
+ocp-bootstrap:/home/ze/ocp-clusters/<cluster>/pull-secret.merged.json
+/home/ze/secrets/openshift-pull-secret.json   # workstation-local, git-ignored
+```
+
+It is never committed to GitLab or GitHub. The install-config template references it by placeholder `<INSERT_LOCAL_ONLY_PULL_SECRET_JSON>`; the render step substitutes the actual file content in-memory and writes the final `install-config.yaml` only under `ocp-bootstrap:/home/ze/ocp-clusters/<cluster>/`.
+
+## FIPS / etcd / disk encryption posture
+
+The install posture is fixed per [ADR 0005](/docs/06-architecture-decisions/):
+
+| Knob | Value | Set where |
+| --- | --- | --- |
+| `fips: true` | Enabled | install-config |
+| etcd encryption at rest | Enabled | post-install via `APIServer/cluster` |
+| Boot-device disk encryption | TPM2-backed LUKS | `99-master-tpm2-encryption.bu` Butane source, rendered to `openshift/99-master-tpm2-encryption.yaml` |
+| IPv6 disabled in host NMState | Yes | `agent-config.yaml` `ipv6.enabled: false` per interface |
+| Public node IPs | Not allowed | enforced by network plan; no `br-vm` attachment on cluster VMs |
+
+FIPS mode rejects `ssh-ed25519` keys in the install-config — supply an RSA or ECDSA public key only. This caught a render run during spoke install (issue #93) and is now documented in the spoke `validation.md`.
+
+## IPv6 baseline (OVN-Kubernetes-safe)
+
+[ADR 0005](/docs/06-architecture-decisions/) originally said "disable IPv6 in host networking" — but [ADR 0026](/docs/06-architecture-decisions/) supersedes that for any OVN-Kubernetes cluster. The operative pre-install requirement is now "IPv6 is not used for cluster traffic", defined as four verifiable invariants:
+
+1. `clusterNetwork` and `serviceNetwork` are IPv4-only.
+2. No admin-managed IPv6 addresses or routes on physical interfaces (link-local `fe80::/10` on the OVN-K geneve tunnel is permitted; `::1/128 scope host` on `lo` is permitted and required).
+3. No upstream DHCPv6 / Router-Advertisement listeners on the `30.30.0.0/16` fabric.
+4. No application workload binds to an IPv6 podIP.
+
+The kernel-arg `ipv6.disable=1` MachineConfig and the `sysctl disable_ipv6=1` MachineConfig variant are both forbidden because OVN-Kubernetes's `ovnkube-controller` startup runs `sysctl -w net.ipv6.conf.all.forwarding=0` unconditionally and crash-loops if `/proc/sys/net/ipv6/conf/all/forwarding` is unwritable (incident #135, MRs `!2` and `!4`).
+
+The `agent-config.yaml` per-interface `ipv6.enabled: false` setting satisfies the "no admin-managed IPv6 on physical interfaces" invariant without disabling the kernel module.
+
+## Bootstrap and rendezvous host
+
+Agent-based install needs one rendezvous host. For the compact hub the rendezvous is `hub-dc-v6-master-0` at `30.30.75.13`; for the spoke it is `spoke-dc-v6-master-0` at `30.30.75.33`. The "bootstrap" allocation row (`.12` for the hub, `.32` for the spoke) is reserved for method flexibility but is **not provisioned** for the agent-based flow — the installer uses one of the masters as both rendezvous and temporary bootstrap until handoff.
+
+`ocp-bootstrap` (separate Linux VM, lab `/24`) is the operator's render host. It holds:
+
+- the merged pull-secret
+- `~/ocp-clusters/<cluster>/install-config.yaml` (final, rendered, never committed)
+- `~/ocp-clusters/<cluster>/agent-config.yaml`
+- `~/ocp-clusters/<cluster>/openshift/99-{master,worker}-tpm2-encryption.yaml`
+- `~/ocp-clusters/<cluster>/<cluster>-agent.iso` after `openshift-install agent create image`
+- `~/ocp-clusters/<cluster>/auth/kubeconfig` and `kubeadmin-password` after install — these never leave the host's `auth/` directory uncopied; the copies that *do* leave are deliberate and tracked under [§4 platform-admin-handoff](/docs/03-openshift-platform/04-acm-multicluster/02-managedcluster-registration/).
+
+## The render-and-stop helpers
+
+Two repeatable scripts in `codex-opp-agent` enforce the gates:
+
+```bash
+# Hub:
+cd /home/ze/codex-opp-agent
+scripts/rebuild/openshift-install/prepare-hub-dc-v6.sh
+scripts/rebuild/openshift-install/create-hub-dc-v6-vm-definitions.sh
+
+# Spoke:
+scripts/rebuild/openshift-install/prepare-spoke-dc-v6.sh
+scripts/rebuild/openshift-install/create-spoke-dc-v6-vm-definitions.sh
+```
+
+`prepare-*` stages mirror auth, pulls reviewed inputs, renders `install-config.yaml` / `agent-config.yaml` / TPM2 MachineConfigs on `ocp-bootstrap`. `create-*-vm-definitions.sh` defines the libvirt domains on the KVM host (deterministic MACs from the allocation table) and stops before VM boot. VM boot and physical worker boot are separate explicit approval gates.
+
+## Stop-before-install criteria
+
+Stop immediately and re-check if any of the following is true:
+
+- a VM gets the wrong IP, MAC, gateway, DNS server, or hostname
+- IPv6 routing appears unexpectedly on a cluster interface
+- any image pull goes to the public internet
+- FIPS, etcd encryption, or disk encryption deviates from plan
+- generated files expose secrets in tracked paths
+- DNS resolution for any `api*` / `*.apps.*` record returns the wrong VIP
+- `oc adm release info` against the mirrored release fails from `ocp-bootstrap`
+
+## References
+
+- `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- `plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
+- `plans/disconnected-rebuild/environments/dc-lab/dns-records.md`
+- `plans/disconnected-rebuild/environments/dc-lab/execution-sequence.md`
+- `plans/disconnected-rebuild/environments/dc-lab/hub-dc-v6/README.md`, `install-config.template.yaml`, `agent-config.yaml`, `validation.md`
+- `plans/disconnected-rebuild/environments/dc-lab/spoke-dc-v6/README.md`, `install-config.template.yaml`, `agent-config.yaml`, `physical-worker-boot-plan.md`, `validation.md`
+- `adr/0005-openshift-rebuild-network-ingress-pki.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0026-ipv6-baseline-for-ovn-kubernetes.md`
+- `connection-details/platform-admin-handoff.md`

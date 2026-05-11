@@ -1,8 +1,202 @@
 ---
-title: "Network CIDRs"
-description: "Section 03-openshift-platform/02-cluster-install: Network CIDRs (placeholder)."
+title: "Network CIDRs and OVN-Kubernetes Wiring"
+description: "Cluster network, service network, machine network, and VIP allocation for hub-dc-v6 and spoke-dc-v6 — plus how OVN-Kubernetes interacts with the IPv6 baseline ADR 0026."
 sidebar_label: "Network CIDRs"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const cidrNodes = [
+  { id: "machine", position: { x: 50,  y: 0 },   data: { label: "Machine network\n30.30.0.0/16\n(physical /16 LAN)" }, style: extBox },
+  { id: "alloc",   position: { x: 50,  y: 120 }, data: { label: "OpenShift /24 reserve\n30.30.75.0/24\n(VIPs + nodes)" }, style: dataBox },
+  { id: "cluster", position: { x: 320, y: 0 },   data: { label: "clusterNetwork\n10.128.0.0/14 hostPrefix /23\n(pod IPs)" }, style: ctrlBox },
+  { id: "service", position: { x: 320, y: 120 }, data: { label: "serviceNetwork\n172.30.0.0/16\n(ClusterIP services)" }, style: ctrlBox },
+  { id: "ovn",     position: { x: 590, y: 60 },  data: { label: "OVN-Kubernetes\nGeneve overlay\nfe80::/10 link-local (internal)" }, style: ctrlBox },
+  { id: "ext",     position: { x: 50,  y: 240 }, data: { label: "Lab fabric\n30.30.0.1 gateway\n30.30.30.53 DNS" }, style: extBox },
+];
+
+export const cidrEdges = [
+  { id: "e-m-a", source: "machine", target: "alloc", label: "reserved subset", ...muted },
+  { id: "e-a-ovn", source: "alloc", target: "ovn", label: "node IPs on geneve underlay", ...muted },
+  { id: "e-c-ovn", source: "cluster", target: "ovn", label: "pod traffic encapsulated", ...reqEdge },
+  { id: "e-s-ovn", source: "service", target: "ovn", label: "kube-proxy / OVN load-balancer", ...reqEdge },
+  { id: "e-a-ext", source: "alloc", target: "ext", label: "default route / DNS", ...muted },
+];
+
+OpenShift has four overlapping networks that all have to be defined and not collide: the **machine network** (physical), the per-cluster **OpenShift allocation range** inside it, the **clusterNetwork** (pod IPs), and the **serviceNetwork** (ClusterIP services). The v6 fleet uses one set of values for both clusters, fixed by [ADR 0005](/docs/06-architecture-decisions/) and unchanged in [ADR 0026](/docs/06-architecture-decisions/).
+
+## How the networks layer
+
+<Whiteboard client:load data={{ nodes: cidrNodes, edges: cidrEdges }} height={420} />
+
+## The values
+
+| Network | CIDR | Where it's set | Notes |
+| --- | --- | --- | --- |
+| Machine network | `30.30.0.0/16` | `install-config.networking.machineNetwork[0].cidr` | The physical LAN. Both clusters share it. Gateway is `30.30.0.1`. |
+| OpenShift allocation reserve | `30.30.75.0/24` | Allocation table, planning only | A subset of the machine network reserved for OpenShift VIPs and node IPs. Per [ADR 0005](/docs/06-architecture-decisions/), do **not** call it a `/16` and do **not** put GitLab, MinIO, Nexus, RKE2, HAProxy, or unrelated lab services in this `/24`. |
+| `clusterNetwork` | `10.128.0.0/14`, `hostPrefix: 23` | `install-config.networking.clusterNetwork` | Default OpenShift pod CIDR. Each node carves a `/23` from this for its pods. |
+| `serviceNetwork` | `172.30.0.0/16` | `install-config.networking.serviceNetwork` | Default OpenShift ClusterIP service CIDR. |
+
+The `install-config.yaml` block both clusters use:
+
+```yaml
+networking:
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+  serviceNetwork:
+    - 172.30.0.0/16
+  machineNetwork:
+    - cidr: 30.30.0.0/16
+  networkType: OVNKubernetes
+platform:
+  baremetal:
+    apiVIPs:
+      - 30.30.75.10        # hub; 30.30.75.30 for spoke
+    ingressVIPs:
+      - 30.30.75.11        # hub; 30.30.75.31 for spoke
+```
+
+`platform.baremetal` is used for agent-based on libvirt + bare metal hybrids. The API and ingress VIPs come from the OpenShift allocation reserve, never from elsewhere in the machine network.
+
+## Per-cluster VIPs and node addresses
+
+`hub-dc-v6`:
+
+| Slot | Address |
+| --- | --- |
+| API VIP | `30.30.75.10` |
+| Ingress VIP | `30.30.75.11` |
+| Master 0 (rendezvous) | `30.30.75.13` |
+| Master 1 | `30.30.75.14` |
+| Master 2 | `30.30.75.15` |
+
+`spoke-dc-v6`:
+
+| Slot | Address |
+| --- | --- |
+| API VIP | `30.30.75.30` |
+| Ingress VIP | `30.30.75.31` |
+| Master 0 (rendezvous) | `30.30.75.33` |
+| Master 1 | `30.30.75.34` |
+| Master 2 | `30.30.75.35` |
+| Worker 0 (`gold-1`) | `30.30.75.36` |
+| Worker 1 (`gold-2`) | `30.30.75.37` |
+| Worker 2 (`gpu-01`) | `30.30.75.38` |
+
+There is a 15-address gap between the hub block (`.10`-`.15`) and the spoke block (`.30`-`.38`) on purpose — it leaves room for adding a fourth master, a worker, or a per-cluster ingress alias without renumbering. The `.12` and `.32` slots are reserved as bootstrap rows but not provisioned for the agent-based compact flow.
+
+## Why `30.30.75.0/24` and not its own L3 segment
+
+The allocation reserve is inside the lab `/16`; it is not a separate routed subnet with its own VLAN. That works because:
+
+- the lab L3 is flat — every host on `30.30.0.0/16` can reach every other host with the single gateway `30.30.0.1`.
+- ARP, gratuitous ARP, and ARP proxying handle VIP failover; OpenShift's `keepalived` instance on each master fights over the VIPs via VRRP.
+- there are no DHCP servers handing out addresses inside `30.30.75.0/24`. Every IP in that block is statically assigned through the allocation table.
+
+If a future cluster overflows `30.30.75.0/24`, [ADR 0005](/docs/06-architecture-decisions/) requires reserving another allocation range inside `30.30.0.0/16` or introducing a routed/VLAN subnet — not stretching `30.30.75.0/24` upward into used space.
+
+## OVN-Kubernetes overlay
+
+The `networkType: OVNKubernetes` setting picks the default OpenShift 4.20 CNI. OVN-K runs a Geneve overlay over the machine network:
+
+- pod-to-pod traffic across nodes is encapsulated in Geneve UDP on port 6081.
+- the encapsulation endpoints are the node IPs in `30.30.0.0/16`.
+- OVN-K uses IPv6 link-local (`fe80::/10`) on its `ovn-k8s-mp0` and geneve tunnels for **internal** OVN tunneling. This is what [ADR 0026](/docs/06-architecture-decisions/) is about — even on an IPv4-only `clusterNetwork`/`serviceNetwork`, OVN-K still needs the IPv6 kernel module loaded for these link-locals to come up. Disabling IPv6 at the kernel-arg or sysctl level breaks the geneve tunnel and the cluster goes `Ready=False`.
+
+The compatible posture (per ADR 0026):
+
+| Invariant | Met by |
+| --- | --- |
+| `clusterNetwork` IPv4-only | `install-config` above (`10.128.0.0/14`) |
+| `serviceNetwork` IPv4-only | `install-config` above (`172.30.0.0/16`) |
+| No admin IPv6 on physical interfaces | `agent-config.yaml` per-interface `ipv6.enabled: false` |
+| No upstream DHCPv6/RA on fabric | Lab infra; tracked as residual evidence (INFRA-V3) |
+| No workload pod binds to IPv6 podIP | Pod default; OVN-K assigns IPv4 podIPs from `10.128.0.0/14` |
+
+What is forbidden (per [ADR 0026](/docs/06-architecture-decisions/) §Forbidden Actions):
+
+- `ipv6.disable=1` in any `MachineConfig` kernel argument.
+- `net.ipv6.conf.all.disable_ipv6 = 1`, `default.disable_ipv6 = 1`, `lo.disable_ipv6 = 1`, or any sysctl that makes `/proc/sys/net/ipv6/conf/all/forwarding` unwritable.
+- Disabling the OVN-K geneve tunnel as a workaround.
+
+## DNS resolver and gateway
+
+Both clusters use:
+
+- Default route via `30.30.0.1` (lab L3 gateway).
+- DNS resolver `30.30.30.53` (the lab PowerDNS recursor VM on the `30.30.30.0/24` plane).
+
+Set per-interface in `agent-config.yaml`:
+
+```yaml
+networkConfig:
+  interfaces:
+    - name: enp1s0
+      type: ethernet
+      state: up
+      mac-address: 52:54:00:75:10:00
+      ipv4:
+        enabled: true
+        dhcp: false
+        address:
+          - ip: 30.30.75.13
+            prefix-length: 16
+      ipv6:
+        enabled: false
+  dns-resolver:
+    config:
+      server:
+        - 30.30.30.53
+  routes:
+    config:
+      - destination: 0.0.0.0/0
+        next-hop-address: 30.30.0.1
+        next-hop-interface: enp1s0
+        table-id: 254
+```
+
+The `prefix-length: 16` matches the machine network `/16` mask. The node carries one address inside `30.30.75.0/24` but routes the rest of `30.30.0.0/16` over the same interface.
+
+## Live verification (after install)
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+
+# clusterNetwork / serviceNetwork / machineNetwork
+oc --kubeconfig "$K" get networks.config.openshift.io cluster \
+  -o jsonpath='{.spec.clusterNetwork[*].cidr}{"\n"}{.spec.serviceNetwork[*]}{"\n"}{.spec.machineNetwork[*].cidr}{"\n"}'
+
+# pod CIDR per node
+oc --kubeconfig "$K" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.podCIDR}{"\n"}{end}'
+
+# OVN-K pod health
+oc --kubeconfig "$K" -n openshift-ovn-kubernetes get pods -l app=ovnkube-node -o wide
+oc --kubeconfig "$K" -n openshift-ovn-kubernetes get pods -l app=ovnkube-control-plane -o wide
+```
+
+Expected:
+
+- `clusterNetwork`: `10.128.0.0/14`.
+- `serviceNetwork`: `172.30.0.0/16`.
+- `machineNetwork`: `30.30.0.0/16`.
+- Each node carries a `/23` pod CIDR (`10.128.0.0/23`, `10.128.2.0/23`, …).
+- All `ovnkube-node` and `ovnkube-control-plane` pods `Running` with full containers ready.
+
+## References
+
+- `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`, `environment-profile.md`
+- `plans/disconnected-rebuild/environments/dc-lab/hub-dc-v6/install-config.template.yaml`, `agent-config.yaml`
+- `plans/disconnected-rebuild/environments/dc-lab/spoke-dc-v6/install-config.template.yaml`, `agent-config.yaml`
+- `adr/0005-openshift-rebuild-network-ingress-pki.md`, `adr/0026-ipv6-baseline-for-ovn-kubernetes.md`
+- `runbooks/openshift-ipv6-disable-correct-approach.md`

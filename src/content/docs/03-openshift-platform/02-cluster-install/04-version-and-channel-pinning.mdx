@@ -1,8 +1,176 @@
 ---
 title: "Version and Channel Pinning"
-description: "Section 03-openshift-platform/02-cluster-install: Version and Channel Pinning (placeholder)."
+description: "Why the fleet pins OpenShift to 4.20.18 with no upgrade graph, why every operator pins channel + startingCSV, and how oc-mirror's ImageSet feeds into platform-gitops."
 sidebar_label: "Version and Channel Pinning"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Disconnected installs cannot rely on Red Hat's upgrade graph. The fleet locks one OpenShift release, one mirror pass, and one set of operator channels and `startingCSV` values per cluster — all evidenced in `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` and the active `imageset-config.yaml`. This page lists what is pinned, where, and what to change when a version bump is in scope.
+
+## What is pinned
+
+### OpenShift release
+
+- Cluster version: **`4.20.18`** on both `hub-dc-v6` and `spoke-dc-v6`.
+- Architecture: `amd64` only.
+- Update channel: **none**. The update graph is disabled for this install; the cluster shows no upgrade availability until an explicit graph mirror lands.
+- `install-config.yaml` is rendered against the mirrored release image from oc-mirror, with `imageDigestSources` pointing at `mirror-registry.apps.sub.comptech-lab.com/<generated-path>`.
+
+The release pin is enforced at two layers:
+
+1. **oc-mirror ImageSet** — `plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml` lists the single release `4.20.18` (no `min`/`max` range). `oc mirror --v2` will refuse to mirror other versions from this ImageSet.
+2. **Cluster `ClusterVersion`** — the rendered `install-config.yaml` references the digest-pinned release image, so the install bootstraps the exact released payload, no float.
+
+To rev the release later: edit the ImageSet, run a mirror pass, update `clusters/<cluster>/platform/catalogs/` digests, and add an upgrade path through `ClusterVersion.spec.desiredUpdate`. The current install does **not** carry an upgrade graph.
+
+### Hub operator pins
+
+These are mirrored, installed, and pinned via the v6 hub `Subscription` resources (`clusters/hub-dc-v6/operators/*` and `clusters/hub-dc-v6/platform/acm/`):
+
+| Package | Channel | Version | CatalogSource |
+| --- | --- | --- | --- |
+| `openshift-gitops-operator` | `latest` | `1.20.3` | `cs-redhat-operator-index-v4-20` |
+| `advanced-cluster-management` | `release-2.16` | `2.16.1` | `cs-redhat-operator-index-v4-20` |
+| `multicluster-engine` | `stable-2.11` | `2.11.1` | `cs-redhat-operator-index-v4-20` |
+| `lvms-operator` | `stable-4.20` | `4.20.0` | `cs-redhat-operator-index-v4-20` |
+| `rhacs-operator` | `stable` | `4.10.2` | `cs-redhat-operator-index-v4-20` |
+| `openshift-cert-manager-operator` | `stable-v1` | `1.19.0` | `cs-redhat-operator-index-v4-20` |
+| `openshift-external-secrets-operator` | `stable-v1` | `1.1.0` | `cs-redhat-operator-index-v4-20` |
+
+### Spoke operator pins
+
+These are mirrored, installed via the spoke `Subscription` resources (`clusters/spoke-dc-v6/operators/*`):
+
+| Package | Channel | Version | CatalogSource |
+| --- | --- | --- | --- |
+| `openshift-gitops-operator` | n/a (gitops-addon Deployment) | image-digest only | n/a — addon-installed by ACM |
+| `local-storage-operator` | `stable` | `4.20.0-202604140241` | `cs-redhat-operator-index-v4-20` |
+| `odf-operator` | `stable-4.20` | `4.20.10-rhodf` | `cs-redhat-operator-index-v4-20` |
+| `redhat-oadp-operator` | `stable` | `1.5.5` | `cs-redhat-operator-index-v4-20` |
+| `openshift-external-secrets-operator` | `stable-v1` | `1.1.0` | `cs-redhat-operator-index-v4-20` |
+| `rhacs-operator` | `stable` | `4.10.2` | `cs-redhat-operator-index-v4-20` |
+| `openshift-cert-manager-operator` | `stable-v1` | `1.19.0` | `cs-redhat-operator-index-v4-20` |
+| `compliance-operator` | `stable` | `1.9.0` | `cs-redhat-operator-index-v4-20` |
+| `gatekeeper-operator-product` | `stable` | `3.21.0` | `cs-redhat-operator-index-v4-20` |
+| `container-security-operator` | `stable-3.16` | `3.16.3` | `cs-redhat-operator-index-v4-20` |
+| `cluster-observability-operator` | `stable` | `1.4.0` | `cs-redhat-operator-index-v4-20` |
+| `loki-operator` | `stable-6.5` | `6.5.0` | `cs-redhat-operator-index-v4-20` |
+| `cluster-logging` | `stable-6.5` | `6.5.0` | `cs-redhat-operator-index-v4-20` |
+| `tempo-product` | `stable` | `0.20.0-3` | `cs-redhat-operator-index-v4-20` |
+| `opentelemetry-product` | `stable` | `0.144.0-3` | `cs-redhat-operator-index-v4-20` |
+| `netobserv-operator` | `stable` | `1.11.1` | `cs-redhat-operator-index-v4-20` |
+| `servicemeshoperator3` | `stable-3.3` | `3.3.2` | `cs-redhat-operator-index-v4-20` |
+| `kiali-ossm` | `stable` | `2.22.2` | `cs-redhat-operator-index-v4-20` |
+| `quay-operator` | `stable-3.17` | `3.17.1` | `cs-redhat-operator-index-v4-20` |
+| `cluster-kube-descheduler-operator` | `stable` | `5.3.2` | `cs-redhat-operator-index-v4-20` |
+| `file-integrity-operator` | `stable` | `1.3.8` | `cs-redhat-operator-index-v4-20` |
+| `security-profiles-operator` | `release-alpha-rhel-8` | `0.10.0` | `cs-redhat-operator-index-v4-20` |
+| `openshift-pipelines-operator-rh` | `pipelines-1.22` | `1.22.0` | `cs-redhat-operator-index-v4-20` |
+| `cloudnative-pg` | `stable-v1` | `1.29.0` | `cs-certified-operator-index-v4-20` |
+| `open-liberty-certified` | `v1.6` | `1.6.1` | `cs-certified-operator-index-v4-20` |
+| `kubevirt-hyperconverged` | `stable` | `4.20.11` | `cs-redhat-operator-index-v4-20` (re-introduced under #139) |
+
+### Deferred (mirrored but not installed)
+
+| Package | Channel | Version | Reason |
+| --- | --- | --- | --- |
+| `rhods-operator` (OpenShift AI) | `stable` | `2.25.6` | Deferred 2026-05-09 — large RHOAI images; reintroduce only when AI is explicitly in scope. |
+| `gpu-operator-certified` (NVIDIA) | `v26.3` | `26.3.1` | Deferred 2026-05-09 — large GPU images; reintroduce only when GPU enablement is in scope. |
+
+## How a Subscription expresses the pin
+
+Every operator `Subscription` carries channel + `startingCSV`:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-pipelines-operator-rh
+  namespace: openshift-operators
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  channel: pipelines-1.22
+  installPlanApproval: Automatic
+  name: openshift-pipelines-operator-rh
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: openshift-pipelines-operator-rh.v1.22.0
+```
+
+`installPlanApproval: Automatic` lets OLM apply the InstallPlan immediately; `startingCSV` blocks any version older than the pin from being installed accidentally. The catalog source is the mirrored one — never the default external `OperatorHub` source, which is disabled per [ADR 0019](/docs/06-architecture-decisions/).
+
+## CatalogSources and ClusterCatalogs
+
+Two mirrored catalogs cover everything:
+
+| Name | Index image | Mirrored from |
+| --- | --- | --- |
+| `cs-redhat-operator-index-v4-20` | `mirror-registry.apps.sub.comptech-lab.com/redhat-operator-index@sha256:...` | `registry.redhat.io/redhat/redhat-operator-index:v4.20` |
+| `cs-certified-operator-index-v4-20` | `mirror-registry.apps.sub.comptech-lab.com/certified-operator-index@sha256:...` | `registry.redhat.io/redhat/certified-operator-index:v4.20` |
+
+The matching OLM v1 `ClusterCatalog` objects are also present with digest-pinned images. Built-in OLM v1 `openshift-*` ClusterCatalogs are disabled with `availabilityMode: Unavailable` (the default OperatorHub posture in disconnected mode).
+
+The catalog manifests live at:
+
+```text
+clusters/spoke-dc-v6/platform/catalogs/catalogsource-redhat-operator-index-v4-20.yaml
+clusters/spoke-dc-v6/platform/catalogs/catalogsource-certified-operator-index-v4-20.yaml
+clusters/spoke-dc-v6/platform/catalogs/clustercatalog-redhat-operator-index-v4-20.yaml
+clusters/spoke-dc-v6/platform/catalogs/clustercatalog-certified-operator-index-v4-20.yaml
+```
+
+The hub has the same set under `clusters/hub-dc-v6/platform/catalogs/`. Disabling the default `OperatorHub` sources is done with:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: OperatorHub
+metadata:
+  name: cluster
+spec:
+  disableAllDefaultSources: true
+```
+
+This manifest is part of the disconnected-catalog baseline applied immediately after install.
+
+## When to refresh
+
+A version bump on any operator (or the OpenShift release itself) is a four-step ritual:
+
+1. **Edit the ImageSet** at `plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml` — change channel / min / max / target version for the specific package.
+2. **Run `oc mirror --v2`** from the `oc-mirror` VM with the merged authfile, into `mirror-registry.apps.sub.comptech-lab.com`. Capture the dry-run mapping count first.
+3. **Update GitOps catalog digests** — `oc mirror` regenerates catalog index digests. Update the `CatalogSource` / `ClusterCatalog` images under `clusters/<cluster>/platform/catalogs/` to the new digests.
+4. **Update the `Subscription`** — change `channel` and `startingCSV` to the new values. Commit, push, let Argo CD reconcile.
+
+After Argo sync, validate:
+
+```bash
+oc --kubeconfig "$K_SPOKE" -n openshift-marketplace get packagemanifest <package> \
+  -o jsonpath='{.status.catalogSource}{" "}{.status.defaultChannel}{"\n"}'
+oc --kubeconfig "$K_SPOKE" -n <operator-namespace> get sub,installplan,csv,pods
+```
+
+Expected: the package shows the new default channel; the Subscription reaches `AtLatestKnown` and the new CSV phase `Succeeded`.
+
+## Why all pins, no float
+
+[ADR 0019](/docs/06-architecture-decisions/) and the platform-admin handoff require explicit pins because:
+
+- Disconnected catalogs change digest every time `oc mirror` runs, even if the upstream channel didn't ship a new version. Without `startingCSV` pinning the cluster could silently move to a digest you didn't review.
+- Operator upgrades in OLM happen on InstallPlan creation, which is automatic. The pin gives a known-good fallback even if a new InstallPlan lands later.
+- The platform-gitops repo is the durable record. A version bump that lands in Git is reviewable, revertable, and tied to a tracker issue — much better than a console-driven channel change that nobody else sees.
+
+## Known gotchas
+
+- **ODF dependency packages**: mirroring only `odf-operator` is not enough. The full set (`cephcsi-operator`, `mcg-operator`, `ocs-client-operator`, `ocs-operator`, `odf-csi-addons-operator`, `odf-dependencies`, `odf-external-snapshotter-operator`, `odf-prometheus-operator`, `recipe`, `rook-ceph-operator`) must be in the ImageSet explicitly. This was the issue #125 lesson.
+- **Operand image misses**: even with the operator package mirrored, individual operand images may not be covered by IDMS/ITMS. The OpenShift Data Foundation CSI pods on the spoke crashed with `ImagePullBackOff` on `registry.redhat.io` until the missing operand digests were copied into Nexus and the generated IDMS was captured in GitOps.
+- **Channel rename across minor versions**: ACM `release-2.16` is for `2.16.x`. Going to `2.17.x` requires changing both `channel` and `startingCSV`. The `ClusterServiceVersion` upgrade-edge graph in the catalog determines whether the bump is in-place or requires reinstall.
+
+## References
+
+- `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+- `plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`
+- `connection-details/platform-admin-handoff.md` — "Planned Operator Install Queue" and "Operator Install Workflow" sections
+- `adr/0019-nexus-only-image-supply-chain.md`
+- platform-gitops `clusters/{hub-dc-v6,spoke-dc-v6}/platform/catalogs/` and `operators/*`

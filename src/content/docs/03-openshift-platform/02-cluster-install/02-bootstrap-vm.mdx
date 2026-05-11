@@ -1,8 +1,205 @@
 ---
-title: "Bootstrap VM"
-description: "Section 03-openshift-platform/02-cluster-install: Bootstrap VM (placeholder)."
+title: "Bootstrap VM and Install Hosts"
+description: "What runs where during agent-based install: the ocp-bootstrap operator host, the libvirt KVM hypervisor, the rendezvous master, and the physical-worker iLO virtual-media path."
 sidebar_label: "Bootstrap VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const bsNodes = [
+  { id: "op", position: { x: 50, y: 0 }, data: { label: "operator workstation\n/home/ze/codex-opp-agent/\nplans + scripts" }, style: ctrlBox },
+  { id: "ocpbs", position: { x: 300, y: 0 }, data: { label: "ocp-bootstrap VM\n(lab /24)\nrender + ISO + auth/" }, style: ctrlBox },
+  { id: "kvm", position: { x: 580, y: 0 }, data: { label: "KVM host\nlibvirt domains for\nVM masters" }, style: dataBox },
+  { id: "mirror", position: { x: 50, y: 130 }, data: { label: "Nexus mirror-registry\n(release + operators)" }, style: extBox },
+  { id: "iLO", position: { x: 580, y: 130 }, data: { label: "iLO Redfish\nUSB-key virtual media\n(physical workers)" }, style: extBox },
+  { id: "rend", position: { x: 300, y: 250 }, data: { label: "Rendezvous master\nhub-dc-v6-master-0\nspoke-dc-v6-master-0" }, style: agentBox },
+  { id: "phys", position: { x: 580, y: 250 }, data: { label: "Physical workers\ngold-1, gold-2, gpu-01\n(spoke only)" }, style: agentBox },
+  { id: "cluster", position: { x: 440, y: 380 }, data: { label: "Cluster installed\nClusterVersion 4.20.18\nAvailable=True" }, style: ctrlBox },
+];
+
+export const bsEdges = [
+  { id: "e-op-bs", source: "op", target: "ocpbs", label: "ssh + scp render", ...reqEdge },
+  { id: "e-bs-kvm", source: "ocpbs", target: "kvm", label: "agent-ISO over HTTP", ...reqEdge },
+  { id: "e-bs-mir", source: "ocpbs", target: "mirror", label: "oc adm release info", ...muted },
+  { id: "e-bs-rend", source: "ocpbs", target: "rend", label: "agent wait-for bootstrap-complete", ...reqEdge },
+  { id: "e-kvm-rend", source: "kvm", target: "rend", label: "boot VM masters", ...muted },
+  { id: "e-iLO-phys", source: "iLO", target: "phys", label: "virtual-USB ISO", ...reqEdge },
+  { id: "e-rend-cl", source: "rend", target: "cluster", label: "elect, wait, install-complete", ...muted },
+  { id: "e-phys-cl", source: "phys", target: "cluster", label: "workers join + CSRs auto-approve", ...muted },
+];
+
+The "bootstrap VM" in agent-based install is not a separate provisioned VM — it is a temporary role that one of the control-plane masters plays until the cluster takes over. The operator-side install host is `ocp-bootstrap`, a small Linux VM on the lab `/24` that holds the merged pull-secret, the rendered install-config, and the generated agent ISO. This page traces the four-host pipeline.
+
+## What runs where
+
+<Whiteboard client:load data={{ nodes: bsNodes, edges: bsEdges }} height={520} />
+
+## Operator workstation
+
+The operator works from `/home/ze/codex-opp-agent` on their personal workstation. This is the planning and source-of-truth side:
+
+- `plans/disconnected-rebuild/environments/dc-lab/` — environment profile, allocation table, hub and spoke install inputs.
+- `scripts/rebuild/openshift-install/prepare-{hub-dc-v6,spoke-dc-v6}.sh` — render helpers.
+- `scripts/rebuild/openshift-install/create-{hub-dc-v6,spoke-dc-v6}-vm-definitions.sh` — libvirt domain helpers.
+- `secrets/` — git-ignored local-only copies of kubeconfig, kubeadmin passwords, pull-secret, after install completes and they are copied off `ocp-bootstrap` deliberately.
+
+The workstation does **not** generate ISOs or run `openshift-install`. It edits planning inputs, runs `ssh` and `scp` to the bootstrap host, and reads validation reports back.
+
+## ocp-bootstrap render host
+
+`ocp-bootstrap.sub.comptech-lab.com` is a small Linux VM on the lab `/24` that has:
+
+- direct LAN reach to the Nexus mirror-registry, the KVM host, and (post-install) the cluster API VIP.
+- the merged pull-secret at `~/ocp-clusters/<cluster>/pull-secret.merged.json` (combining the Red Hat customer pull-secret with the local Nexus `mirror-registry` credential).
+- `openshift-install` binary at the cluster's release version.
+
+The render helpers stage:
+
+```text
+~/ocp-clusters/hub-dc-v6/install-config.yaml
+~/ocp-clusters/hub-dc-v6/agent-config.yaml
+~/ocp-clusters/hub-dc-v6/openshift/99-master-tpm2-encryption.yaml
+~/ocp-clusters/hub-dc-v6/hub-dc-v6-agent.iso
+~/ocp-clusters/hub-dc-v6/auth/kubeconfig           # populated post-install
+~/ocp-clusters/hub-dc-v6/auth/kubeadmin-password   # populated post-install
+~/ocp-clusters/hub-dc-v6/mirror-resources/         # idms/itms/cs from oc-mirror
+```
+
+ISO generation:
+
+```bash
+ssh ze@ocp-bootstrap
+cd ~/ocp-clusters/hub-dc-v6
+openshift-install agent create image --dir .
+ls -la hub-dc-v6-agent.iso
+```
+
+After ISO generation, `scp` or `curl` it to the KVM host's image directory:
+
+```bash
+scp hub-dc-v6-agent.iso \
+  kvm-host:/var/lib/libvirt/images/openshift/hub-dc-v6/hub-dc-v6-agent.iso
+```
+
+The KVM host serves the ISO over HTTP for the physical-worker iLO virtual-media flow on the spoke; the hub uses local libvirt CDROM attachment instead, since the hub has no physical workers.
+
+## KVM hypervisor
+
+The KVM host runs the three (or six) VM masters as libvirt domains. The domains are defined by `scripts/rebuild/openshift-install/create-<cluster>-vm-definitions.sh` and stop before VM boot. The helper enforces:
+
+- deterministic MACs from the allocation table (`52:54:00:75:10:00`-`02` for hub masters, `52:54:00:75:30:00`-`02` for spoke masters)
+- network attachment to `br30` only (the private machine network bridge), never `br-vm` (the public-routed bridge)
+- vTPM for TPM2-backed LUKS encryption
+- enough vCPU / memory / disk for an OpenShift master (`vm-plan.yaml` lists the per-domain sizing)
+
+Boot is a separate explicit approval gate — once `domiflist` matches the allocation table and the operator approves, the VMs power on against the agent ISO, find the rendezvous host over the machine network, and the agent install proceeds.
+
+## Rendezvous master
+
+For agent-based compact install, one of the masters is the rendezvous host. For `hub-dc-v6` this is `hub-dc-v6-master-0` at `30.30.75.13`; for `spoke-dc-v6` it is `spoke-dc-v6-master-0` at `30.30.75.33`. The rendezvous master:
+
+1. Boots from the agent ISO with the rendezvous IP set in `agent-config.yaml`.
+2. Other masters boot from the same ISO and contact the rendezvous on the assisted-service port.
+3. Once all three masters are reachable, the rendezvous master runs the temporary bootstrap services (`assisted-service`, `assisted-installer`).
+4. The cluster bootstraps as a self-hosted control plane. The bootstrap role on the rendezvous master ends; it becomes a normal master.
+
+The `bootstrap` row in the allocation table (`30.30.75.12` for the hub, `30.30.75.32` for the spoke) is reserved but **not provisioned** for the compact agent-based flow. It exists in case the install method is changed later to a non-agent flow that needs a dedicated bootstrap VM.
+
+## Physical-worker boot (spoke only)
+
+The spoke has three physical workers (`gold-1`, `gold-2`, `gpu-01`). They boot via HPE iLO virtual-USB media backed by a byte-range capable HTTP server on `ocp-bootstrap`:
+
+```bash
+# On ocp-bootstrap (range-capable HTTP server; do NOT use python3 -m http.server)
+cd ~/ocp-clusters/spoke-dc-v6
+# any Go/Nginx/Apache range-aware server suffices; this is the issue #93
+# known-good pattern.
+```
+
+Then in iLO, for each worker:
+
+1. Mount the ISO via `VirtualMedia/1` as USB-key media (HTTP URL to the ISO on `ocp-bootstrap`).
+2. Set a one-time boot override to UEFI target `PciRoot(0x0)/Pci(0xD,0x0)/Pci(0x0,0x4)/USB(0x2,0x0)`.
+3. Force-restart.
+4. Wait for RHCOS to write to `/dev/nvme0n1` (the NS204i RAID1 boot volume).
+5. Eject virtual USB media before the next restart, so the worker boots from the installed disk.
+
+### Why not Python's `http.server`
+
+Python 3.9 `http.server` returns `200 OK` for HTTP Range requests instead of `206 Partial Content`. iLO virtual media requires range-aware behavior — without it, the ISO appears to mount but reads stall partway and the worker boots from local disk instead. This was the failure mode that surfaced in issue #93. Use a range-aware server (Go's `ran`, Nginx, Apache) instead.
+
+### Why not iLO CD/DVD virtual media
+
+iLO CD/DVD virtual media mounts but fell back to local disk during the issue #93 install. The known-good path is the USB-key virtual-media target above, full stop.
+
+## Post-bootstrap handoff
+
+Once the masters elect, install services, and finish the bootstrap, the install host on `ocp-bootstrap` watches via:
+
+```bash
+openshift-install agent wait-for bootstrap-complete --dir ~/ocp-clusters/<cluster> --log-level info
+openshift-install agent wait-for install-complete   --dir ~/ocp-clusters/<cluster> --log-level info
+```
+
+The `auth/kubeconfig` and `auth/kubeadmin-password` files are then written under `~/ocp-clusters/<cluster>/auth/`. They are copied to the workstation's `secrets/` and `.kube/configs/` directories under specific filenames and stay local-only.
+
+For the hub:
+
+```text
+/home/ze/.kube/config                                   # default kubeconfig
+/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+/home/ze/codex-opp-agent/ocp-clusters/hub-dc-v6/auth/kubeconfig
+/home/ze/codex-opp-agent/secrets/hub-dc-v6-kubeconfig
+/home/ze/codex-opp-agent/secrets/hub-dc-v6-kubeadmin-password
+```
+
+For the spoke:
+
+```text
+/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+/home/ze/codex-opp-agent/secrets/spoke-dc-v6-kubeconfig
+/home/ze/codex-opp-agent/secrets/spoke-dc-v6-kubeadmin-password
+```
+
+The `kubeadmin` password is never pasted in chat, Git, wiki, or session reports. For CLI work, prefer the kubeconfig paths above; `kubeadmin` is for console access and one-off bootstrap checks only.
+
+## Validation after bootstrap-complete
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+oc --kubeconfig "$K" get nodes -o wide
+oc --kubeconfig "$K" get clusterversion version -o wide
+oc --kubeconfig "$K" get co | awk \
+  'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+oc --kubeconfig "$K" get csr | awk '/Pending/'
+```
+
+Expected:
+
+- All masters (and for the spoke, all workers) are `Ready`.
+- `ClusterVersion` is `4.20.18`, `Available=True`, `Progressing=False`.
+- The `co` filter prints only the header (no degraded operators).
+- No pending CSRs.
+
+If pending CSRs remain (rare with agent-based install, but possible on a delayed worker join), approve them:
+
+```bash
+oc --kubeconfig "$K" get csr -o name | xargs oc --kubeconfig "$K" adm certificate approve
+```
+
+## References
+
+- `plans/disconnected-rebuild/environments/dc-lab/hub-dc-v6/README.md`, `vm-plan.yaml`, `validation.md`
+- `plans/disconnected-rebuild/environments/dc-lab/spoke-dc-v6/README.md`, `vm-plan.yaml`, `physical-worker-boot-plan.md`
+- `connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md`
+- `connection-details/platform-admin-handoff.md`
