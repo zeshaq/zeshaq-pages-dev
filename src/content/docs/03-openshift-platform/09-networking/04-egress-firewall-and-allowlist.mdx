@@ -1,0 +1,225 @@
+---
+title: "EgressFirewall and the outbound allowlist"
+description: "How dc-lab clusters control where workloads can egress to: per-namespace EgressFirewall, the Nexus / Vault / DNS allowlist pattern, and the ESO-to-Vault egress requirement."
+sidebar_label: "EgressFirewall"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+A pod's outbound network surface is the part most often overlooked. The dc-lab v6 fleet treats it as a first-class admission concern: each workload namespace declares the **specific destinations** it needs to reach, and `EgressFirewall` enforces it at the OVN-K layer. This page covers the patterns and the lab-specific allowlist that closes the disconnected-mode contract.
+
+## What EgressFirewall does
+
+`EgressFirewall` is an OpenShift-specific CR (`k8s.ovn.org/v1`) — one per namespace — that filters pod-egress traffic. Each rule is `Allow` or `Deny` with one of:
+
+- `cidrSelector` (a CIDR block)
+- `dnsName` (a DNS name, lazily resolved by OVN-K)
+- `to.nodeSelector` (allow traffic to specific cluster nodes' addresses)
+- ports (per-protocol filtering)
+
+Rules are evaluated **top-to-bottom**, and the **first match wins**. The last rule should be a catch-all `Deny`.
+
+## Why per-namespace egress matters
+
+`NetworkPolicy` can also filter egress, but it has two limits:
+
+1. NetworkPolicy egress matches on **pod / namespace selectors** and **CIDRs** — not on DNS names.
+2. NetworkPolicy is *additive* — multiple NetworkPolicies in the same namespace are ORed; you need a default-deny to make missing rules effective.
+
+EgressFirewall is **subtractive** — the whole namespace gets one ordered rule list. It also resolves DNS names automatically, which is what you actually want for "let this namespace reach Vault and Nexus." For DNS-name targets, OVN-K periodically resolves and updates the matching rule.
+
+The dc-lab v6 baseline uses both:
+
+- EgressFirewall for "where can this namespace's pods go outside the cluster?"
+- NetworkPolicy for "which pods inside the cluster can reach which other pods?"
+
+## The "external-secrets" egress requirement
+
+The memory entry *project_eso_egress_to_vault.md* records the specific case:
+
+> Red Hat ESO 1.1.0 ships default-deny in `external-secrets` namespace; reconciler hangs on Vault login until allow-egress NP targeting the Vault VM is present. Fix already in GitOps; restart operand after policy change.
+
+This is both an EgressFirewall and NetworkPolicy story: the ESO reconciler must reach the Vault VM at its private IP and port (HTTPS to Vault), or every `ExternalSecret` will fail to materialize. The lab's GitOps repo includes the allow rule; without it, the operator hangs silently on its login step.
+
+## A typical EgressFirewall for an operator namespace
+
+```yaml
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  name: default
+  namespace: external-secrets
+spec:
+  egress:
+    # 1) Cluster-internal — kube-apiserver, in-cluster Services
+    - type: Allow
+      to:
+        cidrSelector: 172.30.0.0/16            # serviceNetwork
+    - type: Allow
+      to:
+        cidrSelector: 10.128.0.0/14            # clusterNetwork (pod-to-pod)
+    # 2) DNS resolver (lab PowerDNS)
+    - type: Allow
+      to:
+        cidrSelector: <lab-dns>/32             # internal-only specifics — kept in connection-details/
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 3) Vault VM for ESO Vault-provider login
+    - type: Allow
+      to:
+        cidrSelector: <vault-vm>/32            # internal-only
+      ports:
+        - protocol: TCP
+          port: 8200
+    # 4) Catch-all deny
+    - type: Deny
+      to:
+        cidrSelector: 0.0.0.0/0
+```
+
+> Internal-only addresses (DNS, Vault, Nexus VM) are kept in `codex-opp-agent/connection-details/`.
+
+This is a tight allowlist:
+
+- ESO needs the kube-apiserver (for the `kubernetes`-provider variant) — covered by `serviceNetwork`.
+- ESO Vault provider needs the Vault VM on TCP/8200 — covered by the specific rule.
+- DNS is needed for `vault.<lab>` name resolution — covered by the lab-DNS rule.
+- Everything else is denied.
+
+## The fleet allowlist pattern
+
+| Namespace | Permitted egress targets | Why |
+| --- | --- | --- |
+| `external-secrets` | kube-apiserver, lab DNS, Vault VM:8200 | ESO Vault provider; ADR 0019 doesn't apply directly but the limit-of-egress principle does |
+| `openshift-gitops` | kube-apiserver, lab DNS, GitLab VM:443 | Argo CD repo fetch |
+| `openshift-marketplace` | kube-apiserver, Nexus mirror-registry:443 | CatalogSource gRPC pod pulls catalog images |
+| `openshift-image-registry` | kube-apiserver, Nexus mirror-registry:443 | image-registry pulls (rare; in-cluster registry usually serves builds) |
+| Workload tenant namespaces | kube-apiserver, lab DNS, in-cluster Services only | applications connect to in-cluster Postgres / Loki / etc. |
+| `cnpg-operator` | kube-apiserver, lab DNS, Nexus mirror-registry:443 | catalog/operand pulls |
+
+The intent is **denial of general internet access**. No workload namespace can reach the public internet. The Nexus mirror endpoints are explicitly listed where needed.
+
+## EgressFirewall + DNS gotcha
+
+`type: dnsName` rules resolve through the OVN-K controller, which uses the cluster DNS service. This means:
+
+- The DNS rule (allow lab DNS) **must come before** any `dnsName` rule — otherwise OVN-K can't resolve the name to add the iptables / OVN flow.
+- DNS-name rules are re-resolved periodically (default 30 minutes). Static IPs that change behind the name take time to propagate.
+
+For high-stability targets (Vault, Nexus, DNS itself), the lab convention is to use `cidrSelector` with the IP, not `dnsName`. The named approach is reserved for upstream content (where it would be relevant); on a disconnected fleet, it almost never applies.
+
+## A workload tenant EgressFirewall
+
+For a tenant application namespace:
+
+```yaml
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  name: default
+  namespace: tenant-platform-app-prod
+spec:
+  egress:
+    # In-cluster Services and Pods
+    - type: Allow
+      to:
+        cidrSelector: 172.30.0.0/16
+    - type: Allow
+      to:
+        cidrSelector: 10.128.0.0/14
+    # Lab DNS
+    - type: Allow
+      to:
+        cidrSelector: <lab-dns>/32
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Catch-all deny
+    - type: Deny
+      to:
+        cidrSelector: 0.0.0.0/0
+```
+
+Tenant apps in this fleet have **no** direct external egress. Anything they need — Postgres, S3, app-registry — is in-cluster. If a tenant needs to call out to something off-cluster, that becomes an explicit egress rule with a tracking issue.
+
+## Egress IP (and why we don't use it)
+
+OVN-K supports **Egress IP** — pin a namespace's outbound source IP so external services see a stable address. The dc-lab v6 fleet doesn't use this because:
+
+- External services aren't part of the design (workloads don't egress to the internet).
+- The lab's external services (Vault, Nexus, DNS) are reached via SNAT through the node's own IP, which is fine — they don't enforce per-namespace identity.
+- Egress IP requires either a separate node or careful subnet management; the operational cost isn't justified.
+
+If a future workload requires per-namespace egress identity (e.g., calling a third-party API that whitelists by source IP), Egress IP becomes the right tool. Not today.
+
+## Operating EgressFirewall
+
+### Apply
+
+```yaml
+# clusters/<cluster>/tenants/<team>/<app>/<env>/egressfirewall.yaml
+# committed to platform-gitops alongside the tenant manifests
+```
+
+Argo CD applies it; OVN-K renders it into per-node iptables / OVN flows within seconds.
+
+### Inspect
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+# Per-namespace EgressFirewall
+oc --kubeconfig "$K" -n <ns> get egressfirewall default -o yaml
+
+# Live test from a pod in the namespace
+oc --kubeconfig "$K" -n <ns> debug pod/<pod> -- bash -c '
+  curl -m 5 -sSI https://<vault-host>:8200/v1/sys/health
+  echo "exit: $?"
+'
+# expected: 200 if Vault is in the allow list; timeout if not
+```
+
+### Update
+
+EgressFirewall changes propagate within seconds. There's no MachineConfig rollout (unlike IDMS) — OVN-K applies it directly. This makes adjustments cheap.
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| Pod `connection timeout` to a known-reachable address | EgressFirewall denying it | add an `Allow` rule before the catch-all deny |
+| ESO reconciler hung on Vault login | egress to Vault denied | add the Vault rule (NP and/or EgressFirewall) — see memory: *project_eso_egress_to_vault.md* |
+| OperatorHub CatalogSource pod can't pull index | egress to Nexus mirror-registry denied | add the rule for `openshift-marketplace` |
+| `dnsName` rule never matches | DNS allow rule below the dnsName rule | reorder rules; lab convention is DNS-first |
+| Catch-all deny missing | EgressFirewall is effectively permit-all if last rule is Allow | always end with `cidrSelector: 0.0.0.0/0, type: Deny` |
+| Pod can reach internet | EgressFirewall missing entirely in the namespace | add a per-namespace EgressFirewall via GitOps |
+| EgressFirewall conflicts with EgressIP | misuse — pick one model per namespace | dc-lab uses EgressFirewall only |
+
+## Interaction with NetworkPolicy egress
+
+EgressFirewall is OVN-K-specific and per-namespace. NetworkPolicy is per-pod and standard Kubernetes. Both filter outbound traffic. The relationship:
+
+| Layer | Granularity | What it filters | Used in dc-lab |
+| --- | --- | --- | --- |
+| EgressFirewall | namespace | per-pod outbound to external CIDR / DNS / port | yes — primary boundary |
+| NetworkPolicy egress | pod-selector | pod outbound to other pods/namespaces (and CIDRs) | yes — for east-west, less for north-south |
+
+For the dc-lab v6 fleet:
+
+- **EgressFirewall is the primary** for "where outside the namespace can this pod go?"
+- **NetworkPolicy egress is the secondary** for "which other in-cluster Services can this pod reach?"
+
+They're complementary; both apply. If both deny, the packet is denied (intersection of allows).
+
+## References
+
+- Memory: *project_eso_egress_to_vault.md* — the ESO-Vault egress story.
+- OpenShift docs (Red Hat): *EgressFirewall*.
+- [05-network-policy-baseline](/docs/openshift-platform/networking/network-policy-baseline) — the east-west layer.
+- ADR 0019 — Nexus-only image supply chain (egress to Nexus is required).
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — per-cluster network plan.

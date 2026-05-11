@@ -1,0 +1,183 @@
+---
+title: "Networking overview — OVN-Kubernetes, ingress, egress, policy"
+description: "How OpenShift networking is composed on the dc-lab v6 fleet: OVN-Kubernetes as the CNI, Routes via IngressController, EgressFirewall on the way out, NetworkPolicy boundaries inside."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const clusterBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 };
+export const policyBox = { background: "#fce7f3", border: "1px solid #be185d", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const denyEdge = { style: { stroke: "#be185d", strokeWidth: 1.5, strokeDasharray: "3,3" }, markerEnd: { type: "arrowclosed", color: "#be185d" }, labelStyle: { fill: "#be185d", fontSize: 11 }, labelBgStyle: { fill: "#fdf2f8" } };
+
+export const netNodes = [
+  { id: "client",   position: { x: 0,   y: 0   }, data: { label: "External client\n(lab user, HAProxy)" }, style: extBox },
+  { id: "ingress",  position: { x: 240, y: 0   }, data: { label: "OpenShift IngressController\n(haproxy router pods)" }, style: ctrlBox },
+  { id: "vip",      position: { x: 240, y: 130 }, data: { label: "Ingress VIP\n(MetalLB / on-VIP)" }, style: dataBox },
+  { id: "route",    position: { x: 480, y: 0   }, data: { label: "Route / Ingress CR" }, style: dataBox },
+  { id: "svc",      position: { x: 480, y: 130 }, data: { label: "Service\n(ClusterIP)" }, style: dataBox },
+  { id: "pod",      position: { x: 480, y: 260 }, data: { label: "Pod\n(workload)" }, style: agentBox },
+  { id: "ovn",      position: { x: 720, y: 130 }, data: { label: "OVN-Kubernetes\n(geneve overlay, IPv4-only)" }, style: clusterBox },
+  { id: "np",       position: { x: 720, y: 260 }, data: { label: "NetworkPolicy\n(allow-list, default-deny)" }, style: policyBox },
+  { id: "efw",      position: { x: 720, y: 390 }, data: { label: "EgressFirewall\n(per-namespace)" }, style: policyBox },
+  { id: "egress",   position: { x: 480, y: 390 }, data: { label: "Egress traffic\n(to Vault, Nexus, DNS)" }, style: dataBox },
+  { id: "vms",      position: { x: 240, y: 390 }, data: { label: "Platform VMs\n(Vault, Nexus, DNS, HAProxy)" }, style: extBox },
+];
+
+export const netEdges = [
+  { id: "e1", source: "client", target: "ingress", label: "HTTPS", ...reqEdge },
+  { id: "e2", source: "ingress", target: "vip", label: "binds", ...muted },
+  { id: "e3", source: "ingress", target: "route", label: "reads", ...muted },
+  { id: "e4", source: "route", target: "svc", label: "targets", ...reqEdge },
+  { id: "e5", source: "svc", target: "pod", label: "endpoints", ...reqEdge },
+  { id: "e6", source: "ovn", target: "svc", label: "kube-proxy=OVN", ...muted },
+  { id: "e7", source: "ovn", target: "pod", label: "pod IP allocation", ...muted },
+  { id: "e8", source: "np", target: "pod", label: "filters ingress/egress", ...denyEdge },
+  { id: "e9", source: "pod", target: "egress", label: "outbound", ...pullEdge },
+  { id: "e10", source: "efw", target: "egress", label: "namespace-scoped allowlist", ...denyEdge },
+  { id: "e11", source: "egress", target: "vms", label: "to lab subnets", ...pullEdge },
+];
+
+OpenShift networking on the dc-lab v6 fleet has four cleanly separated layers: the **CNI** (OVN-Kubernetes), the **north-south ingress** (IngressController + Routes), the **east-west traffic shaping** (NetworkPolicy), and the **outbound boundary** (EgressFirewall + traffic to platform VMs). This page draws the boundaries and links into the page that owns each layer.
+
+## The picture
+
+<Whiteboard client:load data={{ nodes: netNodes, edges: netEdges }} height={580} />
+
+Reading the diagram:
+
+- **External clients** (lab users, the lab HAProxy edge) reach Routes via the **IngressController** — the `openshift-ingress` namespace's haproxy router pods bound to the cluster's Ingress VIP.
+- **Routes / Ingress CRs** declare which hostname maps to which Service. The cluster's wildcard DNS (`*.apps.<cluster>.<base-domain>`) resolves to the Ingress VIP.
+- **Services** (ClusterIP) sit in front of Pods. OVN-Kubernetes implements `kube-proxy` natively — there is no separate `kube-proxy` daemonset.
+- **OVN-Kubernetes** is the CNI. It allocates pod IPs (IPv4-only — see [02-ovn-kubernetes-and-ipv6](/docs/openshift-platform/networking/ovn-kubernetes-and-ipv6) and ADR 0026), runs a geneve tunnel mesh between nodes, and enforces Services + NetworkPolicy + EgressFirewall.
+- **NetworkPolicy** filters east-west traffic between pods. The lab convention is `default-deny` per namespace with explicit allow rules.
+- **EgressFirewall** is the OpenShift-specific CR that filters outbound traffic per namespace; useful for "this namespace can only egress to Vault and Nexus."
+- **Platform VMs** (Vault, Nexus, DNS, HAProxy) sit on the lab management subnet. Pods reach them via egress; the egress path is intentionally narrow (this is the boundary ADR 0019 cares about).
+
+## The four layers
+
+### 1. CNI: OVN-Kubernetes
+
+OVN-Kubernetes is the **only supported CNI for OCP 4.20+**. OpenShift-SDN is end-of-life. The CNI handles:
+
+- Pod IP allocation from `clusterNetwork` (`10.128.0.0/14` in dc-lab).
+- Service IP allocation from `serviceNetwork` (`172.30.0.0/16`).
+- Inter-node tunneling via the **geneve** overlay (uses IPv6 link-local internally — see ADR 0026).
+- `kube-proxy` equivalent (Service load-balancing).
+- NetworkPolicy enforcement.
+- EgressFirewall enforcement.
+- Cluster DNS for pod-to-Service resolution.
+
+ADR 0026 (cross-linked from ADR 0005) covers IPv6 baseline rules — the cluster network is IPv4-only at the workload level, but geneve uses IPv6 link-local for its tunnels. Trying to disable IPv6 at the kernel breaks OVN-K. Page 02 covers the four verifiable invariants.
+
+### 2. North-south: Routes + IngressController
+
+A **Route** maps an HTTP(S) hostname to a Service. OpenShift's `IngressController` (a `haproxy` deployment in `openshift-ingress`) reads the Routes and renders an `haproxy.cfg` that load-balances to the Service backends.
+
+| Route TLS termination | Meaning |
+| --- | --- |
+| `edge` | TLS terminates at the router; pod connection is plain HTTP |
+| `passthrough` | TLS terminates at the pod; router does TCP-level pass-through |
+| `reencrypt` | TLS terminates at the router and a new TLS handshake is started to the pod |
+
+The dc-lab convention is `edge` with the lab's Let's Encrypt wildcard cert for `*.apps.<cluster>.<base-domain>` — see page 03.
+
+### 3. East-west: NetworkPolicy
+
+`NetworkPolicy` is a standard Kubernetes API for filtering pod-to-pod traffic. The dc-lab baseline:
+
+- Every workload namespace has a `default-deny` ingress (and often egress) NetworkPolicy.
+- Each operand declares the specific ingress its peers need (e.g. tenant app → Postgres).
+- System namespaces (`openshift-*`) inherit OpenShift's own NetworkPolicy posture.
+
+Page 05 covers the patterns.
+
+### 4. Outbound: EgressFirewall + egress allowlists
+
+`EgressFirewall` (OpenShift-specific) is per-namespace: it filters where pods in this namespace can egress to. The dc-lab v6 baseline mostly uses it for:
+
+- Operator namespaces that should only egress to Nexus, Vault, and DNS.
+- Tenant namespaces that should only egress to the cluster-internal Services they need.
+- The fleet refuses general outbound internet access for any workload namespace.
+
+Page 04 covers the allowlist details.
+
+## The address plan
+
+| Item | CIDR / VIP | Notes |
+| --- | --- | --- |
+| Lab L3 network | private `/16` | hosts all platform VMs |
+| OpenShift node allocation (per cluster) | a `/24` carved out of the lab `/16` | hosts node interfaces + VIPs |
+| OpenShift `clusterNetwork` (pod CIDR) | `10.128.0.0/14` | default; identical hub + spoke |
+| OpenShift `serviceNetwork` (Service CIDR) | `172.30.0.0/16` | default; identical hub + spoke |
+| API VIP | one address from the `/24` | served by the cluster control plane |
+| Ingress VIP | another address from the `/24` | served by IngressController |
+| Cluster wildcard DNS | `*.apps.<cluster>.<base-domain>` → Ingress VIP | PowerDNS A record |
+
+> Exact addresses are kept in `codex-opp-agent/connection-details/openshift-{hub,spoke}-dc-v6.md`.
+
+The convention from ADR 0005:
+
+- `30.30.0.0/16` is the lab L3 network.
+- A `/24` is reserved per OpenShift cluster (`30.30.75.0/24` for spoke-dc-v6).
+- `machineNetwork` in install-config is set to `30.30.0.0/16` — the actual node network — not the reserved `/24`.
+- Helper services (GitLab, MinIO, Nexus, HAProxy, DNS) live outside the per-cluster `/24`.
+
+## ADRs that govern this section
+
+| ADR | Topic |
+| --- | --- |
+| **ADR 0005** | OpenShift rebuild network, ingress, PKI, IPv6 baseline (the original) |
+| **ADR 0026** | IPv6 baseline for OVN-Kubernetes — amends ADR 0005 §IPv6 with verifiable invariants |
+| **ADR 0019** | Nexus-only image supply chain — touches egress (allowlist to Nexus) |
+| **ADR 0020** | PCI-DSS baseline — touches NetworkPolicy posture |
+
+## The "HAProxy for OpenShift" non-rule
+
+ADR 0005 §HAProxy is explicit: **HAProxy is not part of OpenShift console or route exposure.** The lab HAProxy edge VM serves Jenkins / SigNoz / Nexus / etc., but does **not** front OpenShift Routes or the OCP console. Application Routes use the OpenShift IngressController directly.
+
+Memory entry: *feedback_haproxy_scope.md* — never put OpenShift Routes behind HAProxy.
+
+The exception is the **mirror-registry / nexus-mirror / docker-group / app-registry** endpoints, which run on the lab Nexus VM and use HAProxy as a TLS terminator. That's a non-OpenShift traffic path (it's image-supply infrastructure) and is the correct use of the lab HAProxy.
+
+## Each page in this section
+
+| Page | Topic |
+| --- | --- |
+| [02-ovn-kubernetes-and-ipv6](/docs/openshift-platform/networking/ovn-kubernetes-and-ipv6) | OVN-K internals; the four IPv6 invariants from ADR 0026 |
+| [03-ingress-and-routes](/docs/openshift-platform/networking/ingress-and-routes) | IngressController, Routes, TLS termination, wildcard DNS |
+| [04-egress-firewall-and-allowlist](/docs/openshift-platform/networking/egress-firewall-and-allowlist) | EgressFirewall, the allowlist convention, traffic to platform VMs |
+| [05-network-policy-baseline](/docs/openshift-platform/networking/network-policy-baseline) | default-deny, allow patterns, namespace exemptions |
+
+## Failure-mode summary across the four layers
+
+| Symptom | Layer | See page |
+| --- | --- | --- |
+| Node `Ready=False` after MachineConfig that touches IPv6 | CNI (OVN-K) | 02 |
+| Route returns 503 for a healthy backend | Ingress | 03 |
+| TLS cert mismatch on `*.apps.<cluster>.<base-domain>` | Ingress | 03 |
+| Pod can't reach Vault | Egress | 04 |
+| Pod can't reach Postgres in same namespace | Policy | 05 |
+| Cluster pods can't resolve external DNS | CNI / Egress | 02 / 04 |
+| `oc port-forward` works but pod-to-pod fails | Policy | 05 |
+| Inbound from another spoke fails | Ingress | 03 (`Route` is the ingress for cross-cluster traffic) |
+
+## References
+
+- ADR 0005 — OpenShift rebuild network, ingress, PKI, IPv6 baseline.
+- ADR 0026 — IPv6 baseline for OVN-Kubernetes (amends ADR 0005).
+- ADR 0019 — Nexus-only image supply chain.
+- ADR 0020 — PCI-DSS profile compliance.
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — spoke topology.
+- `codex-opp-agent/runbooks/openshift-ipv6-disable-correct-approach.md` — IPv6 governing reference.
+- Memory: *feedback_haproxy_scope.md* — HAProxy is not for OpenShift route exposure.
