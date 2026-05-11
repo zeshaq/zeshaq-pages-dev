@@ -1,0 +1,108 @@
+---
+title: "GitOps consume — overview"
+description: "How the platform-managed ApplicationSet discovers tenant overlays in GitLab and turns them into namespace-scoped Argo Applications on each spoke."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const tenantBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const consumeNodes = [
+  { id: "tenantRepo", position: { x: 0,   y: 0   }, data: { label: "Tenant app repo (GitLab)\napps/<team>/<app>/" }, style: extBox },
+  { id: "appset",     position: { x: 280, y: 0   }, data: { label: "platform-gitops\nApplicationSet" }, style: ctrlBox },
+  { id: "decision",   position: { x: 560, y: 0   }, data: { label: "ACM Placement\n+ PlacementDecision" }, style: dataBox },
+  { id: "hubArgo",    position: { x: 280, y: 140 }, data: { label: "Hub Argo CD\n(coordinator)" }, style: ctrlBox },
+  { id: "manifest",   position: { x: 560, y: 140 }, data: { label: "ManifestWork\n(per spoke)" }, style: dataBox },
+  { id: "spokeArgo",  position: { x: 280, y: 290 }, data: { label: "Spoke Argo CD\n(reconciler)" }, style: agentBox },
+  { id: "appProject", position: { x: 0,   y: 290 }, data: { label: "AppProject\nteam-<team>" }, style: tenantBox },
+  { id: "argoApp",    position: { x: 560, y: 290 }, data: { label: "Argo Application\nteam-<team>-<app>-<env>" }, style: dataBox },
+  { id: "namespace",  position: { x: 280, y: 430 }, data: { label: "Namespace\napps-<division>-<team>-<env>" }, style: tenantBox },
+  { id: "workload",   position: { x: 560, y: 430 }, data: { label: "Deployment + Service\n+ Route + ExternalSecret" }, style: dataBox },
+];
+
+export const consumeEdges = [
+  { id: "e1", source: "tenantRepo", target: "appset",     label: "git generator scans overlays/*/", ...muted },
+  { id: "e2", source: "appset",     target: "decision",   label: "cluster generator", ...muted },
+  { id: "e3", source: "appset",     target: "hubArgo",    label: "creates Applications", ...muted },
+  { id: "e4", source: "hubArgo",    target: "manifest",   label: "wraps as ManifestWork", ...muted },
+  { id: "e5", source: "spokeArgo",  target: "manifest",   label: "klusterlet pull (gRPC)", ...pullEdge },
+  { id: "e6", source: "spokeArgo",  target: "argoApp",    label: "reconciles", ...muted },
+  { id: "e7", source: "appProject", target: "argoApp",    label: "constrains", ...muted },
+  { id: "e8", source: "argoApp",    target: "namespace",  label: "destinationNamespace", ...muted },
+  { id: "e9", source: "argoApp",    target: "workload",   label: "kustomize apply", ...reqEdge },
+];
+
+This subsection is for **platform-admin operators**, not tenant developers. It describes how a tenant overlay sitting in a GitLab app repo turns into a running `Deployment` on `spoke-dc-v6`. The pipe between Git and the cluster is owned by `platform-gitops`; tenants do not write `Application` or `ApplicationSet` YAML, and the platform team does not write tenant `Deployment` YAML.
+
+## Whiteboard — Tenant overlay to spoke namespace
+
+<Whiteboard client:load data={{ nodes: consumeNodes, edges: consumeEdges }} height={620} />
+
+Read the diagram top-down:
+
+1. The **tenant app repo** in GitLab carries the overlay layout from the [app-repo overlay contract](./03-app-repo-overlay-contract).
+2. The platform-managed **ApplicationSet** in `platform-gitops/clusters/spoke-dc-v6/appsets/` watches that repo with a `git` generator. For every directory matching `apps/*/*/overlays/*/kustomization.yaml`, it templates one Argo `Application` per (team, app, env, target-cluster) tuple.
+3. The **ACM Placement / PlacementDecision** pair feeds the ApplicationSet's `clusterDecisionResource` generator, so an overlay only becomes an Application on clusters where ACM has placed it.
+4. The **hub Argo CD** turns each templated Application into a **ManifestWork** addressed at the matching spoke (Red Hat pull model, per ADR 0018).
+5. The **spoke Argo CD** pulls its ManifestWork through the klusterlet's outbound gRPC channel and reconciles the contained `Application` against the spoke's local API server.
+6. Each Application is **constrained by an AppProject** (one per team) that whitelists source repos, destination namespaces, and resource kinds the tenant may create.
+7. The Application's `destinationNamespace` is `apps-<division>-<team>-<env>` (already provisioned by [tenant onboarding](../05-tenant-onboarding/01-overview)).
+8. `kustomize build` of the overlay renders the final `Deployment` (image pinned by digest), `Service`, `Route`, and any `ExternalSecret`, which Argo applies into the tenant namespace.
+
+## What this subsection covers
+
+| Page | Purpose |
+| --- | --- |
+| [02 — ApplicationSet generator pattern](./02-appset-generator-pattern) | The `git` + `clusterDecisionResource` generator combination, ApplicationSet YAML, and the templating that produces one Application per (team, app, env). |
+| [03 — App-repo overlay contract](./03-app-repo-overlay-contract) | The directory layout, naming rules, and `images:` block convention that every tenant repo MUST honour for ApplicationSet to discover it. |
+
+For the **tenant side** (what to put in `apps/<team>/<app>/`), see [the app-repo overlay contract](./03-app-repo-overlay-contract). For the **platform side** (where the ApplicationSet ships from), see [federated GitLab](../02-federated-gitlab/01-overview) and [pull-model](../../03-rhacm-and-pull-model/01-overview).
+
+## Where the pieces live
+
+| Piece | Repo | Path |
+| --- | --- | --- |
+| ApplicationSet | `comptech-platform/openshift-ops/openshift-platform-gitops` | `clusters/spoke-dc-v6/appsets/tenant-apps-appset.yaml` |
+| AppProject (per team) | `comptech-platform/openshift-ops/openshift-platform-gitops` | `clusters/spoke-dc-v6/appprojects/team-<team>.yaml` |
+| Tenant overlays | `divisions/<division>/<division>-apps-monorepo` | `apps/<team>/<app>/overlays/<env>/` |
+| Pull-mode wiring (klusterlet, manifest agent) | platform-gitops | `clusters/spoke-dc-v6/platform/` |
+| Cluster-wide app-registry pull secret | platform-gitops | `clusters/spoke-dc-v6/secrets/app-registry-pull/` |
+
+## Operating boundary
+
+Three boundaries are load-bearing and must be preserved when you change anything in this subsection:
+
+1. **Tenants cannot write `Application` or `ApplicationSet` CRs.** The AppProject's `roles` do not include those kinds. If a tenant needs a non-templated Application (a one-off CronJob, a Job), they file a `type/enhancement` issue against `codex-opp-agent`; the platform team adds it to the ApplicationSet template or to a separate AppSet shipping from `platform-gitops`.
+2. **CI cannot push to `stg/` or `prd/` overlays.** The Jenkins overlay-patch step and the Tekton overlay-patch step both refuse to write outside `dev/`. Promotion is a human-driven `scripts/promote.sh` run that copies the digest forward. See [the promotion model](../03-build-paths/04-promotion-model) for the rationale and [`promote.sh`](https://github.com/zeshaq/claude-agent/blob/main/scripts/promote.sh) for the mechanics.
+3. **The hub Argo CD never reconciles into the spoke directly.** Every tenant Application is wrapped in a ManifestWork and the spoke's local Argo CD does the actual `kustomize build` and `apply`. This is what makes the pattern survive a hub outage and what keeps the hub CPU footprint flat as spokes scale.
+
+## Failure-mode preview
+
+These reappear with full *symptom → root cause → fix → prevention* tables on the per-page sections, but flagged here so the operator knows the four most common ways this pipeline breaks:
+
+- **Argo silent / not syncing at all** on a spoke after a manifest change. Usually the ACM gitops-addon installed a rogue `routes.route.openshift.io` CRD that shadows the aggregated OpenShift Route APIService and crashes the `/openapi/v2` endpoint, which stalls every Argo sync silently. See [the platform memory entry](../../03-rhacm-and-pull-model/01-overview#failure-modes) — fix is `oc delete crd routes.route.openshift.io`.
+- **`OutOfSync` on a brand-new tenant app** because the cluster-wide `app-registry-pull` Secret was never materialised into the new namespace. Symptom is `ImagePullBackOff` on the `Deployment`. Fix is to label the namespace `apps.platform/tenant=true` so the `ClusterExternalSecret` fans the Secret in; see [04 — ESO Secret and pullSecret](../05-tenant-onboarding/04-eso-secret-and-pullsecret).
+- **ApplicationSet creates an Application against the wrong cluster.** Usually the Placement label matcher overlaps two clusters. Re-run the Placement evaluation: `oc -n open-cluster-management get placementdecision <name> -o yaml` and confirm `status.decisions` contains exactly the target.
+- **`kustomize build` succeeds in Argo but the rendered manifest has a tag, not a digest.** The overlay was hand-edited to a `newTag:` after the digest was patched in by CI. Lint catches this pre-merge; the `kustomize build … | grep -v @sha256` negative check in [03 — App-repo overlay contract](./03-app-repo-overlay-contract) catches it post-merge.
+
+## References
+
+- `codex-opp-agent/connection-details/app-repo-contract.md` (issue #182)
+- `codex-opp-agent/connection-details/image-digest-overlay.md` (issue #185)
+- `codex-opp-agent/connection-details/promotion-model.md` (issue #184)
+- `codex-opp-agent/connection-details/app-registry-pullsecret.md` (issue #172)
+- `codex-opp-agent/adr/0014-developer-readiness-platform-contract.md`
+- `codex-opp-agent/adr/0015-federated-gitops-repo-architecture.md`
+- `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md`
+- ACM gitops-addon Routes CRD lab memory (incident #153, 2026-05-10)

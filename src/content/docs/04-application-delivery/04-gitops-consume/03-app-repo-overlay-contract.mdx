@@ -1,0 +1,357 @@
+---
+title: "App-repo overlay contract"
+description: "The directory layout, naming rules, and kustomization.yaml shape every tenant repo MUST honour so the platform ApplicationSet discovers it and CI can patch image digests without ambiguity."
+sidebar_label: "Overlay contract"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The contract codified at `codex-opp-agent/connection-details/app-repo-contract.md` (DEV-OCP-2.1, issue #182) defines the **exact** shape a tenant repo MUST take so that:
+
+- The platform `ApplicationSet` git-generator can discover overlays without per-app configuration.
+- Jenkins (Path A) and Tekton (Path B) can write image-digest patches into per-env overlays.
+- Argo CD on the spoke can reconcile the overlay through a templated `Application`.
+- The reference linter `scripts/app-repo-lint.sh` can statically validate every app repo on every MR.
+
+The contract is intentionally narrow. Anything outside the rules below is per-app freedom.
+
+## Directory layout
+
+Every app in a tenant monorepo MUST live under:
+
+```
+apps/<team>/<app>/
+  base/
+    kustomization.yaml
+    deployment.yaml
+    service.yaml
+    route.yaml                       (optional; OpenShift Route)
+    configmap.yaml                   (optional; non-secret config)
+    externalsecret-<name>.yaml       (optional; one file per ExternalSecret)
+  overlays/
+    dev/
+      kustomization.yaml
+      patch-*.yaml                   (optional env-specific patches)
+    stg/
+      kustomization.yaml
+      patch-*.yaml
+    prd/
+      kustomization.yaml
+      patch-*.yaml
+```
+
+Hard rules:
+
+| Rule | Why |
+| --- | --- |
+| `base/` MUST contain `kustomization.yaml`, `deployment.yaml`, `service.yaml`. | Minimum surface Argo + the linter rely on. |
+| `overlays/` MUST contain `dev/`, `stg/`, `prd/`. Each MUST have its own `kustomization.yaml`. | Matches the [build-once / promote-by-digest](../03-build-paths/04-promotion-model) flow. CI writes `dev/`; `promote.sh` copies digests forward. |
+| HTTP apps MUST ship `base/route.yaml`. | OpenShift Route is the only platform-supported ingress. |
+| Secrets MUST be delivered via `ExternalSecret`. | Plaintext `Secret` manifests are forbidden by lint AND by the spoke's admission policy. |
+| `<team>` and `<app>` MUST be DNS-1123 labels (`[a-z0-9-]`, ≤ 40 chars). | The names appear in namespace names (`apps-<division>-<team>-<env>`) which must fit DNS-1123 ≤ 63 chars total. |
+
+## What `base/` MUST contain
+
+### base/kustomization.yaml
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# No namespace in base; overlays set it.
+commonLabels:
+  app.kubernetes.io/name: <app>
+  app.kubernetes.io/part-of: <team>
+  app.kubernetes.io/managed-by: argocd
+  apps.platform/team: <team>
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - route.yaml                    # if present
+  - externalsecret-<name>.yaml    # if present
+  - configmap.yaml                # if present
+```
+
+### base/deployment.yaml
+
+The deployment MUST:
+
+- Reference its image as `app-registry.apps.sub.comptech-lab.com/<team>/<app>:placeholder` (or `quay.apps.sub.comptech-lab.com/<team>/<app>:placeholder` for Path B Quay-only apps). The literal string `:placeholder` is what Kustomize's `images:` block matches in the overlay.
+- Set `resources.requests.{cpu,memory}` and `resources.limits.{cpu,memory}`. The `apps-*` `LimitRange` defaults values if you omit them, but RHACS policy `No CPU request or memory limit specified` will scale the Deployment to zero if both are missing — see [tenant RHACS process](../05-tenant-onboarding/05-rhacs-tenant-exception-process).
+- Set `securityContext.allowPrivilegeEscalation: false` and `containers[].securityContext.capabilities.drop: [ALL]`. The spoke-dc-v6 PCI profile (ADR 0020) rejects pods that omit these.
+- Set `readinessProbe` and `livenessProbe`. Per ADR 0014 readiness contract.
+- Run as non-root (`runAsNonRoot: true`, no `runAsUser: 0`). The OpenShift `restricted-v2` SCC enforces this; the linter warns earlier.
+
+A minimal compliant `deployment.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: liberty-hello
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: liberty-hello
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: liberty-hello
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello:placeholder
+          ports:
+            - { name: http, containerPort: 9080 }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 30
+```
+
+### base/service.yaml
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: liberty-hello
+spec:
+  selector:
+    app.kubernetes.io/name: liberty-hello       # overlay-injected labels are NOT stable selectors
+  ports:
+    - { name: http, port: 9080, targetPort: http }
+```
+
+The selector must use `app.kubernetes.io/name` only — overlay-injected labels (`apps.platform/env: dev` etc.) are not stable selectors because Kustomize re-applies them at build time and a selector vs label drift causes the Service to silently lose its endpoints.
+
+### base/route.yaml (when HTTP is exposed)
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: liberty-hello
+spec:
+  to:
+    kind: Service
+    name: liberty-hello
+  port: { targetPort: http }
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+```
+
+`tls.termination: edge` is the default; use `reencrypt` only when the pod terminates TLS itself. The host is NOT pinned in base — per-env overlays MAY patch `spec.host` if a stable URL is required.
+
+### base/externalsecret-<name>.yaml
+
+Vault is the only secret source (ADR 0019, [vault-app-secrets](../05-tenant-onboarding/02-vault-path-and-bound-role)):
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-creds
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore           # NOT ClusterSecretStore — per-tenant
+    name: vault-apps            # tenant-onboarding ships this in the namespace
+  target:
+    name: db-creds
+  data:
+    - secretKey: PGPASSWORD
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: password
+```
+
+The `secretStoreRef.name: vault-apps` is the per-tenant `SecretStore` that lives in the tenant namespace, created by the tenant template (see [02 — Vault path and bound role](../05-tenant-onboarding/02-vault-path-and-bound-role)). It is NOT a `ClusterSecretStore`.
+
+## What `overlays/<env>/kustomization.yaml` MUST contain
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: apps-platform-liberty-hello-dev
+
+commonLabels:
+  apps.platform/env: dev
+  apps.platform/division: platform
+  app.kubernetes.io/instance: liberty-hello-dev
+  app.kubernetes.io/version: "REPLACED_BY_CI"        # git short SHA or semver; Jenkins/Tekton overwrites
+
+resources:
+  - ../../base
+
+images:
+  - name: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+    newName: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+    digest: sha256:REPLACED_BY_CI
+```
+
+Rules:
+
+| Field | Rule |
+| --- | --- |
+| `namespace:` | MUST be `apps-<division>-<team>-<env>`. The namespace is provisioned by [tenant onboarding](../05-tenant-onboarding/01-overview); the overlay only references it. |
+| `images:` | MUST exist on every overlay, even if CI has not yet patched. `sha256:REPLACED_BY_CI` is an acceptable in-repo default. |
+| `images[].newName` | Same value as `name`. Explicit even though Kustomize allows omission — makes diff reviews unambiguous. |
+| `images[].digest` | The single field CI rewrites. CI MUST NOT touch any other field. |
+| `images[].newTag` | Forbidden in `stg/` and `prd/`. `digest` and `newTag` are mutually exclusive in Kustomize. |
+
+`newTag` is **permitted on `dev/` only** for fast inner-loop work, but the dev overlay MUST be re-patched to a digest before the MR that promotes the change is merged. CI does this automatically on every successful build.
+
+## Image digest patch — the exact thing CI writes
+
+CI (Jenkins Path A or Tekton Path B) ends every successful build with a step that:
+
+1. Pushes the built image to `app-registry` (Path A) or Quay (Path B).
+2. Captures the resulting digest from the registry's `manifest` response.
+3. Runs `update-overlay-digest.sh <team> <app> dev <digest>` against a clone of the GitOps repo.
+4. Commits `bump: <team>/<app> dev @<sha256-short>` and pushes to a branch like `ci/dev/<short-sha>`.
+5. Opens an MR / PR into `main`.
+
+The script lives at [`claude-agent/scripts/update-overlay-digest.sh`](https://github.com/zeshaq/claude-agent/blob/main/scripts/update-overlay-digest.sh). It is idempotent: running it twice with the same digest produces no second commit.
+
+The exact change applied:
+
+```diff
+ images:
+   - name: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+     newName: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+-    digest: sha256:REPLACED_BY_CI
++    digest: sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890
+```
+
+CI MAY also write `overlays/<env>/release-evidence.md` (informational; not consumed by kustomize). CI MUST NOT modify `base/` files, the overlay `namespace:`, `commonLabels`, or `resources:` fields. Structural changes are tenant PRs reviewed by the platform team.
+
+## Namespace naming — the canonical pattern
+
+```
+apps-<division>-<team>-<env>
+```
+
+| Field | Constraint | Example |
+| --- | --- | --- |
+| `<division>` | Maintained in `platform-gitops/divisions.yaml`. Lowercase, no underscores. | `platform`, `payments`, `risk` |
+| `<team>` | Per-app-repo. DNS-1123 label, ≤ 40 chars. | `team-platform`, `team-payments` |
+| `<env>` | Exactly one of `dev`, `stg`, `prd`. | |
+
+The total namespace MUST fit in 63 characters (DNS-1123 limit). With reasonable inputs you have ~30 chars of headroom; teams with long names should truncate.
+
+Namespaces are created by the platform team via `platform-gitops/clusters/spoke-dc-v6/tenants/`. **Tenants MUST NOT include a `Namespace` resource in `base/` or `overlays/`** — it would be rejected by the AppProject's empty `clusterResourceWhitelist`.
+
+## Label conventions
+
+Two label families coexist on every tenant Pod:
+
+### Standard Kubernetes recommended labels (base)
+
+| Label | Where | Value |
+| --- | --- | --- |
+| `app.kubernetes.io/name` | base commonLabels | `<app>` |
+| `app.kubernetes.io/part-of` | base commonLabels | `<team>` |
+| `app.kubernetes.io/managed-by` | base commonLabels | `argocd` |
+| `app.kubernetes.io/instance` | overlay commonLabels | `<app>-<env>` |
+| `app.kubernetes.io/version` | overlay commonLabels | git short SHA (CI-written) |
+
+### Platform-specific labels (overlay)
+
+| Label | Where | Value |
+| --- | --- | --- |
+| `apps.platform/team` | base commonLabels | `<team>` |
+| `apps.platform/division` | overlay commonLabels | `<division>` |
+| `apps.platform/env` | overlay commonLabels | `dev` / `stg` / `prd` |
+| `apps.platform/argocd` | overlay (optional, see below) | `"true"` |
+
+The `apps.platform/argocd` annotation is the **explicit discovery signal** the AppSet's git generator can filter on. By default the directory-convention path (`apps/*/*/overlays/*/kustomization.yaml`) is enough; the annotation is only needed for selective rollout (only some overlays generated).
+
+## What CI MAY and MAY NOT modify
+
+| Action | Allowed |
+| --- | --- |
+| Rewrite `overlays/<env>/kustomization.yaml` `images:` digest field | yes |
+| Write `overlays/<env>/release-evidence.md` (informational) | yes |
+| Modify any file under `base/` | **no** |
+| Modify overlay `namespace:`, `commonLabels`, or `resources:` fields | **no** |
+| Create or delete overlays | **no** |
+| Push directly to `main` | **no** (CI opens MRs; humans merge) |
+
+Structural changes (new overlay env, new base resource) are tenant PRs reviewed by the platform team.
+
+## Validation — `scripts/app-repo-lint.sh`
+
+The reference linter (run on every tenant MR and ad-hoc by platform admins auditing tenant repos) enforces:
+
+1. Every `apps/<team>/<app>/` has `base/` and `overlays/{dev,stg,prd}/`.
+2. `oc kustomize` (equivalent to `kustomize build`) succeeds for each overlay.
+3. Every overlay `kustomization.yaml` contains an `images:` block.
+4. For `stg/` and `prd/` overlays, `images[].digest` MUST be present and `newTag` MUST NOT be present.
+5. The overlay `namespace:` matches `apps-<division>-<team>-<env>`.
+6. No plaintext `Secret` resources in any rendered overlay.
+
+A green lint is necessary but not sufficient — the spoke's admission policy stack (Kyverno / OPA / VAP) enforces runtime constraints, see [04 — VAP / RHACS gates](../../05-platform-controls/01-overview).
+
+### Quick local validation
+
+```bash
+# Lint the whole monorepo (run from the repo root).
+bash /opt/claude-agent/scripts/app-repo-lint.sh
+
+# Render a single overlay for review.
+kustomize build apps/team-platform/liberty-hello/overlays/dev
+
+# Negative check: every image in the rendered overlay MUST contain @sha256.
+kustomize build apps/team-platform/liberty-hello/overlays/prd \
+  | grep -E "^\s+image:" \
+  | grep -v "@sha256:" \
+  && { echo "FAIL: tag-pinned image found"; exit 1; } \
+  || echo "OK: all images digest-pinned"
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| ApplicationSet creates Application but `kustomize build` fails in Argo logs | Tenant added a new file to `base/` but forgot to list it in `base/kustomization.yaml`. | Add the file to `resources:` and merge. | Lint runs `kustomize build` and catches this pre-merge. |
+| Pod stuck in `ImagePullBackOff` after first deploy | The cluster-wide `app-registry-pull` Secret is not in the tenant namespace yet (label missing). | `oc label ns apps-<division>-<team>-<env> apps.platform/tenant=true`. | Tenant-onboarding GitOps sets this label automatically. |
+| `Deployment` rendered but Service has no endpoints | The Service selector includes an overlay-injected label that the overlay commonLabels rewrote, while the Pod template did not. | Restrict Service selector to `app.kubernetes.io/name` only. | Contract rule §2.3. Lint warns. |
+| Argo shows `Synced / Healthy` but the wrong image is running | The overlay `images[].name` doesn't exactly match the base Deployment image. Kustomize silently leaves the original image alone. | Make `images[].name` byte-equal to the base Deployment's `image:` minus the tag. | Lint compares the two and warns on mismatch. |
+| `OutOfSync` immediately after the digest-patch MR merged | Argo refreshed before GitLab finished propagating the merge commit to the read replicas. | Wait 60s and force `argocd app refresh <name>`. | Tune ApplicationSet `requeueAfterSeconds` only as a last resort. |
+| Plaintext Secret accidentally committed to `base/` | Tenant copy-pasted from a stack overflow snippet. | Revert the commit; rotate the leaked credential through Vault. | Lint refuses any `kind: Secret` in the rendered output (only ExternalSecret-materialised Secrets are allowed). |
+| `stg/` or `prd/` overlay has `newTag:` after manual edit | Someone hand-edited the overlay instead of running `scripts/promote.sh`. | Replace `newTag:` with a `digest:`. | Lint refuses `newTag` in non-`dev` overlays. |
+
+## Reference template
+
+A copy-paste starting point lives at:
+
+```
+codex-opp-agent/examples/app-repo-template/
+```
+
+See its `README.md` for the customisation recipe. The Liberty hello-world sample [04 — Path-A end-to-end](../06-golden-path-samples/04-path-a-end-to-end-sample) walks through onboarding a new app from that template, end to end.
+
+## References
+
+- `codex-opp-agent/connection-details/app-repo-contract.md` (issue #182, DEV-OCP-2.1)
+- `codex-opp-agent/connection-details/image-digest-overlay.md` (issue #185, DEV-OCP-2.4)
+- `codex-opp-agent/connection-details/promotion-model.md` (issue #184, DEV-OCP-2.3)
+- `codex-opp-agent/adr/0014-developer-readiness-platform-contract.md`
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md`
+- Kustomize `images:` reference — `kustomize.config.k8s.io/v1beta1/Kustomization`.

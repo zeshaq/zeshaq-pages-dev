@@ -1,0 +1,294 @@
+---
+title: "Sample: CNPG-backed app"
+description: "A REST API connected to a CloudNativePG Cluster — 3 instances on ODF Ceph RBD, scheduled backup to MinIO, and a documented recovery drill."
+sidebar_label: "CNPG-backed app"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+## Deploy in 5 commands
+
+Prerequisites: tenant onboarding complete for `apps-platform-cnpg-sample-dev`; `cnpg-operator` is installed cluster-wide; ODF Ceph RBD storage class `ocs-storagecluster-ceph-rbd` is available; the MinIO bucket `apps-platform-cnpg-sample` is created with a writer credential delivered to the namespace via ESO.
+
+```bash
+# 1. Clone the platform app monorepo.
+git clone http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+cd platform-apps-monorepo
+
+# 2. Confirm the AppSet has rendered an Application for the sample.
+oc -n openshift-gitops get application team-platform-cnpg-sample-dev
+
+# 3. Wait for the CNPG Cluster to come up (3 instances; ~3 min).
+oc -n apps-platform-cnpg-sample-dev wait --for=condition=Ready cluster/pg \
+  --timeout=300s
+
+# 4. Wait for the app Deployment.
+oc -n apps-platform-cnpg-sample-dev rollout status deploy/cnpg-sample --timeout=120s
+
+# 5. Exercise the REST API (write a row, read it back).
+ROUTE=$(oc -n apps-platform-cnpg-sample-dev get route cnpg-sample -o jsonpath='{.spec.host}')
+curl -fsS -X POST "https://${ROUTE}/items" -H 'Content-Type: application/json' -d '{"name":"hello"}'
+curl -fsS "https://${ROUTE}/items"
+```
+
+Expected: a JSON list including `{"name":"hello"}`.
+
+## What this sample demonstrates
+
+The first sample with **state**. It exercises:
+
+- The `postgresql.cnpg.io/Cluster` CR in the AppProject's `namespaceResourceWhitelist` (added to `team-platform` once).
+- The `ghcr.io/cloudnative-pg/postgresql` image (in the cluster-wide allowlist — see [image-registry-allowlist](../03-build-paths/01-overview)).
+- A 3-instance Postgres cluster on ODF Ceph RBD, with automatic failover.
+- The auto-generated `pg-app-credentials` Secret (CNPG operator creates this; the Deployment references it directly — no ExternalSecret needed for the runtime DB creds).
+- A scheduled backup to MinIO using CNPG's built-in barman-cloud integration.
+- A documented `Cluster.spec.bootstrap.recovery` recipe for restore.
+
+Per [issue #201 (DEV-OCP-5.2)](https://github.com/zeshaq/codex-opp-agent/issues/201).
+
+## Repo layout
+
+```
+apps/team-platform/cnpg-sample/
+  base/
+    kustomization.yaml
+    cluster.yaml                        # CNPG Cluster (3 instances, ODF Ceph RBD)
+    backup-schedule.yaml                # ScheduledBackup CR (daily to MinIO)
+    deployment.yaml                     # the REST API
+    service.yaml
+    route.yaml
+    externalsecret-minio-backup.yaml    # Vault → Secret for barman-cloud writer creds
+    configmap-app.yaml                  # connection-string template (not the password)
+  overlays/
+    dev/
+      kustomization.yaml
+    stg/
+      kustomization.yaml
+    prd/
+      kustomization.yaml
+```
+
+## Manifest highlights
+
+### `base/cluster.yaml`
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:15.6
+  storage:
+    storageClass: ocs-storagecluster-ceph-rbd
+    size: 10Gi
+  monitoring:
+    enablePodMonitor: true              # exposes /metrics for OCP user-workload Prometheus
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: 256MB
+      work_mem: 4MB
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "2",  memory: 4Gi }
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://apps-platform-cnpg-sample/backups
+      endpointURL: http://minio.sub.comptech-lab.local:9000
+      s3Credentials:
+        accessKeyId:     { name: minio-backup, key: AWS_ACCESS_KEY_ID }
+        secretAccessKey: { name: minio-backup, key: AWS_SECRET_ACCESS_KEY }
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+    retentionPolicy: 14d
+```
+
+A few notes:
+
+- `instances: 3` produces a 1 primary + 2 standby cluster with automatic failover via CNPG's `pg-app` and `pg-app-r` Services (read-write and read-only endpoints respectively).
+- `imageName` is the upstream CNPG image; it lives in the cluster's allowlist (see [image-registry-allowlist](../03-build-paths/01-overview)).
+- Storage class `ocs-storagecluster-ceph-rbd` is ODF's RBD-backed block storage; encrypted at rest per the spoke's ODF profile.
+- The `barmanObjectStore` block writes Postgres backups + WALs to a MinIO bucket. The credentials come from a `Secret/minio-backup` materialised by the `externalsecret-minio-backup.yaml`.
+
+### `base/backup-schedule.yaml`
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-daily
+spec:
+  schedule: "0 2 * * * *"               # 02:00 every day (note: CNPG uses six-field cron with seconds)
+  backupOwnerReference: self
+  cluster:
+    name: pg
+```
+
+### `base/deployment.yaml` — referencing `pg-app-credentials`
+
+CNPG auto-generates a `Secret/pg-app-credentials` in the same namespace as the Cluster:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cnpg-sample
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: cnpg-sample }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cnpg-sample }
+    spec:
+      containers:
+        - name: app
+          image: app-registry.apps.sub.comptech-lab.com/team-platform/cnpg-sample:placeholder
+          env:
+            - name: PGHOST
+              value: pg-rw                            # CNPG's RW Service
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: app
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: pg-app-credentials, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: pg-app-credentials, key: password } }
+          ports:
+            - { name: http, containerPort: 8080 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            capabilities: { drop: [ALL] }
+            allowPrivilegeEscalation: false
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+          livenessProbe:
+            httpGet: { path: /live, port: http }
+```
+
+The `pg-app-credentials` Secret is **not** managed by ESO — CNPG creates it automatically. The app just references the Secret by name.
+
+## Backup → restore drill
+
+This is the operationally important part. CNPG produces backups; restoring is a documented procedure that should be exercised at least quarterly.
+
+### Trigger an on-demand backup
+
+```bash
+oc -n apps-platform-cnpg-sample-dev apply -f - <<'EOF'
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-manual-$(date +%s)
+spec:
+  cluster:
+    name: pg
+EOF
+
+oc -n apps-platform-cnpg-sample-dev get backup
+# Expected: STATUS column eventually becomes "completed".
+```
+
+### Verify backup landed in MinIO
+
+```bash
+mc alias set minio http://minio.sub.comptech-lab.local:9000 <reader-access-key> <reader-secret>
+mc ls minio/apps-platform-cnpg-sample/backups/
+# Expected: a directory tree with base/, wals/, and a backup.info file.
+```
+
+### Restore drill (point-in-time recovery)
+
+The restore flow creates a **new** Cluster from the backup, in a separate namespace, so the original keeps running:
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-restored
+  namespace: apps-platform-cnpg-sample-dev-restore
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:15.6
+  storage:
+    storageClass: ocs-storagecluster-ceph-rbd
+    size: 10Gi
+  bootstrap:
+    recovery:
+      source: pg
+      recoveryTarget:
+        targetTime: "2026-05-10 14:00:00.00000+00"   # PITR target
+  externalClusters:
+    - name: pg
+      barmanObjectStore:
+        destinationPath: s3://apps-platform-cnpg-sample/backups
+        endpointURL: http://minio.sub.comptech-lab.local:9000
+        s3Credentials:
+          accessKeyId:     { name: minio-backup, key: AWS_ACCESS_KEY_ID }
+          secretAccessKey: { name: minio-backup, key: AWS_SECRET_ACCESS_KEY }
+```
+
+Apply, wait for `Cluster/pg-restored` Ready, port-forward to the restored primary, and verify the data is at the targetTime. Document time-to-recovery in the drill record (typical: 10-15 min for a small Cluster).
+
+## Smoke validation
+
+```bash
+NS=apps-platform-cnpg-sample-dev
+
+# 1. Argo Application Synced/Healthy.
+oc -n openshift-gitops get app team-platform-cnpg-sample-dev \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+# 2. CNPG Cluster reports Ready.
+oc -n $NS get cluster pg -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+# 3. 3 Postgres Pods are running.
+oc -n $NS get pod -l postgresql=pg -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{"\n"}{end}'
+
+# 4. App Pod connects and serves /ready.
+ROUTE=$(oc -n $NS get route cnpg-sample -o jsonpath='{.spec.host}')
+curl -fsS "https://${ROUTE}/ready"
+
+# 5. Backup ScheduledBackup created the first daily run.
+oc -n $NS get backup
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `Cluster` stays `Initializing` for > 5 min | Storage class missing or default PVC size exceeds the namespace's PVC budget. | Confirm `oc get storageclass ocs-storagecluster-ceph-rbd`; raise quota via MR. | Tenant onboarding sizes `dev` namespaces with PVC budget if CNPG is planned. |
+| Postgres pods crash-loop with `permission denied for relation` | The `bootstrap.initdb` block was modified after first init; once initialised, the schema persists. | Either roll forward (apply migration), or delete the PVCs and let CNPG re-init. | Set up migration tooling outside the Cluster spec. |
+| `pg-app-credentials` Secret missing | CNPG operator did not finish reconciling, or the namespace was deleted and re-created without waiting. | Wait for `Cluster` Ready=True; the Secret is created during `Initializing` → `Healthy`. | Don't reference `pg-app-credentials` from a `Deployment` until the Cluster is Healthy. Argo's Healthy gate naturally orders this. |
+| Backups never run | The `Backup` resource creates but `STATUS` stuck `pending`. Usually the `minio-backup` Secret is wrong. | Verify the credential against `mc ls`; reseed Vault path; force ESO refresh. | Test the MinIO credential at onboarding before relying on the scheduled backup. |
+| Restore Cluster comes up but data is empty | The `bootstrap.recovery.source` references a cluster name that does not have backups in the destinationPath. | Confirm with `mc ls minio/<bucket>/backups/<source-cluster-name>/`; align names. | Document the exact (source name, destination path) pair in the restore drill recipe. |
+| RHACS scales the app Deployment to zero | `Required Image Label` policy violation — the placeholder image has no `app.kubernetes.io/version` label. | Run a real build that emits the label. | CI Containerfile sets the label as a `LABEL app.kubernetes.io/version="${GIT_SHA}"` at build time. |
+| App connects but transactions intermittently fail | The app references `pg-app` Service (read-write Service); during a failover Pods need to reconnect. | Use a connection pool with health-aware retries; CNPG produces a stable Service so DNS doesn't change. | Tune `pgbouncer` if present; otherwise app-level retry is sufficient. |
+
+## Adapting for your own app
+
+| Slot | Substitute |
+| --- | --- |
+| `apps-platform-cnpg-sample-*` namespace | `apps-<division>-<app>-<env>` |
+| `pg` Cluster name | `<app>-pg` or similar, namespace-local. |
+| `instances: 3` | 1 for `dev`, 3 for `stg`/`prd`. |
+| Storage `size: 10Gi` | Size against expected data growth + budget. |
+| `apps-platform-cnpg-sample` MinIO bucket | One bucket per (division, app); the platform admin creates it. |
+| `imageName: ghcr.io/cloudnative-pg/postgresql:15.6` | Adjust the Postgres version; the image registry prefix is fixed (allowlisted). |
+| `pg-app-credentials` Secret reference | Keep; CNPG auto-generates this name. |
+
+## References
+
+- Issue #201 (DEV-OCP-5.2) — sample closure.
+- CNPG operator docs — `postgresql.cnpg.io/v1/Cluster`, `Backup`, `ScheduledBackup`, `bootstrap.recovery`.
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` — registry allowlist.
+- ADR 0019 — Nexus-only image supply chain (CNPG image is an explicit allowlist entry).
+- Platform memory `project_obc_to_operand_secret_bridge.md` (related ESO bridge pattern; CNPG's barman-cloud uses the same Secret shape).

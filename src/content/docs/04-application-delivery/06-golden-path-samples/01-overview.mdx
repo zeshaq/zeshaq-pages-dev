@@ -1,0 +1,126 @@
+---
+title: "Golden-path samples — overview"
+description: "Five reference apps that exercise the full delivery chain end-to-end, each demonstrating one slice of the platform: hello-world, CNPG, Path A, Path B, mesh-tempo."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const tenantBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center" };
+export const extBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const samplesNodes = [
+  { id: "lib",   position: { x: 0,   y: 0   }, data: { label: "Liberty hello-world\n(02)\nminimum viable app" }, style: tenantBox },
+  { id: "cnpg",  position: { x: 280, y: 0   }, data: { label: "CNPG-backed app\n(03)\nstateful + operator CR" }, style: tenantBox },
+  { id: "patha", position: { x: 560, y: 0   }, data: { label: "Path-A end-to-end\n(04)\nJenkins -> Nexus -> Argo" }, style: tenantBox },
+  { id: "pathb", position: { x: 0,   y: 160 }, data: { label: "Path-B end-to-end\n(05)\nTekton -> Quay -> Argo" }, style: tenantBox },
+  { id: "mesh",  position: { x: 280, y: 160 }, data: { label: "Mesh + Tempo trace\n(06)\nfront -> backend -> CNPG" }, style: tenantBox },
+  { id: "plat",  position: { x: 560, y: 160 }, data: { label: "Platform substrate\n(AppSet, AppProject,\nVault, ESO, RHACS)" }, style: ctrlBox },
+];
+
+export const samplesEdges = [
+  { id: "e1", source: "lib",   target: "plat", label: "exercises overlay contract + ESO", ...muted },
+  { id: "e2", source: "cnpg",  target: "plat", label: "exercises operator CR allowlist", ...muted },
+  { id: "e3", source: "patha", target: "plat", label: "exercises Jenkins evidence + AppSet", ...muted },
+  { id: "e4", source: "pathb", target: "plat", label: "exercises Quay pullSecret + Tekton", ...muted },
+  { id: "e5", source: "mesh",  target: "plat", label: "exercises mesh + Tempo + Kiali", ...muted },
+];
+
+The platform ships **five** golden-path samples under `apps/team-platform/` in the platform app monorepo. Each sample is intentionally minimal — small enough that a developer can read all the YAML in one sitting, but exercising at least one new piece of the platform that the previous samples did not.
+
+## Whiteboard — the five samples and what they each demonstrate
+
+<Whiteboard client:load data={{ nodes: samplesNodes, edges: samplesEdges }} height={400} />
+
+## What / why
+
+The samples are **not** general-purpose libraries to copy-paste blindly. They are validation artefacts that prove each delivery path can be onboarded end-to-end. New developers read them, then **adapt** rather than fork.
+
+| Sample | What it demonstrates | Why it exists |
+| --- | --- | --- |
+| **02 — Liberty hello-world** | Minimum-viable Liberty app + Route + one ExternalSecret. | The smallest possible "deploy in 5 commands" entry point. Validates the overlay contract, the tenant Vault path, the ESO bridge, and the AppSet discovery — all in ~80 lines of YAML. |
+| **03 — CNPG-backed app** | A `Deployment` that connects to a CloudNativePG `Cluster` CR; restore drill included. | Validates the `postgresql.cnpg.io/Cluster` kind in the tenant AppProject's whitelist; demonstrates the operator-CR pattern for tenant workloads; covers the backup → restore drill operators need. |
+| **04 — Path-A end-to-end** | One sample (Liberty hello-world) configured for Path A: GitLab push → Jenkins → Trivy → Nexus → overlay patch → Argo → OCP. | Validates the full Path A chain on real infrastructure; documents timing (push to first request served on Route). |
+| **05 — Path-B end-to-end** | Different sample (Quay-only image) configured for Path B: GitLab push → Tekton EventListener → Pipeline (build/scan/push) → Quay → overlay patch → Argo → OCP. | Validates the Path B chain in parallel with Path A; demonstrates the cluster-side Quay pullSecret path. |
+| **06 — Mesh + Tempo trace** | Two-service app (`front` → `backend` → CNPG) labelled for ambient mesh; OTel-instrumented; traces visible in Tempo; Kiali topology shows the edge. | Validates the mesh layer + the OTel collector + the Tempo backend + the Kiali topology view, all in one place. |
+
+## Common scaffolding
+
+All five samples live under `apps/team-platform/` in the `platform-apps-monorepo`. All five follow [the overlay contract](../04-gitops-consume/03-app-repo-overlay-contract) — `base/` + `overlays/{dev,stg,prd}/` — even when only `dev/` is used during demo. All five deploy into `apps-platform-<app>-<env>` namespaces provisioned by [tenant onboarding](../05-tenant-onboarding/01-overview).
+
+The platform team commits the initial scaffolding for each sample (issues #200-#205 close them). Tenant teams then read the sample, copy the relevant pattern, and adapt for their own apps.
+
+## "Deploy in 5 commands" quickstart pattern
+
+Each per-sample page opens with a **literal "deploy in 5 commands" block** at the top. The five commands are exact: paste-and-run on a fresh tenant namespace (assuming platform onboarding is complete). The pattern across all five samples:
+
+1. Clone the platform-apps-monorepo (read-only).
+2. (For Path A / Path B samples) Trigger a build.
+3. Wait for Argo sync.
+4. Curl the Route or check the trace.
+5. Verify success.
+
+The commands are deliberately **the same** across samples wherever possible — operators learn one rhythm, not five.
+
+## Sample-to-platform coverage matrix
+
+This matrix maps each sample to the platform pieces it exercises. Useful when triaging "what samples should I read before working on X":
+
+| Platform piece | 02 hello | 03 cnpg | 04 path-A | 05 path-B | 06 mesh |
+| --- | --- | --- | --- | --- | --- |
+| Overlay contract (`base/` + `overlays/`) | x | x | x | x | x |
+| AppSet directory discovery | x | x | x | x | x |
+| AppProject namespace-scoped whitelist | x | x | x | x | x |
+| Vault `secret/apps/<div>/<app>/<env>/...` | x | x | x | x | x |
+| Per-tenant `SecretStore` + `ExternalSecret` | x | x | x | x | x |
+| Cluster-wide `app-registry-pull` Secret | x | x | x | (Quay) | x |
+| Cluster-wide `quay-pull` Secret | | | | x | |
+| OpenLibertyApplication CR | x | | x | | |
+| CNPG `Cluster` CR | | x | | | x |
+| Path A (Jenkins) build + scan + push | | | x | | |
+| Path B (Tekton) build + scan + push | | | | x | |
+| CI evidence to MinIO | | | x | x | |
+| Trivy gate (fail on CRITICAL) | | | x | x | |
+| Image digest patch overlay step | | | x | x | |
+| RHACS deploy-time policy compliance | x | x | x | x | x |
+| OpenShift Route with edge TLS | x | x | x | x | x |
+| Ambient service mesh participation | | | | | x |
+| OTel + Tempo span emission | | | | | x |
+| Kiali topology rendering | | | | | x |
+
+Each "x" is a feature the sample demonstrates working end-to-end on real infrastructure. Each blank cell is intentional — the sample does not exercise that platform feature, by design.
+
+## What the per-sample pages contain
+
+Every sample's page is structured the same way:
+
+1. **Deploy in 5 commands** — the quickstart, at the very top.
+2. **What this sample demonstrates** — one-paragraph statement of the slice.
+3. **Repo layout** — the on-disk directory listing.
+4. **Manifest highlights** — the YAML excerpts that matter; full files linked.
+5. **Smoke validation** — the commands to confirm it works.
+6. **Failure modes** — the four or five most common ways the sample breaks, with fixes.
+7. **Adapting for your own app** — the substitution map.
+8. **References** — issues, ADRs, connection-details.
+
+## Order to read
+
+For a new tenant onboarding their first app: **02 → 04 → 05**. (Read 02 to understand the overlay shape; then either 04 if pushing to Nexus or 05 if pushing to Quay.)
+
+For an operator validating a new cluster's golden paths: **02 → 03 → 04 → 05 → 06**. (Run all five; if 02 works, the substrate is right. If 03 works, operator CR allowlist is right. If 04 and 05 work, CI evidence + AppSet is right. If 06 works, mesh + observability are right.)
+
+For a platform admin debugging "is the substrate broken or is it my app": **02**. (If hello-world is broken, the substrate is broken.)
+
+## References
+
+- Issues #200-#205 (DEV-OCP-5.1 through 5.6) — the milestone #32 closures.
+- `codex-opp-agent/connection-details/app-repo-contract.md`
+- `codex-opp-agent/connection-details/promotion-model.md`
+- ADR 0014 — developer-readiness-platform-contract.
+- ADR 0015 — federated-gitops-repo-architecture.

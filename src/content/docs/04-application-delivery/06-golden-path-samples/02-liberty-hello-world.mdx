@@ -1,0 +1,224 @@
+---
+title: "Sample: Liberty hello-world"
+description: "Minimum-viable Open Liberty app with one ExternalSecret, Route, and OpenLibertyApplication CR — the smallest possible deploy that exercises the full overlay contract and AppSet flow."
+sidebar_label: "Liberty hello-world"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+## Deploy in 5 commands
+
+Prerequisites: tenant onboarding for `apps-platform-liberty-hello-dev` is complete (Vault role + namespace + ESO bridge + pull-secret label, per [tenant onboarding](../05-tenant-onboarding/01-overview)). The Vault path `secret/apps/platform/liberty-hello/dev/db-creds` is seeded.
+
+```bash
+# 1. Clone the platform app monorepo (read-only).
+git clone http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+cd platform-apps-monorepo
+
+# 2. Confirm the sample is present and the AppSet has rendered an Application.
+ls apps/team-platform/liberty-hello
+oc -n openshift-gitops get application team-platform-liberty-hello-dev
+
+# 3. Force an Argo sync (skip if AppSet has already synced).
+argocd app sync team-platform-liberty-hello-dev
+
+# 4. Wait for the Deployment to roll out.
+oc -n apps-platform-liberty-hello-dev rollout status deploy/liberty-hello --timeout=120s
+
+# 5. Hit the Route's /health endpoint.
+ROUTE=$(oc -n apps-platform-liberty-hello-dev get route liberty-hello -o jsonpath='{.spec.host}')
+curl -fsS "https://${ROUTE}/health" && echo "  OK"
+```
+
+Expected: a JSON `{"status":"UP"}` response with HTTP 200. Pod logs show Liberty starting, reading `PGUSER` and `PGPASSWORD` from the `db-creds` Secret.
+
+## What this sample demonstrates
+
+The smallest possible delivery — no database, no mesh, no CI. The sample's job is to prove **the substrate works**: a tenant overlay in GitLab becomes a running Pod with secret material delivered from Vault.
+
+It exercises:
+
+- The [overlay contract](../04-gitops-consume/03-app-repo-overlay-contract) (`base/` + `overlays/{dev,stg,prd}/`).
+- The [AppSet directory discovery](../04-gitops-consume/02-appset-generator-pattern) (auto-creates Argo `Application/team-platform-liberty-hello-dev`).
+- The [tenant Vault path](../05-tenant-onboarding/02-vault-path-and-bound-role) (`secret/apps/platform/liberty-hello/dev/db-creds`).
+- The per-tenant `SecretStore/vault-apps` and an `ExternalSecret/db-creds`.
+- The cluster-wide `app-registry-pull` Secret + the default SA's `imagePullSecrets`.
+- The `OpenLibertyApplication` CR (the certified Red Hat Open Liberty operator from `icr.io/appcafe/open-liberty-operator`).
+- An OpenShift `Route` with edge TLS termination.
+
+Per [issue #200 (DEV-OCP-5.1)](https://github.com/zeshaq/codex-opp-agent/issues/200).
+
+## Repo layout
+
+```
+apps/team-platform/liberty-hello/
+  base/
+    kustomization.yaml
+    openlibertyapplication.yaml         # the CR (replaces a raw Deployment)
+    service.yaml
+    route.yaml
+    configmap-server-xml.yaml           # Liberty server.xml fragment
+    externalsecret-db-creds.yaml        # Vault → Secret bridge
+  overlays/
+    dev/
+      kustomization.yaml
+    stg/
+      kustomization.yaml
+    prd/
+      kustomization.yaml
+```
+
+## Manifest highlights
+
+### `base/openlibertyapplication.yaml`
+
+The Open Liberty operator's CR replaces a raw `Deployment` — the operator reconciles a Deployment + Service + Route for you, plus reasonable defaults (probes, requests/limits, runAsNonRoot):
+
+```yaml
+apiVersion: apps.openliberty.io/v1
+kind: OpenLibertyApplication
+metadata:
+  name: liberty-hello
+spec:
+  applicationImage: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello:placeholder
+  applicationVersion: "REPLACED_BY_CI"
+  replicas: 2
+  service:
+    port: 9080
+    type: ClusterIP
+  expose: true               # creates a Route
+  route:
+    termination: edge
+  manageTLS: false           # Route handles TLS; pod does not
+  envFrom:
+    - secretRef:
+        name: db-creds       # ESO-materialised
+  probes:
+    readiness:
+      httpGet: { path: /health/ready, port: 9080 }
+    liveness:
+      httpGet: { path: /health/live, port: 9080 }
+  resources:
+    requests: { cpu: 200m, memory: 384Mi }
+    limits:   { cpu: 500m, memory: 768Mi }
+  securityContext:
+    runAsNonRoot: true
+    capabilities: { drop: [ALL] }
+    allowPrivilegeEscalation: false
+```
+
+### `base/externalsecret-db-creds.yaml`
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-creds
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore           # tenant-scoped (per-namespace), not Cluster
+    name: vault-apps
+  target:
+    name: db-creds
+  data:
+    - secretKey: PGUSER
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: username
+    - secretKey: PGPASSWORD
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: password
+```
+
+### `overlays/dev/kustomization.yaml`
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: apps-platform-liberty-hello-dev
+
+commonLabels:
+  apps.platform/env: dev
+  apps.platform/division: platform
+  app.kubernetes.io/instance: liberty-hello-dev
+  app.kubernetes.io/version: "REPLACED_BY_CI"
+
+resources:
+  - ../../base
+
+images:
+  - name: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+    newName: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+    digest: sha256:REPLACED_BY_CI
+```
+
+The full file set is in the platform-apps-monorepo. The above are the load-bearing pieces.
+
+## Smoke validation
+
+```bash
+NS=apps-platform-liberty-hello-dev
+
+# 1. AppSet rendered the Application.
+oc -n openshift-gitops get application team-platform-liberty-hello-dev \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+# Expected: Synced Healthy
+
+# 2. ExternalSecret resolved.
+oc -n $NS get externalsecret db-creds \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# Expected: True
+
+# 3. db-creds Secret was materialised by ESO.
+oc -n $NS get secret db-creds -o jsonpath='{.type}{"\n"}'
+# Expected: Opaque
+
+# 4. OpenLibertyApplication reconciled to a Deployment.
+oc -n $NS get openlibertyapplication liberty-hello \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# Expected: True
+
+# 5. Deployment is rolled out.
+oc -n $NS get deploy liberty-hello \
+  -o jsonpath='{.status.readyReplicas}/{.status.replicas}{"\n"}'
+# Expected: 2/2
+
+# 6. Route serves /health.
+ROUTE=$(oc -n $NS get route liberty-hello -o jsonpath='{.spec.host}')
+curl -fsS "https://${ROUTE}/health"
+# Expected: {"status":"UP","checks":[...]}
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Argo `OutOfSync` with `kustomize build failed: cannot read resource` | `base/kustomization.yaml` lists a file that does not exist (typo in filename). | Fix the resource list. | `scripts/app-repo-lint.sh` catches pre-merge. |
+| Pod stuck `ImagePullBackOff` referencing `:placeholder` | Overlay was never patched by CI; the placeholder tag is what's on the cluster. | Run a real Jenkins build (or substitute a known-good digest manually in the overlay for a quick smoke). | CI's first successful build patches the overlay automatically. |
+| `OpenLibertyApplication` reconciles but Deployment never appears | The `apps.openliberty.io/Cluster` resource is missing from the AppProject's `namespaceResourceWhitelist`. | Add `{group: openliberty.io, kind: OpenLibertyApplication}` and `{group: apps, kind: Deployment}` to `team-platform` AppProject. | Cluster-onboarding checklist includes the AppProject whitelist for known operator CRs. |
+| Pod runs but logs `Could not find data source jdbc/postgres` | The Liberty `server.xml` references a JDBC datasource that the sample does not actually use (Postgres is in CNPG sample). Hello-world only needs envFrom for env-vars. | Verify `configmap-server-xml.yaml` doesn't reference real JDBC — hello-world reads env-vars only. | Use the configmap-server-xml.yaml that ships with the sample, don't hand-edit. |
+| Route returns 503 with TLS handshake errors | `manageTLS: true` in the OLA CR creates a self-signed cert in the pod that conflicts with the Route's edge termination. | Set `manageTLS: false` (pod serves plaintext; Route terminates TLS). | Sample ships with `manageTLS: false`. |
+| RHACS scales the Deployment to zero with `Latest tag` violation | The overlay's `images[].digest` was not patched and still says `:placeholder`, which RHACS treats as a mutable tag. | Patch the digest (run a build or substitute a digest). | Lint refuses to merge an overlay where the digest is the placeholder sentinel. |
+| ExternalSecret `Ready=False, SecretSyncedError: permission denied` | The Vault path `secret/apps/platform/liberty-hello/dev/db-creds` is not seeded. | `vault kv put secret/apps/platform/liberty-hello/dev/db-creds username=liberty password=<value>`. | Document the seed step in the per-sample README. |
+
+## Adapting for your own app
+
+| Slot in `apps/team-platform/liberty-hello/` | Substitute |
+| --- | --- |
+| `team-platform` (path segment) | Your team's name (DNS-1123 label, ≤ 40 chars). |
+| `liberty-hello` (path segment + manifest names) | Your app's name. |
+| `apps-platform-liberty-hello-<env>` (namespace) | `apps-<your-division>-<your-app>-<env>`. |
+| `app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello` (image) | `app-registry.apps.sub.comptech-lab.com/<your-team>/<your-app>`. |
+| `apps/platform/liberty-hello/dev/db-creds` (Vault path) | `apps/<your-division>/<your-app>/<env>/<your-secret>`. |
+| `OpenLibertyApplication` CR | Keep if Liberty; replace with a raw `Deployment` for other stacks (Node, Python, Go). |
+
+## References
+
+- Issue #200 (DEV-OCP-5.1) — the closure for this sample.
+- `codex-opp-agent/examples/liberty-hello/README.md` — the per-sample README in the codex-opp-agent repo.
+- `codex-opp-agent/connection-details/app-repo-contract.md` — the overlay contract.
+- Red Hat Open Liberty operator docs — `apps.openliberty.io/v1/OpenLibertyApplication`.
+- ADR 0014 — developer-readiness-platform-contract.

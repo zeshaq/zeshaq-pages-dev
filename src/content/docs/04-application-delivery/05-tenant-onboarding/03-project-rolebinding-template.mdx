@@ -1,0 +1,241 @@
+---
+title: "AppProject + RoleBinding template"
+description: "The per-team Argo AppProject, the team's RoleBinding to the namespace, and the ServiceAccounts the tenant template creates."
+sidebar_label: "Project + RoleBinding"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+For every team that ships at least one app, the platform creates **one** Argo `AppProject` (named `team-<team>`) and **one** `RoleBinding` per tenant namespace that grants the team's GitLab group `edit` on that namespace. This is the "frame" the tenant's app sits inside; tenants never write Project, RoleBinding, or Namespace YAML themselves.
+
+Per [issue #173 (DEV-OCP-0.3)](https://github.com/zeshaq/codex-opp-agent/issues/173).
+
+## What / Why / How
+
+### What
+
+| Object | Kind / API | Source-of-truth | One per |
+| --- | --- | --- | --- |
+| `team-<team>` | `argoproj.io/v1alpha1/AppProject` | `platform-gitops/clusters/<cluster>/appprojects/` | team |
+| `apps-<division>-<team>-<env>` | `v1/Namespace` | `platform-gitops/clusters/<cluster>/tenants/<ns>/` | (team, env) |
+| `team-developers-edit` | `rbac.authorization.k8s.io/v1/RoleBinding` | same | (team, env) |
+| `app-eso` | `v1/ServiceAccount` | same | (team, env) |
+| `default` | (built-in) | same — patched `imagePullSecrets` | (team, env) |
+
+### Why one AppProject per team, not per app
+
+A team owns many apps; each app shares the team's source repos and destination-namespace glob (`apps-<division>-<team>-*`). Per-app AppProjects would be O(apps); per-team is O(teams), typically ≤ 20.
+
+The AppProject is the **only** place that decides:
+
+- Which Git repos may be a `source.repoURL` for an Application.
+- Which destinations (cluster + namespace pattern) may be a `destination` for an Application.
+- Which resource kinds an Application may create.
+- Which OpenShift / GitLab groups have which actions on the Application objects themselves.
+
+Tenants cannot circumvent the AppProject because they cannot create `Application` CRs (the AppProject's `roles[].policies` denies `create` on `applications`). The platform-managed `ApplicationSet` is the only thing creating Applications, and the AppSet template hard-codes `spec.project: team-<team>`.
+
+### How — the AppProject
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-platform
+  namespace: openshift-gitops
+spec:
+  description: "AppProject for the platform team's tenant apps."
+
+  # Only the team's app monorepo (and the platform shared modules repo if used) may be a source.
+  sourceRepos:
+    - http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+
+  # Destinations: any cluster ACM places on, but namespace pattern apps-platform-*.
+  destinations:
+    - server: '*'
+      namespace: 'apps-platform-*'
+
+  # Cluster-scoped: empty. Tenants may NOT create CRD, ClusterRole, ClusterRoleBinding, etc.
+  clusterResourceWhitelist: []
+
+  # Namespace-scoped: explicit allowlist of what tenants may ship.
+  namespaceResourceWhitelist:
+    - { group: '',                       kind: ConfigMap }
+    - { group: '',                       kind: Service }
+    - { group: '',                       kind: ServiceAccount }
+    - { group: apps,                     kind: Deployment }
+    - { group: apps,                     kind: StatefulSet }
+    - { group: batch,                    kind: Job }
+    - { group: batch,                    kind: CronJob }
+    - { group: autoscaling,              kind: HorizontalPodAutoscaler }
+    - { group: policy,                   kind: PodDisruptionBudget }
+    - { group: route.openshift.io,       kind: Route }
+    - { group: external-secrets.io,      kind: ExternalSecret }
+    - { group: external-secrets.io,      kind: SecretStore }
+    - { group: networking.k8s.io,        kind: NetworkPolicy }
+    - { group: openliberty.io,           kind: OpenLibertyApplication }
+    - { group: postgresql.cnpg.io,       kind: Cluster }
+    - { group: serving.knative.dev,      kind: Service }   # optional; only if Knative is in scope
+
+  roles:
+    - name: read
+      description: Read-only access for the team's developers (Argo console).
+      policies:
+        - p, proj:team-platform:read, applications, get,    team-platform/*, allow
+        - p, proj:team-platform:read, applications, sync,   team-platform/*, deny
+        - p, proj:team-platform:read, applications, override,team-platform/*, deny
+      groups:
+        - platform-developers           # GitLab group; OIDC-mapped on Argo
+```
+
+The `roles[].policies` are Argo RBAC casbin rules. Only `applications/get` is allowed for `proj:team-platform:read`. The team cannot trigger an Argo sync, override the desired state, or delete the Application from the console — sync is automated and the desired state is Git.
+
+If the team needs a "force sync" path (rare; usually for an emergency rollback that does not want to wait for the AppSet refresh), the platform adds a `proj:team-platform:operator` role with `applications, sync, ...` allow, gated on a smaller group.
+
+### How — the RoleBinding inside the namespace
+
+Tenant namespaces are PSA-restricted and the team's developers need namespace-level edit so they can `oc logs` / `oc exec` / `oc port-forward` for debugging. The RoleBinding grants `edit` on the namespace to the team's GitLab group:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: team-developers-edit
+  namespace: apps-platform-liberty-hello-dev
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+  - kind: Group
+    apiGroup: rbac.authorization.k8s.io
+    name: platform-developers      # OIDC-projected from GitLab group
+```
+
+Notes:
+
+- `edit` is the OpenShift / Kubernetes built-in ClusterRole — broad enough for normal debugging, narrow enough that the team cannot create cluster-scoped resources or escalate privileges in the namespace.
+- The subject is the **GitLab group** mapped via OIDC (RHSSO → OpenShift → group resolution). The lab uses OpenShift's OIDC IdP so that `oc login --web` resolves the user's groups.
+- For `prd` namespaces, the platform usually swaps `edit` for `view` and gives `edit` only to a smaller `<team>-prod-ops` group. This is a per-namespace decision, not a project-wide one.
+
+### How — the tenant ServiceAccount
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-eso
+  namespace: apps-platform-liberty-hello-dev
+```
+
+This is the SA the `SecretStore` (see [02 — Vault path and bound role](./02-vault-path-and-bound-role)) uses to authenticate to Vault. It has no Kubernetes RBAC bound to it — its only purpose is to project a service-account JWT to Vault.
+
+The `default` SA (which the Deployment uses unless overridden) is patched with `imagePullSecrets: [{name: app-registry-pull}]` by the bootstrap step, so the Pod can pull tenant images without per-workload config. See [04 — ESO Secret and pullSecret](./04-eso-secret-and-pullsecret).
+
+## The tenant template directory
+
+`platform-gitops/clusters/<cluster>/tenants/_template/`:
+
+```
+_template/
+  namespace.yaml                # the Namespace CR with the canonical label set
+  rolebinding-edit.yaml         # the team's RoleBinding
+  serviceaccount-app-eso.yaml   # the app-eso ServiceAccount
+  secretstore-vault-apps.yaml   # the per-tenant SecretStore (placeholder substitutions)
+  resourcequota.yaml            # default ResourceQuota
+  limitrange.yaml               # default LimitRange
+  networkpolicy-deny-all.yaml   # baseline default-deny-ingress + egress-allow-dns
+  kustomization.yaml            # binds them all together
+```
+
+To onboard a new tenant namespace, the platform operator copies `_template/` into `tenants/apps-<division>-<team>-<env>/` and substitutes `<DIVISION>`, `<TEAM>`, `<APP>`, `<ENV>`, `<CLUSTER>` placeholders. A small `tenant-onboard.sh` helper script lives in the `platform-gitops` repo for the substitution.
+
+## The canonical `namespace.yaml`
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps-<DIVISION>-<TEAM>-<ENV>
+  labels:
+    # Division / team / env identification
+    apps.platform/division: <DIVISION>
+    apps.platform/team:     <TEAM>
+    apps.platform/env:      <ENV>
+
+    # Cluster-wide app-registry pull-secret fan-out trigger
+    apps.platform/tenant:   "true"
+
+    # Pod Security Admission profile (PCI-DSS, ADR 0020)
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit:   restricted
+    pod-security.kubernetes.io/warn:    restricted
+
+    # OpenShift node-isolation / monitoring opt-ins
+    openshift.io/cluster-monitoring: "true"
+  annotations:
+    argocd.argoproj.io/managed-by: openshift-gitops
+    openshift.io/description: "<TEAM> <APP> <ENV> tenant namespace"
+```
+
+The `apps.platform/tenant=true` label is **load-bearing**: it is what the `ClusterExternalSecret/app-registry-pull` watches to decide where to fan the pull secret. Forget the label and the namespace gets no pull secret, and the first Deployment fails with `ImagePullBackOff`.
+
+## Onboarding sequence — single MR
+
+The whole "step 3 + step 4" of the onboarding checklist is one MR:
+
+```
+platform-gitops/
+  clusters/spoke-dc-v6/
+    appprojects/
+      team-platform.yaml                              # one per team (rarely changes)
+    tenants/
+      apps-platform-liberty-hello-dev/
+        kustomization.yaml
+        namespace.yaml
+        rolebinding-edit.yaml
+        serviceaccount-app-eso.yaml
+        secretstore-vault-apps.yaml
+        resourcequota.yaml
+        limitrange.yaml
+        networkpolicy-default-deny.yaml
+      apps-platform-liberty-hello-stg/
+        ...
+      apps-platform-liberty-hello-prd/
+        ...
+```
+
+The `tenants/kustomization.yaml` already aggregates everything under `tenants/`, so all the new tenant folder needs is its own `kustomization.yaml` listing the seven files above, plus an entry added to `tenants/kustomization.yaml` in the same MR.
+
+CODEOWNERS on `platform-gitops` requires platform-admin review on this directory. The platform-admin merges, hub Argo (or the spoke-local Argo for the tenants subdirectory) reconciles within ~3 min, and the namespace is live.
+
+## Inventory snapshot
+
+Active AppProjects (illustrative):
+
+| AppProject | Source repo | Destination glob | Groups (read role) |
+| --- | --- | --- | --- |
+| `team-platform` | `platform-apps-monorepo` | `apps-platform-*` | `platform-developers` |
+| `team-payments` | `payments-apps-monorepo` | `apps-payments-*` | `payments-developers` |
+| `team-risk` | `risk-apps-monorepo` | `apps-risk-*` | `risk-developers` |
+
+Each row is one platform MR to add (one AppProject YAML + adding the team's GitLab group to the OIDC config).
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Application stuck `Sync: Failed, Message: project 'team-foo' is not allowed to use source 'http://gitlab/.../foo-apps.git'` | The AppProject's `sourceRepos` doesn't include the new monorepo URL. | Add the URL to `sourceRepos` and merge. | The AppSet's `git` generator and the AppProject's `sourceRepos` are tied; keep them in lock-step in the same MR. |
+| Application's `Deployment` rejected by API with `forbidden: not allowed by project 'team-foo'` | The resource kind is not in `namespaceResourceWhitelist`. | Add the kind (CRD-qualified `group/kind`) to the AppProject. | Audit the AppProject yearly against any new operator CRDs the team uses (e.g. cnpg-operator's `postgresql.cnpg.io/Cluster`). |
+| Team developer cannot `oc logs` in their own namespace | The RoleBinding subject's group name does not match the OIDC-projected group. Common cause: GitLab group is `platform/developers`, OIDC projection is `platform-developers`, RoleBinding says `platform.developers`. | Fix the RoleBinding `subjects[].name` to match the OIDC projection. Confirm with `oc auth can-i list pods --as=<user> -n <ns>`. | Use one canonical group-name convention everywhere; document in the platform handoff. |
+| Tenant namespace exists but Argo never applies the `Deployment` | The namespace is missing the `apps.platform/tenant=true` label, so the `app-registry-pull` Secret is absent and the AppSet's `CreateNamespace=false` syncOption means Argo will not synthesise it. | Add the label. The ClusterExternalSecret materialises within the refresh window. | Always copy from `_template/namespace.yaml` — it carries the label. Lint catches missing label. |
+| Tenant tries to ship a `ClusterRole` and Argo refuses | `clusterResourceWhitelist` is empty by design. | Refuse the request. Cluster-scoped resources go through a platform MR with a `type/decision` issue. | Document the constraint upfront in tenant onboarding. |
+| Two namespaces collide because a team renamed an app | The new app's namespace prefix matches the old one. | Delete the old namespace via a platform MR. Argo prunes the tenants's content. | Lint pre-merge: a `tenants/` MR introducing a namespace that already exists fails the kustomize build (duplicate `Namespace` resource). |
+
+## References
+
+- Issue #173 (DEV-OCP-0.3) — tenant Project + Role + RoleBinding template.
+- Argo CD AppProject docs — `argoproj.io/v1alpha1/AppProject`.
+- OpenShift Pod Security Admission docs — `pod-security.kubernetes.io/*` labels.
+- ADR 0020 — PCI-DSS profile compliance on spoke-dc-v6.

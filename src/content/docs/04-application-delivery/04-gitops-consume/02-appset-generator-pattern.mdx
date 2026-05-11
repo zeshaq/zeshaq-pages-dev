@@ -1,0 +1,261 @@
+---
+title: "ApplicationSet generator pattern"
+description: "The git + clusterDecisionResource matrix generator combination that turns every tenant overlay directory into a per-(team,app,env,cluster) Argo Application, and the templating that keeps tenant content out of platform-gitops."
+sidebar_label: "ApplicationSet generator"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Mermaid from "../../../../components/Mermaid";
+
+The platform ships **one** `ApplicationSet` per spoke cluster, in `platform-gitops/clusters/<cluster>/appsets/`. That single ApplicationSet:
+
+- Scans every tenant app monorepo it is configured to watch.
+- For every match, produces one Argo `Application` per environment overlay.
+- Cross-multiplies that against an ACM PlacementDecision so an overlay only becomes an Application on clusters the team is allowed to deploy to.
+- Constrains every generated Application to a tenant `AppProject` (named `team-<team>`).
+
+Tenants never edit this file. The platform team edits it once when a new division or new app monorepo joins.
+
+## What / Why / How
+
+### What
+
+| Object | Kind / API | Where |
+| --- | --- | --- |
+| `tenant-apps-appset` | `argoproj.io/v1alpha1/ApplicationSet` | `platform-gitops/clusters/spoke-dc-v6/appsets/tenant-apps-appset.yaml` |
+| `team-<team>` | `argoproj.io/v1alpha1/AppProject` | `platform-gitops/clusters/spoke-dc-v6/appprojects/team-<team>.yaml` |
+| `<cluster>-tenant-apps` | `cluster.open-cluster-management.io/v1beta1/Placement` | `platform-gitops/clusters/spoke-dc-v6/placements/tenant-apps.yaml` |
+
+### Why a matrix generator, not one ApplicationSet per app
+
+Three constraints push the design toward a single multi-generator ApplicationSet:
+
+1. **No tenant edits to `platform-gitops`.** A per-app ApplicationSet would mean a `platform-gitops` MR every time a new app onboards — a contradiction of [ADR 0015's federated boundary](../../09-decision-records/0015-federated-gitops-repo-architecture). One platform-side AppSet that auto-discovers overlays is the only shape that respects that boundary.
+2. **One AppProject per team, not per app.** AppProjects govern RBAC and source-repo allow-lists. Tenants ship many apps in one app monorepo; a per-app AppProject would be O(apps), a per-team one is O(teams). The latter is the platform-team's preference.
+3. **Cluster fan-out is rare.** Within a single division most apps deploy to exactly one cluster's `dev` / `stg` / `prd`. Cluster fan-out happens at the ACM Placement layer, not at the Application layer.
+
+### How — the ApplicationSet shape
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tenant-apps
+  namespace: openshift-gitops          # hub Argo CD
+spec:
+  goTemplate: true
+  goTemplateOptions: [missingkey=error]
+
+  generators:
+    - matrix:
+        generators:
+          # 1. Walk every tenant overlay directory in every app monorepo.
+          - git:
+              repoURL: http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+              revision: main
+              directories:
+                - path: apps/*/*/overlays/*
+          # 2. Cross-multiply with the ACM PlacementDecision.
+          - clusterDecisionResource:
+              configMapRef: acm-placement
+              labelSelector:
+                matchLabels:
+                  cluster.open-cluster-management.io/placement: spoke-dc-v6-tenant-apps
+              requeueAfterSeconds: 180
+
+  template:
+    metadata:
+      name: 'team-{{index .path.segments 1}}-{{index .path.segments 2}}-{{index .path.segments 4}}'
+      # e.g. team-platform-liberty-hello-dev
+    spec:
+      project: 'team-{{index .path.segments 1}}'
+      source:
+        repoURL: http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+        targetRevision: main
+        path: '{{.path.path}}'
+      destination:
+        name: '{{.name}}'                                # ACM-managed cluster name
+        namespace: 'apps-platform-{{index .path.segments 2}}-{{index .path.segments 4}}'
+        # e.g. apps-platform-liberty-hello-dev
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=false      # namespaces are created by tenant-onboarding GitOps, NOT by Argo here
+          - ServerSideApply=true
+```
+
+The `path.segments` slice is `['apps', '<team>', '<app>', 'overlays', '<env>']`. Hence `segments[1]` is `<team>`, `[2]` is `<app>`, and `[4]` is `<env>`.
+
+### Path-segment templating sequence
+
+<Mermaid client:load chart={`sequenceDiagram
+    participant Git as GitLab app monorepo
+    participant Gen as git generator
+    participant ACM as clusterDecisionResource
+    participant Tmpl as template
+    participant Hub as hub Argo CD
+    participant Spoke as spoke Argo CD
+    Git->>Gen: directories match apps/*/*/overlays/*
+    Gen->>Tmpl: emit param tuple (path, segments)
+    ACM->>Tmpl: emit param tuple (clusterName)
+    Tmpl->>Hub: render Application team-<team>-<app>-<env>
+    Hub->>Hub: wrap as ManifestWork(spoke=<clusterName>)
+    Spoke->>Hub: gRPC pull manifestwork
+    Spoke->>Spoke: reconcile Application
+    Spoke->>Spoke: kustomize build + apply
+`} />
+
+## ACM Placement and the GitOpsCluster wiring
+
+The `clusterDecisionResource` generator does not read `Placement` directly — it reads a ConfigMap shaped to look like one. The wiring is:
+
+```yaml
+apiVersion: apps.open-cluster-management.io/v1beta1
+kind: GitOpsCluster
+metadata:
+  name: spoke-dc-v6-tenant-apps
+  namespace: openshift-gitops
+spec:
+  argoServer:
+    cluster: local-cluster
+    argoNamespace: openshift-gitops
+  placementRef:
+    kind: Placement
+    apiVersion: cluster.open-cluster-management.io/v1beta1
+    name: spoke-dc-v6-tenant-apps
+```
+
+That CR is what creates the `acm-placement` ConfigMap-shaped resource the ApplicationSet generator reads. It is part of `clusters/<cluster>/platform/gitopscluster/` and is shipped once at cluster bootstrap.
+
+The Placement itself looks like:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: spoke-dc-v6-tenant-apps
+  namespace: openshift-gitops
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            tenant-apps-allowed: "true"
+```
+
+Only ManagedClusters with that label flow through. The hub itself is NOT labelled — tenant apps are not allowed to deploy onto the hub.
+
+## The AppProject per team
+
+Every team needs a permissive-enough AppProject to let the templated Application land, but tight enough that one team cannot read another team's repos or namespaces.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-platform
+  namespace: openshift-gitops
+spec:
+  description: "AppProject for the platform team's tenant apps."
+  sourceRepos:
+    - http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+  destinations:
+    - server: '*'
+      namespace: 'apps-platform-*'
+  clusterResourceWhitelist: []          # tenants may NOT create cluster-scoped resources
+  namespaceResourceWhitelist:
+    - group: ''
+      kind: ConfigMap
+    - group: ''
+      kind: Service
+    - group: ''
+      kind: ServiceAccount
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: batch
+      kind: Job
+    - group: batch
+      kind: CronJob
+    - group: route.openshift.io
+      kind: Route
+    - group: external-secrets.io
+      kind: ExternalSecret
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: openliberty.io
+      kind: OpenLibertyApplication
+    - group: postgresql.cnpg.io
+      kind: Cluster
+  roles:
+    - name: read
+      description: Read-only view for the team's Argo console role.
+      policies:
+        - p, proj:team-platform:read, applications, get, team-platform/*, allow
+      groups:
+        - platform-developers
+```
+
+Two notes on the AppProject choices:
+
+- **`destinations.server: '*'`** would normally be too broad. It is constrained instead by ACM's PlacementDecision: the ApplicationSet only generates an Application against a cluster Placement has decided on. Combined with the namespace pattern, a tenant cannot accidentally deploy to a system namespace or to a cluster they aren't approved on.
+- **`clusterResourceWhitelist` is empty.** Tenants may never create `CRD`, `ClusterRole`, `Namespace`, or `ValidatingWebhookConfiguration` etc. Cluster-scoped resources are platform-team work.
+
+## What changes when a new app onboards
+
+Almost nothing on the platform side. The ApplicationSet generator finds the new overlay directory automatically:
+
+1. Tenant adds `apps/<team>/<newapp>/overlays/{dev,stg,prd}/` to their app monorepo and merges to `main`.
+2. ApplicationSet's `git` generator picks it up on next refresh (default 3 min; `argocd appset get` to force).
+3. Hub creates Argo `Application/team-<team>-<newapp>-dev` (and `-stg`, `-prd`).
+4. Spoke Argo pulls and reconciles.
+
+What the platform team does *only* when a new team onboards:
+
+1. Add an entry to the `git` generator's `repoURL` list (or, if using one app monorepo per division, no change needed).
+2. Create the `team-<team>` AppProject if it does not already exist.
+3. Wire the team's GitLab group into the AppProject `roles[].groups`.
+
+Both edits are one-line additions to `platform-gitops` and review-gated by CODEOWNERS.
+
+## Multi-repo variant
+
+If a division has many app monorepos (rare in this lab; typical in larger orgs), the `git` generator block supports a list:
+
+```yaml
+- git:
+    repoURL: http://gitlab.sub.comptech-lab.com/divisions/payments/payments-apps-monorepo.git
+    revision: main
+    directories:
+      - path: apps/*/*/overlays/*
+- git:
+    repoURL: http://gitlab.sub.comptech-lab.com/divisions/risk/risk-apps-monorepo.git
+    revision: main
+    directories:
+      - path: apps/*/*/overlays/*
+```
+
+The two `git` blocks are themselves combined inside the matrix, so each app monorepo cross-multiplies with the same `clusterDecisionResource`. The Application `name` template prefixes `team-<team>` so name collisions across divisions are impossible.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `ApplicationSet` exists but no `Application` ever appears | The `git` generator cannot reach GitLab (CA, DNS, or token). | `kubectl -n openshift-gitops logs deploy/argocd-applicationset-controller` reveals TLS / `dial: no such host` errors. Check the repo Secret and CA bundle ConfigMap. | Use the platform `gitlab-ca-bundle` ConfigMap, mount it on the controller, and reference the repo URL with `http://` (lab-internal) — not `https://` to the public route. |
+| Application created against a cluster that no longer exists | Placement still decides on a stale `ManagedCluster` entry. | `oc -n open-cluster-management get managedcluster` to confirm membership; if the cluster was removed, `oc -n openshift-gitops get placementdecision <name> -o yaml` may still list it for a refresh window. Wait or force-refresh the ApplicationSet. | Run `placementdecision`-aware tear-down: when decommissioning a cluster, remove the `tenant-apps-allowed` label *first*, wait for Placement to drop it, then unjoin. |
+| Application name collision between two divisions | Templating omitted the `team-` prefix or two teams share a team name across divisions. | Re-add the `team-{{index .path.segments 1}}-` prefix; if two teams legitimately share a slug, namespace the slug with the division. | Lint pre-merge with `kubectl kustomize` + `yq` to dump rendered Application names and grep for duplicates. |
+| Tenant edited overlay structure (renamed `overlays/dev` → `overlays/development`) | The git generator's directory pattern no longer matches. | Rename back. The contract is `dev/`, `stg/`, `prd/` (see [03 — app-repo overlay contract](./03-app-repo-overlay-contract)). | Pre-merge lint in the tenant repo (`scripts/app-repo-lint.sh`) rejects non-canonical overlay names. |
+| `Application` shows `OutOfSync` even after a fresh patch | Spoke Argo CD has not received the ManifestWork yet (klusterlet lag) or the spoke's CA bundle for GitLab has not been pushed. | Wait 60s; if persistent, `oc -n <spoke-ns-on-hub> get manifestwork` on the hub and `oc -n openshift-gitops get application -o wide` on the spoke. | Apply CA bundles to both hub and spoke at install time via the `argocd-tls-certs-cm` ConfigMap. |
+| New Application created in the wrong namespace | The `destination.namespace` template miscomputed `<division>` because the AppSet hard-codes a division per generator block. | Use a separate `git` generator entry per division (see "Multi-repo variant" above), each with its own destination namespace template. | Code-review every change to the AppSet template against the namespace pattern `apps-<division>-<team>-<env>`. |
+
+## References
+
+- `codex-opp-agent/connection-details/app-repo-contract.md` (issue #182) — overlay directory contract.
+- `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md` — pull-model wiring.
+- `codex-opp-agent/adr/0015-federated-gitops-repo-architecture.md` — repo boundary.
+- Argo CD ApplicationSet docs — `generators.matrix`, `generators.git`, `generators.clusterDecisionResource`.
+- RHACM `GitOpsCluster` API (`apps.open-cluster-management.io/v1beta1`).

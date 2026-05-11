@@ -1,0 +1,212 @@
+---
+title: "RHACS tenant exception process"
+description: "How a tenant requests a time-bounded exception to one of the five built-in deploy-time RHACS policies, and how the platform admin applies it without weakening cluster-wide enforcement."
+sidebar_label: "RHACS exceptions"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Mermaid from "../../../../components/Mermaid";
+
+The platform enforces a minimal set of **five built-in** RHACS Central deploy-time policies on every namespace matching `apps-.*`. The defaults are intentional and tight; an exception is a per-(app, namespace, policy) carve-out with a justification, a compensating control, and an expiry date.
+
+Per [issue #198 (DEV-OCP-4.3)](https://github.com/zeshaq/codex-opp-agent/issues/198).
+
+## The five enforced policies
+
+| # | RHACS built-in policy | Why it's in the app-team set |
+| --- | --- | --- |
+| 1 | `Latest tag` | Blocks Deployments that pull `:latest`. Forces digest-pinned or version-tagged images, the only way build-once / promote-by-digest is meaningful. |
+| 2 | `No CPU request or memory limit specified` | Blocks Deployments missing CPU request or memory limit. Catches the case where the `LimitRange` hasn't applied yet or has been deleted. |
+| 3 | `Privileged Container` | Blocks `securityContext.privileged: true`. Closes the most common container-escape vector. |
+| 4 | `CAP_SYS_ADMIN capability added` | Blocks containers that add `CAP_SYS_ADMIN`. Effectively equivalent to root on the host. |
+| 5 | `Required Image Label` | Requires `app.kubernetes.io/version` (or equivalent) on every image. Forces tenant builds through CI pipelines that emit standard OCI labels. |
+
+All five are **built-in** policies that ship with RHACS 4.10.2. We intentionally do not author custom policies — built-ins are battle-tested and survive RHACS upgrades.
+
+- Enforcement action: `SCALE_TO_ZERO_ENFORCEMENT` on the `DEPLOY` lifecycle. RHACS aborts the offending Deployment by scaling to zero on admit.
+- Scope: namespace regex `apps-.*` on `hub-dc-v6` and `spoke-dc-v6`.
+- Platform / operator namespaces (`openshift-*`, `stackrox`, `external-secrets-operator`, `openshift-gitops`, ...) are **not** affected.
+
+The script `scripts/rhacs-enable-app-policies.sh` is the idempotent way to scope and enable these policies. Re-running is a safe no-op.
+
+## When a tenant should request an exception
+
+Almost never. The default answer is "fix the manifest." Examples that are **not** legitimate exceptions:
+
+- "Our base image's Dockerfile uses `:latest` and we don't want to fork it." — Tag-pin via Skopeo copy to the app-registry, then reference the digest. See [the image registry allowlist](../03-build-paths/01-overview).
+- "We don't know what CPU request to set." — Use the `LimitRange` defaults; refine after running for a week with monitoring.
+- "The container needs `CAP_SYS_ADMIN` to mount FUSE for reads." — Almost always solvable by mounting the filesystem from an init-container or a PV.
+
+Legitimate exceptions are rare. A canonical example: a vendor's container legitimately needs `CAP_SYS_ADMIN` for FUSE mounts, the container runs as non-root, and the seccomp profile is strict. The risk is bounded; the exception is reasonable. It still has a 90-day expiry.
+
+## The process
+
+<Mermaid client:load chart={`flowchart TD
+  start([Tenant identifies a policy violation]) --> fix{Fix in manifest?}
+  fix -- Yes --> done([Fix and re-deploy])
+  fix -- No, real exception --> file[Tenant files MR: apps/_exceptions/<team>-<app>-<policy>.md]
+  file --> review[Platform-admin reviews Justification + Compensating Control]
+  review -- Reject --> back[Tenant fixes manifest]
+  review -- Accept --> apply[Platform-admin patches RHACS policy exclusions field]
+  apply --> verify[RHACS UI / API confirms exclusion live]
+  verify --> redeploy[Tenant re-deploys; deployment succeeds]
+  redeploy --> expire[Auto-expire 90 days from approval]
+  expire --> renew{Still needed?}
+  renew -- Yes --> file
+  renew -- No --> done
+`} />
+
+### 1. File the exception in GitLab
+
+The tenant opens an MR against their app repo (the same one referenced by the [overlay contract](../04-gitops-consume/03-app-repo-overlay-contract)) that adds a single Markdown file at:
+
+```
+apps/_exceptions/<team>-<app>-<policy-shortname>.md
+```
+
+Example: `apps/_exceptions/platform-eso-smoke-latest-tag.md`.
+
+The file MUST contain the following sections, in this order:
+
+```markdown
+# RHACS Policy Exception: <Policy Name>
+
+- Policy name: Latest tag
+- Policy ID: <UUID from Central, see "Looking up policy IDs" below>
+- Tenant / division: platform
+- App: eso-smoke
+- Namespace(s): apps-platform-eso-smoke-dev
+- Requested by: <gitlab handle>
+- Requested on: 2026-05-10
+
+## Justification
+
+One paragraph (3-5 sentences). Why does this app legitimately need to
+violate the policy? Generic answers ("it works on my machine") are rejected
+in review.
+
+## Compensating Control
+
+One paragraph. What other mechanism prevents the risk this policy was
+guarding against?
+
+## Approval
+
+- Platform owner: <name>
+- Approved on: <date>
+- Expiry: <date, default = approved-on + 90 days>
+
+## Renewal
+
+When expiry approaches, the tenant re-files the same Markdown with a new
+`Requested on` date. Lapsed exceptions are removed by the next run of
+`rhacs-enable-app-policies.sh --reconcile-exceptions` (future work; today
+they are removed manually via the Central UI).
+```
+
+### 2. Review
+
+Reviewed and merged by the platform owner (`platform-admin` group on GitLab) **only** after both Justification and Compensating Control are filled in. The MR is the audit trail; nothing else needs to be filed.
+
+Generic answers like "it works on my machine" or "the vendor said so" are rejected. The Compensating Control must name a concrete mechanism — a NetworkPolicy, an SCC, a seccomp profile, an admission webhook, a kernel-level allowlist — not "we trust the vendor."
+
+### 3. Apply to RHACS
+
+Once merged, the platform owner adds an entry to the matching policy's `exclusions` field in Central. The shape Central expects:
+
+```json
+{
+  "name": "platform/eso-smoke (exception: platform-eso-smoke-latest-tag)",
+  "deployment": {
+    "name": "eso-smoke",
+    "scope": {
+      "namespace": "apps-platform-eso-smoke-dev"
+    }
+  },
+  "expiration": "2026-08-08T00:00:00Z"
+}
+```
+
+Rules:
+
+- The `name` field MUST embed the exception file name so the exclusion in RHACS is traceable back to its GitLab MR. Future drift checks compare this against `apps/_exceptions/*.md`.
+- The `expiration` field MUST be set; RHACS auto-disables on expiry.
+- The `deployment.scope.namespace` MUST be one of the namespaces listed in the exception MR — not a wider glob.
+
+Operators may PATCH the policy with:
+
+```bash
+ROX_PW=$(oc -n stackrox get secret central-htpasswd \
+  -o jsonpath='{.data.password}' | base64 -d)
+
+curl -fsSk -u "admin:${ROX_PW}" \
+  -H 'Content-Type: application/json' \
+  -X PUT \
+  -d @policy-with-new-exclusion.json \
+  "https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies/<POLICY_ID>"
+```
+
+…or do the equivalent in Central UI → Policy Management → the policy → Exclusions tab. The UI is simpler for one-offs; the API path is preferred when adding multiple exceptions in one go.
+
+### 4. Audit
+
+`scripts/rhacs-enable-app-policies.sh` does **not** delete existing exclusions. The policy GET dumped by the script (`--dry-run`) is the source of truth for which exceptions are currently live. Diff against `apps/_exceptions/*` in the tenant repos to catch drift.
+
+## Looking up policy IDs
+
+Built-in RHACS policy IDs are stable per Central install (they are generated at first boot, not at upgrade), but they differ between installs. To find the IDs on `hub-dc-v6`:
+
+```bash
+ROX_PW=$(oc -n stackrox get secret central-htpasswd \
+  -o jsonpath='{.data.password}' | base64 -d)
+
+curl -fsSk -u "admin:${ROX_PW}" \
+  "https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies" \
+  | jq '.policies[] | select(.name | IN(
+        "Latest tag",
+        "No CPU request or memory limit specified",
+        "Privileged Container",
+        "CAP_SYS_ADMIN capability added",
+        "Required Image Label"
+      )) | {id, name}'
+```
+
+`scripts/rhacs-enable-app-policies.sh` does this lookup internally and patches by name, so operators rarely need raw IDs.
+
+## VAP exceptions — a different beast
+
+Per [`vap-tenant-exclusions.md`](../05-platform-controls/02-image-registry-allowlist) and [`vap-tenant-exclusions.md`](https://github.com/zeshaq/codex-opp-agent/blob/main/connection-details/vap-tenant-exclusions.md): **there is no clean per-tenant VAP bypass.** VAPs aggregate by AND. Tenant exceptions to the cluster-wide allowed-image-registries VAP go through one of two paths:
+
+- **Path A (preferred):** Mirror the image to `app-registry`. No VAP change required.
+- **Path B (rare):** Open a `type/decision` issue and add the prefix to the cluster-wide allowlist. Single-digit count over the platform's lifetime.
+
+An RHACS exclusion on the `Images from disallowed registry` policy only narrows RHACS's own alert — the VAP still denies at the Kubernetes API layer. RHACS exclusions buy nothing for an admission-blocked Pod while the VAP is in `Deny` mode.
+
+The two exception flows do not interact. A tenant who needs a vendor sidecar from an unallowed registry must go through the VAP governance path (mirror or allowlist extension), independent of any RHACS exception they file.
+
+## Why we don't do per-tenant VAP override policies
+
+A second VAP that "allows" the gcr.io sidecar in one namespace **does not override** the cluster-wide VAP. VAP semantics are AND across all matching policies: every policy that matches must pass. There is no `Allow` action, no priority field, no namespace-level escape hatch built into the VAP API.
+
+The corollary: any image a tenant Pod references must satisfy the cluster-wide VAP. Per-tenant flexibility has to be expressed somewhere other than VAP, or by changing the cluster-wide VAP itself.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Tenant Deployment is scaled to zero immediately after Argo applies it | Tenant manifest violates one of the five RHACS policies (most commonly Required Image Label or No CPU request). | Fix the manifest. The exclusion is the exception, not the default. | Tenant template + lint catches missing labels and resource requests. |
+| Exclusion entered in Central UI but Deployment still fails | The exclusion's `scope.namespace` does not match the live namespace, or the deployment name does not match. | Re-check the exclusion JSON; trailing whitespace and case sensitivity bite here. | Use the API PUT path with a JSON file in version control, not the UI. |
+| Exclusion appears in Central but exception MR was never filed | Someone added an exclusion through Central UI without filing the MR. | Roll back the exclusion in Central; ask the requester to file the MR. | Periodic drift check: GET all policies, dump exclusions, diff against `apps/_exceptions/*`. |
+| Exclusion is for the wrong policy ID | The platform admin patched the wrong policy. RHACS shows the exclusion in the wrong policy's Exclusions list. | Remove the exclusion from the wrong policy; add to the right one. | Use the `rhacs-enable-app-policies.sh --add-exclusion --policy-name '<name>'` helper (future work) which looks up the ID. |
+| Exception expired silently and tenant noticed only on next deploy | RHACS does not notify on expiry. The exclusion just disappears. | Tenant re-files the exception MR. | Quarterly audit: dump all exclusions with `expiration < now() + 30d`; remind tenants. |
+| Tenant's exception MR is approved but the exclusion is never applied | The MR merged but the platform admin's TODO to PATCH the policy was lost. | Apply the exclusion. | Tie MR merge to a follow-up task or include the PATCH command in the merge comment. |
+| Two exceptions for the same (app, namespace) on different policies — one approved, one rejected | The MR template forces single-policy filings, but a tenant submitted a multi-policy "umbrella" MR. | Split into one MR per (app, policy). | Reject multi-policy MRs at review. |
+
+## References
+
+- `codex-opp-agent/connection-details/rhacs-app-policy.md` (issue #198, DEV-OCP-4.3)
+- `codex-opp-agent/connection-details/vap-tenant-exclusions.md` (issue #199, DEV-OCP-4.4)
+- `scripts/rhacs-enable-app-policies.sh` (claude-agent)
+- ADR 0019 — Nexus-only image supply chain.
+- ADR 0020 — PCI-DSS profile compliance on spoke-dc-v6.

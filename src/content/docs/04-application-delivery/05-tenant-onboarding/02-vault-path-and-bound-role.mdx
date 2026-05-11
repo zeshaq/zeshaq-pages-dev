@@ -1,0 +1,226 @@
+---
+title: "Vault path and bound role"
+description: "Per-division Vault tenancy — path tree (secret/apps/<division>/<app>/<env>/*), Kubernetes auth role, ACL policy, and the onboarding script that wires them."
+sidebar_label: "Vault path and role"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The platform Vault is a per-VM HashiCorp Vault (KV-v2, Kubernetes auth method per cluster). Application secrets live under a path subtree that is **per division**, not per app. Each division has its own ACL policy + Kubernetes-auth role; ESO bindings are **per-tenant `SecretStore`** (namespace-scoped), never a `ClusterSecretStore`.
+
+## What / Why / How
+
+### What
+
+| Object | Scope | Name pattern |
+| --- | --- | --- |
+| KV-v2 path tree | per-division, per-app, per-env, per-key | `secret/apps/<division>/<app>/<env>/<key>` |
+| ACL policy | per-division (cluster-agnostic) | `apps-<division>-read` |
+| K8s-auth role | per-cluster, per-division | `apps-<cluster>-<division>` |
+| Tenant ServiceAccount | per-namespace | `app-eso` |
+| Tenant SecretStore | per-namespace | `vault-apps` (kind `SecretStore`, not `ClusterSecretStore`) |
+
+### Why per-division, not per-app
+
+A per-app role would be O(apps): hundreds of Vault roles to maintain. A per-division role is O(divisions): typically <10. The role's `bound_service_account_namespaces` glob (`apps-<division>-*`) restricts the role to namespaces belonging to that division, so cross-division leakage at the API layer is impossible.
+
+A per-cluster role (not a single cross-cluster role) means a compromised JWT from one cluster cannot read secrets a different cluster is bound to. The K8s-auth mount is `auth/kubernetes-<cluster>/`, and each cluster's JWKS is registered to that mount only.
+
+### How — the path tree
+
+KV-v2 mount: `secret/` (shared with platform ESO wiring; no per-tenant mount).
+
+```
+secret/apps/
+  <division>/                       e.g. platform, payments, retail
+    <app>/                          e.g. liberty-hello, checkout-api
+      dev/                          env scope
+        <key>                       individual secret entries
+      stg/
+      prd/
+```
+
+Examples:
+
+- `secret/apps/platform/liberty-hello/dev/db-creds` — Liberty hello-world dev DB creds.
+- `secret/apps/payments/checkout-api/prd/oauth.client-secret` — Payments checkout prod OAuth secret.
+- `secret/apps/platform/quay-only-sample/ci/quay-robot` — Path B Quay robot token (CI-time, not env-time).
+
+Reads use the KV-v2 data path: `secret/data/apps/<division>/...`
+Listing uses metadata: `secret/metadata/apps/<division>/...`
+
+## The ACL policy
+
+One ACL policy per division (cluster-agnostic), name `apps-<division>-read`:
+
+```hcl
+path "secret/data/apps/<division>/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/apps/<division>/*" {
+  capabilities = ["list", "read"]
+}
+```
+
+The policy is shared across clusters; the role pins which cluster and which namespace glob can use it.
+
+## The Kubernetes-auth role
+
+Per-cluster, per-division. Lives under the existing K8s-auth mount for the cluster: `auth/kubernetes-<cluster>/role/apps-<cluster>-<division>`.
+
+```json
+{
+  "bound_service_account_names":      ["app-eso"],
+  "bound_service_account_namespaces": ["apps-<division>-*"],
+  "token_policies":                   ["apps-<division>-read"],
+  "token_ttl":                        "1h",
+  "token_max_ttl":                    "4h",
+  "audience":                         "vault"
+}
+```
+
+Notes:
+
+- `app-eso` is the per-tenant ServiceAccount the tenant template creates in every `apps-<division>-<team>-<env>` namespace. **Do not confuse** with the platform `external-secrets-operator-controller-manager` SA used by the cluster-wide `ClusterSecretStore`.
+- The namespace glob `apps-<division>-*` matches every tenant namespace belonging to the division (e.g. `apps-platform-liberty-hello-dev`, `apps-platform-mesh-trace-prd`).
+- TTLs match the platform ESO role.
+
+## The onboarding script
+
+```bash
+# Run from the operator's host (Vault-reachable). NOT from a subagent worktree.
+/home/ze/claude-agent/scripts/vault-apps-onboard.sh <division> <cluster>
+
+# Example:
+/home/ze/claude-agent/scripts/vault-apps-onboard.sh platform spoke-dc-v6
+```
+
+The script creates / updates:
+
+- policy `apps-<division>-read`
+- role `apps-<cluster>-<division>` under `auth/kubernetes-<cluster>/`
+
+It is **idempotent** — re-running rewrites the policy and role with the canonical body. Useful when:
+
+- A new cluster is added (run for every existing division).
+- A new division is added (run for every active cluster).
+- The canonical role / policy bodies change (run platform-wide).
+
+## The per-tenant SecretStore
+
+Namespace-scoped (`kind: SecretStore`, NOT `ClusterSecretStore`). Each tenant namespace owns its own store; it cannot read other divisions' paths because the role's namespace glob refuses to issue a token outside `apps-<division>-*`.
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: vault-apps
+  namespace: apps-<DIVISION>-<APP>-<ENV>
+spec:
+  provider:
+    vault:
+      server: https://vault.sub.comptech-lab.com:8200
+      path: secret
+      version: v2
+      caBundle: <base64 vault CA>
+      auth:
+        kubernetes:
+          mountPath: kubernetes-<CLUSTER>
+          role: apps-<CLUSTER>-<DIVISION>
+          serviceAccountRef:
+            name: app-eso
+            audiences:
+              - vault
+```
+
+The base64 `caBundle` is the same Vault CA already embedded in `clusters/<cluster>/secrets/eso/clustersecretstore-vault.yaml`. Copy it verbatim.
+
+A placeholder copy of this manifest lives at `platform-gitops/clusters/spoke-dc-v6/tenants/_template/secretstore-vault-apps.yaml`. The tenant template copies it into each new tenant directory and substitutes `<DIVISION>`, `<APP>`, and `<CLUSTER>`.
+
+## How an `ExternalSecret` references this
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-creds
+  namespace: apps-platform-liberty-hello-dev
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: vault-apps
+  target:
+    name: db-creds
+  data:
+    - secretKey: PGPASSWORD
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: password
+    - secretKey: PGUSER
+      remoteRef:
+        key: apps/platform/liberty-hello/dev/db-creds
+        property: username
+```
+
+Note: the `remoteRef.key` is the path **without** the `secret/data/` prefix — ESO adds the `data/` segment for KV-v2 automatically. Get this wrong and the secret resolves to a 404 with no clear error other than `Status: NotReady`.
+
+## Seeding the secret server-side
+
+The platform operator (not the tenant, not CI) seeds the secret value the first time:
+
+```bash
+# From a host with vault CLI and the right VAULT_TOKEN.
+vault kv put secret/apps/platform/liberty-hello/dev/db-creds \
+  username=liberty \
+  password='<read-from-secrets-vault-not-from-chat>'
+```
+
+Subsequent rotations:
+
+```bash
+vault kv put secret/apps/platform/liberty-hello/dev/db-creds \
+  username=liberty \
+  password='<new-value>'
+
+# ESO picks it up within the `refreshInterval` (1h default).
+# To force immediate refresh, annotate the ExternalSecret:
+oc -n apps-platform-liberty-hello-dev annotate externalsecret db-creds \
+  force-sync=$(date +%s) --overwrite
+```
+
+## Path examples by intent
+
+| Intent | Vault path | Notes |
+| --- | --- | --- |
+| App runtime secret (dev) | `secret/apps/platform/liberty-hello/dev/db-creds` | The most common case. |
+| App runtime secret (prd) | `secret/apps/platform/liberty-hello/prd/db-creds` | Same shape, different env. |
+| CI-only secret (per-app robot) | `secret/apps/<division>/<app>/ci/quay-robot` | The `ci/` segment is reserved for CI-time only (e.g. Quay robot tokens for Path B). Distinct from `dev/`, `stg/`, `prd/`. |
+| Shared division secret | `secret/apps/<division>/_shared/<env>/<key>` | Not yet conventionally used; if needed, by ADR. |
+
+## Inventory snapshot (illustrative — not a live registry)
+
+| Division | Apps | Clusters with role | Notes |
+| --- | --- | --- | --- |
+| `platform` | liberty-hello, mesh-trace-sample, cnpg-sample, quay-only-sample | spoke-dc-v6 | First division to onboard; reference. |
+| `payments` | (none yet) | (none yet) | Reserved name; not active. |
+| `risk` | (none yet) | (none yet) | Reserved name; not active. |
+| `retail` | (none yet) | (none yet) | Reserved name; not active. |
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `ExternalSecret` stuck `Status: NotReady, ReadyCondition: SecretSyncedError` | `remoteRef.key` includes the `secret/data/` prefix; ESO adds it for KV-v2 and the resulting double `data/data/` is a 404. | Drop the `secret/data/` prefix: use `apps/<division>/<app>/<env>/<key>` only. | Lint the tenant overlay against the path pattern. |
+| `ExternalSecret` `permission denied` from Vault | The Vault role does not include `apps-<division>-read` policy, or the SA `app-eso` is not in the role's namespace glob. | Re-run `vault-apps-onboard.sh <division> <cluster>` to rewrite the role and policy. Confirm with `vault read auth/kubernetes-<cluster>/role/apps-<cluster>-<division>`. | The script is idempotent — run it every time a new (division, cluster) pair appears. |
+| ESO operand hangs forever on `vault login` | The NetworkPolicy stack in `external-secrets` namespace blocks egress to the Vault VM. | Apply the platform `eso-allow-egress-to-vault` NetworkPolicy on the `external-secrets` namespace; restart the operand. See platform memory `project_eso_egress_to_vault.md`. | Ship the NetworkPolicy alongside ESO at install time. |
+| Tenant's SecretStore reads from a different division's path | The `<DIVISION>` placeholder in the SecretStore was not substituted, or the role's `bound_service_account_namespaces` glob accepts the wrong namespace. | Inspect the SecretStore `auth.kubernetes.role` and confirm it matches `apps-<cluster>-<division>`. | The tenant template's `_template/secretstore-vault-apps.yaml` is the only blessed copy — never hand-roll. |
+| `vault-apps-onboard.sh` fails with `permission denied` writing the policy | The operator's `VAULT_TOKEN` does not have `sys/policies/acl/*` write capability. | Get a token with the platform's `vault-admin` policy. | Use the lab convention: only the `vault-admin` token is allowed for onboarding scripts; never the per-tenant tokens. |
+| Multiple divisions accidentally share a role | The script was run with the same `<division>` twice; the second run rewrote the role for the first division. | The script is idempotent within a (division, cluster) tuple — repeat with the correct arguments. | The script's first action is to `vault read` the existing role and abort if it would overwrite different policies. |
+
+## References
+
+- `codex-opp-agent/connection-details/vault-app-secrets.md` (issue #174, DEV-OCP-0.4) — the authoritative spec.
+- ADR 0019 — Nexus-only image supply chain (rules around CI-time vs runtime secrets).
+- ESO docs — `external-secrets.io/v1/SecretStore` (Vault kubernetes auth provider).
+- Vault docs — KV-v2 path conventions; Kubernetes auth method `bound_service_account_*`.
