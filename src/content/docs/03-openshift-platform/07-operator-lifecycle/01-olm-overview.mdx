@@ -1,0 +1,217 @@
+---
+title: "OLM overview — Subscription, CSV, OperatorGroup, InstallPlan"
+description: "How the OpenShift Operator Lifecycle Manager turns a Subscription into a running operator deployment, and the four CRs that participate in the dance."
+sidebar_label: "OLM overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const olmNodes = [
+  { id: "user",     position: { x: 0,   y: 0   }, data: { label: "GitOps commit\n(Subscription YAML)" }, style: extBox },
+  { id: "sub",      position: { x: 240, y: 0   }, data: { label: "Subscription\n(channel + startingCSV)" }, style: ctrlBox },
+  { id: "og",       position: { x: 240, y: 130 }, data: { label: "OperatorGroup\n(target namespaces)" }, style: dataBox },
+  { id: "catsrc",   position: { x: 0,   y: 130 }, data: { label: "CatalogSource\n(mirrored index)" }, style: dataBox },
+  { id: "catop",    position: { x: 0,   y: 260 }, data: { label: "catalog-operator\n(reads gRPC index)" }, style: agentBox },
+  { id: "olmop",    position: { x: 240, y: 260 }, data: { label: "olm-operator\n(reconciles CSV)" }, style: agentBox },
+  { id: "ip",       position: { x: 480, y: 130 }, data: { label: "InstallPlan\n(resolved manifests)" }, style: ctrlBox },
+  { id: "csv",      position: { x: 480, y: 260 }, data: { label: "ClusterServiceVersion\n(CSV)" }, style: ctrlBox },
+  { id: "deploy",   position: { x: 480, y: 400 }, data: { label: "Deployment\nServiceAccount\nRBAC\nCRDs" }, style: dataBox },
+  { id: "operator", position: { x: 240, y: 520 }, data: { label: "Operator pod\n(reconciles operand)" }, style: agentBox },
+  { id: "operand",  position: { x: 480, y: 520 }, data: { label: "Operand CRs\n(LokiStack, ACM, ...)" }, style: dataBox },
+];
+
+export const olmEdges = [
+  { id: "e1", source: "user", target: "sub", label: "argo apply", ...reqEdge },
+  { id: "e2", source: "user", target: "og",  label: "argo apply", ...reqEdge },
+  { id: "e3", source: "sub", target: "catop", label: "resolves from", ...muted },
+  { id: "e4", source: "catop", target: "catsrc", label: "reads index", ...muted },
+  { id: "e5", source: "catop", target: "ip", label: "creates", ...reqEdge },
+  { id: "e6", source: "ip", target: "olmop", label: "after Approve", ...muted },
+  { id: "e7", source: "olmop", target: "csv", label: "applies", ...reqEdge },
+  { id: "e8", source: "csv", target: "deploy", label: "renders", ...reqEdge },
+  { id: "e9", source: "deploy", target: "operator", label: "becomes", ...muted },
+  { id: "e10", source: "operator", target: "operand", label: "reconciles", ...pullEdge },
+  { id: "e11", source: "og", target: "csv", label: "scopes to ns", ...muted },
+];
+
+The Operator Lifecycle Manager (OLM) is the in-cluster system that turns a few short CRs into a fully wired operator: it resolves the right bundle from a catalog, creates ServiceAccounts and RBAC, applies CRDs, runs the operator Deployment, and (under our policy) waits for human approval before doing any of it. This page maps the four CRs you'll see in every operator install on the fleet and the controllers that read them.
+
+## The four CRs and what each does
+
+| CR | Who creates it | Purpose |
+| --- | --- | --- |
+| **`CatalogSource`** | platform (mirrored from `oc mirror`) | Tells OLM where to find operator bundles. See [04-catalogsources-and-icsp](/docs/openshift-platform/disconnected-image-supply/catalogsources-and-icsp). |
+| **`OperatorGroup`** | platform (per namespace) | Defines the namespace scope an operator is allowed to watch and reconcile. |
+| **`Subscription`** | platform (per operator install) | Declares intent: "install this package, from this channel, starting at this CSV, against this catalog." |
+| **`ClusterServiceVersion`** (CSV) | created by OLM (not by hand) | The materialized operator manifest — Deployment, RBAC, ServiceAccounts, owned CRDs, supported install modes. |
+| **`InstallPlan`** | created by OLM | The resolved bundle of CSVs to apply for a Subscription. Approval gate when `installPlanApproval: Manual`. |
+
+## The install flow
+
+<Whiteboard client:load data={{ nodes: olmNodes, edges: olmEdges }} height={700} />
+
+Walking the diagram step by step:
+
+1. **GitOps commit lands a Subscription + OperatorGroup** in the operator's namespace. The Argo CD on the cluster applies them.
+2. **`catalog-operator`** (the OLM component that watches CatalogSources) sees the Subscription. It queries the CatalogSource's gRPC index for the named package, channel, and `startingCSV`. It resolves all dependencies — RBAC requirements, CRDs, dependent operators (e.g., `multicluster-engine` for ACM, `mcg-operator` for ODF).
+3. **An `InstallPlan` is created** listing every CSV the install needs to apply.
+4. **Because we set `installPlanApproval: Manual`**, the InstallPlan starts with `spec.approved: false`. A human (or a higher-level controller) flips it to `true` after reviewing the proposed CSV set. This is the gate that prevents a surprise upgrade or dependency drag-in.
+5. **`olm-operator`** picks up the approved InstallPlan and applies each CSV.
+6. **Applying a CSV** creates the operator's Deployment, its ServiceAccount, the cluster-role bindings it requested, and any CRDs it owns.
+7. **The operator pod starts** and begins reconciling its operand CRs (a `LokiStack`, an `MultiClusterHub`, a `StorageCluster`, etc).
+
+Everything in this flow is idempotent at the CR level. If the Deployment is deleted, OLM recreates it on the next reconcile. If a CRD is missing, OLM re-applies it. Drift recovery is automatic.
+
+## A complete Subscription example
+
+This is the actual shape we use across the dc-lab fleet (sanitized):
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: open-cluster-management-og
+  namespace: open-cluster-management
+spec:
+  targetNamespaces:
+    - open-cluster-management
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+spec:
+  channel: release-2.16
+  installPlanApproval: Manual           # mandatory; see version-pinning page
+  name: advanced-cluster-management
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: advanced-cluster-management.v2.16.1
+```
+
+Key fields, by purpose:
+
+| Field | Purpose | Convention |
+| --- | --- | --- |
+| `channel` | which upgrade lane (`release-2.16`, `stable-4.20`, `pipelines-1.22`, ...) | mirrors the channel pinned in `ImageSetConfiguration` |
+| `installPlanApproval` | `Manual` or `Automatic` | **always `Manual`** in the dc-lab fleet |
+| `source` | the CatalogSource name | always the mirrored `cs-redhat-operator-index-v4-20` or `cs-certified-operator-index-v4-20` |
+| `sourceNamespace` | `openshift-marketplace` | non-negotiable; OLM looks for CatalogSources here by default |
+| `startingCSV` | exact CSV the install starts from | mirrors the `maxVersion` for the operator in `operator-version-lock.md` |
+
+`channel` and `startingCSV` together are the **install identity** for an operator. Two clusters with identical values install the same operator version regardless of when the install runs.
+
+## What an OperatorGroup actually does
+
+`OperatorGroup` is the most-misunderstood OLM object. It does not *select* operators; it *scopes* them. When a Subscription installs into namespace N, OLM looks at the OperatorGroup in namespace N to determine where the operator is allowed to watch resources.
+
+The three common shapes:
+
+| Shape | `spec.targetNamespaces` | Use when |
+| --- | --- | --- |
+| **OwnNamespace** | `[same as og.metadata.namespace]` | operator only reconciles in its own namespace (small CRDs, scoped tooling) |
+| **SingleNamespace** | `[other-namespace]` | operator watches one specific tenant namespace |
+| **AllNamespaces** | omitted or empty (interpreted by OLM as cluster-wide) | operator is fleet-scoped (ESO, ACM, ODF, Pipelines, GitOps) |
+
+The shape must match what the operator's CSV declares it supports under `spec.installModes`. Mismatches show up as `Subscription` stuck `InstallPlanFailed` with a message like `AllNamespaces InstallModeType not supported`.
+
+Most fleet operators in the lab need `AllNamespaces` — they install into a single namespace (e.g. `openshift-gitops`, `openshift-operators`) but watch the entire cluster:
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: global-operators
+  namespace: openshift-operators
+spec: {}                                # empty = AllNamespaces
+```
+
+Many Red Hat operators ship a built-in OperatorGroup as part of their CSV. When that's the case, do not add a second one — duplicates produce `MultipleOperatorGroupsFound` errors.
+
+## The CSV is the source of truth
+
+Once an InstallPlan has been approved and applied, the resulting **ClusterServiceVersion** is the canonical description of the running operator. CSV inspection is the right thing to do when debugging:
+
+```bash
+oc -n <ns> get csv
+
+# every field that matters:
+oc -n <ns> get csv <name>.v<version> -o yaml | yq eval '.spec | {
+  displayName, version, install: {strategy: .install.strategy},
+  owned: .customresourcedefinitions.owned[].name,
+  installModes: .installModes[] | {type, supported}
+}' -
+```
+
+Useful CSV fields when something is wrong:
+
+| Field | Tells you |
+| --- | --- |
+| `.spec.install.spec.deployments[]` | the actual Deployment(s) the CSV creates |
+| `.spec.install.spec.permissions[]` | namespace-scoped RBAC the operator gets |
+| `.spec.install.spec.clusterPermissions[]` | cluster-scoped RBAC the operator gets |
+| `.spec.customresourcedefinitions.owned[]` | CRDs this CSV manages |
+| `.spec.customresourcedefinitions.required[]` | CRDs this CSV needs from elsewhere (dependency) |
+| `.spec.replaces` | which CSV this version replaces in the upgrade graph |
+| `.status.phase` | `Succeeded` / `Pending` / `InstallReady` / `Failing` / `Replacing` |
+| `.status.conditions[]` | per-reason history with timestamps |
+
+## The InstallPlan approval gate
+
+With `installPlanApproval: Manual`, an InstallPlan lands in `spec.approved: false` state. Until a human flips it, nothing else happens — OLM does not apply the CSV, does not run the Deployment, does not register CRDs.
+
+```bash
+oc -n open-cluster-management get installplan
+# NAME            CSV                                       APPROVAL   APPROVED
+# install-abc12   advanced-cluster-management.v2.16.1       Manual     false
+
+# Review:
+oc -n open-cluster-management get installplan install-abc12 -o yaml \
+  | yq '.spec.clusterServiceVersionNames'
+
+# Approve:
+oc -n open-cluster-management patch installplan install-abc12 \
+  --type merge -p '{"spec":{"approved":true}}'
+```
+
+The approval is a record in Git only if it's done through GitOps (i.e., the InstallPlan YAML is committed with `approved: true`). The lab convention for **planned** upgrades is to do exactly that — write a fresh InstallPlan YAML in the platform-gitops repo and let Argo apply it. Ad-hoc `oc patch` approval is for break-glass only.
+
+ADR 0025 (GitOps-only operations) requires that "approval" is recorded somewhere durable. The platform-gitops MR is the durable record.
+
+## Failure modes (and what the CRs look like)
+
+| Symptom | Where to look | Common cause |
+| --- | --- | --- |
+| Subscription stuck `UpgradePending` | CatalogSource pod logs; PackageManifest list | CatalogSource pod unhealthy or `startingCSV` not in catalog |
+| InstallPlan exists but never applies | InstallPlan `spec.approved` is `false` | approval gate as intended; flip via GitOps MR |
+| CSV stuck `Pending` for >10 min | CSV `.status.conditions` and operator-namespace events | RBAC denied; OperatorGroup shape doesn't match install mode; image pull failure |
+| CSV reports `InstallSucceeded` but operator pod isn't there | Deployment in the operand namespace | Deployment quotas; ImagePullBackOff (check IDMS coverage) |
+| Two CSVs in same namespace `Replacing` each other | `oc get csv -A | grep Replacing` | accidental duplicate Subscription; resolution loop |
+| `RequirementsNotMet` on CSV | `.status.requirementStatus` | dependency operator not installed; ESO requires no upstream deps, but ACM/ODF do |
+
+## What this page does not cover (links instead)
+
+- **Version pinning policy + the manual-approval rule:** [02-version-pinning-strategy](/docs/openshift-platform/operator-lifecycle/version-pinning-strategy).
+- **Dev / eval bundle that intentionally relaxes some of these rules:** [03-dev-eval-bundle](/docs/openshift-platform/operator-lifecycle/dev-eval-bundle).
+- **OperatorPolicy via ACM (fleet-wide governance):** [04-operatorpolicy-via-acm](/docs/openshift-platform/operator-lifecycle/operatorpolicy-via-acm).
+- **Channel-management and upgrade flow:** [05-upgrade-and-channel-management](/docs/openshift-platform/operator-lifecycle/upgrade-and-channel-management).
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — the canonical operator table.
+- OpenShift docs: *Operator Lifecycle Manager workflow* — upstream reference for the four-CR model.
+- ADR 0019 — Nexus-only image supply chain (CatalogSource pinning).
+- ADR 0025 — GitOps-only operations (approval-as-record).
+- [04-catalogsources-and-icsp](/docs/openshift-platform/disconnected-image-supply/catalogsources-and-icsp) — the catalog side.
