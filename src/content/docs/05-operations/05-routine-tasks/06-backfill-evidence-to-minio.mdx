@@ -1,0 +1,202 @@
+---
+title: "Backfill evidence to MinIO"
+description: "How to land CI evidence, compliance close-out packs, and break-glass audit records into the `developer-ci-evidence` bucket on MinIO with the right prefix, lifecycle, and read scope."
+sidebar_label: "Backfill evidence"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This task covers landing evidence in MinIO — the lab's S3-compatible object store running on its own VM. "Evidence" means anything that must survive a session but is too large or too auditable to live in Git: CI run logs, Trivy scan output, SBOM blobs, release artifact archives, smoke-test transcripts, compliance close-out packs, break-glass audit records.
+
+The contract is small: the bucket is `developer-ci-evidence`, the prefix conventions are fixed, the lifecycle is encoded as policy on MinIO. A backfill follows the same five steps regardless of evidence shape.
+
+## When this task runs
+
+- **At the close of a CI run** that produced evidence in the workspace and needs to land in MinIO.
+- **At the close of a compliance phase chain** (PCI-DSS baseline, file-integrity baseline) — the evidence pack lands in MinIO with the right prefix and lifecycle.
+- **After a break-glass action** — the audit record under `codex-opp-agent/reports/break-glass/` is copied into MinIO for long-term retention.
+- **On lifecycle audit.** Per the [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff) cadence — confirm the prefixes and lifecycle still match the policy.
+
+## What is in scope
+
+The single bucket `developer-ci-evidence` with five established prefixes:
+
+| Prefix | What lives there | Lifecycle (expiration) |
+|---|---|---|
+| `builds/` | Per-build artefact blobs (jars, container manifests, build logs) | 90 days |
+| `releases/` | Tagged release artefacts (only items intended as the canonical release) | 365 days |
+| `sbom/` | SBOM JSON / SPDX blobs | 365 days |
+| `trivy/` | Trivy scan output (SARIF + JSON) | 180 days |
+| `smoke/` | Smoke-test transcripts and probe outputs | 30 days |
+
+Out of scope:
+
+- Per-cluster backups (OADP) — those land in their own MinIO bucket (`oadp-spoke-dc-v6-backups`) with the OADP-operator-controlled lifecycle.
+- Database backups (CNPG, future Quay PG) — those follow the CNPG operator's BackupSchedule resource.
+- Vault Raft snapshots — those land via the Vault snapshot API and live under a separate path.
+
+## Pre-checks
+
+1. **Confirm MinIO reachability.**
+
+   ```bash
+   . /home/ze/codex-opp-agent/secrets/minio-developer-ci-evidence.env
+   curl -s -o /dev/null -w "%{http_code}\n" \
+     "${MINIO_ENDPOINT}/${MINIO_BUCKET}/?location"
+   # 200 (or similar AWS-style response)
+   ```
+
+   Or with `mc`:
+
+   ```bash
+   mc alias set lab "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"
+   mc ls lab/${MINIO_BUCKET}/
+   ```
+
+   Expected: the five prefixes are listed.
+
+2. **Confirm credential scope.** The writer credential has write access to all five prefixes; the reader credential at `minio-developer-ci-evidence-reader.env` is list/get only.
+
+3. **Identify the evidence's prefix and lifecycle.** Match the evidence type to one of the five prefixes. If the evidence does not fit, *do not invent a new prefix* — file an issue under #229 to propose the new prefix and its lifecycle.
+
+4. **Open the GitHub issue.** Branch prefix `evidence/<phase-or-control>` if the backfill needs an MR.
+
+## The change
+
+### Step 1 — Stage the evidence locally
+
+Collect the evidence files into a flat directory or a single archive:
+
+```bash
+mkdir -p /tmp/evidence-stage/<phase>/
+cp <evidence files> /tmp/evidence-stage/<phase>/
+ls -la /tmp/evidence-stage/<phase>/
+```
+
+For compliance close-out packs, the convention is one `.tar.gz` per phase containing the sanitized auditor-facing markdown plus the supporting scan output:
+
+```bash
+tar czf /tmp/evidence-stage/pci-baseline-2026-05-11.tar.gz \
+  -C /home/ze/codex-opp-agent/reports/pci-dss/ \
+  spoke-dc-v6-pci-dss-v4-baseline-2026-05-11.md \
+  spoke-dc-v6-pci-dss-v4-baseline-2026-05-11-evidence/
+```
+
+### Step 2 — Compute checksums
+
+The evidence is paired with a checksum file to prove it has not been tampered with:
+
+```bash
+cd /tmp/evidence-stage/<phase>/
+sha256sum * > SHA256SUMS
+cat SHA256SUMS
+```
+
+The `SHA256SUMS` file is the audit anchor — it lands in MinIO alongside the evidence and is referenced from the close-out issue.
+
+### Step 3 — Upload
+
+```bash
+mc cp /tmp/evidence-stage/<phase>/ \
+  lab/${MINIO_BUCKET}/<prefix>/<phase>/
+# (the trailing slash on the source is important — mc cp behaves like rsync)
+```
+
+For a one-shot file:
+
+```bash
+mc cp /tmp/evidence-stage/pci-baseline-2026-05-11.tar.gz \
+  lab/${MINIO_BUCKET}/releases/pci-baseline/pci-baseline-2026-05-11.tar.gz
+mc cp /tmp/evidence-stage/SHA256SUMS \
+  lab/${MINIO_BUCKET}/releases/pci-baseline/SHA256SUMS
+```
+
+### Step 4 — Confirm the lifecycle
+
+The bucket has lifecycle rules per the table at the top of this page. Confirm the rule for the prefix is in place:
+
+```bash
+mc ilm rule list lab/${MINIO_BUCKET}
+```
+
+Expected: a rule per prefix with the expected expiration period.
+
+If you uploaded under a new sub-prefix (e.g., `releases/pci-baseline/`), the parent prefix's lifecycle still applies. Sub-prefixes inherit lifecycle from the parent.
+
+If the lifecycle needs to change (and only if it has to), the change is in the MinIO admin surface, not in S3 API metadata:
+
+```bash
+# Example: change the trivy/ lifecycle from 180 to 365 days
+mc ilm rule add --expire-days 365 --prefix "trivy/" lab/${MINIO_BUCKET}
+# (review existing rule first; replace as needed via `mc ilm rule remove ... && mc ilm rule add ...`)
+```
+
+Lifecycle changes are infrequent — every change should have a tracked issue justifying the new retention.
+
+### Step 5 — Record the upload
+
+The GitHub issue (or the active session report) captures:
+
+- The MinIO path: `s3://${MINIO_BUCKET}/<prefix>/<phase>/<filename>`.
+- The SHA256 of every uploaded file (from `SHA256SUMS`).
+- The lifecycle expiration date computed from the upload date.
+- The reader credential or signed URL the auditor can use to fetch the evidence (read-only credential, not the writer).
+
+For audit-record uploads after a break-glass action, the issue is the break-glass audit issue from `runbooks/break-glass-procedure.md`.
+
+## Validation
+
+A backfill is complete when **all** of the following are true:
+
+1. The evidence is in MinIO at the expected path: `mc stat lab/${MINIO_BUCKET}/<prefix>/<phase>/<filename>` succeeds.
+2. The `SHA256SUMS` file is co-located and the sums match the staged copies.
+3. The bucket's lifecycle rule still covers the prefix (`mc ilm rule list` includes the prefix and the expiration).
+4. The reader credential can list and get the evidence: `mc ls` and `mc cat` from a different shell using `minio-developer-ci-evidence-reader.env` succeeds.
+5. The session report references the MinIO path.
+
+## Prevention
+
+Three guardrails:
+
+1. **Never invent a new prefix without an issue.** The five-prefix convention is the lifecycle contract. Adding `audit/` because `compliance/` "didn't feel right" silently bypasses the lifecycle policy.
+2. **Always co-locate `SHA256SUMS` with the evidence.** Auditors prove tamper-evidence from the checksum; without it the evidence is just "files we uploaded".
+3. **Use the reader credential for distribution.** Sharing the writer credential externally is a credential exfiltration; the reader credential is what auditors and downstream consumers use.
+
+## Worked example — compliance close-out backfill
+
+The PCI-DSS baseline close-out on 2026-05-11 produced:
+
+- `reports/pci-dss/spoke-dc-v6-pci-dss-v4-baseline-2026-05-11.md` — sanitized auditor-facing summary
+- `reports/pci-dss/spoke-dc-v6-pci-dss-v4-baseline-2026-05-11-evidence/` — supporting scan output
+
+Flow:
+
+```bash
+cd /home/ze/codex-opp-agent/reports/pci-dss
+tar czf /tmp/pci-baseline-2026-05-11.tar.gz \
+  spoke-dc-v6-pci-dss-v4-baseline-2026-05-11.md \
+  spoke-dc-v6-pci-dss-v4-baseline-2026-05-11-evidence/
+sha256sum /tmp/pci-baseline-2026-05-11.tar.gz > /tmp/pci-baseline-2026-05-11.SHA256SUMS
+
+. /home/ze/codex-opp-agent/secrets/minio-developer-ci-evidence.env
+mc alias set lab "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}"
+mc cp /tmp/pci-baseline-2026-05-11.tar.gz \
+  lab/${MINIO_BUCKET}/releases/pci-baseline/
+mc cp /tmp/pci-baseline-2026-05-11.SHA256SUMS \
+  lab/${MINIO_BUCKET}/releases/pci-baseline/SHA256SUMS
+
+# Validate:
+mc stat lab/${MINIO_BUCKET}/releases/pci-baseline/pci-baseline-2026-05-11.tar.gz
+mc ilm rule list lab/${MINIO_BUCKET} | grep releases
+# Expect: lifecycle 365 days, applies to releases/ prefix
+```
+
+The session report referenced `s3://developer-ci-evidence/releases/pci-baseline/pci-baseline-2026-05-11.tar.gz` with the SHA256 and the 2027-05-11 expiration date.
+
+## References
+
+- `codex-opp-agent/connection-details/minio.md` (the canonical MinIO endpoint + credential custody doc)
+- ADR `0019-nexus-only-image-supply-chain.md` (image supply; MinIO is for evidence, not images)
+- `codex-opp-agent/reports/pci-dss/` (the source compliance evidence packs)
+- `codex-opp-agent/runbooks/break-glass-procedure.md` (break-glass audit records that also land here)
+- Issues: #229 (this section)

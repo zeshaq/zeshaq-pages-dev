@@ -1,0 +1,264 @@
+---
+title: "Add a cluster to the fleet"
+description: "From a fresh OpenShift cluster to an ACM-managed spoke under the pull-model GitOps: ManagedCluster registration, klusterlet join, GitOpsCluster wiring, baseline operators, and the validation gates."
+sidebar_label: "Add a cluster"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This task covers onboarding a new OpenShift cluster as an ACM-managed spoke under the v6 pull-model GitOps (per ADR 0018). It is the routine task with the highest blast radius — done wrong, you ship a cluster that the hub coordinates but the spoke does not reconcile, and the fleet's GitOps posture silently degrades.
+
+The procedure assumes the new cluster already exists (provisioned via Hive / CAPI / Assisted Installer / IPI / UPI — out of scope for this page). The page picks up at "the kubeconfig is in hand".
+
+## When this task runs
+
+- **Fleet capacity event.** Existing clusters at capacity; a new workload cluster joins.
+- **DR build-out.** `hub-dr-v6` / `spoke-dr-v6` are placeholder names; if/when DR work resumes, the onboarding follows this page (with cluster-name substitution).
+- **Tenancy isolation requirement.** A regulated workload demands a dedicated cluster (rarely, given the lab's PSA + tenant scoping).
+
+In the active fleet today only `hub-dc-v6` and `spoke-dc-v6` are alive (per `project_workspace_scope`); the page is written for the next time the fleet expands.
+
+## What is in scope
+
+- Cluster registration in ACM (`ManagedCluster`, `klusterlet`, `KlusterletAddonConfig`).
+- Hub Application coordination for the new spoke (Placement entry, ApplicationSet generator config, GitOpsCluster binding).
+- The spoke's own OpenShift GitOps install + bootstrap Application.
+- Baseline operators on the spoke (local-storage if the cluster has worker disks, ODF if storage is needed, RHACS SecuredCluster, ESO, cert-manager).
+- Image supply for the new spoke (IDMS/ITMS + CatalogSources + ClusterCatalogs).
+
+Out of scope:
+
+- Cluster provisioning (Hive / CAPI). That is a one-time install task, not a routine onboarding.
+- Workload migration (moving apps to the new cluster). Application Set generators reach the cluster automatically once registered; the workload-migration plan is per-app.
+
+## Pre-checks
+
+1. **Confirm the new cluster is healthy.** From the operator workstation with the new kubeconfig (call it `K_NEW`):
+
+   ```bash
+   K_NEW=/home/ze/.kube/configs/<new-cluster>.kubeconfig
+   oc --kubeconfig "$K_NEW" get nodes -o wide
+   oc --kubeconfig "$K_NEW" get clusterversion version
+   oc --kubeconfig "$K_NEW" get co \
+     | awk 'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+   ```
+
+   Expected: every node `Ready`, ClusterVersion `4.20.x`, every ClusterOperator `Available=True / Progressing=False / Degraded=False`.
+
+2. **Confirm the new cluster has Network reachability to the hub.** The pull-model requires the spoke to initiate outbound connections to the hub's kube-apiserver:
+
+   ```bash
+   oc --kubeconfig "$K_NEW" debug node/$(oc --kubeconfig "$K_NEW" get nodes -o jsonpath='{.items[0].metadata.name}') -- \
+     chroot /host curl -ksI https://api.hub-dc-v6.sub.comptech-lab.com:6443/livez
+   ```
+
+   Expected: HTTP 200. If this fails, NetworkPolicy / VPC / firewall rules need adjusting before continuing.
+
+3. **Confirm image-supply for the new spoke.** New clusters need IDMS/ITMS for mirror routing and CatalogSource/ClusterCatalog entries for OperatorHub.
+
+4. **Open the GitHub issue.** Branch prefix `cluster-onb/<new-cluster>`.
+
+## The change
+
+The change is multi-MR — register first, then bootstrap, then operators. Sequence the MRs; do not bundle.
+
+### MR 1 — ACM registration
+
+In `clones/platform-gitops`, add the hub-side ManagedCluster CRs under `clusters/hub-dc-v6/platform/fleet-registration/<new-cluster>/`:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: <new-cluster>
+  labels:
+    env: <env>
+    region: <region>
+    vendor: OpenShift
+    cloud: <provider>
+spec:
+  hubAcceptsClient: true
+  leaseDurationSeconds: 60
+---
+apiVersion: agent.open-cluster-management.io/v1
+kind: KlusterletAddonConfig
+metadata:
+  name: <new-cluster>
+  namespace: <new-cluster>
+spec:
+  clusterName: <new-cluster>
+  clusterNamespace: <new-cluster>
+  applicationManager:
+    enabled: true
+  policyController:
+    enabled: true
+  searchCollector:
+    enabled: true
+  certPolicyController:
+    enabled: true
+  iamPolicyController:
+    enabled: true
+```
+
+The ACM hub creates an import bundle (a YAML manifest set including `klusterlet` and its CRDs). Apply it on the new cluster:
+
+```bash
+# Get the import bundle from the hub:
+oc --kubeconfig "$K_HUB" -n <new-cluster> get secret <new-cluster>-import \
+  -o jsonpath='{.data.import\.yaml}' | base64 -d > /tmp/<new-cluster>-import.yaml
+
+# Apply on the new cluster:
+oc --kubeconfig "$K_NEW" apply -f /tmp/<new-cluster>-import.yaml
+```
+
+Validate the registration completes:
+
+```bash
+oc --kubeconfig "$K_HUB" get managedcluster <new-cluster>
+# NAME             HUB ACCEPTED   ... AVAILABLE   AGE
+# <new-cluster>    true               True        2m
+```
+
+### MR 2 — GitOpsCluster wiring
+
+The hub Argo CD needs to know the new spoke's cluster registry entry so ApplicationSets can target it. Add to `clusters/hub-dc-v6/gitops-control/gitops-cluster-<new-cluster>.yaml`:
+
+```yaml
+apiVersion: apps.open-cluster-management.io/v1beta1
+kind: GitOpsCluster
+metadata:
+  name: argo-acm-<new-cluster>
+  namespace: openshift-gitops
+spec:
+  argoServer:
+    cluster: local-cluster
+    argoNamespace: openshift-gitops
+  placementRef:
+    apiVersion: cluster.open-cluster-management.io/v1beta1
+    kind: Placement
+    name: placement-all-spokes
+    namespace: openshift-gitops
+```
+
+And ensure the Placement selects the new cluster:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: placement-all-spokes
+  namespace: openshift-gitops
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: vendor
+              operator: In
+              values: [OpenShift]
+            - key: env
+              operator: NotIn
+              values: [hub]
+```
+
+### MR 3 — Spoke OpenShift GitOps install
+
+Add the spoke-side bootstrap under `clusters/<new-cluster>/`:
+
+```text
+clusters/<new-cluster>/
+  bootstrap/
+    namespace.yaml
+    networkpolicy.yaml
+    limitrange.yaml
+    resourcequota.yaml
+    argocd-platform-extensions/
+      clusterrole.yaml
+      clusterrolebinding.yaml
+  operators/
+    openshift-gitops/
+      subscription.yaml
+  platform/
+    argocd-extensions/
+      clusterrole.yaml         # copy from existing spoke; same allowlist
+      clusterrolebinding.yaml
+    catalogs/
+      catalogsource-redhat-operator-index-v4-20.yaml
+      catalogsource-certified-operator-index-v4-20.yaml
+      clustercatalog-*.yaml
+    image-mirrors/
+      idms.yaml
+      itms.yaml
+  kustomization.yaml
+```
+
+The spoke's local Argo CD reconciles from internal GitLab. The hub ApplicationSet on the hub creates an Application on the hub that delivers this bootstrap to the spoke via ManifestWork — that is the pull-model: the hub places the work, the spoke pulls it.
+
+After this MR merges and Argo on the hub reconciles, the new spoke runs its own OpenShift GitOps instance and reconciles its own resources from internal GitLab.
+
+### MR 4 — Spoke baseline operators
+
+Operators that every spoke runs: local-storage (if the spoke has worker disks), ODF (if storage is needed), RHACS SecuredCluster, ESO, cert-manager, the observability / security baseline per the planned operator install queue.
+
+Follow the [operator-install pattern](/docs/05-operations/03-platform-gitops-mr-mechanics) for each. Sync waves spread the install across rounds:
+
+| Wave | What |
+|---|---|
+| 0 | `argocd-platform-extensions` ClusterRole + binding |
+| 10 | Namespace, OperatorGroup, Subscription for each operator |
+| 15 | Operator-scoped Argo RBAC |
+| 20 | Operand CRs that do not trigger MCP rollouts |
+| 25 | Operand-scoped Argo RBAC |
+| 30 | MachineConfigs and operands that trigger MCP rollouts |
+
+This MR is the largest of the four. Plan a session for the install + validation; do not rush.
+
+### MR 5 — RHACS SecuredCluster bundle
+
+Generate a fresh init-bundle via the Central API (see [rotate secrets](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) for the flow), push the flattened properties to Vault under `secret/ocp/platform/rhacs-init-bundle`, and ensure the per-cluster ExternalSecret on the new spoke pulls each property and recreates the `collector-tls` / `sensor-tls` / `admission-control-tls` Secrets in `stackrox` ns.
+
+The SecuredCluster CR's `centralEndpoint` is the hub Central Route: `central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com:443`.
+
+## Validation
+
+The onboarding is complete when **all** of the following are true:
+
+1. `oc get managedcluster <new-cluster>` on the hub shows `HUB ACCEPTED=true / AVAILABLE=True`.
+2. `klusterlet` pods on the new cluster are `Running` (`open-cluster-management-agent` namespace).
+3. Hub Argo `Application` for the new cluster's bootstrap is `Synced / Healthy`.
+4. Spoke Argo on the new cluster is installed and its bootstrap `Application` is `Synced / Healthy`.
+5. Every baseline operator on the new cluster: Subscription `AtLatestKnown`, CSV `Succeeded`, operand pods `Running`.
+6. `oc get co` is clean on the new cluster.
+7. Image-supply drift script reports zero uncovered external runtime references on the new cluster.
+8. RHACS SecuredCluster on the new cluster reports `Healthy` in Central UI.
+9. Hub-side observability shows metrics flowing from the new cluster (`oc get managedcluster <new-cluster>` shows the recent heartbeat).
+10. The new cluster's entry has been added to `connection-details/openshift-<new-cluster>.md`.
+11. The new cluster's kubeadmin password has been copied to `secrets/<new-cluster>-kubeadmin-password` (filesystem-only).
+12. The session report captures every step's evidence; the GitHub issue is closed with links.
+
+## Prevention
+
+Three guardrails:
+
+1. **Stick to the file layout.** The `clusters/<cluster-name>/` shape (`bootstrap/`, `gitops-control/`, `operators/<name>/`, `platform/<area>/`, `storage/<layer>/`, `security/`) is what makes review by another operator possible. New per-cluster deviations bloat the surface area.
+
+2. **Use the consolidated `argocd-platform-extensions` ClusterRole pattern.** Do not scatter per-feature ClusterRoles on the new spoke; copy the existing spoke's `clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml` as the starting point and extend it as new operators get added. See [Spoke RBAC extension memory](/docs/05-operations/07-known-gotchas).
+
+3. **Provision the [ESO -> Vault NetworkPolicy](/docs/05-operations/04-incidents-and-runbooks/03-eso-egress-to-vault) under `clusters/<new-cluster>/secrets/eso/networkpolicy-vault-egress.yaml` in MR 4.** Forgetting this is the most common onboarding regression; the cluster looks operationally fine until the first ClusterSecretStore reconcile silently times out.
+
+## Forbidden actions
+
+- Skipping the hub-side ManagedCluster CR and joining the spoke via a one-off `klusterlet` install. The fleet-registration entry must be in GitOps.
+- Adding the new cluster to an existing ApplicationSet generator without a Placement update — the new cluster will be in scope for resources that have not been validated on it.
+- Importing an OpenShift cluster that is not on the version baseline (`4.20.x` as of 2026-05-11). Operator-version-lock is per-OCP-minor; cross-minor support is not validated.
+
+## References
+
+- ADR: `0018-acm-openshift-gitops-pull-model-v6.md` (the architectural shape)
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"GitOps Source Of Truth"
+- `codex-opp-agent/connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md`
+- Memory: `reference_spoke_argo_extension_rbac`, `reference_rhacs_init_bundle_via_api`, `project_eso_egress_to_vault`
+- Issues: #229 (this section)
+- Blog post: [RHACM: managing OpenShift fleets at scale](/blog/rhacm) (the architectural overview for the pull model)

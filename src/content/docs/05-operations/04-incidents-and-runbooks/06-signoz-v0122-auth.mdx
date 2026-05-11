@@ -1,0 +1,176 @@
+---
+title: "SigNoz v0.122 auth API moved"
+description: "SigNoz v0.121 -> v0.122 silently moved /api/v1/login to /api/v2/sessions/email_password; the SPA serves a 200 HTML body for the old URL, so naive CLI clients think login succeeded. Plus the orgID-from-SQLite trick."
+sidebar_label: "SigNoz v0.122 auth"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This is the small-but-pernicious incident that ate a few hours when SigNoz was upgraded to v0.122.0 EE. The API shape moved between minor versions, the old endpoint returns the SPA's `index.html` with HTTP 200 instead of a JSON error, and any CLI client written against v0.121 silently fails — `200` looks like success.
+
+This runbook documents the v0.122 login contract end to end so the next operator does not have to re-derive it. When v0.123 lands, treat the v1 -> v2 break as precedent and re-discover before relying.
+
+## Symptom
+
+- **CLI scripts against `POST /api/v1/login` return HTTP 200** with a `text/html` body that begins `<!doctype html>`. The body is the SPA `index.html`. Naive parsing thinks the request succeeded; the actual response carries no token.
+- **CLI scripts against `POST /api/v1/loginPrecheck` show the same shape** — HTML 200, no JSON.
+- **The SigNoz UI itself works fine** in a browser. Users see no problem.
+- **Some `/api/v1` endpoints still work normally:**
+
+  ```bash
+  curl -ksSf https://signoz.apps.sub.comptech-lab.com/api/v1/version
+  # {"data":{"version":"v0.122.0"}}
+  curl -ksSf https://signoz.apps.sub.comptech-lab.com/api/v1/health
+  # {"status":"ok"}
+  curl -sk https://signoz.apps.sub.comptech-lab.com/api/v1/user
+  # {"status":"error","error":"missing authentication"}
+  ```
+
+  Specifically: `version`, `health`, `user` (and many others) keep returning proper JSON. Only `login` and `loginPrecheck` moved.
+
+- **`HEAD` requests against any API path return the SPA `index.html`** rather than the handler's real response. `curl -I` is silently misleading.
+
+The misleading-success pattern is the worst part. A v0.121-era login wrapper happily returns `200`, the calling automation marks the session as authenticated, every subsequent API call fails for lack of a token, and the operator chases auth misconfiguration rather than the URL move.
+
+## Root cause
+
+SigNoz v0.122.0 EE moved the login endpoint to `POST /api/v2/sessions/email_password`. The migration was not advertised in the v0.121 -> v0.122 release notes' "breaking changes" section, but the route is gone — `POST /api/v1/login` is no longer registered.
+
+The reverse proxy / router serves the SigNoz SPA as a catch-all for unmatched routes (the standard SPA serving pattern). An unmatched API path therefore returns `200` with `text/html` and the SPA body — the SPA expects to handle the client-side routing.
+
+A side effect of the same catch-all: any `HEAD` request that does not match an explicit `HEAD` handler hits the SPA fallback. SigNoz's API handlers only register `GET` / `POST`, so `HEAD` consistently hits the SPA. Probes that assume `HEAD <api-path>` reflects the handler's status are wrong.
+
+Additionally, the v0.122 `email_password` endpoint requires an `orgID` field — a UUID, not a name. None of the public/unauthenticated endpoints return the orgID:
+
+- `/api/v1/orgs` requires auth.
+- `/api/v1/loginPrecheck` is gone (returns the SPA).
+- `/api/v2/sessions/orgs` returns 401.
+
+The orgID lives in the embedded SQLite on the VM. There is no documented external path to discover it without VM access. This is by design (SigNoz is not multi-tenant by URL) but undocumented.
+
+## Fix
+
+Three things to do, in order.
+
+### 1. Discover the orgID from the VM SQLite
+
+The orgID has to be read from `/var/lib/signoz/signoz.db` inside the SigNoz container. The DB uses WAL mode, so the `signoz.db-wal` companion file must be included in the snapshot:
+
+```bash
+# Snapshot the SigNoz data directory off the VM:
+ssh ze@signoz.sub.comptech-lab.com \
+  'sudo docker cp signoz:/var/lib/signoz/. /tmp/sn-snap/ \
+   && sudo tar czf /tmp/sn.tgz -C /tmp sn-snap \
+   && sudo chown ze:ze /tmp/sn.tgz'
+scp ze@signoz.sub.comptech-lab.com:/tmp/sn.tgz /tmp/
+tar xzf /tmp/sn.tgz -C /tmp
+
+# Read the organisation list (read-only mode against the WAL):
+python3 -c "
+import sqlite3
+c = sqlite3.connect('file:/tmp/sn-snap/signoz.db?mode=ro', uri=True)
+print(list(c.execute('SELECT id, display_name FROM organizations')))
+"
+
+# Clean up:
+ssh ze@signoz.sub.comptech-lab.com 'sudo rm -rf /tmp/sn-snap /tmp/sn.tgz'
+rm -rf /tmp/sn-snap /tmp/sn.tgz
+```
+
+The query returns `[(<uuid>, '<display-name>'), ...]`. The `<uuid>` is the `orgID` you need for the login call.
+
+### 2. Drive the v0.122 login API
+
+```bash
+ORG_UUID="<from step 1>"
+ADMIN_EMAIL="<from secrets/signoz/auth.env>"
+ADMIN_PASS="<from secrets/signoz/auth.env>"
+
+curl -sS -X POST \
+  https://signoz.apps.sub.comptech-lab.com/api/v2/sessions/email_password \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -nc \
+    --arg email "$ADMIN_EMAIL" \
+    --arg password "$ADMIN_PASS" \
+    --arg orgID "$ORG_UUID" \
+    '{email: $email, password: $password, orgID: $orgID}')"
+```
+
+Response shape:
+
+```json
+{
+  "data": {
+    "tokenType": "Bearer",
+    "accessToken": "<jwt>",
+    "refreshToken": "<jwt>",
+    "expiresIn": 86400
+  }
+}
+```
+
+**Note the response field is `accessToken`, not the v0.121 `accessJwt`.** Code written against v0.121 will pull a missing key and fail silently — the JWT will be empty string, and the subsequent `Authorization: Bearer ` header is malformed.
+
+### 3. Use the Bearer token for normal API calls
+
+Once you have the Bearer, the following endpoints work normally:
+
+```bash
+TOKEN="$(<the accessToken from above>)"
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  https://signoz.apps.sub.comptech-lab.com/api/v2/users/me
+
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "https://signoz.apps.sub.comptech-lab.com/api/v1/services?start=<ms>&end=<ms>"
+
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  https://signoz.apps.sub.comptech-lab.com/api/v1/dashboards
+
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  https://signoz.apps.sub.comptech-lab.com/api/v1/channels
+
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  https://signoz.apps.sub.comptech-lab.com/api/v1/rules
+```
+
+Mixed v1 / v2 paths are the new normal — the API was migrated piecemeal.
+
+## Prevention
+
+Three guardrails:
+
+1. **`HEAD` is forbidden for API probes.** `curl -I` against `https://signoz.apps.sub.comptech-lab.com/api/<anything>` returns the SPA. Always use `GET` (and check `Content-Type: application/json` in addition to the status code) to confirm you hit the handler, not the SPA.
+
+   The negative test that catches the next move:
+
+   ```bash
+   curl -sk -o /dev/null -w "%{http_code} %{content_type}\n" \
+     https://signoz.apps.sub.comptech-lab.com/api/v1/version
+   # Must be: 200 application/json (or similar)
+   # If it is: 200 text/html — the path has moved
+   ```
+
+2. **Re-discover the login contract before any major version bump.** Add to the [routine task: bump operator version](/docs/05-operations/05-routine-tasks/03-bump-operator-version) checklist a SigNoz-specific step: "If SigNoz minor version changed, smoke-test the login contract via the published procedure before relying on automation."
+
+3. **Pin the SigNoz client wrapper to a known-good API shape.** When automation uses SigNoz (alert routing, dashboard publish), the client wrapper should:
+   - Validate the response `Content-Type` is `application/json` on every call.
+   - Validate the presence of `data.accessToken` (not `accessJwt`) on login.
+   - Refuse to treat `200 text/html` as success.
+
+   These three lines of defence have been added to the platform-side wrapper as of 2026-05-10.
+
+### Related SigNoz gotchas
+
+The connection-details doc also captures:
+
+- **SSH host key rotation.** The SigNoz VM's SSH host key has been rotated at least once during v0.122 install. If `~/.ssh/known_hosts` was populated before that rotation, SSH refuses to connect. Clean with `ssh-keygen -R signoz.sub.comptech-lab.com`.
+- **Empty install state after bootstrap.** A freshly-installed SigNoz has no dashboards, alert channels, or alert rules. The empty state matches ADR 0010's "hardening gates not closed" flag. Investigations should expect to scaffold from scratch.
+
+Both are documented in `connection-details/signoz.md`; they are not severe enough for their own runbook page.
+
+## References
+
+- `codex-opp-agent/connection-details/signoz.md` (the canonical SigNoz handoff)
+- `codex-opp-agent/runbooks/secrets-custody-drift-check.md` (probe SigNoz admin creds before relying on them)
+- ADR `0010-...` (observability platform decision)
+- SigNoz v0.122.0 EE upstream release notes

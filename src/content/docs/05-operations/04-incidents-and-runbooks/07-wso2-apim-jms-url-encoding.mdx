@@ -1,0 +1,215 @@
+---
+title: "WSO2 APIM 4.7 JMS URL-encoding trap"
+description: "API publishes are 'APPROVED' in the database but never reach the gateway because the AMQP URL HTML-escapes `&` as `&amp;` instead of URL-encoding as `%26`. TOML-level fix in deployment.toml is canonical; sed-patching JNDI files is stopgap."
+sidebar_label: "WSO2 APIM JMS URL encoding"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This trap has cost the lab multiple multi-hour debugging sessions. The shape is unique to WSO2 APIM 4.7.0 with any admin or JMS-user password containing `&`, `%`, `@`, `?`, `#`, or `:`. The fix is a single TOML edit; the wrong fix (sed-patching the rendered JNDI files) survives until the next restart, then wipes silently.
+
+If you arrived here mid-incident with API publishes failing to reach the gateway, jump to [Fix](#fix).
+
+## Symptom
+
+- **API publish from the Publisher Portal looks successful.** Green banner, no error.
+- **`AM_DEPLOYMENT_REVISION_MAPPING.successDeployedTime` stays `NULL`** for the published revision:
+
+  ```sql
+  SELECT status, success_deployed_time, deployed_revision_gateway_count
+    FROM am_deployment_revision_mapping
+    WHERE api_uuid = '<uuid>';
+  -- APPROVED | NULL | 0
+  ```
+
+- **The gateway returns 404 / "Invalid URL" for the published context:**
+
+  ```bash
+  curl -sk https://<gateway-host>/<ctx>/v1/test
+  # HTTP/1.1 404 Not Found
+  # Synapse log: "Invalid URL"
+  ```
+
+- **`wso2carbon.log` shows AMQP authentication failures:**
+
+  ```text
+  org.wso2.andes.client.AMQConnection — Throwable Received but no listener set.
+    AMQDisconnectedException: Server closed connection and reconnection not permitted.
+
+  org.wso2.carbon.apimgt.common.jms.JMSListener — JMS Provider is not yet started.
+    Please start the JMS provider now.
+    Connection attempt : N for JMS Provider failed. Next retry in NN seconds.
+  ```
+
+- **The broker is up.** TCP ports 5672 (AMQP) and 9711 (Andes admin) are listening; the WSO2 Java process is bound:
+
+  ```bash
+  ssh ze@<wso2-host> 'ss -tlnp | grep -E "5672|9711"'
+  ```
+
+- **The rendered JNDI files contain `&amp;` instead of `%26`:**
+
+  ```bash
+  ssh ze@<wso2-host> \
+    'sudo grep -E "amp;|%26" /opt/wso2am-4.7.0/repository/conf/jndi*.properties'
+  ```
+
+  If `&amp;` is present in the connection URL, this trap applies. If only `%26` is present, look elsewhere.
+
+The gateway never renders the published API to its `synapse-configs/default/api/` directory — only `_OpenService_.xml` is present.
+
+## Root cause
+
+WSO2 APIM 4.7 ships four JNDI files under `/opt/wso2am-4.7.0/repository/conf/`:
+
+- `jndi.properties`
+- `jndi-cp.properties`
+- `jndi2.properties`
+- `jndi2-cp.properties`
+
+Each contains an AMQP connection URL line shaped like:
+
+```text
+connectionfactory.TopicConnectionFactory = amqp://<user>:<pass>@clientid/carbon?brokerlist='tcp://${carbon.local.ip}:${jms.port}'
+```
+
+The files are regenerated at WSO2 startup from Jinja templates under `repository/resources/conf/templates/repository/conf/jndi*.properties.j2`. The template's password substitution uses HTML entity-escaping (`&` -> `&amp;`) — correct for XML files like `carbon-config.xml`, **wrong for URLs**.
+
+The AMQP client does not unescape HTML inside a URL. It attempts to authenticate with the literal string `Hkj38djf&amp;&amp;&amp;` against an Andes broker that expects `Hkj38djf&&&`. Andes rejects auth and drops the connection.
+
+The downstream effect: WSO2 cannot receive deployment notifications via the JMS topic, so the publisher-side approval never propagates to the gateway. `successDeployedTime` stays `NULL`, `deployedGatewayCount` stays `0`, and the gateway's Synapse configs never render the API.
+
+The trap reproduces silently after every password rotation that touches the affected password. The trigger is the **set of characters** in the password, not the rotation itself — any new password without `&`/`%`/`@`/`?`/`#`/`:` does not reproduce.
+
+### Which template branch fires
+
+WSO2's JNDI templates have two branches selected by whether `apim.event_hub.event_listening_endpoints` is defined in `deployment.toml`:
+
+| Rendered URL shape | Active branch | Active TOML keys |
+|---|---|---|
+| `brokerlist='tcp://${carbon.local.ip}:${jms.port}'` (single placeholder URL) | final-else | `apim.throttling.jms.username` / `apim.throttling.jms.password` |
+| `brokerlist='<comma-list-of-explicit-tcp-urls>'` | event_hub | `apim.event_hub.jms.username` / `apim.event_hub.jms.password` |
+
+The lab install uses the final-else branch. New installs may differ; check before editing.
+
+## Fix
+
+Two paths: the durable TOML fix and the emergency JNDI sed-patch. Use the TOML fix as the canonical remediation; sed-patching is a stopgap.
+
+### Durable fix — `deployment.toml`
+
+```bash
+ssh ze@<wso2-host>
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp /opt/wso2am-4.7.0/repository/conf/deployment.toml \
+  /opt/wso2am-4.7.0/repository/conf/deployment.toml.bak-$TS
+```
+
+Add the URL-encoded JMS credentials. For the final-else branch (most lab installs):
+
+```toml
+[apim.throttling.jms]
+username = "<jms-user>"
+password = "<URL-encoded-password>"
+```
+
+For the event_hub branch:
+
+```toml
+[apim.event_hub.jms]
+username = "<jms-user>"
+password = "<URL-encoded-password>"
+```
+
+The URL-encoded password rules:
+
+| Character | Encoded form |
+|---|---|
+| `&` | `%26` |
+| `%` | `%25` |
+| `@` | `%40` |
+| `?` | `%3F` |
+| `#` | `%23` |
+| `:` | `%3A` |
+
+Worked example: super-admin password `Hkj38djf&&&` -> `Hkj38djf%26%26%26`.
+
+Restart WSO2:
+
+```bash
+sudo systemctl restart wso2am
+sudo journalctl -u wso2am -f --since "1 minute ago" \
+  | grep -E "JMSListener|AMQConnection|Started to listen|JMS Provider"
+```
+
+Expected line (usually 60-90 seconds after restart):
+
+```text
+org.wso2.carbon.apimgt.common.jms.JMSListener — Started to listen on
+destination : notification of type topic
+```
+
+### Emergency hot-patch — sed the rendered JNDI files
+
+When a TOML edit is blocked (change window, missing admin), sed-patch the rendered files. **The patch survives only until the next WSO2 restart**; the template regeneration on next start wipes the edit silently. Open a follow-up issue immediately to land the TOML fix.
+
+```bash
+ssh ze@<wso2-host>
+cd /opt/wso2am-4.7.0/repository/conf
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+for f in jndi.properties jndi-cp.properties jndi2.properties jndi2-cp.properties; do
+  sudo cp "$f" "${f}.bak-${TS}"
+  sudo sed -i 's/&amp;/%26/g' "$f"
+done
+sudo systemctl restart wso2am
+```
+
+## Validation
+
+The trap is resolved when all of the following are true:
+
+- `wso2carbon.log` shows `JMSListener — Started to listen` after the most recent restart.
+- No `AMQDisconnectedException` lines after the most recent restart.
+- A test API publish marks `APPROVED` in `AM_DEPLOYMENT_REVISION_MAPPING` AND populates `successDeployedTime` AND increments `deployedGatewayCount` to non-zero within seconds.
+- The gateway's `synapse-configs/default/api/` directory contains an XML file for the published API's `<context>` and `<version>` (not just `_OpenService_.xml`).
+- `curl https://<gateway>/<ctx>/<version>/<resource>` returns the expected response, not a 404.
+
+## Prevention
+
+Three layers:
+
+1. **Password generation policy.** The lab convention after this incident is: **24 chars, alphanumeric, no `&`, `@`, `%`, `?`, `:`, `#`**. These characters trigger URL-encoding traps across multiple subsystems (WSO2, plus any AMQP/HTTP basic-auth path). The [secrets custody drift check](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) follows this rule by default.
+
+2. **Password rotation procedure.** When the WSO2 super-admin or JMS-user password is rotated, perform **all** of the following in the same change window:
+
+   - Update `[super_admin].password` with the new HTML-escaped form (`&` -> `&amp;`). This is correct for XML files; the carbon-config loader unescapes it on read.
+   - Update `[apim.throttling.jms].password` (or `[apim.event_hub.jms].password`, whichever branch is active) with the new URL-encoded form (`&` -> `%26`, plus any other URL-special characters).
+   - Update any other consumer (IS 7.2 console operator, downstream automation).
+   - Restart `wso2am` and validate.
+
+   Three files / blocks, three encoding rules. Skipping any one re-introduces the trap.
+
+3. **Pre-action checklist before changing JNDI / TOML.** Always:
+
+   - `ss -tlnp | grep -E "5672|9711"` — confirm the broker is up.
+   - `grep -E "amp;|%26" /opt/wso2am-4.7.0/repository/conf/jndi*.properties` — confirm the URL-encoding state.
+   - `sudo grep -A2 -E "\[super_admin\]|\[apim\.throttling\.jms\]|\[apim\.event_hub\.jms\]" deployment.toml` — confirm which branch is active.
+
+   And always:
+
+   - Take a `deployment.toml.bak-<UTC>` before editing. A bad `deployment.toml` prevents WSO2 from starting and the lab has no console-level recovery.
+
+### Forbidden actions
+
+- Editing rendered JNDI files as a permanent fix — WSO2 regenerates them on every startup; the edit is wiped silently.
+- Changing the super-admin password to remove `&` without coordinating with the IS Console operator and updating every consumer — bigger blast radius than the URL-encoding fix.
+- Adding `[apim.throttling.jms]` AND `[apim.event_hub.jms]` blocks in the same `deployment.toml` — the template selects one based on whether `event_listening_endpoints` is defined; adding both invites future drift.
+- Skipping the TOML backup — a syntax error in `deployment.toml` keeps WSO2 from starting and recovery requires console access.
+
+## References
+
+- Runbook: `codex-opp-agent/runbooks/wso2-apim-jms-url-encoding-trap.md`
+- Runbook: `codex-opp-agent/runbooks/secrets-custody-drift-check.md` (the prior check that surfaces the stale password before this trap fires)
+- `codex-opp-agent/connection-details/` — WSO2 endpoint and port details
+- WSO2 APIM 4.7 documentation — JNDI templates under `repository/resources/conf/templates/repository/conf/jndi*.properties.j2`
+- Project scope note: WSO2 is a supporting platform VM and is in scope for OpenShift operations only when it directly serves OpenShift workloads (per `project_workspace_scope`).

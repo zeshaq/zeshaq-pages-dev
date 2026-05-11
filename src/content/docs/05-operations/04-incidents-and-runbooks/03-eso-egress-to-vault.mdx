@@ -1,0 +1,172 @@
+---
+title: "ESO operand egress blocked to Vault"
+description: "Red Hat ESO 1.1.0 ships default-deny NetworkPolicies in the external-secrets namespace; the operand silently hangs reconciling against the VM Vault until an allow-egress policy is added."
+sidebar_label: "ESO egress to Vault"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This is the silent-failure incident every operator hits the first time they install Red Hat External Secrets Operator (ESO) 1.1.0 against the VM-hosted Vault. The operator pod is healthy, the `ClusterSecretStore` looks well-formed, and the controller-manager can reach Vault — but the operand reconciler runs in a different namespace, the namespace has default-deny NetworkPolicies, and the Vault login times out.
+
+The fix is a single NetworkPolicy at sync-wave 20.
+
+## Symptom
+
+- **ESO operator install completes cleanly.** Subscription `AtLatestKnown`, CSV `Succeeded`, controller-manager pod `Running` with no restarts.
+- **`ClusterSecretStore` reports `Ready=False` with reason `InvalidProviderConfig`:**
+
+  ```bash
+  K=/home/ze/.kube/configs/<cluster>.kubeconfig
+  oc --kubeconfig "$K" get clustersecretstore -o yaml \
+    | grep -A5 conditions
+  # status:
+  #   conditions:
+  #   - lastTransitionTime: "..."
+  #     message: 'unable to create client: ...'
+  #     reason: InvalidProviderConfig
+  #     status: "False"
+  #     type: Ready
+  ```
+
+- **The operand log shows a context deadline on Vault Kubernetes auth:**
+
+  ```bash
+  oc --kubeconfig "$K" -n external-secrets logs deploy/external-secrets \
+    | grep -i vault
+  # ERROR ... unable to log in to auth method:
+  # unable to log in with Kubernetes auth:
+  # context deadline exceeded
+  ```
+
+- **A direct TCP probe from inside the operand pod times out:**
+
+  ```bash
+  oc --kubeconfig "$K" -n external-secrets exec deploy/external-secrets \
+    -- curl -skf https://vault.sub.comptech-lab.com:8200/v1/sys/health
+  # (hangs, exits 124 after default timeout)
+  ```
+
+- **The operator-side controller-manager (in a different namespace) *can* reach Vault.** That is the confusing part — the operator works, the operand does not.
+
+The two namespaces:
+
+| Namespace | What runs there |
+|---|---|
+| `external-secrets-operator` | The CSV's controller-manager pod (operator) |
+| `external-secrets` | The reconciler pods that actually evaluate ClusterSecretStores and ExternalSecrets (operand) |
+
+Default OpenShift `NetworkPolicy` allows all egress unless overridden. ESO 1.1.0 ships overrides on the operand namespace and nothing on the operator namespace, which is why the operator looks fine.
+
+## Root cause
+
+Red Hat ESO 1.1.0 (`openshift-external-secrets-operator.v1.1.0`) ships four NetworkPolicies in the `external-secrets` namespace by default:
+
+| NetworkPolicy | What it allows |
+|---|---|
+| `deny-all-traffic` | Catch-all default-deny (the baseline) |
+| `allow-api-server-egress-for-main-controller` | TCP/6443 to the kube-apiserver only |
+| `allow-api-server-egress-for-cert-controller` | TCP/6443 to the kube-apiserver only |
+| `allow-api-server-egress-for-webhook` | TCP/6443 to the kube-apiserver only |
+| `allow-to-dns` | UDP/53 to in-cluster DNS only |
+
+Egress to anything else is implicitly denied. The VM Vault at `vault.sub.comptech-lab.com:8200` is **outside the cluster**, on the lab `/24` network — none of the shipped policies permit it.
+
+The reconciler in `external-secrets` namespace runs `vault.NewClient(...)` and calls `auth.Login(ctx, ...)`. The TCP SYN to the Vault VM is dropped by the namespace's default-deny. The Go client waits for the context deadline, the deadline elapses (default 30s or 60s depending on call site), and the error surfaces as `context deadline exceeded`.
+
+The operator-side controller in `external-secrets-operator` namespace is not subject to these NetworkPolicies, so a direct probe from there succeeds — leading operators down the wrong diagnostic path of "Vault auth misconfiguration" or "wrong role binding".
+
+## Fix
+
+Add an allow-egress NetworkPolicy in the operand namespace, targeting the Vault VM(s) on TCP/8200, scoped to pods labelled `app.kubernetes.io/name=external-secrets`. The fix is already in GitOps at:
+
+```text
+clusters/hub-dc-v6/secrets/eso/networkpolicy-vault-egress.yaml
+clusters/spoke-dc-v6/secrets/eso/networkpolicy-vault-egress.yaml
+```
+
+Annotated `sync-wave: "20"` so it lands after the operator install (waves 10-11) and before any ClusterSecretStore reconcile.
+
+The shape:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-vault-vm
+  namespace: external-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: external-secrets
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            # Vault VM range on the lab /24 (the specific /30 is in
+            # codex-opp-agent/connection-details/vault-app-secrets.md)
+            cidr: <vault-vm-cidr>/30
+      ports:
+        - protocol: TCP
+          port: 8200
+```
+
+(The exact `cidr` value is internal-only; it lives in `connection-details/vault-app-secrets.md`. This page deliberately does not publish the raw IP range.)
+
+After the MR merges and Argo applies the NetworkPolicy, restart the operand deployment to refresh the connection — the ESO controller does not re-trigger reconcile on NetworkPolicy changes:
+
+```bash
+oc --kubeconfig "$K" -n external-secrets rollout restart deployment external-secrets
+```
+
+Validation:
+
+```bash
+# Operand can now reach Vault:
+oc --kubeconfig "$K" -n external-secrets exec deploy/external-secrets \
+  -- curl -skf https://vault.sub.comptech-lab.com:8200/v1/sys/health
+
+# ClusterSecretStore is Ready:
+oc --kubeconfig "$K" get clustersecretstore \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+# every entry should show True
+
+# Per-secret ExternalSecrets reconcile:
+oc --kubeconfig "$K" -n <app-ns> get externalsecret
+# All entries SecretSynced=True
+```
+
+## Prevention
+
+Three layers of prevention have been adopted in the lab:
+
+1. **The NetworkPolicy lives in GitOps at sync-wave 20** alongside the ESO install. Any future cluster onboarding that follows the same kustomize tree inherits the policy automatically — there is no per-cluster manual step. Issue #229 captures this as a routine cluster-onboarding contract item.
+2. **Periodic check in the every-session warm-up.** A one-line probe confirms ESO can still reach Vault:
+
+   ```bash
+   oc --kubeconfig "$K" -n external-secrets exec deploy/external-secrets \
+     -- curl -skf https://vault.sub.comptech-lab.com:8200/v1/sys/health \
+     > /dev/null && echo "ESO -> Vault OK" || echo "ESO -> Vault FAILED"
+   ```
+
+   Add to the [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff) cluster-health snapshot.
+
+3. **NetworkPolicy widening on Vault endpoint change.** If ESO is later expanded to read from a new Vault endpoint, a different Vault VM, or a different port, the NetworkPolicy's `ipBlock` must be widened in the same MR. The pattern is: one MR, one change to ESO config and one change to the egress policy. Never land one without the other.
+
+A note on the alternative — labelling the operand namespace and using a namespace-level egress allow:
+
+- Labelling pattern (`egress.policy/vault: allowed`) is cleaner architecturally but requires the operator's CSV to set the label on every namespace it creates. ESO 1.1.0 does not do this.
+- An explicit per-namespace NetworkPolicy is the lab's current shape because the operand namespace set is small (one — `external-secrets`) and the policy is identical across clusters.
+
+If the lab adds a second operand namespace consuming Vault (e.g., a tenant-scoped External Secrets instance), revisit the design before scattering identical policies.
+
+## References
+
+- Memory: `project_eso_egress_to_vault.md` (the source incident note)
+- `codex-opp-agent/connection-details/vault-app-secrets.md`
+- `clusters/hub-dc-v6/secrets/eso/networkpolicy-vault-egress.yaml`
+- `clusters/spoke-dc-v6/secrets/eso/networkpolicy-vault-egress.yaml`
+- ADR: `0019-nexus-only-image-supply-chain` (image policy; ESO image comes via the same supply chain)
+- Red Hat ESO 1.1.0 release notes (ships default-deny NetworkPolicies)

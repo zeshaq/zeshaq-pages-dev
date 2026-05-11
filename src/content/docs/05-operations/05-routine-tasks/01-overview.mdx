@@ -1,0 +1,96 @@
+---
+title: "Routine tasks — overview"
+description: "Six recurring operator workflows that own the fleet's running state: secret rotation, operator bumps, fleet onboarding, policy rollout, evidence backfill."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const opsBox  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const rtNodes = [
+  { id: "secrets",   position: { x: 0,   y: 0   }, data: { label: "Rotate secrets\n& tokens" }, style: opsBox },
+  { id: "operator",  position: { x: 240, y: 0   }, data: { label: "Bump operator\nversion" }, style: opsBox },
+  { id: "cluster",   position: { x: 480, y: 0   }, data: { label: "Add a cluster\nto the fleet" }, style: opsBox },
+  { id: "policy",    position: { x: 720, y: 0   }, data: { label: "Roll out a\npolicy" }, style: opsBox },
+  { id: "evidence",  position: { x: 360, y: 150 }, data: { label: "Backfill evidence\nto MinIO" }, style: opsBox },
+  { id: "gitops",    position: { x: 360, y: 300 }, data: { label: "platform-gitops MR\n(every task lands here)" }, style: dataBox },
+  { id: "argo",      position: { x: 360, y: 450 }, data: { label: "Argo CD\nreconcile + validate" }, style: agentBox },
+];
+
+export const rtEdges = [
+  { id: "s1", source: "secrets",  target: "gitops",  ...reqEdge },
+  { id: "s2", source: "operator", target: "gitops",  ...reqEdge },
+  { id: "s3", source: "cluster",  target: "gitops",  ...reqEdge },
+  { id: "s4", source: "policy",   target: "gitops",  ...reqEdge },
+  { id: "s5", source: "evidence", target: "gitops",  ...muted, label: "lifecycle config" },
+  { id: "g1", source: "gitops",   target: "argo",    label: "merge -> sync", ...reqEdge },
+];
+
+This subsection is the operator's playbook for the recurring work the fleet pays for during steady state. Each task is small enough to complete in one session, common enough to standardise, and important enough to get wrong if rushed. Read every page once; come back when the task is on your plate.
+
+Every routine task lands as a [platform-gitops MR](/docs/05-operations/03-platform-gitops-mr-mechanics). There are no exceptions — secret rotations land via ESO config changes, evidence backfills land via lifecycle rule updates, even RHACS init-bundle rotations land via Vault writes + ExternalSecret refreshes captured in GitOps. The MR loop is the standardisation; the per-task page tells you what to put in the MR.
+
+## The five-step shape
+
+<Whiteboard client:load data={{ nodes: rtNodes, edges: rtEdges }} height={600} />
+
+Every page in this subsection follows the same shape:
+
+1. **When it runs.** Cadence (calendar-driven, alert-driven, install-driven) and the trigger that surfaces the task on TODO.
+2. **What is in scope.** The specific systems/credentials/files touched. Boundaries against adjacent tasks.
+3. **Pre-checks.** The state you confirm before you start mutating. Always read-only.
+4. **The change.** The actual MR / commands / config that implement the rotation/bump/onboarding.
+5. **Validation.** The end-of-task evidence that the fleet returned to steady state.
+
+If you find yourself reading a task page and it does not have those five sections, the page is incomplete — file an issue under #229 against this section.
+
+## The five routine tasks
+
+| # | Page | Cadence | Triggers |
+|---|---|---|---|
+| 02 | [Rotate secrets and tokens](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) | Quarterly or on personnel change | Calendar; offboarding event; drift-check failure |
+| 03 | [Bump operator version](/docs/05-operations/05-routine-tasks/03-bump-operator-version) | When upstream releases a CSV with a security fix or required feature | CSV release; CVE; ADR-mandated feature |
+| 04 | [Add a cluster to the fleet](/docs/05-operations/05-routine-tasks/04-add-a-cluster-to-the-fleet) | On capacity event or DR build-out | New ManagedCluster onboarding |
+| 05 | [Roll out a policy](/docs/05-operations/05-routine-tasks/05-roll-out-a-policy) | On compliance gate or new finding | PCI-DSS scan finding; ACM PolicySet update |
+| 06 | [Backfill evidence to MinIO](/docs/05-operations/05-routine-tasks/06-backfill-evidence-to-minio) | When an evidence-pack window closes | CI run; compliance close-out; lifecycle audit |
+
+The cadence column matters: tasks 02 and 06 are calendar-driven; tasks 03 and 04 are event-driven; task 05 is gate-driven. The on-call rotation [escalation matrix](/docs/05-operations/06-on-call-and-escalation) tells you who owns each.
+
+## What is *not* in this subsection
+
+- **Incidents** (live failures) live in [the incidents subsection](/docs/05-operations/04-incidents-and-runbooks/01-overview). Routine tasks run during steady state; incidents run during not-steady state.
+- **Cluster upgrades** (OCP minor/patch). Upgrade procedures are governed by ADR 0018's pull model and the OCP upgrade documentation. They are not yet a published runbook on this site; the next operator who runs one should write the page.
+- **OADP backup drills.** Backup/restore drills follow the OADP operator's documentation plus the lab's evidence-capture convention. A drill runbook is planned under #229 follow-ups.
+- **Trivy scanner refresh and CI evidence rotation.** These touch the developer-side pipeline (GitLab -> Jenkins -> Trivy -> Nexus -> Docker runtime VM) which is paused for app-delivery scope per the user's 2026-05-09 decision (`project_app_dev_direction`). When OpenShift app delivery is reopened, these will join routine tasks.
+
+## A note on naming
+
+The session-handoff convention is one routine task = one MR = one issue = one session report. Branch name embeds the issue key. The MR description references the routine-task page on this site (this is the public-facing "why"). The session report captures the validation evidence.
+
+Naming patterns observed in the active repo:
+
+| Task class | Branch prefix | Example |
+|---|---|---|
+| Secret rotation | `secret-rot/` | `secret-rot/gitlab-pat-rotate-202605` |
+| Operator bump | `op-bump/` | `op-bump/oadp-1.5.5-to-1.5.6` |
+| Cluster onboarding | `cluster-onb/` | `cluster-onb/spoke-dr-v6-import` |
+| Policy rollout | `policy/` | `policy/pci-dss-4-allowedregistries` |
+| Evidence backfill | `evidence/` | `evidence/pci-baseline-2026-05-11` |
+
+These prefixes are not enforced by any hook — they are the lab's conventional shape.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- `codex-opp-agent/runbooks/secrets-custody-drift-check.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+- Memory: `project_workspace_scope`, `project_app_dev_direction`
+- Issues: #229 (this section), #137 (hub mirror capture — example of evidence-backfill class)

@@ -1,0 +1,216 @@
+---
+title: "Roll out a policy"
+description: "Taking a control from compliance-scan finding (or PolicySet update) to enforced state across the fleet: ACM Policy authoring, Placement, PolicyTemplate, remediationAction, canary, full rollout."
+sidebar_label: "Roll out a policy"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This task covers the policy-rollout loop in ACM: take a compliance-scan finding or an upstream PolicySet update, author the Policy CR with the right Placement and PolicyTemplate, dry-run as `inform`, canary on one cluster, then promote to `enforce` fleet-wide.
+
+The procedure is mature in ACM — the lab has used it for the PCI-DSS baseline phase chain (PCI-0 through PCI-5 plus PCI-1.13). This page distills the recurring shape.
+
+## When this task runs
+
+- **Compliance scan finding.** PCI-DSS scan, CIS Benchmark, FedRAMP, or internal control set flags a non-compliant cluster.
+- **Upstream PolicySet update.** Red Hat or upstream community ships a new PolicySet version — vendored into the lab's policy catalog under `policy-templates/`.
+- **New control after an incident.** A postmortem proposes a new automated guardrail that was previously a runbook step.
+- **Tenant onboarding.** A new tenant's namespace requires the platform's default policies attached.
+
+## What is in scope
+
+This page covers ACM `Policy` resources delivered via `Placement` and `PlacementBinding`, evaluated by the spoke-side policy controller and surfaced in the hub's governance pillar.
+
+Out of scope:
+
+- OPA / Gatekeeper policies (the `gatekeeper-operator-product` is in the planned-operator queue; when installed, it gets its own page).
+- ValidatingAdmissionPolicy (VAP) — the lab uses these for tenant exclusions (`vap-tenant-exclusions.md`); they are governed differently from ACM Policy.
+- RHACS image / deployment / runtime policies — different surface, owned by `connection-details/rhacs-app-policy.md`.
+
+## Pre-checks
+
+1. **Identify the control.** Is it a compliance-control (PCI-DSS 1.2.1, CIS 5.1.6), an internal policy ("no namespace without NetworkPolicy"), or an ADR-mandated guardrail? Capture the control text verbatim in the issue.
+
+2. **Identify the affected cluster set.** "All spokes", "spokes labelled `env=prod`", "the new spoke only". The Placement selector encodes this.
+
+3. **Identify the remediation.** A policy can `inform` (report only) or `enforce` (actively converge). Always start `inform`. The promotion to `enforce` is a second MR after canary evidence.
+
+4. **Identify the PolicyTemplate type.** The lab uses three:
+
+   | Template kind | What it checks |
+   |---|---|
+   | `ConfigurationPolicy` | Object-existence / object-spec checks (most policies) |
+   | `OperatorPolicy` | Operator install state |
+   | `CertificatePolicy` | TLS-cert expiry |
+
+5. **Open the GitHub issue.** Branch prefix `policy/<control-id>-<short-slug>`.
+
+## The change
+
+### MR 1 — `inform`-only policy
+
+In `clones/platform-gitops`, add under `clusters/hub-dc-v6/platform/policies/<control-id>/`:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: <control-id>-<slug>
+  namespace: <policy-ns>
+  annotations:
+    policy.open-cluster-management.io/standards: "<framework>"
+    policy.open-cluster-management.io/categories: "<category>"
+    policy.open-cluster-management.io/controls: "<control-id>"
+spec:
+  remediationAction: inform        # always start inform
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: <control-id>-<slug>-cfg
+        spec:
+          remediationAction: inform
+          severity: medium
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: networking.k8s.io/v1
+                kind: NetworkPolicy
+                metadata:
+                  name: default-deny
+                  namespace: '{{hub-template-functions: ...}}'
+                spec:
+                  podSelector: {}
+                  policyTypes: [Ingress, Egress]
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: <control-id>-<slug>-placement
+  namespace: <policy-ns>
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            vendor: OpenShift
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: <control-id>-<slug>-binding
+  namespace: <policy-ns>
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: <control-id>-<slug>-placement
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: <control-id>-<slug>
+```
+
+### Watch the compliance report
+
+After Argo applies and the spoke policy controllers evaluate, the hub aggregates compliance status:
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+oc --kubeconfig "$K_HUB" -n <policy-ns> get policy <control-id>-<slug> \
+  -o jsonpath='{.status.status}{"\n"}'
+```
+
+Output is a list of per-cluster compliance entries:
+
+```text
+[map[clustername:spoke-dc-v6 clusternamespace:spoke-dc-v6 compliant:NonCompliant]]
+```
+
+Read the per-cluster details:
+
+```bash
+oc --kubeconfig "$K_HUB" -n <policy-ns> get policy <control-id>-<slug> \
+  -o jsonpath='{range .status.details[*]}{.templateMeta.name}{"\t"}{.compliant}{"\t"}{.history[0].message}{"\n"}{end}'
+```
+
+`inform` evidence is the input to the enforce decision: the report shows which clusters are out of compliance and what the offending object looks like. Capture the report in the issue.
+
+### MR 2 — Promote to `enforce` (if appropriate)
+
+After review of the `inform` evidence, promote:
+
+```yaml
+spec:
+  remediationAction: enforce    # the change
+  ...
+  policy-templates:
+    - objectDefinition:
+        ...
+        spec:
+          remediationAction: enforce
+          ...
+```
+
+When set to `enforce`, the policy controller actively converges the spoke to the policy. For object-existence policies (`musthave`), the controller creates the missing object. For object-spec policies (`mustnothave` / `mustonlyhave`), the controller deletes or replaces the offending object.
+
+This MR is the production rollout. Wait for `compliant: Compliant` on every spoke before closing the issue.
+
+### Canary first
+
+For high-blast-radius policies (deletes objects, rewrites fields), canary by Placement scope rather than going fleet-wide on MR 2:
+
+```yaml
+# MR 2a — canary
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            env: canary
+
+# MR 2b — full rollout after canary evidence
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            vendor: OpenShift
+```
+
+Label one spoke `env=canary` (or use an existing canary marker), let MR 2a converge, validate, then MR 2b for full rollout.
+
+## Validation
+
+A policy rollout is complete when **all** of the following are true:
+
+1. The `Policy` resource is `Compliant` on every spoke in the Placement scope.
+2. The on-cluster effect of the policy is visible — for "namespace must have NetworkPolicy", every namespace has the NetworkPolicy; for "etcd encryption at rest", `apiservers/cluster` shows `encryption.type: aescbc`.
+3. The hub governance dashboard shows the policy with a `100% Compliant` ratio.
+4. No new failures appeared in adjacent compliance scans (the new policy did not break another control).
+5. `argocd-platform-extensions` ClusterRole on the spoke includes any new API groups the policy reads/writes (see [Spoke RBAC extension](/docs/05-operations/07-known-gotchas)).
+6. The session report captures the inform evidence, the enforce decision, the canary evidence, and the full-rollout validation.
+
+## Prevention
+
+- **`inform` before `enforce`.** Always. Even if the policy looks safe. The `inform` evaluation surfaces objects you did not expect to be in scope.
+- **Use Placement labels, not cluster-name selectors.** Hardcoding cluster names (`name: spoke-dc-v6`) does not scale; label-based selection (`env=prod`) does.
+- **Vendor PolicySets from the upstream `policy-templates` catalog when possible.** Authoring custom policies is fine but they need maintenance; PolicySets vendored from upstream get free updates.
+- **Tag every policy with the framework + control ID** in the annotation set above. The hub's PolicySet aggregation builds compliance bundles from these annotations.
+
+## Forbidden actions
+
+- Landing an `enforce` policy without prior `inform` evidence.
+- Using `evaluationInterval: 0s` — that loops the controller and pegs CPU. The default `10s` is right for almost everything.
+- Authoring a policy that conflicts with another policy in scope. The hub does not resolve conflicts; both controllers will fight.
+- Rolling out a policy across the fleet without canary on at least one spoke.
+
+## References
+
+- ACM Policy Framework documentation
+- `codex-opp-agent/connection-details/compliance-implementor-handbook.md` (the PCI-DSS phase chain — example of multi-policy rollout)
+- `codex-opp-agent/connection-details/vap-tenant-exclusions.md` (the adjacent VAP surface)
+- ADRs: `0018` (pull-model), `0020` (PCI-DSS baseline), `0026` (IPv6-for-OVN-K amendment)
+- Issues: #108-#113 (PCI-0 through PCI-5), #135 (PCI-1.13), #229 (this section)
+- Blog post: [RHACM: managing OpenShift fleets at scale](/blog/rhacm) §"Governance and policy"

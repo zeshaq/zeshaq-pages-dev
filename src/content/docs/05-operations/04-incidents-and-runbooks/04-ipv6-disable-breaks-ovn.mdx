@@ -1,0 +1,211 @@
+---
+title: "IPv6 disable breaks OVN-Kubernetes (and how to recover)"
+description: "The #135 PCI-1.13 incident: both intuitive ways to 'disable IPv6 at the host' break OVN-K, and the MCO desiredConfig annotation procedure for unsticking the nodes after the failed rollout."
+sidebar_label: "IPv6 disable / OVN (#135)"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers the highest-cost MachineConfig incident the lab has paid for. Two MR attempts on `spoke-dc-v6` (OCP 4.20) tried to satisfy ADR 0005's "IPv6 disabled at host" requirement. Both attempts broke OVN-Kubernetes. Both attempts left nodes stuck `Ready=False` after the revert because MCO refused to roll an already-unavailable node. ADR 0005 was amended (under #245 -> ADR 0026) once the architectural lesson was clear.
+
+This runbook is two parts: the architectural lesson (what you must not attempt) and the recovery procedure (how to unstick a node when an MC rollout has already broken it).
+
+## Headline rule
+
+**Do NOT disable IPv6 at the host kernel level on OVN-Kubernetes clusters, by any mechanism.** Both mechanisms break the cluster network:
+
+- `ipv6.disable=1` kernel argument removes the IPv6 module entirely. OVN-K's geneve tunnels use IPv6 link-local `fe80::/10` for inter-node tunnelling even on IPv4-only clusters. Without the module, the CNI never converges, affected nodes report `Ready=False`.
+- `net.ipv6.conf.{all,default,lo}.disable_ipv6=1` sysctl keeps the module loaded but makes `/proc/sys/net/ipv6/conf/all/forwarding` unwritable. The `ovnkube-controller` startup script unconditionally `sysctl -w net.ipv6.conf.all.forwarding=0` and exits 1 on failure. The container crashloops, kubelet restarts it, and the `ovnkube-node` DaemonSet enters an infinite `CrashLoopBackOff`.
+
+The intent "IPv6 disabled at host" is **not achievable on OVN-K** without breaking the network plugin.
+
+The achievable equivalent — translated for ADRs and audits — is four observable invariants, all of which the lab can satisfy:
+
+1. `clusterNetwork` and `serviceNetwork` are IPv4-only.
+2. No site/admin-managed IPv6 addresses or routes on physical interfaces. OVN-K's own `fe80::/10` link-local on geneve is permitted.
+3. No DHCPv6 / RA listeners on the upstream network.
+4. No application workload binds to an IPv6 address.
+
+ADR 0026 (the IPv6-for-OVN amendment of ADR 0005, authored under review issue #245) is the standing reference.
+
+## Symptom
+
+The shape of the incident, in both observed variants:
+
+| Variant | What you see |
+|---|---|
+| `ipv6.disable=1` kargs | Affected nodes return `Ready=False`. Kubelet heartbeats normally, but the node's `ovnkube-node` pods cannot establish the geneve overlay. `oc -n openshift-ovn-kubernetes get pods` shows the relevant pods in `Init` or `CrashLoopBackOff`. |
+| `disable_ipv6=1` sysctl | Affected nodes return `Ready=True` (misleadingly) but `ovnkube-node` containers crashloop. Logs show `sysctl: cannot stat /proc/sys/net/ipv6/conf/all/forwarding`. Pods on the affected node lose access to `172.30.0.1:443` (kube-apiserver service IP). Workloads time out silently. |
+
+Both variants share the post-revert problem: after you merge the revert MR, MachineConfigPool's `.spec.configuration.name` updates to the new rendered config, but the per-node `desiredConfig` annotation on the unhealthy node does **not** update — MCO's max-unavailable safety guard declines to roll an already-unavailable node, and the pool sits forever with `Updating=True` and `readyMachineCount` short of `machineCount`.
+
+Diagnostic to confirm the stuck-on-revert shape:
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+oc --kubeconfig "$K" get nodes \
+  -o custom-columns=NAME:.metadata.name,\
+ROLE:.metadata.labels.node-role\.kubernetes\.io/worker,\
+READY:.status.conditions[?(@.type=="Ready")].status,\
+CURRENT:.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig,\
+DESIRED:.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig
+```
+
+A stuck node shows `READY=False` (or `True` with crashlooping `ovnkube-node`), and `CURRENT == DESIRED` pointing at the OLD (bad) rendered config name. The pool's `.spec.configuration.name` reflects the NEW (good) name. MCP is **not** `Degraded`.
+
+```bash
+oc --kubeconfig "$K" get mcp <pool> \
+  -o jsonpath='{.status.conditions[*].type}{"\n"}{.status.conditions[*].status}{"\n"}'
+# Updated Updating Degraded
+# False   True     False
+```
+
+## Root cause
+
+Two coupled causes are at work.
+
+**OVN-K's IPv6 hard dependency.** OVN-Kubernetes uses `fe80::/10` link-local IPv6 addresses on its geneve tunnel interfaces even when both `clusterNetwork` and `serviceNetwork` are IPv4-only. The geneve protocol implementation in the OVN-K source assumes the IPv6 stack is loaded and writable. Removing or freezing the IPv6 stack breaks the data plane.
+
+The two mechanism-specific causes:
+
+- `ipv6.disable=1` kernel argument unloads the `ipv6` kernel module entirely. The `fe80::/10` link-local addresses cannot be allocated; the geneve interface comes up but cannot bring up its link-local; OVN-K's local NB/SB sync stalls and the node fails its readiness gate.
+- `disable_ipv6=1` sysctl freezes the IPv6 stack but leaves the module loaded. Specifically, it makes `/proc/sys/net/ipv6/conf/all/forwarding` unwritable. The `ovnkube-controller` container's entrypoint script does `sysctl -w net.ipv6.conf.all.forwarding=0` (to enforce its own desired state) and exits 1 if the write fails. The container crashloops.
+
+**MCO's stuck-on-revert behaviour.** When an MC change leaves a node unhealthy, MCO computes a new rendered config target after the revert merges. The pool's `.spec.configuration.name` updates. But MCO's per-node rollout is gated by `maxUnavailable`: it will not roll a node that is *already* unavailable, because doing so would risk rolling a second node before the first recovers, exceeding maxUnavailable.
+
+The result is a deadlock: the bad config caused the node to go unhealthy; the revert cannot roll the node because it is unhealthy; the node will not become healthy without the revert. MCO is, by design, conservative here — it errs on the side of doing nothing.
+
+## Fix
+
+Two layers: short-term unstick the nodes, long-term amend the ADR.
+
+### Short-term: unstick the nodes via `desiredConfig` annotation
+
+The recovery is a one-line annotation patch per stuck node. MCD on the node sees the annotation change, runs the drain -> apply -> reboot cycle, and the node returns Ready.
+
+Per-node procedure (do not batch — one node at a time):
+
+```bash
+K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+# 1. Identify the new (good) rendered-config name:
+GOOD=$(oc --kubeconfig "$K" get mcp <pool> \
+  -o jsonpath='{.spec.configuration.name}')
+echo "Good rendered config: $GOOD"
+
+# 2. Confirm the pool is NOT Degraded:
+oc --kubeconfig "$K" get mcp <pool> \
+  -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}{"\n"}'
+# Must print "False" before continuing.
+
+# 3. Capture starting state (audit record):
+mkdir -p /tmp/mco-recovery-$(date -u +%Y%m%dT%H%M%SZ)
+D=/tmp/mco-recovery-*
+oc --kubeconfig "$K" get node <stuck-node>  -o yaml > $D/before-<stuck-node>.yaml
+oc --kubeconfig "$K" get mcp  <pool>        -o yaml > $D/before-mcp-<pool>.yaml
+
+# 4. Apply the annotation patch:
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "$TS actor=$USER node=<stuck-node> desiredConfig=$GOOD" \
+  | tee -a $D/commands.log
+oc --kubeconfig "$K" annotate node <stuck-node> \
+  machineconfiguration.openshift.io/desiredConfig=$GOOD --overwrite
+
+# 5. Watch MCD on the affected node:
+MCD=$(oc --kubeconfig "$K" -n openshift-machine-config-operator get pods \
+  --field-selector spec.nodeName=<stuck-node> \
+  -l k8s-app=machine-config-daemon \
+  -o jsonpath='{.items[0].metadata.name}')
+oc --kubeconfig "$K" -n openshift-machine-config-operator logs -f $MCD
+```
+
+Expected sequence in the MCD log within seconds:
+
+```text
+node <node> changed: desiredConfig -> <new-rendered-config>
+Disruption type: <kargs|files|both>
+Draining node <node>
+...
+Applying config <new-rendered-config>
+Rebooting node <node>
+```
+
+After the reboot (typically 6-10 minutes for a master, slightly less for a worker), the node returns `Ready` and the pool moves toward `UPDATED=True / UPDATING=False / DEGRADED=False`.
+
+Repeat for each stuck node. Validate when done:
+
+```bash
+oc --kubeconfig "$K" get nodes
+oc --kubeconfig "$K" get mcp
+oc --kubeconfig "$K" -n openshift-ovn-kubernetes get pods -l app=ovnkube-node
+```
+
+Expected: every node `Ready`, every pool `UPDATED=True`, every `ovnkube-node` pod `Running` with no recent restarts.
+
+### When NOT to use the annotation patch
+
+- **MCP is `Degraded`.** Fix the render-controller cause first; the annotation patch will not help and may mask the real failure.
+- **MCD on the stuck node is not `Running`.** The annotation change has no consumer; the patch is silently ignored. Use the console/SSH fallback (edit `/boot/loader/entries/...` manually, reboot, then re-sync MCD's view with the annotation patch).
+- **You want to force a node onto a config the pool has not adopted.** The annotation must point at a rendered-config name that the pool's `.spec.configuration.name` references; anything else gets reverted on the next render.
+
+### Long-term: amend the ADR
+
+ADR 0005 ("IPv6 disabled at host") has been amended to ADR 0026 ("IPv6 not used for cluster traffic") under review issue #245. The four observable invariants (above) are the satisfiable form on OVN-K.
+
+Two paths are open if a future ADR cannot accept the amended language:
+
+1. The cluster's CNI must change. OpenShift-SDN is end-of-life; the realistic alternative is to accept the ADR is unsatisfiable on OVN-K and document the deviation under the compliance exception process.
+2. Switch to a CNI that does not have OVN-K's IPv6 hard dependency. None is currently in the lab's roadmap.
+
+Do not keep landing MachineConfig variants of "disable IPv6" hoping a different mechanism will work. The OVN-K source's unconditional `sysctl -w` is the controlling constraint.
+
+## Prevention
+
+### Pre-change checklist (before any network-touching MachineConfig)
+
+If you are about to roll a MachineConfig that touches network sysctls or kernel arguments, do all of the following first:
+
+1. **Canary the rollout.** Cordon all-but-one node in the target MachineConfigPool so the change rolls to a single node initially:
+
+   ```bash
+   for n in $(oc --kubeconfig "$K" get nodes -l node-role.kubernetes.io/<role> \
+       -o jsonpath='{.items[*].metadata.name}'); do
+     [ "$n" = "<canary-node>" ] || oc --kubeconfig "$K" adm cordon "$n"
+   done
+   ```
+
+2. **Have a revert MR ready.** The change should be one MR away from reversal; do not apply changes you cannot undo within minutes.
+
+3. **Have a smoke test that detects OVN-K crashloop within two minutes** of rollout. The 4-of-6-nodes-OK pattern hides the breakage; trust the DaemonSet status, not the node `Ready` status, for this class of change.
+
+### Post-rollout validation (beyond `oc get nodes Ready`)
+
+For any MachineConfig change touching network sysctls or kernel arguments:
+
+- `oc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node` shows the expected container count per node `Ready` (baseline before the change).
+- No restarts of any `ovnkube-node` container in the last fifteen minutes.
+- `oc -n openshift-ovn-kubernetes logs <pod>` shows no `sysctl: cannot stat /proc/sys/net/ipv6/conf/all/forwarding` errors.
+- From a pod on the affected node, `curl -k https://172.30.0.1:443` (the cluster's kube-apiserver service IP) returns a TLS handshake response.
+
+`Ready=True` on a node can coexist with OVN-K crashloops. Trust the DaemonSet status.
+
+### Forbidden actions
+
+- Adding `ipv6.disable=1` to `kernelArguments` in any MachineConfig on an OVN-K cluster.
+- Writing `net.ipv6.conf.all.disable_ipv6=1` (or any sysctl that makes `/proc/sys/net/ipv6/conf/all/forwarding` unwritable) into an `/etc/sysctl.d/*.conf` MachineConfig file.
+- Proposing to disable the OVN-K geneve tunnel as a workaround — geneve is the CNI's only data-plane mechanism.
+- Patching `desiredConfig` to a rendered-config name that does NOT exist in the cluster's MachineConfig list — MCD will refuse to apply it.
+- `oc patch` on the rendered MachineConfig directly — rendered configs are managed by MCO; direct edits are reverted on next render and break the audit chain.
+- Patching multiple stuck nodes in parallel — risks pushing the pool over `maxUnavailable`.
+- Skipping the before/after capture — the audit record is the evidence the recovery was clean.
+
+## References
+
+- Runbook: `codex-opp-agent/runbooks/openshift-ipv6-disable-correct-approach.md`
+- Runbook: `codex-opp-agent/runbooks/mco-stuck-node-recovery.md`
+- Issue: #135 (PCI-1.13 incident comment thread)
+- Issue: #142 (MCO stuck-node recovery runbook tracking)
+- Issue: #245 (ADR 0005 amendment review)
+- ADR: `0005-...` (pending amendment), `0026-ipv6-for-ovn-k-amendment`, `0018` (GitOps pull model), `0025` (break-glass)
+- MRs: `!2`, `!3`, `!4`, `!7` on `comptech-platform/openshift-ops/openshift-platform-gitops`
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` (node inventory)

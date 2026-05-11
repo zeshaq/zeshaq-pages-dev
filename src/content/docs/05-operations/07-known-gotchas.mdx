@@ -1,8 +1,163 @@
 ---
-title: "Known Gotchas"
-description: "Section 05-operations: Known Gotchas (placeholder)."
-sidebar_label: "Known Gotchas"
+title: "Known gotchas"
+description: "Index of every incident runbook plus the gotchas not severe enough to warrant their own page — the operator's at-a-glance lookup table for the lab's accumulated tribal knowledge."
+sidebar_label: "Known gotchas"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page is the at-a-glance lookup table for the gotchas the lab has paid for. Two parts:
+
+1. **The seven incident runbooks** — each has its own page with the full symptom -> root cause -> fix -> prevention treatment.
+2. **The minor gotchas** — patterns and traps surfaced in session reports and connection-details docs that are not severe enough to be standalone runbooks but are sharp enough to cost an hour if you do not know them.
+
+Use this page as a search-friendly index. The detail lives in the linked pages and source files.
+
+## Incident runbooks (the seven big ones)
+
+| Class | Page | One-line summary | Fix at a glance |
+|---|---|---|---|
+| ACM gitops-addon | [02 — Routes CRD breaks /openapi/v2](/docs/05-operations/04-incidents-and-runbooks/02-acm-gitops-addon-routes-crd) | A rogue `routes.route.openshift.io` CRD installed by `gitops-addon` duplicates the aggregated APIService and stops all Argo CD sync. | `oc delete crd routes.route.openshift.io` |
+| ESO networking | [03 — ESO egress to Vault](/docs/05-operations/04-incidents-and-runbooks/03-eso-egress-to-vault) | Red Hat ESO ships default-deny NetworkPolicies; ClusterSecretStore hangs on `context deadline exceeded`. | Apply allow-egress NetworkPolicy to Vault VM range, restart operand. |
+| MachineConfig | [04 — IPv6 disable breaks OVN-K](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) | Both `ipv6.disable=1` and `disable_ipv6=1` sysctl break OVN-K geneve / forwarding. Nodes go `Ready=False` and MCO refuses to roll the revert. | Don't disable IPv6 at host on OVN-K; recover stuck nodes with `oc annotate node ... desiredConfig=...` |
+| Storage glue | [05 — OBC -> operand Secret bridge](/docs/05-operations/04-incidents-and-runbooks/05-obc-operand-secret-bridge) | NooBaa OBC outputs AWS-style Secret keys (`AWS_ACCESS_KEY_ID`); LokiStack/TempoStack expect lowercase keys (`access_key_id`). | ExternalSecret with Kubernetes provider + templating. |
+| Observability auth | [06 — SigNoz v0.122 auth](/docs/05-operations/04-incidents-and-runbooks/06-signoz-v0122-auth) | Login API moved from `/api/v1/login` to `/api/v2/sessions/email_password`; old paths return SPA HTML with HTTP 200. | Read orgID from VM SQLite, POST to v2 endpoint, use `accessToken` (not `accessJwt`). |
+| App middleware | [07 — WSO2 APIM JMS URL encoding](/docs/05-operations/04-incidents-and-runbooks/07-wso2-apim-jms-url-encoding) | HTML-escaped `&amp;` instead of URL-encoded `%26` in AMQP URL; published APIs never reach the gateway. | Set `[apim.throttling.jms].password` in `deployment.toml` with `&` -> `%26`. |
+
+## Minor gotchas (not severe enough for their own page)
+
+### GitOps / Argo CD
+
+**Spoke `argocd-platform-extensions` ClusterRole extension required for new API groups.** The spoke pull-model Argo controller has a least-privilege ClusterRole. New operator API groups must be added to `clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml` at sync-wave 0. Symptom: `OutOfSync` with `... is forbidden: User "system:serviceaccount:openshift-gitops:acm-openshift-gitops-argocd-application-controller" cannot patch resource ...`. Fix: add the API group/resources to the consolidated ClusterRole. Source: `reference_spoke_argo_extension_rbac` memory.
+
+**The hub does NOT have the consolidated ClusterRole.** It is cluster-admin per ADR 0019. Do not copy the spoke pattern to the hub.
+
+**Argo's failure-mode cache.** When a sync fails repeatedly, Argo may give up after 5 retries. After fixing the underlying cause, the resource may need a one-shot `oc apply` to break the cache, then a Hard Refresh in Argo. Argo will then own the resource.
+
+**`ApplicationSet` cluster generator silence.** If a new spoke is registered but its `ManagedCluster` lacks the labels the `ApplicationSet` Placement expects, the spoke does not get Applications and there is no error — just silence. Check `oc get managedcluster <name> --show-labels`.
+
+### MachineConfig / MCO
+
+**MCO refuses to roll an already-unavailable node.** Captured in detail in the [IPv6 incident](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn). The single-line takeaway: when a revert MR lands but the unhealthy node does not pick it up, patch `desiredConfig` annotation on the node (the procedure is in `runbooks/mco-stuck-node-recovery.md`).
+
+**`Ready=True` can coexist with OVN-K crashloops.** Trust the DaemonSet pod status (`oc -n openshift-ovn-kubernetes get pods`), not the node `Ready` status, for network-touching MC changes.
+
+### Image supply
+
+**Operand image pulls can still go upstream even after `oc mirror`.** The mirror only copies bytes; the IDMS/ITMS generated alongside must also be applied (and captured in GitOps). Symptom: pod `ImagePullBackOff` with `registry.redhat.io` or `quay.io` in the events. Fix: check `oc get imagedigestmirrorset,imagetagmirrorset`; if missing, apply the generated resource. Source: `connection-details/platform-admin-handoff.md` §"What To Do If An Operand Image Is Missing".
+
+**Built-in OLM v1 ClusterCatalogs are default-managed.** Disable them through desired state, not deletion. Deletion does not persist.
+
+**Some live specs show external source registry names even when runtime pulls are mirrored.** This is healthy *only* when IDMS/ITMS covers the source and the exact digest exists in Nexus. Use the image-supply drift script (`scripts/openshift-image-supply-check.sh`) to confirm.
+
+### Nexus
+
+**Three-endpoint split is the architecture, not preference.** `mirror-registry.*` is for OpenShift install only; `docker-group.*` is for developer/CI pull; `app-registry.*` is for CI push. Mixing is forbidden — see `project_nexus_endpoint_split`. App workloads must never write to `mirror-registry.*`.
+
+**`mavenbot` user does not exist on Nexus despite a password file.** A `secrets/nexus-mavenbot-password` file is present but the user was never created. Either create the user with role `nexus-maven-pull`, or remove the dead-weight file.
+
+**Nexus admin realm.** Only `NexusAuthenticatingRealm` is active (no LDAP/SAML). User onboarding is direct on the Nexus REST API.
+
+### Vault / ESO
+
+**Per-tenant SecretStore is the pattern, not ClusterSecretStore.** Per `vault-app-secrets.md` §"Per-tenant SecretStore (namespace-scoped, never ClusterSecretStore)". Each tenant namespace runs its own ESO service account.
+
+**Vault Kubernetes auth role binds to namespace glob.** Roles are named `apps-<cluster>-<division>` and bind to namespace glob `apps-<division>-*`. Cross-division access requires a separate role.
+
+**ESO operand annotation forces immediate sync.** `oc annotate externalsecret <es> force-sync=$(date -u +%s) --overwrite`. Useful when waiting on the `refreshInterval` is unacceptable.
+
+### NetworkPolicy
+
+**Default `NetworkPolicy` allows all egress.** Until a policy is applied to a namespace, all egress is permitted. The [ESO operand incident](/docs/05-operations/04-incidents-and-runbooks/03-eso-egress-to-vault) caught the lab by surprise because Red Hat ESO 1.1.0 ships its own default-deny.
+
+**NetworkPolicy changes do not trigger reconcile loops.** Most controllers do not re-evaluate connections after a NetworkPolicy change. Restart the operand deployment after applying / changing an egress allow-rule.
+
+### RHACS
+
+**Init-bundle generation does not require `roxctl`.** The Central API at `/v1/cluster-init/init-bundles` accepts a POST with basic-auth from `central-htpasswd`. The response includes `kubectlBundle` — base64 YAML containing three Secrets. See [secret rotation](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) for the full flow.
+
+**Init-bundle expiry is ~1 year.** Check `expiresAt` in the bundle metadata; plan to rotate before. The bundle name (`platform-cluster` today) appears as `clusterName` in Central UI; multiple SecuredClusters can share a bundle.
+
+**SecuredCluster `centralEndpoint` for self-secured cluster is `central.stackrox.svc:443`** (in-cluster); for other clusters it is the hub Central Route (`central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com:443`).
+
+### SigNoz (beyond the v0.122 auth runbook)
+
+**`HEAD` requests against SigNoz API return SPA HTML 200.** Always use `GET` to probe API shape; check `Content-Type: application/json` to confirm.
+
+**SSH host key rotation on the SigNoz VM** has happened at least once. If `~/.ssh/known_hosts` was populated before that rotation, SSH refuses to connect — clean with `ssh-keygen -R signoz.sub.comptech-lab.com`.
+
+**Empty install state after bootstrap.** A fresh SigNoz has no dashboards, alert channels, or rules. The empty state is by design — investigations scaffold from scratch.
+
+### Jenkins / GitLab webhook
+
+**`notifyCommit` only fires for jobs that have already run.** Declarative `pipeline { triggers { pollSCM('H/5 * * * *') } }` must be parsed at least once before the trigger is registered. Symptom: GitLab webhook event log shows `200`, but no Jenkins build. Fix: run build #1 manually, after which subsequent webhook deliveries trigger correctly. Source: `runbooks/jenkins-gitlab-webhook-pollscm.md`.
+
+### Secrets custody
+
+**Drift is bidirectional.** The local `secrets/` mirror can drift from the live VM, or vice versa. Probe before assuming "stale credential". The drift-check runbook (`secrets-custody-drift-check.md`) has the probe matrix per service.
+
+**Passwords with `&`, `@`, `%`, `?`, `:`, `#` trigger URL-encoding traps.** The WSO2 incident is the famous one, but the same characters break AMQP URLs, basic-auth Authorization headers, S3 presigned URLs, and more. Lab convention: 24-char alphanumeric, no URL-special characters.
+
+**Reading an ACL/user table first is faster than guessing.** Env-var names in secret files (`REDIS_APP_PASSWORD`) do not always map 1:1 to the live service's user names (`app-default`). Read the live ACL before probing.
+
+### Workspace + tracking
+
+**GitHub-first tracking is the convention.** Issues, milestones, ADR review threads, project boards. Chat is ephemeral. The codex-opp-agent workspace's `feedback_github_first_tracking` is the binding rule.
+
+**Read CURRENT_STATE / SESSION_LOG / TODO at session start.** Write a dated session record at end. The workspace protocol (`feedback_workspace_protocol`).
+
+**MRs are GitLab, not GitHub.** The `gh` CLI does not work for `platform-gitops`. POST to the GitLab API with a PAT. Detail in [MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics).
+
+**`hub-dr` / `spoke-dr` are decommissioned.** Active fleet is `hub-dc-v6` + `spoke-dc-v6`. Future v6-era DR (`hub-dr-v6` / `spoke-dr-v6`) is not built. Source: `project_workspace_scope`.
+
+### HAProxy / DNS
+
+**HAProxy edge is for platform VM exposure only.** Never put OpenShift routes / console behind HAProxy. HAProxy serves Jenkins / SigNoz / Nexus / etc. Source: `feedback_haproxy_scope`.
+
+**PowerDNS is split auth + recursor on one VM.** Internal `sub.comptech-lab.com` resolves locally; everything else forwards to upstream. Detail in `reference_pdns_vm`.
+
+### Off-limits / forbidden patterns
+
+- `oc-mirror` is for OpenShift install / platform mirror only. Never use it for app images. Source: `feedback_oc_mirror_off_limits`.
+- ACM + OpenShift GitOps pull pattern is the design, not drift. Don't flag pull-model behaviour (no hub catalogs, `project=default` in AppSet, hub storage-light) as drift. Source: `feedback_acm_gitops_pull_pattern`.
+
+## How this list grows
+
+When you encounter a new gotcha:
+
+1. If it cost more than an hour or has architectural implications, it gets a runbook under `codex-opp-agent/runbooks/` and a published incident page on this site.
+2. If it cost less than an hour or is a one-off, it lands here under the matching category as a paragraph.
+3. If it changes a contract (file layout, ADR, lifecycle), the contract doc gets updated alongside.
+
+The page is intentionally long. It is grep-friendly under pressure; brevity for its own sake is the wrong optimization.
+
+## References
+
+- Memory entries (all `~/.claude/projects/-home-ze-claude-agent/memory/`):
+  - `project_acm_gitops_addon_routes_crd.md`
+  - `project_eso_egress_to_vault.md`
+  - `project_obc_to_operand_secret_bridge.md`
+  - `project_nexus_endpoint_split.md`
+  - `project_app_dev_direction.md`
+  - `project_workspace_scope.md`
+  - `reference_platform_gitops_mr_path.md`
+  - `reference_spoke_argo_extension_rbac.md`
+  - `reference_rhacs_init_bundle_via_api.md`
+  - `reference_lab_infrastructure.md`
+  - `feedback_github_first_tracking.md`
+  - `feedback_workspace_protocol.md`
+  - `feedback_haproxy_scope.md`
+  - `feedback_oc_mirror_off_limits.md`
+  - `feedback_acm_gitops_pull_pattern.md`
+- Runbooks (all `codex-opp-agent/runbooks/`):
+  - `break-glass-procedure.md`
+  - `mco-stuck-node-recovery.md`
+  - `openshift-ipv6-disable-correct-approach.md`
+  - `wso2-apim-jms-url-encoding-trap.md`
+  - `secrets-custody-drift-check.md`
+  - `jenkins-gitlab-webhook-pollscm.md`
+- Connection-details docs:
+  - `codex-opp-agent/connection-details/platform-admin-handoff.md` §"Known Gotchas From This Rebuild"
+  - `codex-opp-agent/connection-details/signoz.md` §"Known Gotchas"
+  - `codex-opp-agent/connection-details/nexus.md`
+- Issues: #229 (this section), #142 (MCO runbook), #143 (MR conventions doc), #153 (Routes CRD permanent fix)
