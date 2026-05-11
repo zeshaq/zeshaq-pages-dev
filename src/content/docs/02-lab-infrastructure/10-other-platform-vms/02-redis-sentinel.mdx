@@ -1,8 +1,145 @@
 ---
-title: "Redis Sentinel"
-description: "Section 02-lab-infrastructure/10-other-platform-vms: Redis Sentinel (placeholder)."
+title: "Redis + Sentinel"
+description: "The three-node Redis cluster with Sentinel quorum — private lab service, ACLs and AOF persistence, controlled-failover validated, hardening gates open per ADR 0006."
 sidebar_label: "Redis Sentinel"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Redis is deployed as a **standalone private VM service** for the clean rebuild: three Redis nodes plus Sentinel quorum, private on the lab `br30` network, used today for lab/platform smoke testing. Per ADR 0006, Redis is **not yet production-ready** for BFSI applications — six hardening gates separate the current state from production-ready, and they must close before real workloads consume the cluster as a production dependency.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| Nodes | `redis-0`, `redis-1`, `redis-2` |
+| Sentinel endpoint | `redis-sentinel.sub.comptech-lab.com:26379` |
+| Non-Sentinel debug endpoint | `redis.sub.comptech-lab.com:6379` |
+| Persistence | AOF |
+| Replication | Yes; controlled failover from `redis-0` to `redis-2` validated 2026-05-08 |
+| ACLs | Yes, current state |
+| Host firewall | Yes |
+| Quorum size | 3 |
+| Public exposure | None — private lab only |
+| TLS | **No** (gate) |
+| Vault-backed creds | **No** (gate) |
+| Backups | **No** (gate) |
+| Monitoring | **No** (gate) |
+
+## Architecture
+
+Three Redis nodes with one acting as master at any time; Sentinel agents on each (or co-located) provide leader election and client redirection. Production clients use a Sentinel-aware library that queries the Sentinel endpoint list, gets back the current master, and redirects on failover.
+
+## Why a VM cluster (not OpenShift)
+
+Per ADR 0006: Redis is intended as a VM-hosted private platform service for the clean rebuild. The reasoning aligns with the broader ADR pattern — keep stateful platform dependencies on VMs until OpenShift-side gates (ESO, namespace baseline, NetworkPolicy) close, then revisit. Running Redis as a Kubernetes Operator in OpenShift is a future decision; the current state is VM.
+
+## Client contract
+
+Production clients **must** use a Sentinel-aware library and **must** connect through the Sentinel endpoint list. The `redis.sub.comptech-lab.com` DNS round-robin is allowed for diagnostics and break-glass access only; it is **not** the production client contract.
+
+Sentinel client pattern (pseudocode):
+
+```text
+sentinel_endpoints = [
+  "redis-0.sub.comptech-lab.com:26379",
+  "redis-1.sub.comptech-lab.com:26379",
+  "redis-2.sub.comptech-lab.com:26379",
+]
+client = SentinelClient(
+  sentinels=sentinel_endpoints,
+  service_name="<configured-master-name>",
+  user="<workload-acl-user>",
+  password="<workload-acl-password-from-vault>",
+)
+# Client discovers current master from Sentinels, redirects on failover
+```
+
+The non-Sentinel `redis.sub.comptech-lab.com:6379` endpoint is for diagnostics: confirming reachability, checking the AOF tail, reading replication state. Not a production client path.
+
+## Hardening gates (per ADR 0006)
+
+Six gates separate current state from production-ready:
+
+| Gate | Status | What it requires |
+| --- | --- | --- |
+| 1. TLS and listener hardening | Open | Redis cert from internal CA; TLS on client, replication, Sentinel traffic; validate failover through TLS |
+| 2. Credential and ACL hardening | Open | Move app creds to Vault; replace `app-default` smoke user with workload-scoped ACLs; deny dangerous command categories to app users |
+| 3. Network hardening | Open | Narrow firewall from lab `/16` to approved client networks once OpenShift consumer nodes and app namespaces are known |
+| 4. Backup and restore hardening | Open | Current-master backup script; checksumming; encryption; MinIO + offline copy; isolated restore drill |
+| 5. Observability hardening | Open | Export Redis + Sentinel metrics; alert on master changes, quorum loss, replica link failure, replication lag, evictions, memory pressure, persistence failures, disk saturation |
+| 6. Operational resilience | Open | Re-run controlled failover after TLS + ACL hardening; per-node restart tests; client reconnect tests; upgrade/rollback procedure |
+
+Each gate has explicit acceptance criteria in ADR 0006. None are casually closed.
+
+## Operational guardrails
+
+- **No public IPs, no public DNS, no HAProxy wildcard** for Redis. Private only until a more specific allowlist is approved.
+- **TLS is required before BFSI application onboarding.** TLS implementation may use the lab internal CA first, then Vault PKI later after Vault PKI is accepted as an online intermediate.
+- **`app-default` is a smoke-test user only.** Production uses one ACL user per app or per trust boundary, with least privilege and rotation ownership recorded.
+- **Persistence alone is not a backup strategy.** AOF gives durability across restarts; it does not protect against logical corruption, accidental deletion, or VM-level loss.
+- **Don't re-expose publicly.** Any request to expose Redis publicly or through HAProxy needs a **new ADR**. The current decision is private-only.
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> redis-0.sub.comptech-lab.com A +short
+dig @<lab-dns> redis-1.sub.comptech-lab.com A +short
+dig @<lab-dns> redis-2.sub.comptech-lab.com A +short
+dig @<lab-dns> redis-sentinel.sub.comptech-lab.com A +short
+dig @<lab-dns> redis.sub.comptech-lab.com A +short
+
+# Sentinel discovery (replace user/password from custody)
+redis-cli -h redis-0.sub.comptech-lab.com -p 26379 \
+  sentinel masters
+
+redis-cli -h redis-0.sub.comptech-lab.com -p 26379 \
+  sentinel get-master-addr-by-name <master-name>
+```
+
+Custody:
+
+- ACL user passwords: under `secrets/redis-vm/` until Vault delivery is wired.
+- Sentinel service password: same.
+- Future TLS cert custody: TBD when gate 1 closes.
+
+## Failure modes
+
+### Symptom: client fails after a Redis master flap
+
+**Root cause.** Client is using the non-Sentinel `redis.sub.comptech-lab.com:6379` round-robin endpoint, not the Sentinel-aware path. The round-robin can return a non-master node, or a node that becomes non-master mid-connection.
+
+**Fix.** Switch the client to a Sentinel-aware library and the Sentinel endpoint list.
+
+**Prevention.** Document Sentinel-only as the production client contract. Reject non-Sentinel client configs in code review.
+
+### Symptom: replica falls behind master and lag alerts fire
+
+**Root cause.** Replica disk pressure, network throughput, or memory pressure on the replica process.
+
+**Fix.** Identify which replica; check disk/network/memory on that VM; restart the replica process or VM if needed; let Sentinel rebalance.
+
+**Prevention.** Once monitoring is wired (gate 5), alert on replication lag before clients notice.
+
+### Symptom: master and replicas all show "fail-over in progress" but never resolve
+
+**Root cause.** Quorum is partial — two Sentinels disagree, or only two Sentinels are reachable. Or the master-name is misconfigured.
+
+**Fix.** Check Sentinel logs on each node. Verify each Sentinel can reach each Redis node. Restart the failed Sentinel; re-validate quorum.
+
+**Prevention.** Network monitoring across the three Redis VMs; alert on Sentinel-quorum drops.
+
+### Symptom: backup question — can we recover after disk loss?
+
+**Root cause.** Today, no — backup gate is open. AOF persistence on a single node doesn't survive node loss.
+
+**Fix.** Replication to another node is the operational mitigation. Rebuild the lost node and let it catch up.
+
+**Prevention.** Close gate 4 (backup) before production.
+
+## References
+
+- `codex-opp-agent/adr/0006-redis-sentinel-hardening.md` — hardening gates.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/redis-sentinel-vm-plan.md` — VM plan.
+- Memory: `reference_lab_infrastructure.md` — Redis VM endpoints (private only).

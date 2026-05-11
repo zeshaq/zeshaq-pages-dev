@@ -1,8 +1,197 @@
 ---
-title: "WSO2 APIM + Identity Server (legacy)"
-description: "Section 02-lab-infrastructure/10-other-platform-vms: WSO2 APIM + Identity Server (legacy) (placeholder)."
-sidebar_label: "WSO2 APIM + Identity Server (legacy)"
+title: "WSO2 APIM + Identity Server"
+description: "The lab WSO2 stack — APIM 4.7.0 and Identity Server 7.2.0 reintroduced as standalone Ubuntu VMs per ADR 0008, with the HAProxy hostname pattern, the OIDC check-session quirk, and the JMS URL-encoding trap."
+sidebar_label: "WSO2 APIM + IS"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+WSO2 API Manager and WSO2 Identity Server are reintroduced as **standalone Ubuntu cloud-init VMs** per ADR 0008. The historical distributed APIM topology (multiple component VMs, PostgreSQL pairs, DR scripts, OpenShift identity links) is **decommissioned** and is not active target state. The current target is two all-in-one VMs: one for IS, one for APIM.
+
+This page covers the WSO2 split, the HAProxy hostname pattern, and two real operational traps that have caused multi-hour debugging.
+
+## What it is
+
+| VM | Component | Role | Private FQDN |
+| --- | --- | --- | --- |
+| `wso2-is-0` | WSO2 Identity Server `7.2.0.26` | IdP for WSO2 APIM (OIDC) | `wso2-is-0.sub.comptech-lab.com` |
+| `wso2-apim-0` | WSO2 API Manager `4.7.0` (all-in-one) | API gateway + Publisher + DevPortal + Admin + Carbon management | `wso2-apim-0.sub.comptech-lab.com` |
+
+Both VMs are deployed from local product packages under `/home/ze/Software`:
+
+- `wso2am-4.7.0.zip`
+- `wso2is-7.2.0.26.zip`
+
+Per ADR 0008 the lab does **not** depend on RKE2, OpenShift-hosted charts, the old distributed APIM scripts, or retired PostgreSQL nodes for the initial deployment. All-in-one means SQL state, Carbon management, and gateway run inside the WSO2 product itself.
+
+## The five-hostname split
+
+WSO2 APIM has multiple browser-visible portals plus a gateway. Each gets its own hostname to make the OIDC and session cookie semantics work cleanly:
+
+| Hostname | Role |
+| --- | --- |
+| `is.apps.sub.comptech-lab.com` | WSO2 IS (IdP for APIM) |
+| `apim.apps.sub.comptech-lab.com` | APIM management / Carbon console / OIDC OP for APIM |
+| `publisher.apps.sub.comptech-lab.com` | APIM Publisher (API design + lifecycle) |
+| `devportal.apps.sub.comptech-lab.com` | APIM Developer Portal (consumer-facing) |
+| `admin.apps.sub.comptech-lab.com` | APIM Admin portal |
+| `gateway.apps.sub.comptech-lab.com` | APIM Gateway (runtime API traffic) |
+
+All terminate at HAProxy with the LE wildcard `*.apps.sub.comptech-lab.com`. HAProxy routes by SNI hostname to the appropriate WSO2 backend port on the VM.
+
+## Why split hostnames?
+
+WSO2 has session-cookie behavior that depends on hostname scoping. Two specific traps drive the hostname design:
+
+### Trap 1: APIM session nonce across portals
+
+WSO2 APIM ships a session nonce check on Publisher → APIM OAuth. If Publisher (`publisher.apps.*`) starts an OAuth flow that completes on APIM (`apim.apps.*`), the nonce cookie has to be readable from both hostnames. Per ADR 0008 the lab solution is an HAProxy response-header rewrite on the APIM management backend: `sessionNonceCookie-*` cookies must carry `Domain=.apps.sub.comptech-lab.com`. This preserves WSO2's nonce check across the portal-host boundary.
+
+### Trap 2: OIDC check-session iframe
+
+For Publisher and Developer Portal browser settings, login redirect/callback URLs stay on their portal hostnames, **but** the OIDC `check-session` endpoint and origin stay on the configured APIM IDP hostname:
+
+```text
+https://apim.apps.sub.comptech-lab.com/oidc/checksession
+```
+
+If the hidden OIDC check-session iframe is served from the portal vanity host instead, the OP browser-session cookie (scoped to `apim.apps.*`) is invisible to the iframe and the OP returns a session-changed response immediately after login. The visible effect: successful login is followed by an immediate return to the login page.
+
+Both traps are HAProxy edge concerns, not WSO2 product bugs per se. Get the hostnames and cookie scopes right and they don't bite.
+
+## Trap 3: APIM 4.7 JMS URL-encoding (operationally critical)
+
+This is the operational gotcha that has caused multi-hour debugging sessions. It has its own runbook (`runbooks/wso2-apim-jms-url-encoding-trap.md`), summarized here.
+
+### Symptom
+
+API publishes succeed in the UI (green banner, DB row marked `APPROVED`), but the gateway returns `404` or `Invalid URL` for the deployed context.
+
+### Root cause
+
+WSO2 APIM 4.7 ships four JNDI files under `repository/conf/`:
+
+- `jndi.properties`
+- `jndi-cp.properties`
+- `jndi2.properties`
+- `jndi2-cp.properties`
+
+Each contains an AMQP connection URL. When provisioning rewrites the URL after a password rotation, it HTML-entity-escapes `&` as `&amp;` (correct for XML) instead of URL-encoding as `%26` (correct for an AMQP URL). The AMQP client does not unescape HTML inside a URL, so it tries to authenticate with the literal `&amp;` chars and Andes rejects the auth. The downstream effect is that published APIs never render to Synapse — they just hang in the deployment-revision-mapping table with `successDeployedTime=NULL`.
+
+### Fix
+
+Set the URL-encoded password in `deployment.toml` under `[apim.throttling.jms]` (final-else template branch) or `[apim.event_hub.jms]` (event-hub branch), depending on which template branch the install uses. Restart WSO2:
+
+```toml
+[apim.throttling.jms]
+username = "<jms-user>"
+password = "<URL-encoded-password>"
+```
+
+Encode every `&` as `%26`, plus `%` → `%25`, `@` → `%40`, `?` → `%3F`, `#` → `%23`, `:` → `%3A`.
+
+### Forbidden
+
+Don't edit the rendered JNDI files as a permanent fix — WSO2 regenerates them on every startup. The sed-patch on the rendered files is a stopgap that lasts until the next restart.
+
+### Long-term mitigation
+
+Use 24-char alphanumeric passwords that avoid `&`, `%`, `@`, `?`, `#`, `:` entirely. A 24-char alphanumeric is plenty strong and sidesteps every URL-encoding trap.
+
+The full runbook lives at `codex-opp-agent/runbooks/wso2-apim-jms-url-encoding-trap.md` with pre-action checks, validation criteria, and a worked example.
+
+## Exposure model
+
+```text
+Browser
+   ↓ HTTPS
+https://apim.apps.sub.comptech-lab.com (or publisher/devportal/admin/gateway/is)
+   ↓ HAProxy 443 (LE wildcard, SNI route)
+HAProxy → wso2-apim-0 or wso2-is-0 in lab /24
+   ↓ HTTP/HTTPS to WSO2 listener port
+WSO2 product (Carbon-based runtime)
+```
+
+Specific HAProxy treatment:
+
+- **Sticky session** required for APIM portals (per WSO2 docs for Carbon-fronted services).
+- **Cookie rewrite** for `sessionNonceCookie-*` to carry `Domain=.apps.sub.comptech-lab.com`.
+- **Gateway traffic** is per-API-context routed at WSO2 internally; HAProxy just SNI-routes to the gateway hostname.
+
+## Credentials
+
+Per ADR 0008 the requested lab super-admin username is `zahid`. The password is stored only in local-only ignored secret custody under `secrets/wso2-*-vm/`. **Never** committed to Git, GitHub, wiki, or session reports. Per the JMS trap above, the password should avoid URL-special characters.
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> wso2-is-0.sub.comptech-lab.com A +short
+dig @<lab-dns> wso2-apim-0.sub.comptech-lab.com A +short
+dig @<lab-dns> is.apps.sub.comptech-lab.com A +short
+dig @<lab-dns> apim.apps.sub.comptech-lab.com A +short
+dig @<lab-dns> publisher.apps.sub.comptech-lab.com A +short
+dig @<lab-dns> devportal.apps.sub.comptech-lab.com A +short
+dig @<lab-dns> admin.apps.sub.comptech-lab.com A +short
+dig @<lab-dns> gateway.apps.sub.comptech-lab.com A +short
+
+# HTTPS reachability
+curl -sSI https://is.apps.sub.comptech-lab.com/ | head -1
+curl -sSI https://publisher.apps.sub.comptech-lab.com/publisher | head -1
+curl -sSI https://devportal.apps.sub.comptech-lab.com/devportal | head -1
+
+# AMQP listeners (from the VM)
+ssh ze@wso2-apim-0.sub.comptech-lab.com 'ss -tlnp | grep -E "5672|9711"'
+```
+
+## Operational guardrails
+
+- **Standalone VMs, not OpenShift desired state.** Don't reactivate old `wso2is` OpenShift identity-provider manifests as target state. They may be read for troubleshooting lessons.
+- **No old distributed APIM DC/DR scripts** as authoritative target state. The old scripts may be read for lessons only.
+- **No `pg-is-*` or `pg-apim-*` PostgreSQL nodes** for the initial all-in-one deployment.
+- **Don't store WSO2 super-admin passwords, private keys, keystore passwords, client secrets, or generated token material in Git.**
+- **HAProxy/PDNS scope** is narrow — only the WSO2 hostnames listed above.
+- **Independent milestone** — keep this track separate from Kafka, Vault, Redis, and OpenShift rebuild milestones.
+
+## Production readiness
+
+The first deployment is bootstrap-oriented (all-in-one products, local secret custody). Production readiness will require:
+
+- **External database decisions.** All-in-one means embedded H2 in some configs; production wants PostgreSQL/MySQL external.
+- **Keystore/TLS custody.** WSO2 ships default keystores; production must replace them.
+- **Backup/restore** for the H2 / external DB + the Carbon repository state.
+- **Monitoring** for the JVM + the WSO2 product metrics.
+- **Identity integration.** Whether to keep WSO2 IS as the lab IdP or migrate to Keycloak (when that lands).
+- **Upgrade rehearsal.** WSO2 minor upgrades have a non-trivial migration path.
+
+## Failure modes
+
+### Symptom: API publish marks APPROVED but gateway returns 404
+
+**Root cause.** The JMS URL-encoding trap (above). The full runbook is `runbooks/wso2-apim-jms-url-encoding-trap.md`.
+
+**Fix.** Apply the durable TOML fix; restart WSO2; validate per the runbook.
+
+**Prevention.** Use passwords without URL-special chars.
+
+### Symptom: login on Publisher succeeds and then immediately returns to login page
+
+**Root cause.** OIDC check-session iframe is served from the portal hostname instead of the APIM hostname. The OP session cookie is invisible to the iframe → session-changed response → re-login.
+
+**Fix.** Configure check-session origin and endpoint to `https://apim.apps.sub.comptech-lab.com/oidc/checksession`.
+
+**Prevention.** ADR 0008 documents the iframe scope rule.
+
+### Symptom: Publisher → APIM OAuth handshake fails with nonce mismatch
+
+**Root cause.** `sessionNonceCookie-*` is scoped to one hostname instead of both via `Domain=.apps.sub.comptech-lab.com`.
+
+**Fix.** Add the HAProxy response-header rewrite for APIM management backend per ADR 0008.
+
+**Prevention.** Use the standard HAProxy template for WSO2 APIM.
+
+## References
+
+- `codex-opp-agent/adr/0008-wso2-apim-is-standalone-vms.md` — VM design and HAProxy hostname pattern.
+- `codex-opp-agent/runbooks/wso2-apim-jms-url-encoding-trap.md` — JMS URL-encoding trap full runbook.
+- WSO2 APIM 4.7 documentation — JNDI templates and `deployment.toml` keys.
