@@ -1,8 +1,280 @@
 ---
 title: "Tenant Monorepo Contract"
-description: "Section 04-application-delivery/02-federated-gitlab: Tenant Monorepo Contract (placeholder)."
+description: "What an application repository under divisions/<division>/ must look like — directory layout, required files, label conventions, namespace naming, and what CI may and may not modify."
 sidebar_label: "Tenant Monorepo Contract"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page is the contract that every tenant application repo on the platform must honour. It is the GitLab-side companion to the ApplicationSet discovery rules on the OpenShift side. The contract is intentionally narrow: anything outside the rules below is per-app freedom.
+
+The full source-of-truth document is `connection-details/app-repo-contract.md` (DEV-OCP-2.1, issue #182). This page is the developer-facing summary plus the rationale for each rule.
+
+## Why a contract at all
+
+Five consumers read tenant repos and they cannot all read different shapes:
+
+1. **Jenkins (Path A)** writes a digest patch into `apps/<team>/<app>/overlays/dev/kustomization.yaml`. It expects a fixed file path.
+2. **Tekton (Path B)** writes the same patch from a different runtime — but to the same path, so a `path A -> path B` migration is zero-change at the Git layer.
+3. **Argo CD ApplicationSet** generates one `Application` per overlay directory by scanning `apps/*/*/overlays/*/kustomization.yaml`. The glob pattern is part of the contract.
+4. **Lint and policy gates** statically validate each repo on every MR (kustomize build, label presence, no plaintext Secrets, no public image references).
+5. **Auditors** walk a release. They expect to find the digest of what shipped to prod in `apps/<team>/<app>/overlays/prd/kustomization.yaml`, not in a release tracker spreadsheet.
+
+If any of those five sees a different shape per app, the chain breaks open.
+
+## The directory layout
+
+Every app in a tenant repo lives under:
+
+```text
+apps/<team>/<app>/
+  base/
+    kustomization.yaml
+    deployment.yaml
+    service.yaml
+    route.yaml                       (optional; OpenShift Route)
+    configmap.yaml                   (optional; non-secret config)
+    externalsecret-<name>.yaml       (optional; one file per ExternalSecret)
+  overlays/
+    dev/
+      kustomization.yaml
+      patch-*.yaml                   (optional env-specific patches)
+    stg/
+      kustomization.yaml
+      patch-*.yaml
+    prd/
+      kustomization.yaml
+      patch-*.yaml
+```
+
+Rules:
+
+- `apps/<team>/<app>/base/` must contain at minimum `kustomization.yaml`, `deployment.yaml`, `service.yaml`.
+- `apps/<team>/<app>/overlays/` must contain `dev/`, `stg/`, and `prd/` subdirectories. Each must contain its own `kustomization.yaml`.
+- An app that exposes HTTP must ship `base/route.yaml`.
+- Secrets must be delivered via `ExternalSecret` from Vault (see Section 2.4); plaintext `Secret` manifests are forbidden.
+- `<team>` and `<app>` must be DNS-1123 labels: `[a-z0-9-]`, start/end alphanumeric, max 40 characters.
+
+## What lives in `base/`
+
+The base is environment-agnostic: it describes the workload's identity, not where or how it is deployed.
+
+### `base/kustomization.yaml`
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# No namespace in base; overlays set it.
+commonLabels:
+  app.kubernetes.io/name: <app>
+  app.kubernetes.io/part-of: <team>
+  app.kubernetes.io/managed-by: argocd
+  apps.platform/team: <team>
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - route.yaml                    # if present
+  - externalsecret-<name>.yaml    # if present
+  - configmap.yaml                # if present
+```
+
+### `base/deployment.yaml`
+
+Requirements:
+
+- Container `image:` must use a placeholder reference that Kustomize `images:` can rewrite. Recommended:
+  ```yaml
+  image: app-registry.apps.sub.comptech-lab.com/<team>/<app>:placeholder
+  ```
+- Resource requests/limits, readiness probe, liveness probe must be set (per ADR 0014 readiness contract).
+- `securityContext.allowPrivilegeEscalation: false` and `capabilities.drop: [ALL]` must be set (the spoke's PCI profile rejects pods without them).
+
+### `base/service.yaml`
+
+- Port `name` matches the container port `name` (e.g. `http`).
+- Selector uses `app.kubernetes.io/name: <app>` only. Overlay-injected labels are not stable selectors and Service selector mismatches are silent.
+
+### `base/route.yaml` (when HTTP is exposed)
+
+- `tls.termination: edge` for typical cases; `reencrypt` only when the pod itself terminates TLS.
+- Host is not pinned in base. Overlays may patch `spec.host` if a stable URL is required for a given environment.
+
+### `base/externalsecret-<name>.yaml`
+
+- Vault is the only secret source (ADR 0019 + Section 2.4).
+- `secretStoreRef` points to the namespace-local `ClusterSecretStore` (default name: `vault-apps`).
+- One file per ExternalSecret keeps diff review readable.
+
+## What lives in `overlays/<env>/`
+
+The overlay layers environment-specific values on top of the base. Every overlay's `kustomization.yaml` is structurally identical:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: apps-<division>-<team>-<env>
+
+commonLabels:
+  apps.platform/env: <env>          # dev | stg | prd
+  apps.platform/division: <division>
+  app.kubernetes.io/instance: <app>-<env>
+  app.kubernetes.io/version: "REPLACED_BY_CI"
+
+resources:
+  - ../../base
+
+images:
+  - name: app-registry.apps.sub.comptech-lab.com/<team>/<app>
+    newName: app-registry.apps.sub.comptech-lab.com/<team>/<app>
+    digest: sha256:REPLACED_BY_CI
+```
+
+Rules:
+
+- `namespace:` must be `apps-<division>-<team>-<env>`. The namespace is created and labelled by the platform team via `openshift-platform-gitops`; the tenant must not include a `Namespace` resource.
+- `images:` block must exist in every overlay, even if no real digest has been written yet. `sha256:REPLACED_BY_CI` is acceptable as the in-repo default.
+- CI writes digests by modifying the `digest:` field in this `images:` entry only. CI must not touch `base/` files.
+
+The Path B / Quay variant is identical except for the registry hostname:
+
+```yaml
+images:
+  - name: quay.apps.sub.comptech-lab.com/team-<team>/<app>
+    newName: quay.apps.sub.comptech-lab.com/team-<team>/<app>
+    digest: sha256:REPLACED_BY_CI
+```
+
+## What CI may and may not modify
+
+This is the rule that keeps the contract enforceable.
+
+- **CI may**:
+  - Rewrite `overlays/<env>/kustomization.yaml` `images:` digest field.
+  - Write a `release-evidence.md` under `overlays/<env>/` (informational; not consumed by Kustomize).
+- **CI must not**:
+  - Modify any file under `base/`.
+  - Modify overlay `namespace:`, `commonLabels:`, or `resources:`.
+  - Create or delete overlays.
+
+Structural changes (new overlay env, new base resource, new ExternalSecret) are tenant pull requests reviewed by the platform team — not CI-driven.
+
+The point: a build pipeline's only Git write is **the single-line digest bump**. Any other change is a human-authored MR with a normal review.
+
+## Naming conventions
+
+### Namespaces
+
+- Pattern: `apps-<division>-<team>-<env>`.
+- Examples: `apps-platform-myteam-dev`, `apps-payments-checkout-prd`.
+- DNS-1123 label rules apply, max 63 chars total.
+- `<division>` is the coarse business grouping (`platform`, `payments`, `risk`); the set is maintained in `platform-gitops/divisions.yaml`.
+- Namespaces are created by the platform team. The tenant must not include `Namespace` in `base/` or `overlays/`.
+
+### Resource names within a namespace
+
+- Workload names use bare `<app>` (e.g. `Deployment/myapp`, `Service/myapp`, `Route/myapp`).
+- Do **not** suffix `-dev` / `-prd` — the namespace already isolates them. `Deployment/myapp` in `apps-payments-checkout-prd` is unambiguous.
+
+## Label families
+
+Two coexisting label families.
+
+### Standard Kubernetes recommended labels
+
+| Label | Where | Value |
+|---|---|---|
+| `app.kubernetes.io/name` | base `commonLabels` | `<app>` |
+| `app.kubernetes.io/part-of` | base `commonLabels` | `<team>` |
+| `app.kubernetes.io/instance` | overlay `commonLabels` | `<app>-<env>` |
+| `app.kubernetes.io/version` | overlay `commonLabels` | git short SHA or semver (CI-written) |
+| `app.kubernetes.io/managed-by` | base `commonLabels` | `argocd` |
+
+### Platform-specific labels
+
+| Label | Where | Value |
+|---|---|---|
+| `apps.platform/team` | base `commonLabels` | `<team>` |
+| `apps.platform/division` | overlay `commonLabels` | `<division>` |
+| `apps.platform/env` | overlay `commonLabels` | `dev` / `stg` / `prd` |
+| `apps.platform/argocd` | overlay annotation or sentinel file | `"true"` |
+
+`apps.platform/argocd` is the discovery signal the ApplicationSet uses if a team chooses the explicit opt-in mode (see below).
+
+## ApplicationSet discovery — two equivalent modes
+
+The platform `ApplicationSet` (in `openshift-platform-gitops`, DEV-OCP-2.2 / #183) discovers tenant overlays in one of two equivalent ways. Tenants pick.
+
+### Mode 1: Directory convention (default)
+
+The git generator scans:
+
+```text
+apps/*/*/overlays/*/kustomization.yaml
+```
+
+For each match, the discovered path components (`<team>`, `<app>`, `<env>`) become Argo `Application` template parameters. This is the recommended path for most teams.
+
+### Mode 2: Explicit opt-in via annotation
+
+```yaml
+# overlays/<env>/kustomization.yaml
+commonAnnotations:
+  apps.platform/argocd: "true"
+```
+
+The git generator filters on presence of this annotation. Useful for staged migration of one app.
+
+Exactly one mode is active per app repo; mixing them is a lint warning, not an error.
+
+## Validation
+
+The reference linter `scripts/app-repo-lint.sh` (in the platform repo's `examples/` tree) enforces:
+
+1. Every `apps/<team>/<app>/` has `base/` and `overlays/{dev,stg,prd}/`.
+2. `oc kustomize` (or `kustomize build`) succeeds for each overlay.
+3. Every overlay `kustomization.yaml` contains an `images:` block.
+
+The linter runs:
+
+- in tenant repo CI on every MR;
+- in `platform-gitops` validation pipeline on every change to a tenant directory;
+- ad hoc by platform admins auditing a repo.
+
+A green lint is necessary but not sufficient. Admission policy on the spoke (Kyverno or VAP, see Section 5) enforces runtime constraints that the linter does not check (image registry allowlist, pod security baseline, RBAC scoping).
+
+## Failure modes and gotchas
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Jenkins / Tekton overlay-patch step fails: `ERROR: no 'digest: sha256:<64-hex>' line found` | Overlay's `images:` block is missing or has a placeholder different from the expected shape | Seed the overlay manually: edit `overlays/<env>/kustomization.yaml`, add the `images:` block from the template, commit, re-run pipeline. |
+| Argo `Application` for an overlay never appears | Overlay path doesn't match `apps/*/*/overlays/*/kustomization.yaml` (extra directory level, missing `kustomization.yaml`) | Move the overlay back into the canonical path; the ApplicationSet generator is strict. |
+| Service selector matches nothing after image bump | Selector uses an overlay label like `app.kubernetes.io/instance` | Change the Service selector to `app.kubernetes.io/name`; only base labels survive across overlay refactors. |
+| Kustomize build error: `failed to find unique target for patch` | `<app>` doesn't match the resource name a patch is targeting | Don't suffix env to resource names; keep `Deployment/<app>` everywhere. |
+| Argo flags `OutOfSync` with a diff in `namespace` | Tenant added a `Namespace` resource in base or overlay | Remove the resource; namespaces are platform-owned. |
+| Plaintext Secret found by validation pipeline | `Secret` manifest committed directly | Convert to `ExternalSecret` referencing a Vault path; the linter rejects literal `kind: Secret`. |
+| Linter complains about mixed discovery modes | Some overlays have the annotation, some don't | Pick one mode per app repo and apply consistently. |
+
+## Failure mode: forgetting `images:` on a new env
+
+A common onboarding mistake: a team adds `overlays/prd/` for production, copies `overlays/stg/kustomization.yaml`, but forgets the `images:` block. The promotion `promote.sh dev prd` script then fails with:
+
+```text
+ERROR: no 'digest: sha256:...' entry found under images: in
+       apps/<team>/<app>/overlays/prd/kustomization.yaml
+```
+
+Fix: seed the target overlay with the same `images:` block (registry, name, `newName`, `digest: sha256:REPLACED_BY_CI`) and re-run.
+
+## References
+
+- `connection-details/app-repo-contract.md` (DEV-OCP-2.1, #182)
+- `connection-details/image-digest-overlay.md` (#185)
+- `connection-details/promotion-model.md` (#184)
+- `connection-details/vault-app-secrets.md` — `ExternalSecret` wiring
+- `adr/0014-developer-readiness-platform-contract.md`
+- `adr/0019-nexus-only-image-supply-chain.md`
+- `adr/0020-spoke-pci-profile.md` — pod security baseline
+- DEV-OCP issues: #173 (tenant Project + Role + RoleBinding), #182 (overlay contract), #183 (ApplicationSet + AppProject)

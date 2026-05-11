@@ -1,8 +1,168 @@
 ---
-title: "Overview"
-description: "Section 04-application-delivery: Overview (placeholder)."
+title: "Application Delivery — Overview"
+description: "End-to-end view of how an application moves from a developer's laptop, through GitLab, a build path, image registry, and GitOps overlay patch, onto a spoke OpenShift workload cluster."
 sidebar_label: "Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const dev      = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8,  color: "#1f2937", width: 150, textAlign: "center" };
+export const ctrl     = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const stage    = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8,  color: "#1f2937", width: 170, textAlign: "center" };
+export const agent    = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+export const tenant   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const evidence = { background: "#ede9fe", border: "1px solid #6d28d9", borderRadius: 8, padding: 8,  color: "#1f2937", width: 150, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const evtEdge  = { style: { stroke: "#6d28d9", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#6d28d9" }, labelStyle: { fill: "#6d28d9", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const flowNodes = [
+  { id: "dev",      position: { x:   0, y:   0 }, data: { label: "Developer\nlaptop" },                          style: dev },
+  { id: "gitlab",   position: { x: 220, y:   0 }, data: { label: "GitLab CE\n(internal LAN endpoint)\ndivisions/<division>/<repo>" }, style: ctrl },
+  { id: "ci",       position: { x: 480, y:   0 }, data: { label: "Build path\nJenkins (A) | Tekton (B)" },       style: ctrl },
+  { id: "trivy",    position: { x: 740, y:  -90}, data: { label: "Trivy server\nseverity gate" },               style: stage },
+  { id: "minio",    position: { x: 740, y:  90 }, data: { label: "MinIO\ndeveloper-ci-evidence" },              style: evidence },
+  { id: "nexus",    position: { x: 480, y: 150 }, data: { label: "Nexus app-registry\n(Path A)" },              style: stage },
+  { id: "quay",     position: { x: 480, y: 260 }, data: { label: "Quay\n(Path B, in-cluster)" },                style: stage },
+  { id: "appsrepo", position: { x: 220, y: 200 }, data: { label: "App GitOps repo\n<division>-gitops\nMR: bump digest" }, style: ctrl },
+  { id: "hubargo",  position: { x: 220, y: 360 }, data: { label: "Hub Argo CD\nApplicationSet\n(hub-dc-v6)" },   style: ctrl },
+  { id: "spokeargo",position: { x: 480, y: 380 }, data: { label: "Spoke Argo CD\n(spoke-dc-v6)" },               style: agent },
+  { id: "ns",       position: { x: 740, y: 380 }, data: { label: "apps-<div>-<team>-<env>\nDeployment + pods" }, style: tenant },
+];
+
+export const flowEdges = [
+  { id: "e1",  source: "dev",      target: "gitlab",    label: "git push",          ...reqEdge },
+  { id: "e2",  source: "gitlab",   target: "ci",        label: "push webhook",      ...reqEdge },
+  { id: "e3",  source: "ci",       target: "trivy",     label: "scan (CRITICAL=fail)", ...reqEdge },
+  { id: "e4",  source: "ci",       target: "nexus",     label: "podman push  (A)",  ...reqEdge },
+  { id: "e5",  source: "ci",       target: "quay",      label: "buildah push (B)",  ...reqEdge },
+  { id: "e6",  source: "ci",       target: "minio",     label: "evidence (mc cp / tkn)", ...evtEdge },
+  { id: "e7",  source: "ci",       target: "appsrepo",  label: "MR: digest patch\non overlays/dev/", ...reqEdge },
+  { id: "e8",  source: "appsrepo", target: "hubargo",   label: "ApplicationSet\nreads main",      ...muted },
+  { id: "e9",  source: "hubargo",  target: "spokeargo", label: "ManifestWork\n(pull model)",      ...pullEdge },
+  { id: "e10", source: "spokeargo",target: "ns",        label: "kustomize apply\nimage @sha256:", ...muted },
+];
+
+This section documents how an application repository becomes a running pod on `spoke-dc-v6`. Read this overview first; the rest of the section breaks the steps apart and details the contracts each step is required to honour.
+
+The audience is anyone shipping or operating an application on the v6 fleet: developers, CI/CD maintainers, platform admins reviewing tenant onboarding, and auditors walking a release. Cross-link to the platform-side details (cluster, GitOps engine, Vault, Nexus, RHACS) under sections 2 and 5.
+
+## What "application delivery" means here
+
+A request travels through six logical hops and one fixed shape of evidence. The hops are: **source -> build -> scan -> image registry -> GitOps repo -> spoke Argo -> workload**. The contract that connects them is digest-pinned: every successful build produces one immutable `sha256:<64hex>` digest, that digest is what gets written into Git, and the same digest is what runs in every environment.
+
+The platform deliberately supports **two** build paths and **one** consume contract:
+
+| Layer | Path A (Jenkins) | Path B (Tekton) |
+|---|---|---|
+| Where the build runs | `jenkins-0` VM + `jenkins-agent-0` agent | `openshift-pipelines` namespace on `spoke-dc-v6` |
+| Trigger | GitLab push webhook -> Jenkins `notifyCommit` | GitLab push webhook -> Tekton EventListener |
+| Build tool | `podman` / `buildah` on the agent | `buildah` Task in a per-build pod |
+| Scan | Trivy server (shared VM) | Trivy server (same VM) |
+| Image push target | `app-registry.apps.sub.comptech-lab.com` (Nexus) | `quay.apps.sub.comptech-lab.com` (Quay) or Nexus fallback |
+| Overlay patch | `update-overlay-digest.sh` from Jenkins agent | `update-overlay-digest` Tekton Task |
+| Evidence target | MinIO `developer-ci-evidence` bucket | MinIO `developer-ci-evidence` bucket |
+| ApplicationSet generator | unchanged | unchanged |
+
+Both paths land at the same digest patch on `apps/<team>/<app>/overlays/dev/kustomization.yaml`, and Argo CD cannot tell which path produced a given commit. That symmetry is the design centre of this section.
+
+## Whiteboard: the end-to-end flow
+
+<Whiteboard client:load data={{ nodes: flowNodes, edges: flowEdges }} height={620} />
+
+Reading the diagram from left to right:
+
+1. **Developer pushes** to a feature branch (or to `main` for trusted maintainers) in their division's GitLab project under `divisions/<division>/<repo>`.
+2. **GitLab webhook fires** at the LAN endpoint of the build path. Path A uses the Jenkins Git plugin `notifyCommit` URL; Path B uses a Tekton EventListener Route. Both validate an HMAC secret to keep the trigger surface from being abused.
+3. **The build path** clones the source, compiles and tests, and assembles a container image. Tool versions for the Jenkins agent: Podman 4.9.3, Buildah 1.33.7, Skopeo 1.13.3, Trivy 0.70.0. Tekton uses the OpenShift Pipelines distribution of those same tools through Tasks.
+4. **Trivy scans** the built image in server mode against the shared Trivy VM. The severity policy is `fail on CRITICAL, warn on HIGH`, identical for both paths so promotion semantics do not depend on which path produced the image.
+5. **The image is pushed** to either Nexus app-registry (Path A) or Quay (Path B). The push response carries the manifest digest; that digest is captured and used everywhere downstream.
+6. **CI evidence** (`build.log`, `sbom.spdx.json`, `trivy-scan.json`, `image-digest.txt`) is uploaded to MinIO under `developer-ci-evidence/<team>/<app>/<git-sha>/`. The schema is the same regardless of which path produced the build.
+7. **An MR is opened** against the division's GitOps repo (`<division>-gitops`). The MR contains a single change: the `digest:` field under `images:` in `apps/<team>/<app>/overlays/dev/kustomization.yaml`. No other file changes. Merge into `main` is gated by approval (one approver for non-production, two for production-impacting paths).
+8. **Hub Argo CD** on `hub-dc-v6` runs the `app-tenants` ApplicationSet. The Git directory generator scans `apps/<team>/<app>/overlays/*/kustomization.yaml`, produces one Argo `Application` per overlay, and (in the v6 pull model from ADR 0018) ships each as a `ManifestWork` to the target spoke.
+9. **Spoke Argo CD** on `spoke-dc-v6` pulls its `ManifestWork`, applies the rendered Kustomize output to the local API server, and the kubelet pulls the image strictly by digest from the registry referenced in the overlay.
+
+Steps 8 and 9 are the pull-model boundary: the hub never opens a TCP connection toward the spoke's API server. The spoke's klusterlet maintains the only long-running session, initiated outbound. See [`RHACM`](/blog/rhacm) and [`OpenShift GitOps`](/blog/openshift-gitops) for the architectural background.
+
+## What lives where
+
+| System | Hostname (public route) | Internal LAN endpoint | Role in the flow |
+|---|---|---|---|
+| GitLab CE 18.11.1 | `gitlab.apps.sub.comptech-lab.com` | LAN endpoint on the GitLab VM | Source repos, webhooks, MRs, approvals |
+| Jenkins 2.555.1 | `jenkins.apps.sub.comptech-lab.com` | LAN endpoint on the Jenkins VM | Path A build controller |
+| Jenkins agent | n/a (private) | LAN endpoint on the Jenkins agent VM | Path A build executor, `developer-build` label |
+| OpenShift Pipelines (Tekton) | served on `spoke-dc-v6` | `openshift-pipelines` namespace | Path B build pipelines |
+| Trivy server | `trivy.apps.sub.comptech-lab.com` | LAN endpoint on the Trivy VM | Shared scan gate, both paths |
+| Nexus | `nexus-mirror.apps.sub.comptech-lab.com` | LAN endpoint on the Nexus VM | App image pushes (Path A) + base image pulls |
+| Nexus app-registry | `app-registry.apps.sub.comptech-lab.com` | TLS-fronted by HAProxy | Path A push target |
+| Nexus docker-group | `docker-group.apps.sub.comptech-lab.com` | TLS-fronted by HAProxy | Base image pulls (both paths) |
+| Quay | `quay.apps.sub.comptech-lab.com` | served from spoke-dc-v6 | Path B push target |
+| MinIO | n/a (private API) | LAN endpoint on the MinIO VM | CI evidence bucket `developer-ci-evidence` |
+| OpenShift hub | `*.apps.hub-dc-v6.sub.comptech-lab.com` | served from hub-dc-v6 | Hub Argo, ACM, ApplicationSet |
+| OpenShift spoke | `*.apps.spoke-dc-v6.sub.comptech-lab.com` | served from spoke-dc-v6 | Spoke Argo, tenant workloads |
+
+> Internal-only specifics (IP addresses, private DNS aliases, runner tokens, robot credentials) are kept in `codex-opp-agent/connection-details/`.
+
+## The contracts that hold the chain together
+
+The chain is brittle if any one contract drifts. Five contracts are codified in source-of-truth files:
+
+| Contract | Source | Owns |
+|---|---|---|
+| App-repo overlay layout | `connection-details/app-repo-contract.md` (DEV-OCP-2.1, #182) | `apps/<team>/<app>/{base,overlays}` shape, what CI may modify |
+| Image-tag -> digest convention | `connection-details/image-digest-overlay.md` (#185) | The `images:` block format in every overlay |
+| Build-once / promote-by-digest | `connection-details/promotion-model.md` (#184) | How `dev -> stg -> prd` promotion works |
+| CI evidence schema | `connection-details/ci-evidence-schema.md` (#195) | What keys land in MinIO per build, required vs optional |
+| Image registry allowlist | `connection-details/image-registry-allowlist.md` (#186) | Which registries the spoke accepts at admission |
+
+Drift in any one of them surfaces as a downstream failure that looks unrelated at first glance: an overlay missing `images:` block fails the Jenkins overlay-patch step (#188 symptom: `ERROR: no 'digest: sha256:<64-hex>' line found`); a registry not in the allowlist passes the build and pull but is denied by the VAP (`allowed-image-registries`) at pod create. The pattern is always *the same shape* of failure - the chain's invariants stop holding.
+
+## What the platform deliberately does not do
+
+A few things are not part of application delivery in this lab; they belong to neighbouring sections:
+
+- **Cluster provisioning and tenant guardrails.** Namespaces, AppProjects, quotas, RBAC, NetworkPolicies, ResourceQuota, LimitRange, PodSecurity labels — owned by `openshift-platform-gitops` (Section 5). Tenants do not register their own namespaces.
+- **Secret content delivery.** The build path may know the *name* of a Secret to reference, never its bytes. All app secrets come from Vault via ExternalSecrets (Section 2.4); ConfigMaps and Secret data are not committed.
+- **VM-hosted tools' own configuration.** GitLab, Jenkins, Nexus, HAProxy, PowerDNS, Vault, Trivy, MinIO live under `vm-platform-ops` (Section 3), not in any application repo and not in `openshift-platform-gitops`.
+- **Direct `oc apply` from a build job.** Build paths write Git, not the API server. The only path the API server accepts changes on for tenant workloads is the Argo sync.
+
+## Glossary used in this section
+
+| Term | Meaning |
+|---|---|
+| **App repo** | `divisions/<division>/<repo>` or `divisions/<division>/<division>-apps-monorepo` — the application source. |
+| **App GitOps repo** | `divisions/<division>/<division>-gitops` — the overlay tree Argo reconciles. |
+| **Platform GitOps repo** | `comptech-platform/openshift-ops/openshift-platform-gitops` — cluster desired state. App teams do not have write access. |
+| **Path A** | Jenkins build path on the Jenkins VM + agent. Pushes to Nexus app-registry. |
+| **Path B** | Tekton build path on `spoke-dc-v6` (OpenShift Pipelines). Pushes to Quay (or Nexus fallback). |
+| **Digest patch** | The single-line change in `images:` that updates `digest:` to the new `sha256:...`. |
+| **Overlay** | One subdirectory under `apps/<team>/<app>/overlays/<env>/` (`dev`, `stg`, `prd`). |
+| **AppProject** | Per-tenant Argo CD scoping object — allowed source repos, namespaces, kinds. Authored in `openshift-platform-gitops`. |
+| **ApplicationSet** | The hub-side controller that generates one `Application` per overlay directory. |
+
+## Where to read next
+
+- **The federated GitLab side.** Section 02-federated-gitlab covers the repo layout, role groups, runner classes, and branching conventions that make CI behave consistently across divisions.
+- **The build paths in detail.** Section 03-build-paths walks Path A (Jenkins) and Path B (Tekton) end-to-end with stage tables, decision matrix, and the overlay patch mechanics.
+- **The GitOps consume side.** Section 04-gitops-consume describes how the ApplicationSet, AppProjects, and per-cluster admission policies turn an overlay into a pod.
+- **Tenant onboarding and golden-path samples.** Sections 05 and 06 are the "how do I actually onboard" runbook with copy-paste sample apps.
+
+## References
+
+- `connection-details/gitlab-operator-guide.md` (FG-1 operator handoff, #128)
+- `connection-details/app-repo-contract.md` (#182, DEV-OCP-2.1)
+- `connection-details/image-digest-overlay.md` (#185, DEV-OCP-2.4)
+- `connection-details/promotion-model.md` (#184, DEV-OCP-2.3)
+- `connection-details/build-path-matrix.md` (#194, DEV-OCP-3.6)
+- `connection-details/ci-evidence-schema.md` (#195, DEV-OCP-3.7)
+- `connection-details/image-registry-allowlist.md` (#186, DEV-OCP-2.5)
+- `connection-details/jenkins-ocp-path.md` (#187/#188, DEV-OCP-3A.1/3A.2)
+- `adr/0015-federated-gitops-repo-architecture.md`
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md`
+- `adr/0019-nexus-only-image-supply-chain.md`
+- `adr/0023-federated-gitlab-group-repo-ownership.md`
+- DEV-OCP closed issues under milestone #32 (especially #173, #174, #182-#195)
