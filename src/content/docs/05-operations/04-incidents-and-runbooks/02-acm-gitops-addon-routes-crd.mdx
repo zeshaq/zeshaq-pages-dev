@@ -1,0 +1,152 @@
+---
+title: "ACM gitops-addon Routes CRD breaks /openapi/v2"
+description: "The recurring #153 incident where ACM ships a routes.route.openshift.io CRD on real OpenShift clusters, kube-apiserver /openapi/v2 fails 503, and all Argo CD sync silently stalls."
+sidebar_label: "Routes CRD (#153)"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This is the highest-visibility incident in the lab's GitOps history: a known recurring issue on ACM + OpenShift GitOps pull-model clusters where every Argo CD sync silently stalls with `ComparisonError`, while the cluster itself looks healthy by every other indicator. The fix is one `oc delete crd`. The permanent fix is tracked under #153.
+
+If you arrived here mid-incident with Argo on every spoke stuck on `ComparisonError`, skip to the [Fix](#fix) section. The diagnostic and the recovery together take under two minutes.
+
+## Symptom
+
+What the operator sees:
+
+- **Every Argo CD `Application` on the affected cluster goes `OutOfSync` with `ComparisonError`.** The status condition message is:
+
+  ```text
+  failed to load open api schema while syncing cluster cache:
+  error getting openapi resources:
+  the server is currently unable to handle the request
+  ```
+
+- **No application-side error.** `oc get pods -A` is steady, `oc get co` is clean, `oc get nodes` shows everything `Ready`.
+- **`oc get --raw /openapi/v2` returns `ServiceUnavailable`:**
+
+  ```bash
+  oc get --raw /openapi/v2
+  # Error from server (ServiceUnavailable): the server is currently unable
+  # to handle the request
+  ```
+
+- **`oc get --raw /openapi/v3` works** — this is the diagnostic that pinpoints the cause:
+
+  ```bash
+  oc get --raw /openapi/v3 | head -c 50
+  # {"paths":{".well-known/openid-configuration":...
+  ```
+
+- **The kube-apiserver log shows a `duplicated path` error in the OpenAPI handler:**
+
+  ```bash
+  oc -n openshift-kube-apiserver logs \
+    -c kube-apiserver kube-apiserver-<master> \
+    | grep "OpenAPI handler"
+  # E .... handler.go:160] Error in OpenAPI handler:
+  #   failed to build merge specs:
+  #   unable to merge: duplicated path /apis/route.openshift.io/v1/routes
+  ```
+
+- **The offending CRD is present:**
+
+  ```bash
+  oc get crd routes.route.openshift.io --show-labels
+  # NAME                          ... LABELS
+  # routes.route.openshift.io     ... apps.open-cluster-management.io/gitopsaddon=true
+  ```
+
+The pattern: cluster is healthy, OpenAPI v3 works, OpenAPI v2 returns 503, kube-apiserver log shows `duplicated path` for `routes.route.openshift.io`, and the gitops-addon-labelled CRD exists.
+
+## Root cause
+
+ACM's `gitops-addon` is designed to work on non-OpenShift managed clusters where Argo CD needs to create OpenShift `Route` objects as plain CRDs. To make that work, the addon installs a `routes.route.openshift.io` CRD onto every managed cluster it touches.
+
+On an **actual OpenShift cluster**, that CRD duplicates the aggregated `Route` API that is already served by the `openshift-apiserver`. Two API surfaces declare `/apis/route.openshift.io/v1/routes` — one as a CRD, one as an aggregated APIService.
+
+The OpenAPI v2 compiler in kube-apiserver merges all API surfaces into a single spec. When it encounters the duplicate path it fails the merge with `unable to merge: duplicated path …`. The handler returns 503 for `/openapi/v2` until the cause is removed.
+
+The OpenAPI v3 handler treats overlapping paths differently (per-group documents instead of a single merged spec) and keeps working. That is why the cluster looks healthy from every other angle — only the v2 endpoint is dead.
+
+**Argo CD uses `/openapi/v2`.** That is why every Argo sync attempt stalls with `ComparisonError` on the OpenAPI load step. The cluster cache cannot be built; the diff cannot be computed; the sync cannot run.
+
+Existing `Route` objects survive throughout. They are stored against the aggregated APIService, not the CRD. `oc get routes -A` works normally during the entire incident. The only symptom is the v2 endpoint being unavailable.
+
+The CRD's origin is the gitops-addon `ManifestWork` that the hub places on each managed cluster. The addon's reconciler can recreate the CRD after a deletion if it has not been suppressed.
+
+## Fix
+
+The recovery is one command:
+
+```bash
+oc delete crd routes.route.openshift.io
+```
+
+That is the whole fix. Once the CRD is gone, the kube-apiserver OpenAPI v2 handler stops failing the merge and `/openapi/v2` recovers within seconds. Argo CD's next sync attempt succeeds.
+
+Validation, in order:
+
+```bash
+# v2 recovers (this should now return a JSON spec, not an error):
+oc get --raw /openapi/v2 | head -c 50
+# {"swagger":"2.0",...
+
+# Existing Routes survived (this should still work):
+oc get routes -A | head
+
+# Argo apps recover:
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+oc --kubeconfig "$K" -n openshift-gitops get applications.argoproj.io
+# Every Application should be Synced/Healthy (may need a "Refresh" click in
+# the UI or a one-shot `oc patch ... --type merge -p '{"operation":{"sync":{}}}'`
+# to break a cached error state).
+```
+
+If multiple managed clusters are affected, run the delete on each. The blast radius of `oc delete crd routes.route.openshift.io` is bounded: it removes the CRD only, leaves Route objects intact (because they live behind the APIService), and does not change cluster-wide state.
+
+## Prevention
+
+The permanent fix is tracked under issue #153 (INC-ROUTES-CRD-1). Two layers of prevention apply.
+
+### Periodic guard
+
+A simple cluster-side check, run as part of any cluster-health sweep, catches a recreated CRD before Argo silently stalls again:
+
+```bash
+oc get crd routes.route.openshift.io --no-headers 2>&1 \
+  | grep -v 'NotFound\|not found' \
+  && echo "ROUTES_CRD_PRESENT - DELETE IT"
+```
+
+The check returns silently when the CRD is absent (the expected state on an OpenShift cluster) and emits the loud `ROUTES_CRD_PRESENT - DELETE IT` line when the CRD has been recreated. Add it to the every-session warm-up checklist in [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff) under "cluster health snapshot".
+
+### Architectural fix
+
+Two paths are open under #153:
+
+- **Upstream patch to gitops-addon** so it does not install the Route CRD on managed clusters that are OpenShift (i.e., that already have the aggregated APIService). The detection is `oc get apiservice v1.route.openshift.io` — if it exists, the addon should not install the CRD.
+- **Hub-side ManifestWork override** that explicitly deletes the addon-installed CRD on every spoke after the addon places it. This is a workaround, not a fix; it produces noisy reconciliation but is in-our-control.
+
+The permanent fix is not yet merged as of 2026-05-10. Until then, the recurring nature of the incident is the prevention: periodic check + one-line delete.
+
+### Same-class CRDs to watch for
+
+The same architectural pattern (`duplicated path` between an aggregated APIService and a CRD) could affect other ACM-shipped CRDs that duplicate built-in OpenShift APIs. If `/openapi/v2` fails again with a *different* `duplicated path`, the recipe is the same — find the duplicating CRD via the kube-apiserver log message and `oc delete crd <name>`.
+
+Known candidates (none observed yet, listed for vigilance):
+
+- `images.image.openshift.io`
+- `projects.project.openshift.io`
+- `users.user.openshift.io`
+
+If you observe one of these, open an incident issue, document the symptom and the offending CRD, and add it to this list.
+
+## References
+
+- Memory: `project_acm_gitops_addon_routes_crd.md` (the source incident note)
+- Issue: #153 (INC-ROUTES-CRD-1 — permanent fix tracker)
+- Issue: #152 (BACKUP-1 — context where the issue surfaced)
+- MR: `!8` on `openshift-platform-gitops` (the MR whose sync surfaced this)
+- ADR: `0018-acm-openshift-gitops-pull-model-v6` (the pull-model design)
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"Known Gotchas From This Rebuild"

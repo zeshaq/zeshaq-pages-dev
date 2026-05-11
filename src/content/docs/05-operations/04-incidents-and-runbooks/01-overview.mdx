@@ -1,0 +1,109 @@
+---
+title: "Incidents and runbooks — overview"
+description: "How incident response works on the fleet: the loop from alert to postmortem, the seven incident classes the lab has paid for, and how to use this section under pressure."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const opsBox  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const incBox  = { background: "#fee2e2", border: "1px solid #b91c1c", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const incEdge  = { style: { stroke: "#b91c1c", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const incNodes = [
+  { id: "detect",     position: { x: 0,   y: 0   }, data: { label: "Detect\n(alert / drift / user report)" }, style: incBox },
+  { id: "triage",     position: { x: 240, y: 0   }, data: { label: "Triage\n(symptom -> runbook)" }, style: incBox },
+  { id: "fix",        position: { x: 480, y: 0   }, data: { label: "Fix\n(GitOps MR or break-glass)" }, style: opsBox },
+  { id: "validate",   position: { x: 720, y: 0   }, data: { label: "Validate\n(Argo Synced/Healthy)" }, style: agentBox },
+  { id: "postmortem", position: { x: 480, y: 150 }, data: { label: "Postmortem\n(session report)" }, style: dataBox },
+  { id: "runbook",    position: { x: 240, y: 150 }, data: { label: "Runbook\nupdate" }, style: dataBox },
+  { id: "memory",     position: { x: 0,   y: 150 }, data: { label: "Memory entry\n(project_*.md)" }, style: dataBox },
+];
+
+export const incEdges = [
+  { id: "f1", source: "detect",     target: "triage",     label: "open issue", ...incEdge },
+  { id: "f2", source: "triage",     target: "fix",        label: "match -> apply", ...incEdge },
+  { id: "f3", source: "fix",        target: "validate",   label: "watch Argo", ...reqEdge },
+  { id: "f4", source: "validate",   target: "postmortem", label: "close issue", ...muted },
+  { id: "f5", source: "postmortem", target: "runbook",    label: "land lesson", ...muted },
+  { id: "f6", source: "postmortem", target: "memory",     label: "preserve in memory", ...muted },
+];
+
+This subsection is the operator's incident library. Seven incidents have been documented in detail because the lab has paid for each at least once. Reading them ahead of time is the cheapest insurance the fleet has.
+
+Every runbook follows the same five-section schema, mandated by the section tracker (#229) and by the workspace's runbook convention:
+
+| Section | What it answers |
+|---|---|
+| **Symptom** | What does the operator see? What does the alert / log line / `oc` output look like? |
+| **Root cause** | Why does this happen? What is the underlying contract that broke? |
+| **Fix** | Concrete commands — copy-paste-able — to recover the fleet. |
+| **Prevention** | What guardrail, alert, or design change reduces the chance of recurrence? |
+| **References** | The runbook file, ADRs, memory entries, and incident issues that back the page. |
+
+## The incident loop
+
+<Whiteboard client:load data={{ nodes: incNodes, edges: incEdges }} height={400} />
+
+The loop runs left to right and bottom-up:
+
+1. **Detect.** An alert fires, a `kustomize` builds fail, Argo CD shows `ComparisonError`, a user reports a 404. Open an incident issue on `zeshaq/codex-opp-agent` with the label `incident` and the cluster name.
+2. **Triage.** Match the symptom to one of the runbooks below. The diagnostic is usually a single read-only command (e.g., `oc get --raw /openapi/v2` for the Routes CRD incident).
+3. **Fix.** Most fixes are GitOps changes. Some — node cordons, a CRD delete to recover `/openapi/v2`, a stuck-node `desiredConfig` patch — are break-glass actions per ADR 0025 and produce an audit record.
+4. **Validate.** Argo CD returns to `Synced / Healthy` (or the incident-specific success indicator). Update the issue with validation evidence.
+5. **Postmortem.** Write a dated session report under `codex-opp-agent/reports/sessions/`. If the lesson is durable, update the relevant runbook, write a memory entry under `~/.claude/projects/-home-ze-claude-agent/memory/project_*.md`, and (if architectural) open an ADR amendment review issue.
+
+## The seven incident classes
+
+| # | Page | Class | Severity |
+|---|---|---|---|
+| 02 | [ACM gitops-addon Routes CRD](/docs/05-operations/04-incidents-and-runbooks/02-acm-gitops-addon-routes-crd) | All Argo sync silently stalls; recurring on ACM + OpenShift GitOps pull model clusters | High — fleet-wide GitOps pause |
+| 03 | [ESO egress blocked to Vault](/docs/05-operations/04-incidents-and-runbooks/03-eso-egress-to-vault) | Red Hat ESO ships default-deny NetworkPolicies; ClusterSecretStore hangs | Medium — affects secret delivery |
+| 04 | [IPv6 disable breaks OVN-K](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) | "Disable IPv6 at host" MachineConfig variants both break OVN-K; nodes go `Ready=False` | Critical — cluster network down |
+| 05 | [OBC -> operand storage-Secret bridge](/docs/05-operations/04-incidents-and-runbooks/05-obc-operand-secret-bridge) | NooBaa OBC Secret key shape doesn't match LokiStack/TempoStack expectation | Medium — observability stack stuck `Warning Degraded` |
+| 06 | [SigNoz v0.122 auth API shape](/docs/05-operations/04-incidents-and-runbooks/06-signoz-v0122-auth) | v0.121 -> v0.122 login API moved; old code silently fails | Low — affects automation, not user UI |
+| 07 | [WSO2 APIM JMS URL encoding](/docs/05-operations/04-incidents-and-runbooks/07-wso2-apim-jms-url-encoding) | HTML-escaped `&amp;` in JMS URL where `%26` is required; published APIs don't reach gateway | Medium — silent app-publish failure |
+
+The seventh slot in the brief is the [MCO stuck-node recovery](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) — captured as the procedural companion under the IPv6 page because the two incidents are intertwined (the stuck-node recovery is what unblocks the IPv6 rollback).
+
+## How to use this section under pressure
+
+- **At 3 AM, start at the symptom table** at the top of each runbook. Each page leads with "When this runbook applies" — match your situation against the bullets. If your situation does not match, do not force-fit.
+- **Capture before-state first.** Every fix that involves a live mutation requires a `before-<kind>-<name>.yaml` capture per the [break-glass procedure](/docs/05-operations/06-on-call-and-escalation). The capture is the audit record.
+- **Make the smallest change.** A single `oc delete crd` is preferable to a `oc apply -k` of the whole cluster overlay. Argo will own the resource going forward; you are unblocking, not reconfiguring.
+- **Walk the validation block.** Each runbook ends with a "Validation" or "When this is resolved" block. Run every command in it. Do not declare done because the symptom went away — the symptom going away can be a side effect.
+
+## How runbook entries land here
+
+A runbook becomes a published page when *all* of the following are true:
+
+- The incident has occurred at least once in the lab with a recorded session-report or GitHub-issue post-mortem.
+- The fix has been validated in production by walking the documented commands.
+- A future operator (or the same operator, six months from now) could follow it without re-deriving the recipe.
+
+If you experience an incident that does not fit one of the seven below, open an incident issue, write the postmortem, then propose a new runbook MR against this site and a parallel runbook under `codex-opp-agent/runbooks/`. The same lesson lives in two places: the operator-facing runbook (procedure under pressure) and this section's published page (the public-facing summary).
+
+## What is *not* in this section
+
+- **Generic OpenShift troubleshooting.** This section covers incident classes that the lab has specifically paid for. For generic CrashLoopBackOff / ImagePullBackOff / PodSchedulingFailed troubleshooting, the OpenShift docs and the cluster's Events stream are the right entry points.
+- **Application-side incidents.** Workload-specific incidents (CNPG primary failover, Open Liberty health-check fail) belong in the application's own runbook surface under `developer-handbook/`, not here.
+- **Compliance scan failures.** These have their own audit / remediation cycle under `connection-details/compliance-implementor-handbook.md` — they are operator-followed but not incident-shaped.
+
+## References
+
+- `codex-opp-agent/runbooks/break-glass-procedure.md` — overall break-glass policy
+- `codex-opp-agent/runbooks/mco-stuck-node-recovery.md`
+- `codex-opp-agent/runbooks/openshift-ipv6-disable-correct-approach.md`
+- `codex-opp-agent/runbooks/wso2-apim-jms-url-encoding-trap.md`
+- `codex-opp-agent/runbooks/secrets-custody-drift-check.md`
+- `codex-opp-agent/runbooks/jenkins-gitlab-webhook-pollscm.md`
+- Memory entries: `project_acm_gitops_addon_routes_crd`, `project_eso_egress_to_vault`, `project_obc_to_operand_secret_bridge`
+- ADRs: 0018 (pull model), 0019 (image supply), 0025 (break-glass)
+- Issues: #135 (IPv6/OVN incident), #142 (MCO runbook), #153 (Routes CRD permanent fix), #229 (this section)
