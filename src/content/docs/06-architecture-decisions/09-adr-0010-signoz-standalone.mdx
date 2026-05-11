@@ -1,8 +1,113 @@
 ---
-title: "ADR 0010 — SigNoz Standalone"
-description: "Section 06-architecture-decisions: ADR 0010 — SigNoz Standalone (placeholder)."
-sidebar_label: "ADR 0010 — SigNoz Standalone"
+title: "ADR 0010 — SigNoz standalone VM observability"
+description: "Self-hosted SigNoz v0.122.0 on a single Ubuntu VM via Docker Compose; UI behind HAProxy, OTLP ingestion private until source-restricted auth is recorded."
+sidebar_label: "0010 — SigNoz standalone VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-08
+**Status:** Accepted; implemented 2026-05-08 (live on the VM, milestone #17 closed).
+
+## Context
+
+SigNoz existed in historical RKE2 / OpenShift planning and workload manifests, but that state is **not** the active target for the v6 rebuild. The operator has explicitly reintroduced SigNoz as a **standalone Ubuntu cloud-init VM service**, exposed through the usual PowerDNS / HAProxy edge pattern ([ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)).
+
+This workspace is OpenShift-only by default, but external observability systems are in scope when they directly support OpenShift core operations. SigNoz is accepted as an **OpenShift-facing observability support service** for traces, metrics, logs, smoke telemetry, and operational dashboards. It is not a general application-catalogue entry. The lab also runs a parallel learning-stack VM ([ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)) so the team can compare a product-bundle approach (SigNoz) against a component-built approach (Grafana/Prom/Loki/Tempo).
+
+The official SigNoz self-host Docker documentation was checked on 2026-05-08: it supports Linux/Ubuntu installs through an install script or Docker Compose and requires host access to UI port `8080` and OTLP ports `4317` (gRPC) and `4318` (HTTP). The lab uses Docker Compose specifically (not the install script) so the operator can pin the version and read each container's config in plain Compose YAML.
+
+## Decision
+
+Deploy SigNoz as **one standalone Ubuntu 24.04 cloud-init VM** on `br30`.
+
+| Property | Value |
+|---|---|
+| VM name | `signoz-0` |
+| Private DNS | `signoz-0.sub.comptech-lab.com` (private IP and MAC kept in `connection-details/signoz.md`) |
+| Public edge DNS | `signoz.apps.sub.comptech-lab.com` |
+| Public edge TLS | existing Let's Encrypt wildcard for `*.apps.sub.comptech-lab.com` |
+| Runtime | self-hosted SigNoz via Docker Engine + Docker Compose |
+| Version pin | SigNoz `v0.122.0` |
+| OS image | `/var/lib/libvirt/images/ubuntu-24.04-base.qcow2` |
+| Admin username | `zahid` (lab convention) |
+| Credential custody | `secrets/signoz-vm/` (local-only, ignored) |
+
+This is **not** an OpenShift-hosted SigNoz deployment and it does not reactivate the old RKE2 / OpenShift SigNoz manifests as desired state.
+
+### Edge exposure
+
+Expose the SigNoz UI through PowerDNS + HAProxy:
+
+- `signoz.apps.sub.comptech-lab.com` → HAProxy public apps address → SigNoz UI on the VM (port `8080`).
+- HAProxy terminates TLS on the existing wildcard certificate.
+
+### Telemetry ingestion
+
+Telemetry ingestion starts **private and source-restricted**:
+
+- OTLP/gRPC: `signoz-0.sub.comptech-lab.com:4317` — private only.
+- OTLP/HTTP: `signoz-0.sub.comptech-lab.com:4318` — private only.
+
+If OTLP ingestion needs to be exposed through HAProxy/TLS later, it must use explicit hostnames and source restrictions. **Do not rely on a broad wildcard or unauthenticated public ingestion path.** A SigNoz endpoint open to the internet without auth is an immediate denial-of-service amplifier.
+
+### Admin convention
+
+The lab admin username is `zahid` per workspace convention. The default password is stored in **local-only ignored secret custody** under `secrets/signoz-vm/` and must not be copied into Git, GitHub, wiki pages, session reports, command output, or chat. SigNoz `v0.122.0` enforces a 12-character root-user password policy, so the deployed local-custody value is SigNoz-compliant while keeping the requested `zahid` convention.
+
+### Implementation status
+
+Implemented on 2026-05-08:
+
+- `signoz-0` is live on the lab.
+- PowerDNS records applied for the direct VM and edge hostnames.
+- HAProxy routes the UI/API hostname to the VM through the wildcard certificate.
+- OTLP/gRPC `4317` and OTLP/HTTP `4318` remain private on the VM.
+- GitHub milestone #17 and phase issues #27–#32 are closed.
+
+## Alternatives considered
+
+**OpenShift cluster-monitoring stack + external Grafana.** Use OCP's own user-workload monitoring + a Thanos receiver. Attractive because everything is "OpenShift native." Rejected because:
+
+- The lab wants to learn the OTel/SigNoz product-bundle path, not stay inside the OpenShift monitoring operator.
+- Cluster-monitoring is in scope for *cluster* observability (which is separate). SigNoz covers application traces and the cross-service view.
+
+**SigNoz on OpenShift via the SigNoz Helm chart.** Possible but adds the disconnected-mirror / operator-subscription complexity for a product that doesn't need to be in-cluster. Rejected for the same reasons VM Jenkins and VM Redis were preferred over their OpenShift versions — the operator wants to minimize "things on OpenShift" for the v6 rebuild while learning the products.
+
+**Skip SigNoz, use only the component-based monitoring VM ([ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)).** Rejected because the operator wants both — SigNoz for product-bundle experience, Grafana/Prom/Loki/Tempo as a learning stack. The duplication is intentional.
+
+**Use a SaaS observability provider (Datadog, New Relic, Honeycomb).** Rejected because the lab is on-premises and intentionally disconnected; sending telemetry to a SaaS would be an outbound dependency the lab doesn't accept.
+
+## Phase gates
+
+1. **Scope and milestone.** Accept this ADR. Create the SigNoz GitHub milestone and phase issues. Record proposed VM allocation and endpoint names.
+2. **Prerequisite validation.** Confirm `br30`, Ubuntu base image, SSH keys, DNS resolver, available IP/MAC, PowerDNS, HAProxy, outbound install access (apt + Docker images via the lab Nexus apt-proxy and Docker proxy), and storage capacity. Reconfirm the SigNoz install method and ports.
+3. **VM plan and secret custody.** Prepare cloud-init and provisioning inputs. Define OS/data disk sizes for Docker and ClickHouse data. Create local-only admin credential custody under `secrets/signoz-vm/` without printing values.
+4. **VM provisioning.** Create the Ubuntu VM. Validate cloud-init completion, SSH access, resolver config, host firewall baseline.
+5. **SigNoz installation.** Install Docker Engine + Docker Compose. Install SigNoz `v0.122.0`. Validate containers, UI health, OTLP receiver reachability.
+6. **Edge exposure and telemetry contracts.** Add / validate PowerDNS records. Add narrow HAProxy routing for the UI. Decide whether OTLP remains private-only or receives explicit HAProxy/TLS routes. Record OpenShift collector / exporter contracts for `hub-dc-v6` and `spoke-dc-v6` once those clusters are ready.
+7. **Handoff validation.** Validate UI login reachability without recording credentials. Send smoke traces, metrics, logs from an approved private source. Record retention, restart behavior, backup expectations, and residual production-readiness risks.
+
+## Guardrails
+
+- Keep SigNoz separate from the OpenShift rebuild, Kafka/KRaft, Vault OSS, Redis/Sentinel, WSO2, and Jenkins milestones.
+- Do not modify live OpenShift clusters or GitOps desired state as part of the first VM installation.
+- Do not use the retired RKE2 SigNoz app manifests as target state. They may be read only for lessons.
+- Do not store SigNoz admin passwords, generated keys, ClickHouse passwords, auth headers, API keys, or future ingestion tokens in Git or GitHub.
+- Keep HAProxy / PDNS changes narrowly scoped to SigNoz hostnames.
+- Keep telemetry ingestion private until TLS, auth, source allowlists, and OpenShift collector contracts are explicitly recorded.
+- Treat the first VM deployment as lab/bootstrap readiness, not production observability readiness.
+
+## Consequences
+
+- **SigNoz can be rebuilt independently of old RKE2 and OpenShift-hosted observability experiments.** Hostnames, VM names, and version pins are new.
+- **OpenShift workloads can later consume a stable external OTLP endpoint**, but only after source restrictions and collector contracts are recorded.
+- **The first deployment is lab/bootstrap-oriented.** Production observability readiness still requires: TLS/auth decisions for ingestion, backup/restore posture for ClickHouse data (the biggest data store SigNoz holds), retention policy, monitoring of SigNoz itself (Prometheus scrape from the monitoring VM), restart drills, and upgrade rehearsal.
+
+## References
+
+- Source: `codex-opp-agent/adr/0010-signoz-standalone-vm-observability.md`
+- Sister VM: [ADR 0012 — Monitoring VM](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)
+- Edge wiring rules: [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
+- SigNoz operator notes: `codex-opp-agent/connection-details/signoz.md`
+- GitHub milestone: `zeshaq/codex-opp-agent` #17

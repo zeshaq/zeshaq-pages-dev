@@ -1,8 +1,115 @@
 ---
-title: "ADR 0013 — DefectDojo"
-description: "Section 06-architecture-decisions: ADR 0013 — DefectDojo (placeholder)."
-sidebar_label: "ADR 0013 — DefectDojo"
+title: "ADR 0013 — DefectDojo VM security dashboard"
+description: "DefectDojo 2.58.1 Docker Compose on one standalone Ubuntu VM, replacing the stale RKE2 backend; imports Trivy scan results via API and becomes the lab vulnerability-management surface."
+sidebar_label: "0013 — DefectDojo"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-08
+**Status:** Accepted.
+
+## Context
+
+The operator asked to add DefectDojo after confirming that **Trivy itself does not provide a vulnerability-management dashboard.** Trivy is a scanner; the lab needed an aggregator where scan results across CI jobs, OpenShift admission, image registries, and VM scans accumulate, get triaged, and feed compliance evidence.
+
+This workspace remains **OpenShift-first**, so DefectDojo is accepted only as a supporting **AppSec and vulnerability-management surface** for OpenShift, GitOps, CI, image scanning, and VM security evidence. It is not a general application-catalogue entry.
+
+Historical RKE2 DefectDojo material exists in old GitOps paths, and HAProxy still had a stale `defectdojo.apps.sub.comptech-lab.com` backend pointing at the old RKE2 ingress. That path returned 503 and is not the active target. The new VM-backed deployment supersedes it.
+
+The official DefectDojo open-source documentation was checked on 2026-05-08. Key facts:
+
+- For Open Source, **Docker Compose** is the recommended deployment path.
+- **Debian AMD64** is the supported/tested image variant.
+- The project **explicitly warns** that the stock `docker-compose.yml` is not production-ready without customization (default secrets, default `ALLOWED_HOSTS`, no external URL).
+
+## Decision
+
+Deploy DefectDojo as **one standalone Ubuntu 24.04 cloud-init VM** on `br30`.
+
+| Property | Value |
+|---|---|
+| VM name | `defectdojo-0` |
+| Private DNS | `defectdojo-0.sub.comptech-lab.com`, `defectdojo.sub.comptech-lab.com` |
+| Public edge DNS | `defectdojo.apps.sub.comptech-lab.com` |
+| Public edge TLS | existing Let's Encrypt wildcard for `*.apps.sub.comptech-lab.com` |
+| Runtime | pinned DefectDojo Open Source Docker Compose release `2.58.1` under `/opt/defectdojo` |
+| Image variant | upstream Debian AMD64 |
+| Data path | Docker volumes on a dedicated disk mounted at `/var/lib/docker` |
+| Admin username | `zahid` |
+| Admin / API custody | `secrets/defectdojo-vm/auth.env` (local-only, ignored) |
+
+### Edge wiring
+
+- HAProxy backend: host-specific route to the VM port `8080`.
+- **Replace the stale `defectdojo-rke2-be` host route with a VM backend.** Don't leave the old backend with a different name pointing nowhere; delete it so a stale match doesn't shadow the new one.
+
+### Bootstrap settings that must override defaults
+
+The DefectDojo install ships with **insecure defaults**. The bootstrap must override:
+
+- `DD_SECRET_KEY` (Django secret key — used to sign session cookies)
+- `DD_CREDENTIAL_AES_256_KEY` (used to encrypt stored credentials inside DefectDojo)
+- Database password
+- Admin password
+- JIRA webhook secret (if JIRA integration is enabled)
+- External site URL (`DD_SITE_URL`)
+- `ALLOWED_HOSTS`
+- `CSRF_TRUSTED_ORIGINS`
+- Proxy / TLS cookie settings (`DD_SECURE_PROXY_SSL_HEADER`, `DD_SESSION_COOKIE_SECURE`, `DD_CSRF_COOKIE_SECURE`)
+
+**Do not print or commit any generated values.** Custody is `secrets/defectdojo-vm/auth.env` on the operator workstation.
+
+### API token
+
+DefectDojo's REST API is how CI integrates: Jenkins / GitLab CI / Tekton calls the API to upload Trivy scan results. The lab creates a stable API token for `zahid`, stores it in the same local-only secret file, and references it by name in CI job credentials (never in plain text).
+
+## Alternatives considered
+
+**Redeploy DefectDojo on OpenShift.** The historical RKE2 path with an OpenShift twist. Rejected because:
+
+- The storage-light hub ([ADR 0004](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs)) and pending ODF readiness on the workload cluster mean DefectDojo's database PVC would be a non-trivial OpenShift dependency.
+- Docker Compose is the project's recommended OSS deployment; a VM Compose deployment is simpler to back up (file-system snapshot of `/var/lib/docker` to MinIO).
+- The lab is intentionally limiting "things on OpenShift" for the v6 rebuild — the [storage-light hub policy](/docs/06-architecture-decisions/04-adr-0004-management-only-hubs) and the VM-first pattern for Jenkins, SigNoz, monitoring, Redis, Kafka, etc., apply here too.
+
+**Use Trivy operator + OpenShift native reporting alone.** Trivy operator emits findings to CRDs that you can query. Rejected because that's not a usable triage surface for humans — there's no UI, no findings lifecycle, no compliance grouping, no JIRA/ticket integration. Trivy operator may still appear inside OpenShift; its findings flow into DefectDojo via API for triage.
+
+**Use a SaaS AppSec dashboard (Snyk, Mend.io).** Rejected because the lab is on-premises and intentionally disconnected. Outbound dependency unacceptable for scan evidence.
+
+**Use the OSS Docker Compose `docker-compose.yml` as-shipped.** Explicitly forbidden by the DefectDojo docs ("not production-ready without customization"). The default secrets, default `ALLOWED_HOSTS`, and missing site URL would all fail edge access and leak the secret key.
+
+## Phase gates
+
+1. **Scope and milestone.** Accept this ADR. Create the GitHub milestone (#21) and phase issues. Record proposed VM allocation and endpoint names.
+2. **Prerequisite validation.** Confirm `br30`, Ubuntu base image, SSH keys, DNS resolver, available IP/MAC, Docker/Compose prerequisites, storage capacity, stale HAProxy state, and supported upstream installation mode.
+3. **VM plan and secret custody.** Prepare cloud-init inputs. Define OS / data disk sizing for `/var/lib/docker`. Create local-only admin / API / Django / AES / database custody under `secrets/defectdojo-vm/`.
+4. **VM provisioning.** Create the VM. Validate cloud-init completion, SSH, resolver, Docker availability, host firewall baseline.
+5. **DefectDojo installation.** Install pinned DefectDojo Open Source Docker Compose release. Override upstream default secrets and external URL settings. Ensure `zahid` is a superuser and create a stable API token. Validate local login and authenticated API access.
+6. **Edge exposure.** Add PowerDNS records for direct VM, private alias, and edge hostnames. Replace stale HAProxy RKE2 routing with `defectdojo-vm-be`. Validate HTTPS edge login, API access, public-IP route, backend health, and wildcard certificate.
+7. **Import and handoff validation.** Import a small Trivy-format smoke report through the API. Validate service restart behavior and Docker Compose state. Record residual risks and next work (Trivy/Jenkins/OpenShift integration, backup/restore, retention, monitoring, upgrade cadence).
+
+## Guardrails
+
+- Do not reactivate the old RKE2 DefectDojo Argo app as target state.
+- Keep this separate from OpenShift rebuild, Kafka, Vault, Redis, WSO2, Jenkins, SigNoz, Trivy, and generic monitoring tracks.
+- Keep HAProxy and PowerDNS changes narrowly scoped to DefectDojo hostnames.
+- Store all admin / API / database / Django / AES keys only under ignored local custody and on the VM as root-owned files.
+- Do not print API tokens, admin passwords, database passwords, Django signing keys, AES keys, kubeconfigs, pull secrets, PAT values, or scan-target credentials.
+- Treat imported scan reports as potentially sensitive evidence. Do not store raw scan reports in Git unless explicitly scrubbed.
+- Treat the first VM as lab-operational, not production-complete, until backup, isolated restore, upgrade rehearsal, retention, import contracts, and monitoring alerts are recorded and tested.
+
+## Consequences
+
+- **DefectDojo becomes the lab dashboard for vulnerability findings and scan evidence** while Trivy remains the scanner / server.
+- **The old broken RKE2 DefectDojo host route is intentionally superseded** by a VM-backed endpoint. The stale `defectdojo-rke2-be` HAProxy backend is removed.
+- **Future OpenShift and CI integration must use explicit API-token custody** and import contracts rather than ad-hoc report uploads. Each pipeline records which findings batch it owns and which it doesn't.
+- **The DefectDojo VM is also the obvious destination for RHACS scan evidence** when RHACS produces findings that need cross-pipeline triage; that integration is a follow-up phase.
+- **Backup posture is the next gate.** Docker volumes back up to MinIO via a snapshot script; isolated-restore drill must pass before the lab claims "DefectDojo is durable."
+
+## References
+
+- Source: `codex-opp-agent/adr/0013-defectdojo-vm-security-dashboard.md`
+- Trivy scanner ADR: `codex-opp-agent/adr/0011-trivy-ubuntu-vm-scanner.md`
+- Edge wiring rules: [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
+- RHACS integration context: `codex-opp-agent/connection-details/rhacs-app-policy.md`
+- GitHub milestone: `zeshaq/codex-opp-agent` #21
