@@ -1,232 +1,203 @@
 ---
-title: "Brac POC — OpenShift-native delivery plan"
-sidebar_label: "Plan (OpenShift)"
-description: "Strategy, scope, per-section delivery, sequencing, and demo flow for the BRAC Bank POC. Everything runs on OpenShift; no docker-compose, no Docker-runtime VMs."
+title: "Brac POC — consolidated demo plan"
+sidebar_label: "Demo plan"
+description: "Single consolidated demo plan for BRAC Bank — merged requirements from the original 9-section email and the v2 demo-scope PDF, with delivery, sequencing, and the live demo flow."
 last_reviewed: 2026-05-11
 draft: false
 ---
 
-This is the working plan for the BRAC Bank POC. **The POC is delivered entirely on OpenShift.** Every workload — including the ones our internal dc-lab currently runs on plain VMs (Jenkins, Nexus, SigNoz, Kafka, Redis, WSO2) — is redeployed OpenShift-native for this engagement. No docker-runtime, no docker-compose, no plain-VM services in the POC plane.
+This page consolidates the two BRAC source documents into one plan: the requirements, the architecture, what we reuse vs build, the per-item delivery, the phase sequencing, and the live demo flow.
 
-## Why OpenShift-only
+**Operating principle:**
 
-- The customer's evaluation explicitly anchors on OpenShift (Section 1 of the [requirements email](./requirements-email)). Showing the rest of the stack OpenShift-native makes the POC cohere as one platform story rather than a mosaic of provisioning paths.
-- It removes a class of objection ("why is Kafka on a VM if you're an OpenShift shop?") and lets us demonstrate one set of operating patterns — Operators, CRs, namespaces, NetworkPolicies, Vault/ESO, GitOps — across every product.
-- It limits the failure surface during evaluation. One control plane to demo, one log pipeline to inspect, one RBAC story to defend.
+- **Demo apps run on OpenShift** (spoke-dc-v6). Not on the `docker-runtime-vm` we built earlier for the broader app-dev path.
+- **dc-lab platform VMs are reused as-is.** SigNoz, DefectDojo, Kafka KRaft, Redis Sentinel, WSO2 APIM/IS, Jenkins, GitLab, Nexus, Trivy — no Helm/operator rebuild of services that already run on lab VMs.
+- **New work is OCP-side**: the demo apps + Service Mesh + OTel collector + integration glue (ESO bindings, Routes, NetworkPolicies, mesh canary, the few new operators).
+
+The two source documents (preserved verbatim for the audit trail):
+
+- [Requirements email](./requirements-email) — the 9-section tender qualifying scope.
+- v2 Demo-Scope PDF (received 2026-05-11) — 8-item live-demo subset, adds Service Mesh + mesh canary, includes the MFE/BFF reference architecture image.
+
+## Merged requirements
+
+The union of both documents, deduplicated, priority-ordered for the live demo. Live-demo priorities come from the v2 PDF; the rest are tender-qualifying scope from the original email.
+
+| # | Component | Source | Priority |
+|---|---|---|---|
+| 1 | **API Gateway** (WSO2 APIM, distributed CP/DP split, HA, external DBs, policies, IS as Identity Key Manager) | both | Demo |
+| 2 | **IAM** (WSO2 IS, SAML + OIDC SSO, Identity Federation, hardening) | both | Demo |
+| 3 | **Service Mesh + mTLS** ("Comply MTLS" — strict mTLS between services) | v2 PDF only — NEW | Demo |
+| 4 | **Canary deployment via service mesh** (replaces the original email's NGINX header-canary) | v2 PDF (replaces email §8) | Demo |
+| 5 | **Observability + Kafka (HIGH PRIORITY)** — OTel SDK + non-SDK, OTel→Kafka→SigNoz, trace sampling + log filtering + metrics routing, ClickHouse hot/cold, 4 dashboards (app perf, .NET runtime, system, tracing) | both | Demo (HIGH) |
+| 6 | **Redis HA** (Sentinel topology, hard-kill failover with mock client reconnect — email says "on OpenShift Platform") | both | Demo |
+| 7 | **SigNoz** (the existing observability backend; explicitly named in v2) | both | Demo |
+| 8 | **Nexus OSS** (multi-format repos — Maven, PyPI, npm, Docker — three-endpoint split with HA + Backup) | both | Demo |
+| 9 | **MFE Router + BFF Router + layered TLS** (per the v2 architecture diagram: User → MFE Router → WSO2 API GW → BFF Router → Mesh → Identity → Product, with two TLS-terminate hops) | v2 PDF only — NEW | Demo (architectural) |
+| 10 | **Open Liberty demo workloads** (in-mesh services with MicroProfile health + metrics) | email §8 (NGINX canary removed, mesh canary replaces) | Demo |
+| 11 | OpenShift Platform foundation (Terraform 3-node cluster, ODF Block + Object) | email §1 | Tender |
+| 12 | Compliance Operator + PCI-DSS scan + remediation report | email §1 | Tender |
+| 13 | RHACS Critical-vuln deployment-block policy | email §1 | Tender |
+| 14 | Prometheus/Grafana custom alerts + Loki log forwarding (System + Infrastructure + Audit to external) | email §1 | Tender |
+| 15 | Trivy SCA + SBOM single dashboard | email §5 | Tender |
+| 16 | GitLab + Jenkins + ArgoCD chain (HA + DC-DR, monorepo conditional builds, hybrid CD) | email §4 | Tender |
+| 17 | Kafka Schema Registry + Connect + DLQ (the Kafka cluster itself is item 5) | email §7 | Tender |
+| 18 | JBoss EAP managed domain | email §9 | Tender |
+
+Original email also mentions **"Support Service for 13 Products"** but the PDF is truncated at section 9 — sections 10-13 are not captured. Open question to BRAC.
+
+## Architecture (consolidated)
+
+The v2 PDF's reference image translated to OCP + dc-lab terms:
+
+```
+User
+  │ HTTPS (TLS terminate #1 — OCP Route + cert-manager)
+  ▼
+MFE Router               ───┐
+  │ HTTP                    │ in `brac-demo-frontend`
+  ▼                         │ namespace on spoke-dc-v6
+WSO2 API GW              ───┘
+  │ HTTPS (TLS terminate #2 — existing WSO2 VM, lab CA)
+  ▼
+BFF Router               ───┐
+  │ HTTP                    │ in `brac-demo-frontend`
+  ▼                         │ (mesh sidecar attached)
+Mesh boundary ─────┐        │
+  │ mTLS strict    │        │
+  ▼                │        │
+Identity ◀────── WSO2 IAM (lateral, token introspection / authz callout — existing WSO2 IS VM)
+  │ mTLS           │
+  ▼                │
+Product            │
+  │                │
+  └─[mesh observability sidecars → OTel Collector → existing Kafka VMs → existing SigNoz VM + ClickHouse]
+```
+
+Pieces and their hosts:
+
+| Layer | Component | Host |
+|---|---|---|
+| Edge TLS | OCP Route + cert-manager + lab CA | `spoke-dc-v6` |
+| MFE Router | NGINX `Deployment` | `brac-demo-frontend` ns on spoke-dc-v6 |
+| API Gateway | WSO2 APIM (existing distributed CP/DP setup) | dc-lab WSO2 VMs |
+| BFF Router | Liberty or Node `Deployment` | `brac-demo-frontend` ns |
+| Mesh data plane | OSSM 3 ambient | `brac-demo-services` ns (label `istio.io/dataplane-mode=ambient`) |
+| Identity service | Open Liberty `OpenLibertyApplication` v1+v2 (canary'd) | `brac-demo-services` ns |
+| Product service | Open Liberty `OpenLibertyApplication` | `brac-demo-services` ns |
+| IAM (authz callouts) | WSO2 IS (existing) | dc-lab WSO2 IS VM |
+| Trace + log pipeline | OTel Collector (Gateway) → Kafka → SigNoz | Collector on `brac-demo-otel` ns; Kafka + SigNoz on existing dc-lab VMs |
 
 ## Target environment
 
-- **1 OpenShift cluster, 3 nodes, on VMs**, provisioned with Terraform per Section 1.Infrastructure. Sized to host every workstream simultaneously — masters consolidated with worker role for the POC (acceptable for evaluation; production sizing addressed separately).
-- **ODF** (OpenShift Data Foundation) for Block + Object storage classes.
-- **Internal services namespace strategy** — one tenant namespace per workstream so RHACS, NetworkPolicies, and resource quotas can be demonstrated cleanly:
-  - `brac-observability` (OTel + SigNoz + ClickHouse)
-  - `brac-identity` (WSO2 APIM CP/DP + WSO2 IS)
-  - `brac-cicd` (GitLab + Jenkins + Nexus + ArgoCD instance scoped to POC)
-  - `brac-trivy-dashboard` (DefectDojo on OCP — the one-dashboard view)
-  - `brac-redis` (Redis HA)
-  - `brac-streaming` (Kafka KRaft + Schema Registry + Connect)
-  - `brac-middleware` (Open Liberty + NGINX)
-  - `brac-jboss` (JBoss EAP managed domain)
-- **Platform plane** (RHACS, Compliance Operator, Loki, Tempo, cert-manager, ESO + Vault, Argo CD) shared across all tenant namespaces.
-- **Identity** — htpasswd + cluster-admin for evaluators; WSO2 IS for application-layer federation demos.
+| Plane | Host | Status |
+|---|---|---|
+| OpenShift demo plane (new namespaces) | `spoke-dc-v6` | Existing cluster; new namespaces only |
+| dc-lab platform plane | dc-lab VMs (HAProxy / PDNS / MinIO / Vault / Nexus / GitLab / Jenkins / SigNoz + ClickHouse / Kafka KRaft / Redis Sentinel / WSO2 APIM + IS / Trivy / DefectDojo) | Existing; reused as-is, no rebuild |
+| Hub control plane | `hub-dc-v6` (ACM + GitOps pull control plane) | Existing |
+| Bootstrap automation | `scripts/rebuild/` (profile-aware after #244) | Existing; demo'd as the "Terraform 3-node automation" requirement |
+
+New tenant namespaces created for the POC, on `spoke-dc-v6`:
+
+- `brac-demo-frontend` — MFE Router, BFF Router, optional demo SPA.
+- `brac-demo-services` — in-mesh Open Liberty demo services (Identity, Product), OSSM ambient.
+- `brac-demo-otel` — OTel Collector (Gateway).
+- `brac-demo-redis-ocp` — small Redis HA on OCP (decision-pending; see open questions).
+- `brac-demo-jboss` — JBoss EAP managed-domain demo (separate from mesh services).
+- `brac-demo-evidence` — scratch / artifacts during the live demo.
 
 ## Reuse vs build matrix
 
-What we already have in dc-lab that ports over directly (manifest-level), versus what's a fresh build for the POC.
-
-| Section | Reuse from dc-lab | Fresh build for POC |
+| Component | Reuse from dc-lab (as-is) | Build new for POC |
 |---|---|---|
-| 1. OpenShift Platform | install-config patterns, ODF manifests, Compliance Operator + PCI-DSS profile (ADR 0020), RHACS Sensor + Central + Scanner V4, Cluster Observability Operator + LokiStack manifests | Terraform module that provisions the 3-node cluster end-to-end (not just consumes an existing one); custom Prom alerts scoped to the POC workloads |
-| 2. OTel + Kafka + SigNoz + ClickHouse | OTel Collector pattern (TempoStack lessons), LokiStack pattern | SigNoz on OCP (Helm chart), ClickHouse on OCP (Altinity operator) with hot/cold retention, .NET runtime dashboards, full SigNoz/OTel→Kafka pipeline |
-| 3. WSO2 distributed | WSO2 APIM + IS *configuration shape* from the VM deployments | WSO2 Helm charts on OCP with CP/DP split, CloudNativePG for HA Postgres backends, SSO + SAML/OIDC + Federation flow |
-| 4. CI/CD on OCP | OpenShift GitOps (ArgoCD) instance pattern, app-repo contract, Path-A/Path-B build patterns, Tekton pipeline templates | GitLab on OCP (Cloud-Native chart, external Postgres), Jenkins on OCP via the Jenkins Operator with HA configuration, Nexus on OCP (Sonatype's Helm chart, external Postgres), DC-DR replication |
-| 5. Trivy single dashboard | Trivy server pattern, today's `trivy-defectdojo-import.groovy` Jenkins pipeline + lib (commit b84037c) | DefectDojo deployed on OCP (Helm chart) instead of the VM/docker-compose form; SBOM section of the dashboard |
-| 6. Redis HA | Redis Sentinel topology (ADR 0006) | Redis on OCP (e.g., `redis-operator` from OT Containers or Redis Enterprise Operator); hard-kill failover demo with a mock client |
-| 7. Kafka KRaft | KRaft topology decisions (ADR 0007) | Strimzi `Kafka` CR in KRaft mode, Apicurio Schema Registry, Strimzi `KafkaConnect` + DLQ |
-| 8. Open Liberty + NGINX | Open Liberty Operator + OpenLibertyApplication CR (DEV-OCP-5.1, #200) | Two Liberty instances + NGINX as a Service/Deployment with header-based canary; MicroProfile health/metrics dashboards |
-| 9. JBoss EAP managed domain | None (not in dc-lab) | EAP Operator on OCP with managed-domain CRs (Domain Controller + Host Controller StatefulSet + 2 Server Groups) |
-
-## Per-section delivery
-
-### 1. OpenShift Platform foundation
-
-- **Terraform module** at `infra/terraform/brac-poc-cluster/` that provisions a 3-node OCP cluster on VMs (libvirt or vSphere depending on what BRAC provides). Inputs: cluster name, base domain, machine network CIDR, pull-secret reference. Outputs: kubeconfig + cluster API + console URL.
-- **ODF**: install via OperatorHub, create `StorageCluster` CR for Block + Object classes. Demonstrate by binding a PVC (block) and an `ObjectBucketClaim` (object).
-- **Compliance Operator + PCI-DSS**: install operator, apply `ScanSetting` + `ScanSettingBinding` for `ocp4-pci-dss-4-0` + `ocp4-pci-dss-node-4-0`. Run scan; export the auto-remediation report (`ComplianceCheckResult` + `ComplianceRemediation` CRs) as a PDF artifact.
-- **RHACS critical-block policy**: enable Central + Sensor, create a policy in the "Build" + "Deploy" lifecycles with severity `CRITICAL_SEVERITY` and `enforcementActions: [SCALE_TO_ZERO_ENFORCEMENT, FAIL_BUILD_ENFORCEMENT]`. Demonstrate by deploying an intentionally-vulnerable image and showing the scale-down.
-- **Prom/Grafana custom alerts**: PrometheusRule CRs scoped per workstream namespace. At least three alert classes: workload health (pod restart loops), resource (CPU/mem usage > 80%), and security (RHACS violation count).
-- **Logging pipeline**: LokiStack via the Loki Operator; ClusterLogForwarder forwarding `application` + `infrastructure` + `audit` log types to (a) in-cluster Loki and (b) an external mock destination (a TCP receiver pod in `brac-observability` to prove the forwarder works).
-
-**Done = a single command (`terraform apply` + `argocd app sync`) brings the cluster up with all baseline operators installed and the PCI-DSS scan, RHACS policy, and logging pipeline running.**
-
-### 2. Logging & Observability (OpenTelemetry stack)
-
-- **Instrumented sample microservice**: deploy two pods of the same app — one with OTel SDK auto-instrumentation (.NET preferred per the dashboard requirement), one without SDK (relying on sidecar interception). Demonstrate both flows produce traces/metrics/logs in the pipeline.
-- **Pipeline**: OTel Collector (Gateway mode) → Kafka topic per signal (`otel.traces`, `otel.metrics`, `otel.logs`) → SigNoz consumer → ClickHouse storage. Each signal has its own topic so consumers can scale independently.
-- **Traffic management**:
-  - **Trace sampling** at the Collector via the `tail_sampling` processor (e.g., 100% of error spans, 10% of OK spans).
-  - **Log filtering** at the Collector via the `filter` processor (drop debug-level by default; configurable).
-  - **Metrics segregation** at the Collector via the `routing` processor — workload metrics vs runtime metrics go to separate ClickHouse tables.
-- **ClickHouse lifecycle**:
-  - 2-day hot retention via `TTL` clauses on the relevant tables.
-  - Cold archive: `s3` table function targeting an MinIO bucket (`brac-poc-otel-archive`), driven by a daily `clickhouse-backup` schedule.
-- **Dashboards** (in SigNoz, exported as JSON committed to git):
-  1. **Application Performance** — HTTP request duration p50/p95/p99, request count, active requests, DB connection pool usage.
-  2. **.NET Runtime** — GC heap size, GC collection counts per generation, thread pool active threads.
-  3. **System** — process CPU + memory per pod.
-  4. **Tracing** — service dependency graph (SigNoz's native), top latency endpoints, throughput per service, span timeline view.
-
-### 3. Identity & API Management (WSO2)
-
-- **Distributed APIM**: WSO2 Helm chart with `controlPlane.enabled: true` + `dataPlane.enabled: true` deployed as two StatefulSets in `brac-identity`. CP fronts the Publisher + DevPortal; DP fronts the Gateway runtime.
-- **External databases**: CloudNativePG (CNPG) `Cluster` CRs for the four WSO2 databases (`WSO2_SHARED_DB`, `WSO2_USER_STORE`, `WSO2_APIM_DB`, `WSO2_REG_DB`). 3-replica clusters with `instances: 3` for HA. Backup to MinIO via the CNPG `barmanObjectStore`.
-- **Key Manager**: WSO2 IS deployed as a separate Helm release in `brac-identity`. Configured as the Identity Key Manager from the APIM Publisher.
-- **SSO**: configure two demo Service Providers in IS — one SAML2 (for a sample SP webapp), one OIDC (for the APIM Publisher UI itself). Federate against an upstream demo IdP (a second IS instance acting as "Customer IdP") to prove identity federation.
-- **Hardening**: drop default H2 (verified by exec into pods, no `repository/database/WSO2*_DB.mv.db` files), enable mutual TLS between CP and DP, configure the WSO2 logger to forward to Loki via the ClusterLogForwarder, add a RHACS policy to flag any pod still mounting `WSO2_H2`.
-
-### 4. CI/CD & DevOps Tooling
-
-- **GitLab on OCP**: GitLab Cloud-Native Helm chart with `psql.external: true` pointing at a CNPG cluster, MinIO for object storage, and Redis for session/cache. HA mode = `replicas: 2` on the web/sidekiq/registry components. Backup via the chart's built-in `gitlab-backup` cron + replication to a DR namespace.
-- **Jenkins HA on OCP**: Jenkins Operator-managed Jenkins controller with `replicas: 2` (active-standby via leader election + shared PVC on ODF). Casc config from a ConfigMap, plugins pinned via a `plugins.txt` ConfigMap (today's `templates/jenkinsfiles/lib/defectdojo.groovy` pattern from #64-#66 applies unchanged).
-- **Monorepo conditional Jenkinsfiles**: demonstrate via a sample monorepo with two app dirs (`apps/payment-api/`, `apps/risk-engine/`). Jenkinsfile uses `changedFilesPattern` + matrix to trigger only the affected app's build + scan. Reuses the `update-overlay-digest.sh` script that today's #234 work aligned to `dev|stg|prd`.
-- **Hybrid CD**: Jenkins pipeline that deploys one path to OpenShift (Liberty app via OpenLibertyApplication CR) and one path to a legacy VM (mock VM target — a single docker-less Liberty instance reached via SSH + `systemctl`). Acceptance: same build artifact lands in both planes via the same pipeline.
-- **ArgoCD**: dedicated ArgoCD instance in `brac-cicd` (separate from the platform ArgoCD running OCP infra). AppProject scoped to `brac-*` namespaces, ApplicationSet generating one App per workstream namespace from the GitOps repo, sync waves following the dc-lab convention (10 = operators, 20 = operands, 30 = wiring).
-- **Sonatype Nexus on OCP**: Sonatype Helm chart with `database.external.host` pointing at a CNPG cluster, ODF block-storage PVCs for blob stores. Three repositories per format (Maven, PyPI, npm, Docker) — proxy + hosted + group — mirroring the three-endpoint split from dc-lab ADR 0019. HA via 2 read-write replicas (caveat: Nexus OSS doesn't do true active-active; document the limitation and demonstrate failover with the standby).
-
-### 5. Trivy single dashboard (SCA + SBOM)
-
-- **DefectDojo on OCP**: deploy the official DefectDojo Helm chart (not the docker-compose form) in `brac-trivy-dashboard`. External Postgres via CNPG.
-- **Jenkins → Trivy → DefectDojo import**: reuse today's shipped pipeline (commit `b84037c`, `templates/jenkinsfiles/trivy-defectdojo-import.groovy` + `lib/defectdojo.groovy`). Configure Vault path `secret/platform/defectdojo/api-token` via ESO and a Jenkins credential.
-- **SBOM section**: extend the existing pipeline to call Trivy with `--format cyclonedx` for SBOM generation; import the CycloneDX SBOM into DefectDojo as an `Anchore Grype` or `Generic Findings Import` and demonstrate the SBOM view in the DefectDojo UI alongside the SCA findings.
-- **Dashboard view**: a single DefectDojo product per app with two engagements per build — "SCA" + "SBOM". Findings views configured so the evaluator sees both side-by-side.
-
-### 6. Redis HA on OpenShift
-
-- **Operator**: OT Containers' `redis-operator` (CRD: `RedisSentinel` + `RedisReplication`) or Redis Enterprise Operator (if a license is acceptable). Sentinel topology with `RedisSentinel.spec.size: 3` + `RedisReplication.spec.size: 3` (1 master + 2 replicas).
-- **Networking**: ClusterIP Service for the Sentinel pool, separate Service for the data-plane (Redis primary), NetworkPolicy allowing only `brac-cicd` + `brac-identity` ingress.
-- **Failover demo**:
-  1. Deploy a mock client pod (Python `redis-py` with `Sentinel` constructor pointing at the Sentinel Service).
-  2. `oc delete pod redis-replication-0 --grace-period=0 --force` (hard kill).
-  3. Tail the Sentinel logs showing the new primary election.
-  4. Tail the mock client's logs showing it reconnecting through Sentinel (typically &lt;30 seconds).
-- **Evidence**: a recorded terminal session with the kill timestamp, the Sentinel `+switch-master` event, and the client reconnect.
-
-### 7. Event Streaming & Governance (Apache Kafka)
-
-- **Strimzi Kafka KRaft**: `Kafka` CR in `brac-streaming` with `spec.kafka.kraftMetadata: migration` or pure KRaft (no ZooKeeper deps). 3 KRaft controller nodes + 3 broker nodes (can be the same StatefulSet via combined roles for the POC). Storage via ODF `csi.ceph.com` block class.
-- **Schema Registry**: Apicurio Registry (CRD: `ApicurioRegistry`) backed by Kafka topics for schema storage. Configured as the schema source for two clients: a producer pod and a consumer pod.
-- **Schema validation demo**:
-  1. Define an Avro schema for a `Payment` event.
-  2. Producer publishes a valid `Payment` — accepted.
-  3. Producer publishes a malformed `Payment` (missing required field) — Registry rejects via the `AvroConverter` schema-id check; the produce call surfaces the error.
-- **Kafka Connect + DLQ**: `KafkaConnect` CR with two `KafkaConnector` CRs:
-  - **Source**: `FileStreamSourceConnector` reading from a ConfigMap-backed file.
-  - **Sink**: `FileStreamSinkConnector` writing to a PVC.
-  - **DLQ**: `errors.tolerance: all` + `errors.deadletterqueue.topic.name: brac-dlq`. Inject a poison record into the source; tail the `brac-dlq` topic to show the failed message.
-
-### 8. Middleware & Web Tier (Open Liberty + NGINX)
-
-- **Two Liberty instances**: two `OpenLibertyApplication` CRs in `brac-middleware`. Same image, different `replicas: 1` each, different `app.openliberty.io/instance` labels (`a` vs `b`).
-- **NGINX reverse proxy**: deploy NGINX as a `Deployment` (not the Ingress Controller — this is application-layer reverse proxy per the email). Config via ConfigMap with:
-  ```nginx
-  map $http_version $upstream_pool {
-      "beta"  liberty-b;
-      default liberty-a;
-  }
-  upstream liberty-a { server liberty-a-svc:9080; }
-  upstream liberty-b { server liberty-b-svc:9080; }
-  server {
-      listen 8080;
-      location / { proxy_pass http://$upstream_pool; }
-  }
-  ```
-  Tested with `curl -H "version: beta" http://nginx-svc/...` → routes to `liberty-b`; everything else → `liberty-a`.
-- **MicroProfile observability**: enable `microprofile-health-4.0` + `microprofile-metrics-4.0` features in the Liberty `server.xml` (via the CR's `applicationImage` build or a `ConfigMap` mount). Expose `/health` and `/metrics` through NGINX. Scrape `/metrics` from Prometheus; build a SigNoz/Grafana dashboard showing `vendor:thread_count` (JVM thread count) and the per-readiness/liveness probe status.
-- **Hardening**: NGINX config adds:
-  - `add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;` (HSTS)
-  - `error_page 404 /custom-404.html;` + a custom 404 ConfigMap-mounted page.
-  - `limit_req_zone $binary_remote_addr zone=loginzone:10m rate=5r/s;` on the application's login route to demonstrate brute-force resistance.
-
-### 9. Enterprise App Platform (JBoss EAP managed domain)
-
-- **EAP Operator on OCP**: install via OperatorHub. The operator provides the `WildFlyServer` CR; managed domain is exposed via the `domain.xml`-driven init path.
-- **Topology**:
-  - **Domain Controller**: one `StatefulSet` replica running `domain.sh --host-config=host-master.xml`.
-  - **Host Controller**: one `StatefulSet` replica running `domain.sh --host-config=host-slave.xml` pointing at the Domain Controller's discovery Service.
-  - **Server Groups**: two declared in `domain.xml` (`brac-eap-app-a` and `brac-eap-app-b`); each maps to a Deployment that the Host Controller spawns as a server instance.
-- **Operating demo**:
-  1. Show domain-mode CLI: `bin/jboss-cli.sh --connect`, `:read-children-names(child-type=server-group)` → returns both groups.
-  2. Deploy a sample WAR to Server Group A only; verify B is unaffected.
-  3. Roll Server Group A (`/server-group=brac-eap-app-a:reload-servers`); B keeps serving.
-- **Caveat**: managed-domain mode is unusual in containers — typical OpenShift JBoss deployments use standalone mode. The plan explicitly demonstrates managed domain because the requirements call for it; we'll note in the deliverable that standalone is the typical production pattern for OCP and managed domain is shown for parity with the requirement.
+| **API Gateway (WSO2 APIM)** | WSO2 APIM CP/DP VMs + their DB backends (per ADR 0008) | OCP-side: ESO secret pulling APIM admin/key Manager credentials from Vault; demo SP and OIDC client registrations |
+| **IAM (WSO2 IS)** | WSO2 IS VM with existing SAML + OIDC + Federation setup | Demo SP webapp, demo OIDC client, demo Federation IdP source registration |
+| **Service Mesh + mTLS** | OSSM 3 ambient mode already installed on spoke-dc-v6 (DEV-OCP-1.4 #178) | Scope to `brac-demo-services`; `PeerAuthentication.mtls.mode=STRICT`; Kiali dashboard scoped view |
+| **Mesh canary** | None — new pattern (replaces NGINX header-canary from email §8) | `VirtualService` + `DestinationRule` with header-based override (`x-canary: beta` → v2) + 90/10 default split |
+| **Observability + Kafka** | Kafka KRaft VMs (kafka-0/1/2, ADR 0007), SigNoz VM (signoz-0) + ClickHouse, NooBaa OBC pattern for cold archive | OTel Collector (Gateway) on `brac-demo-otel` with `tail_sampling` + `filter` + `routing` processors; sample microservice (.NET preferred) with + without SDK; 4 dashboards (app perf, .NET runtime, system, tracing) authored in SigNoz |
+| **Redis HA** | Redis Sentinel VMs (ADR 0006) — work today | OCP-side small Redis HA in `brac-demo-redis-ocp` via `redis-operator` (decision dependent — see Q1); mock-client reconnect demo |
+| **SigNoz** | SigNoz VM with ClickHouse + retention | None — the four BRAC dashboards are authored against the existing SigNoz |
+| **Nexus OSS** | Existing Nexus three-endpoint split (`mirror-registry` / `docker-group` / `app-registry`, ADR 0019) | None — demo the existing setup |
+| **MFE Router + BFF Router** | None | NGINX `Deployment` for MFE; Liberty/Node `Deployment` for BFF, both in `brac-demo-frontend`; cert-manager Route at the edge |
+| **Open Liberty demo apps** | Open Liberty Operator + Liberty hello-world (DEV-OCP-5.1 #200) | `identity-svc` v1 + v2 (canary'd) + `product-svc`, all `OpenLibertyApplication` CRs with MicroProfile features enabled |
+| **OpenShift platform foundation** | spoke-dc-v6 cluster, ODF (Block + Object), all baseline operators | Walkthrough of `scripts/rebuild/` Terraform/Ansible as the "automation" demo (no fresh cluster needed) |
+| **Compliance / PCI-DSS** | ScanSettingBinding `ocp4-pci-dss-4-0` already running on spoke-dc-v6 (ADR 0020) | Filtered view of latest ComplianceCheckResult + ComplianceRemediation, exported as a report artifact |
+| **RHACS critical-block** | RHACS Central + Sensor + Scanner V4 already running | Policy scoped to `brac-demo-*` namespaces; intentionally-vulnerable image triggers scale-to-zero |
+| **Prom alerts + Loki forwarding** | Cluster Observability Operator + LokiStack + ClusterLogForwarder already running | Three BRAC-scoped `PrometheusRule` CRs; ClusterLogForwarder output to an external mock destination |
+| **Trivy SCA + SBOM dashboard** | Trivy server VM, DefectDojo VM, today's Jenkins pipeline `templates/jenkinsfiles/trivy-defectdojo-import.groovy` (commit b84037c) | Extend pipeline to add `--format cyclonedx` SBOM stage; DefectDojo product with SCA + SBOM engagements side-by-side |
+| **GitLab + Jenkins + ArgoCD chain** | GitLab VM, Jenkins single VM (ADR 0009), ArgoCD instances (hub + spoke-local) | BRAC monorepo (`apps/brac-payment-api/`, `apps/brac-risk-engine/`) + conditional Jenkinsfile + hybrid CD pipeline; DC-DR as documented procedure + rehearsed restore |
+| **Kafka Schema Registry + Connect + DLQ** | Kafka KRaft VMs | Schema Registry (Apicurio) deployed alongside Kafka or on OCP as a client; Kafka Connect with mock Source/Sink + DLQ topic |
+| **JBoss EAP managed domain** | None (not in dc-lab) | EAP Operator on OCP, Domain Controller + Host Controller StatefulSets + 2 Server Groups in `brac-demo-jboss` |
 
 ## Phase sequencing
 
-The 9 sections compose into 6 phases. Phases run sequentially; sections within a phase run in parallel.
+Block A items are reuse-walkthroughs (no new code; just narration + screencasts). Block B is the actual build work, sequenced so highest-priority demo items land first.
 
-| Phase | Wall-clock target | Sections | What lands |
+| Phase | Wall-clock | What lands | Demo'able by end |
 |---|---|---|---|
-| **P1: Foundation** | Week 1 | 1 | OCP cluster + ODF + RHACS + Compliance Operator + LokiStack + Prom alerts + log forwarder |
-| **P2: Streaming + Storage** | Week 2 | 6, 7 | Redis HA on OCP, Kafka KRaft + Schema Registry + Connect on OCP |
-| **P3: Observability stack** | Week 2-3 | 2 | SigNoz on OCP, ClickHouse with hot/cold, OTel collector pipeline, 4 dashboards |
-| **P4: Identity + API** | Week 3-4 | 3 | Distributed WSO2 APIM + IS, CNPG backends, SSO flows |
-| **P5: CI/CD on OCP** | Week 3-4 | 4, 5 | GitLab + Jenkins + Nexus on OCP, ArgoCD scoped instance, DefectDojo dashboard, Trivy SCA + SBOM imports |
-| **P6: App Platform** | Week 4-5 | 8, 9 | Open Liberty × 2 + NGINX canary, JBoss EAP managed domain |
+| **P0: Block A foundation walkthroughs** | Day 1-2 | Cluster provisioning narrative + ODF + Compliance + RHACS + Prom alerts + Loki forwarder, all with BRAC-scoped views applied | Cluster + compliance + RHACS + log forwarding demos |
+| **P1: Observability + Kafka pipeline** *(HIGH PRIORITY)* | Day 3-5 | OTel Collector deployed; sample microservice w/+w/o SDK; pipeline OTel→Kafka→SigNoz wired; 4 dashboards authored | End-to-end trace appears in SigNoz; sampling/filter/routing visible |
+| **P2: Service Mesh + mTLS + canary** *(v2 priority)* | Day 5-7 | OSSM scoped to `brac-demo-services`; STRICT mTLS; VirtualService canary on identity-svc v1/v2; Istio→OTel trace export | Kiali shows mTLS green; canary curl demo passes |
+| **P3: MFE + BFF + WSO2 wiring** | Day 7-10 | MFE Router (NGINX edge), BFF Router, egress NetworkPolicy to WSO2 VMs, SAML + OIDC + Federation flows verified end-to-end | Full user → MFE → API GW → BFF → mesh → Identity → Product chain |
+| **P4: Redis + Trivy + CI/CD glue** | Day 10-12 | Redis HA on OCP (if Q1 = yes); SBOM pipeline extension; BRAC monorepo + conditional Jenkinsfile; hybrid CD to OCP + one VM target | Hard-kill failover; DefectDojo SBOM view; monorepo-aware build triggers only the affected app |
+| **P5: JBoss managed domain + evidence pack** | Day 12-14 | EAP Operator + Domain/Host Controllers + 2 Server Groups; deploy + reload demo; full evidence pack written | All demo steps recorded + filed in `reports/brac-poc/<section>/` |
 
-After P6: one week reserved for the **demo flow + evidence pack** (see below).
+## Live demo flow (v2 priority order)
 
-## Demo / acceptance flow
+The live demo runs in v2 PDF order so the HIGH-PRIORITY items land first if time runs short. The tender items follow as a secondary block.
 
-The evaluator should be able to follow this sequence end-to-end without any side conversations. Each step has a 5-minute screencast and a written artifact in the evidence pack.
+**Block 1 — v2 PDF priority subset:**
 
-1. **Cluster provision** — `terraform apply` from zero → working 3-node OCP cluster + console URL + admin login.
-2. **Operator install via GitOps** — `argocd app sync brac-poc-platform` → ODF + RHACS + Compliance + Loki + Tempo + Pipelines + CNPG + Strimzi + Apicurio + EAP + Liberty all install via Subscriptions in sync-wave 10.
-3. **Compliance scan** — kick `ScanSettingBinding`; export the PCI-DSS remediation report.
-4. **RHACS critical block** — try to deploy a CVE-rich image; show the deployment scaled to zero and the policy hit recorded.
-5. **Logging** — query Loki for an `audit` log from a `cluster-admin` action.
-6. **Kafka + Schema Registry** — produce valid + invalid payments; show validation reject.
-7. **Kafka Connect DLQ** — inject poison record; show DLQ.
-8. **Redis hard-kill** — `oc delete pod` the primary; show the mock client reconnecting.
-9. **SigNoz dashboards** — open all 4 dashboards, hit the sample microservice with load, watch metrics update.
-10. **ClickHouse retention** — query the hot tier; query the archive bucket via `s3` table function.
-11. **WSO2 SSO** — SAML demo + OIDC demo + Federation demo.
-12. **GitLab → Jenkins monorepo conditional** — push a change to `apps/payment-api/`, watch only the payment build trigger.
-13. **Hybrid CD** — same build deploys to OCP and to the mock legacy VM.
-14. **Trivy + DefectDojo** — push an image with known criticals; show DefectDojo dashboard with both SCA and SBOM views.
-15. **Liberty + NGINX canary** — `curl` with and without the `version: beta` header; show different upstreams.
-16. **Liberty health/metrics** — open the dashboard, show JVM thread count + liveness toggling.
-17. **NGINX hardening** — show HSTS header, custom 404, rate-limit hit on the login route.
-18. **JBoss managed domain** — CLI domain navigation, server-group deploy, rolling reload.
+1. **API Gateway** (existing WSO2 APIM): publish a sample API, show the policy + key flow + IS-as-Key-Manager link.
+2. **IAM** (existing WSO2 IS): SAML SP demo + OIDC client demo + Federation against a second IdP source.
+3. **Service Mesh — mTLS** (new OCP): `istioctl authn tls-check` returns MUTUAL; Kiali shows all-green mTLS edges.
+4. **Canary via mesh** (new OCP): `curl` with and without `x-canary: beta`; show traffic split + Kiali request graph.
+5. **Observability + Kafka — high priority** (new collector + existing Kafka + SigNoz): hit the demo app, watch traces traverse identity → product in SigNoz, show Kafka topic lag, expand spans.
+6. **Redis** (decision-dependent): if Q1=yes, demo OCP-side hard-kill failover; otherwise narrate existing VM Sentinel topology with mock client reconnect.
+7. **SigNoz** (existing VM): tour the 4 dashboards (app perf, .NET runtime, system, tracing).
+8. **Nexus OSS** (existing VM): show three-endpoint split; demo multi-format pull (Maven + npm + Docker) from the same Nexus.
+
+**Block 2 — tender-only items (if time permits):**
+
+9. **OpenShift Platform foundation**: walkthrough `scripts/rebuild/` profile-aware automation; ODF Block + Object PVCs.
+10. **Compliance + PCI-DSS**: export latest ComplianceCheckResult + remediation report.
+11. **RHACS critical-block**: try to deploy a CVE-rich image; show scale-to-zero.
+12. **Prom alerts + Loki**: trigger a BRAC-scoped alert; query Loki for an `audit` log; show external-mock log forward.
+13. **Trivy SCA + SBOM dashboard**: DefectDojo product view with both engagements side-by-side.
+14. **GitLab + Jenkins monorepo conditional**: push to `apps/brac-payment-api/`; show only that build triggers.
+15. **Hybrid CD**: same build artifact deploys to OCP (Liberty CR) and to one existing VM target.
+16. **Kafka Schema Registry + DLQ**: produce a malformed Avro message; show Registry reject. Inject a poison record into Connect; show DLQ.
+17. **JBoss EAP managed domain**: CLI navigation, WAR deploy to one Server Group, rolling reload.
 
 ## Evidence pack
 
-Per section, a folder in `reports/brac-poc/<section-number>-<slug>/` with:
+Per workstream, a folder in `reports/brac-poc/<NN>-<slug>/`:
 
-- A 1-page summary of what was demonstrated.
-- The CRs and ConfigMaps applied (committed to `platform-gitops` under `clusters/brac-poc/`).
-- Screenshots of the relevant UIs (RHACS, SigNoz, DefectDojo, WSO2 Publisher, JBoss CLI).
-- Logs from the critical demo moments (Sentinel `+switch-master`, RHACS policy hit, DLQ message, Schema Registry reject).
-- Recorded terminal sessions (asciinema or `script` output) for the live demos.
+- 1-page summary of what was demonstrated + which dc-lab assets it consumed.
+- CRs + ConfigMaps applied to `spoke-dc-v6` (committed to `platform-gitops` under `clusters/spoke-dc-v6/brac-demo/`).
+- Screenshots of the relevant UIs (RHACS, SigNoz dashboards, WSO2 Publisher, DefectDojo, Kiali mesh graph, JBoss CLI).
+- Recorded terminal sessions (asciinema or `script`) for the live demos.
+- Logs from the critical moments (Sentinel `+switch-master`, RHACS policy hit, canary traffic shift, mTLS handshake, Schema Registry reject).
 
-Nothing in the evidence pack contains tokens, kubeconfigs, or credential bytes — Vault paths are referenced by name only.
+No secret values, no kubeconfigs, no credential bytes in the evidence pack. Vault paths referenced by name only.
 
 ## Open questions
 
-These need answers from BRAC or internal decisions before P1 starts.
-
-1. **Environment choice**: BRAC infra vs ours? If theirs, what VM platform (vSphere, OpenStack, libvirt) does the Terraform module need to target?
-2. **OCP version**: pinned to a specific minor (e.g., 4.16 EUS) or latest? Some operator-version pins depend on this.
-3. **Identity for the evaluators**: htpasswd users + their list, or do they federate to an IdP? Affects how we configure the cluster's OAuth.
-4. **Redis operator preference**: open-source `redis-operator` (OT Containers) or licensed Redis Enterprise Operator? The email is silent.
-5. **JBoss EAP license**: do we have evaluation credentials for the EAP Operator's image pull? If not, fall back to WildFly community.
-6. **WSO2 license**: Helm charts use commercial container images by default — confirm license entitlement before P4 starts.
-7. **DC-DR scope**: the email mentions DC-DR for GitLab and Jenkins. Does the POC need a second cluster + cross-cluster replication, or is "DC-DR documented + tested in a second namespace" sufficient?
-8. **Truncation**: the requirements email PDF ends at JBoss 9.1; it references "13 Products" but only 9 sections were captured. Sections 10–13 may exist — request the rest before P6 finalizes.
+1. **Redis on OCP vs reuse VM Sentinel:** BRAC says "deploy on OpenShift Platform." Default in this plan: deploy a small Redis HA on `spoke-dc-v6` *in addition to* the existing VM Sentinel. Confirm or override.
+2. **OCP cluster choice:** use existing `spoke-dc-v6` (default — fastest) or stand up a separate POC cluster (more demonstrable for the Terraform-automation requirement but adds 2-3 days)?
+3. **OCP version pin:** confirm BRAC's evaluation tools work against the current spoke-dc-v6 minor; if they want a specific version, plan a controlled upgrade or a side cluster.
+4. **JBoss EAP image entitlement:** valid pull secret for the EAP Operator's images? Otherwise fall back to community WildFly.
+5. **WSO2 license / image entitlement:** existing WSO2 VMs run fine. Confirm no new license needed for the POC.
+6. **DC-DR scope:** default is "documented procedure + one rehearsed restore in a side namespace" rather than a second live cluster. Confirm.
+7. **Truncated requirements PDF:** original email mentions "13 Products" but PDF ends at section 9. Request sections 10-13 before P5 finalizes.
+8. **MFE / BFF stack choice:** NGINX-only for MFE, or a real micro-frontend aggregator (Module Federation / single-spa)? BFF as Liberty (Java ecosystem fit) or Node (lighter)?
+9. **"Comply MTLS" interpretation:** v2 PDF says "MTLS (Commply MTLS / Service mesh)". Likely typo for "Compliance-grade mTLS" — strict mTLS + FIPS-ish posture + audit. Confirm.
 
 ## What's intentionally not in this plan
 
-- The dc-lab platform (`hub-dc-v6` + `spoke-dc-v6`) keeps running independently. The POC cluster is new; nothing in dc-lab is reused as the live system.
-- No docker-runtime VM, no docker-compose deployments anywhere. Tools the dc-lab runs on docker-compose (SigNoz, DefectDojo) get redeployed via Helm charts on OCP.
-- No oc-mirror for the POC. Image supply uses the same Nexus three-endpoint split deployed inside the POC namespace, or BRAC's existing registry if they prefer.
-- No "Path A vs Path B" distinction. Jenkins is the single CI path for the POC. Tekton patterns from dc-lab may inform some Jenkins pipeline shapes but Tekton is not deployed.
-- Sections 10–13 (if they exist in the un-truncated PDF) are out of scope until we see them.
+- **No rebuild of dc-lab services on OCP.** SigNoz, DefectDojo, Kafka KRaft, Redis Sentinel, WSO2 APIM/IS, Jenkins, GitLab, Nexus, Trivy — all reused on their existing VMs.
+- **No deployment of demo apps to `docker-runtime-vm`.** That path exists for the broader app-dev direction (`project_app_dev_direction.md`), but for this POC the demo apps run on OCP.
+- **No second OCP cluster** unless Q2 = yes.
+- **No NGINX-based header canary** at the application tier — replaced by mesh canary per v2 PDF (the MFE Router still has NGINX hardening: HSTS + custom 404 + rate-limit on login).
+- **No new ADRs** unless a load-bearing direction changes (e.g., adopting OCP-native Redis or migrating Kafka off VMs as strategic direction beyond the demo).
+- **Sections 10-13** of the original requirements PDF — not in scope until we see them.
