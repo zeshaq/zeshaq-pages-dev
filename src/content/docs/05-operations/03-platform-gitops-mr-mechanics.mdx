@@ -1,8 +1,387 @@
 ---
-title: "platform-gitops MR Mechanics"
-description: "Section 05-operations: platform-gitops MR Mechanics (placeholder)."
-sidebar_label: "platform-gitops MR Mechanics"
+title: "platform-gitops MR mechanics"
+description: "How a change gets from a thought to a running cluster: the working-copy convention, the GitLab API flow, sync-wave numbering, and the operator-install pattern."
+sidebar_label: "MR mechanics"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const opsBox  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const mrNodes = [
+  { id: "operator", position: { x: 0,   y: 0   }, data: { label: "Operator\n(workstation)" }, style: opsBox },
+  { id: "clones",   position: { x: 240, y: 0   }, data: { label: "clones/platform-gitops/\n(writable working copy)" }, style: dataBox },
+  { id: "gitlab",   position: { x: 480, y: 0   }, data: { label: "GitLab\nplatform-gitops" }, style: extBox },
+  { id: "api",      position: { x: 720, y: 0   }, data: { label: "GitLab API\nmerge_requests" }, style: extBox },
+  { id: "main",     position: { x: 480, y: 150 }, data: { label: "main branch\n(merged)" }, style: dataBox },
+  { id: "argohub",  position: { x: 240, y: 300 }, data: { label: "Argo CD on\nhub-dc-v6" }, style: opsBox },
+  { id: "argospoke",position: { x: 480, y: 300 }, data: { label: "Argo CD on\nspoke-dc-v6" }, style: agentBox },
+  { id: "hubcluster",position:{ x: 240, y: 450 }, data: { label: "hub-dc-v6\nresources" }, style: dataBox },
+  { id: "spokecluster",position:{x: 480, y: 450 }, data: { label: "spoke-dc-v6\nresources" }, style: dataBox },
+];
+
+export const mrEdges = [
+  { id: "e1", source: "operator", target: "clones",      label: "git pull / commit", ...reqEdge },
+  { id: "e2", source: "clones",   target: "gitlab",      label: "git push origin <branch>", ...reqEdge },
+  { id: "e3", source: "operator", target: "api",         label: "curl POST /merge_requests", ...reqEdge },
+  { id: "e4", source: "api",      target: "gitlab",      label: "creates MR", ...muted },
+  { id: "e5", source: "gitlab",   target: "main",        label: "review + merge", ...muted },
+  { id: "e6", source: "argohub",  target: "main",        label: "polls", ...pullEdge },
+  { id: "e7", source: "argospoke",target: "main",        label: "polls", ...pullEdge },
+  { id: "e8", source: "argohub",  target: "hubcluster",  label: "sync waves 10-30", ...muted },
+  { id: "e9", source: "argospoke",target: "spokecluster",label: "sync waves 10-30", ...muted },
+];
+
+This page is the mechanical reference for changing the fleet. Read it once end to end before you open your first MR, then return to specific sections (the operator-install pattern, the sync-wave table) when the work calls for them.
+
+The platform's source of truth is a single GitLab repo, not a GitHub repo. The `gh` CLI does not work here. That is the most common day-1 confusion; everything below flows from it.
+
+## The end-to-end flow
+
+<Whiteboard client:load data={{ nodes: mrNodes, edges: mrEdges }} height={600} />
+
+Read the arrows top to bottom:
+
+1. The operator works in a writable clone of `platform-gitops` under `clones/platform-gitops/`.
+2. The branch is pushed to the lab GitLab over LAN.
+3. The MR is opened via the GitLab REST API using a PAT; `gh pr create` would target GitHub and not see this repo.
+4. After review, merge to `main` happens on GitLab.
+5. Argo CD on each cluster polls the same `main` branch — the hub Argo for hub-side resources, the spoke Argo for spoke-side resources. Hub never pushes to spoke; that is the ADR 0018 pull-model invariant.
+6. Argo applies resources in sync-wave order.
+
+## The working-copy convention
+
+There are two clones of `platform-gitops` on the operator workstation:
+
+| Path | Purpose | Writable? |
+|---|---|---|
+| `/home/ze/platform-gitops` | Personal scratchpad used by the user historically | Outside Claude-agent workspace boundary; do **not** edit from automation |
+| `/home/ze/claude-agent/clones/platform-gitops/` | Automation working copy inside the workspace boundary | Yes — branch, commit, push from here |
+
+This is the workspace boundary rule: writable in `/home/ze/{claude-agent, secrets, codex-opp-agent}`; other `/home/ze/*` paths are read-only unless explicitly named. Always use the `clones/` copy for changes from this workspace.
+
+At session start, sync the clone with `main`:
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+git checkout main
+git pull --ff-only origin main
+```
+
+If `--ff-only` fails (your local `main` diverged), do not merge — reset to `origin/main` after capturing any local work to a branch first.
+
+## Repo layout
+
+The per-cluster tree under `clusters/<cluster-name>/` follows a stable shape. Stick to it; new directories under `clusters/<cluster>/` need a kustomization entry to be included.
+
+```text
+clusters/<cluster-name>/
+  bootstrap/        # namespace + PSA + LimitRange + ResourceQuota + NetworkPolicy + scoped Argo RBAC
+  gitops-control/   # AppProject + ApplicationSet + Application + Argo cluster-admin (hub only)
+  operators/<name>/ # namespace + OperatorGroup + Subscription + kustomization
+  platform/<area>/  # catalogs / image-mirrors / fleet-registration / etc.
+  platform-services/<area>/  # operand-level config: logging, tracing, security, etc.
+  secrets/<area>/   # ESO Stores + ExternalSecrets + NetworkPolicies
+  security/         # APIServer + OAuth + MachineConfigs + scoped Argo RBAC
+  storage/<layer>/  # LocalVolumeSet + StorageCluster + StorageClass overrides
+  kustomization.yaml  # cluster-level kustomization, lists every resource dir above
+```
+
+A few stable patterns to recognize:
+
+- **`bootstrap/` is the only place where namespace + PSA + LimitRange + ResourceQuota + NetworkPolicy + scoped Argo RBAC live together** for the cluster-level bootstrap Application. Per-operator namespaces are owned by `operators/<name>/`.
+- **`gitops-control/` exists only on `hub-dc-v6`.** The spoke does not own its own AppProject/ApplicationSet; the hub places work on the spoke via ManifestWork.
+- **`platform/argocd-extensions/clusterrole.yaml` on the spoke** holds the consolidated ClusterRole `argocd-platform-extensions` — the single place to extend the spoke Argo controller's RBAC beyond the least-privilege allowlist. See [Spoke RBAC extension pattern](/docs/05-operations/04-incidents-and-runbooks/01-overview).
+
+## Branch naming
+
+Pattern: `<phase-or-issue>/<topic>` — slash-separated, lowercase, hyphens between words.
+
+Examples observed in the active repo:
+
+| Branch | Issue / phase |
+|---|---|
+| `pci-2/compliance-operator` | PCI-2 phase, #110 |
+| `pci-1/etcd-oauth-ipv6-remediation` | PCI-1 phase, #109 |
+| `pci-1.13/revert-ipv6-kernel-disable` | PCI-1.13 sub-phase, #135 |
+| `pci-1.13/ipv6-disable-sysctl` | PCI-1.13 reattempt |
+| `cert-mgr-1/install-on-both-clusters` | cert-manager onboarding |
+| `rhacs-1/operator-subscriptions-with-hub-lvms` | RHACS onboarding |
+| `backup/oadp-baseline` | Unrelated work — `backup/` domain prefix |
+
+The `<phase>` segment matches the GitHub issue's title prefix when one exists. For unrelated work, use a domain prefix (`backup/`, `cert-manager/`, `runner/`).
+
+## Commit message header block
+
+Every commit starts with a tracking header block. This is the single artefact that links the GitLab commit back to the GitHub issue, milestone, phase, and governing ADRs.
+
+```text
+<one-line summary> (#<issue>)
+
+Issue:     #<issue> <phase prefix>
+Milestone: <milestone title> (#<milestone-number>)
+Phase:     <phase>
+ADRs:      <comma-separated ADR numbers>
+
+<rationale paragraph>
+
+<what changed: file list>
+
+<validation plan: exact oc commands>
+
+<rollback plan: concrete steps>
+```
+
+Commit author is `Zahid Platform Admin <zahid@comptech-lab.com>` (configured in the clone). **No `Co-Authored-By` trailer** — this matches the repo's existing style across 30+ commits. The Claude-agent commits do not add a `Claude` co-author here.
+
+## Pre-commit validation
+
+Before every `git commit`, prove the kustomization builds clean on both cluster overlays:
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+kubectl kustomize clusters/hub-dc-v6   > /dev/null
+kubectl kustomize clusters/spoke-dc-v6 > /dev/null
+```
+
+If kustomize errors out, stop and fix. Argo CD will produce the same error post-merge and `Application` will go `Degraded`.
+
+Server-side dry-run is optional but useful for non-trivial CR changes:
+
+```bash
+oc --kubeconfig "$K_SPOKE" apply --server-side --dry-run=server \
+  -k clusters/spoke-dc-v6
+```
+
+A "namespace not found" warning for namespaced resources whose Namespace is in the same apply is benign — Argo resolves this via sync-wave 10 ordering.
+
+## Opening the MR — the API flow
+
+The repo is on the lab GitLab. `gh` targets GitHub. To open an MR, POST to the GitLab API directly:
+
+```bash
+PAT=$(tr -d '\r\n' < /home/ze/codex-opp-agent/secrets/gitlab-zahid-pat)
+GLAB_API=http://<gitlab-vm>/api/v4
+PROJECT_ENC=comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops
+
+curl -sSf -H "PRIVATE-TOKEN: $PAT" \
+  -H "Content-Type: application/json" \
+  -X POST "$GLAB_API/projects/$PROJECT_ENC/merge_requests" \
+  -d @- <<EOF
+{
+  "source_branch": "<your-branch>",
+  "target_branch": "main",
+  "title": "<short title (#<issue>)>",
+  "description": "<see template below>",
+  "remove_source_branch": true,
+  "squash": false
+}
+EOF
+```
+
+The response includes `web_url` — paste it into the GitHub issue you opened earlier.
+
+The internal-only specifics (the exact GitLab VM hostname, the `PROJECT_ENC` path) are in `connection-details/gitlab-operator-guide.md` inside the workspace.
+
+## MR description template
+
+The MR description has a stable shape. Reviewers expect every section.
+
+```markdown
+## Summary
+
+<1-3 lines plus tracking artifacts>
+
+Tracking: zeshaq/codex-opp-agent#<n>, milestone "<milestone>", phase <phase>.
+Governing ADRs: <list>.
+
+## Changes
+
+- `clusters/<cluster>/<area>/<file>.yaml`: <what>
+- ...
+
+## Why
+
+<design rationale when not obvious from the issue>
+
+## Image-supply note
+
+<confirm IDMS/ITMS coverage, list any new external image refs and the mirror rule that covers them>
+
+## Validation plan
+
+```bash
+<exact oc commands the smoke test runs>
+```
+
+## Rollback
+
+<concrete steps — usually "revert the MR and let Argo re-sync">
+```
+
+## Sync waves
+
+Argo CD applies resources in sync-wave order. The repo's convention:
+
+| Wave | What lands |
+|---|---|
+| **0** | RBAC consolidation (ClusterRole/ClusterRoleBinding extensions to `argocd-platform-extensions`) — must precede anything that needs the extra permission |
+| **10** | Namespace, OperatorGroup, Subscription, baseline RBAC for an operator install |
+| **11** | Dependency Subscriptions (e.g., operators that depend on another operator being installed first) |
+| **15** | Operator-scoped Argo RBAC (e.g., `argocd-<scope>-rbac.yaml` — bindings that grant Argo access to apply the operand) |
+| **20** | Server-Side Apply singleton patches (`APIServer`, `OAuth`, network config, etc.) |
+| **25** | Operand-scoped Argo RBAC |
+| **30** | MachineConfigs and operands that trigger MachineConfigPool rollouts |
+
+Why these numbers and not 1/2/3: the repo uses a `argocd.argoproj.io/sync-wave: "10"` annotation, and the numeric spread leaves room to insert new waves between existing ones. Waves are signed integers; negative waves are valid for pre-bootstrap resources.
+
+A non-obvious consequence: **a wave-0 RBAC change must merge and Argo-apply before the wave-10+ resource that uses it.** If you bundle them in the same MR, Argo applies wave 0 first and the operator install lands on the second sync cycle. If you split them across MRs, sequence the merges.
+
+## The operator-install pattern
+
+Adding a new platform operator follows a repeatable five-file pattern. The example below shows the OADP install scaffold; substitute names as needed.
+
+```text
+clusters/<cluster>/operators/oadp/
+  kustomization.yaml
+  namespace.yaml
+  operatorgroup.yaml
+  subscription.yaml
+```
+
+`namespace.yaml` — sync-wave 10:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-adp
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+```
+
+`operatorgroup.yaml` — sync-wave 10:
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-adp
+  namespace: openshift-adp
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  targetNamespaces:
+    - openshift-adp
+```
+
+`subscription.yaml` — sync-wave 10, pin `startingCSV` from `operator-version-lock.md`:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: redhat-oadp-operator
+  namespace: openshift-adp
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  channel: stable-1.5
+  installPlanApproval: Automatic
+  name: redhat-oadp-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: oadp-operator.v1.5.5
+```
+
+`kustomization.yaml` lists the three files:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - operatorgroup.yaml
+  - subscription.yaml
+```
+
+Then add `operators/oadp` to `clusters/<cluster>/kustomization.yaml`.
+
+Operand-level config goes in a sibling directory at sync-wave 20+ (e.g., `platform-services/backup/oadp/dataprotectionapplication.yaml`) so the operator is fully installed before its CR lands. The `startingCSV` value is pinned from `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — never use channel-floating.
+
+The full installed-and-planned operator inventory lives in `connection-details/platform-admin-handoff.md` §"Current Installed Operator Baseline" and §"Planned Operator Install Queue".
+
+## CatalogSource selection
+
+The repo's CatalogSource convention:
+
+- **`cs-redhat-operator-index-v4-20`** — Red Hat operator catalog (OADP, GitOps, Compliance, etc.)
+- **`cs-certified-operator-index-v4-20`** — certified operators (Open Liberty, CloudNativePG)
+
+Both are mirrored locally and refreshed by `oc mirror --v2` from the mirror VM. The catalog image digests are pinned in `clusters/spoke-dc-v6/platform/catalogs/` (and the equivalent for hub when hub-side catalogs land per #137).
+
+Do not use the default `redhat-operators` / `certified-operators` CatalogSources — they hit upstream and are disabled at install per ADR 0019.
+
+## Post-merge validation
+
+After Argo CD reconciles, validate:
+
+```bash
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get app spoke-dc-v6-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+```
+
+Expected: `Synced Healthy <git-sha>`. The `<git-sha>` should match the merge commit on `main`.
+
+For an operator install, also:
+
+```bash
+oc --kubeconfig "$K_SPOKE" -n <operator-ns> get sub,installplan,csv,pods
+oc --kubeconfig "$K_SPOKE" get co \
+  | awk 'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+oc --kubeconfig "$K_SPOKE" get mcp
+```
+
+If `MachineConfigPool` updates were triggered, expect 30-60 minutes for the rollout per pool. Watch `oc get mcp -w`.
+
+## Common failure modes
+
+- **`OutOfSync` on a freshly-merged MR.** First check is the Argo `Application`'s `status.conditions` — usually it's an RBAC `forbidden` line pointing at an API group missing from `argocd-platform-extensions`. Add the group/resources to the ClusterRole at sync-wave 0 in a follow-up MR; see [Spoke RBAC extension pattern memory](/docs/05-operations/07-known-gotchas).
+- **Argo `Application` shows `ComparisonError: failed to load open api schema`** on `oc get --raw /openapi/v2` returning 503. That is the [Routes CRD incident](/docs/05-operations/04-incidents-and-runbooks/02-acm-gitops-addon-routes-crd); `oc delete crd routes.route.openshift.io` recovers within seconds.
+- **Subscription stuck on `ResolutionFailed` with `ConstraintsNotSatisfiable`.** Package or a dependency is not in the mirrored catalog. Add to `imageset-config.yaml`, mirror with `oc mirror --v2`, pin the refreshed catalog digest in GitOps. The full recipe is in `connection-details/platform-admin-handoff.md` §"What To Do If An Operator Package Is Missing".
+- **Pod stuck on `ImagePullBackOff` from `registry.redhat.io` or `quay.io`.** Operand image not mirrored or not covered by IDMS/ITMS. Mirror the exact digest, apply/GitOps-capture the IDMS/ITMS, restart stale pods. Recipe in `connection-details/platform-admin-handoff.md` §"What To Do If An Operand Image Is Missing".
+
+## What never lands as an MR
+
+Per ADR 0019 and the break-glass policy in ADR 0025:
+
+- **Bypassing or disabling an RHACS image, deployment, runtime, or admission policy.** RHACS is authoritative for image supply.
+- **Disabling, deleting, or modifying security operators directly** (RHACS, compliance, cert-manager, External Secrets, oauth).
+- **Granting `cluster-admin` or broad ClusterRoleBindings to a user or service account without code-owner review.**
+- **Direct edits to `rendered-*` MachineConfig objects.** Rendered configs are owned by MCO.
+- **Direct edits to etcd or `kube-system` cluster signing keys.**
+- **Silent credential rotation** without updating Vault and the local mirror in the same change window.
+
+If a real incident requires one of these, follow the [break-glass procedure](/docs/05-operations/06-on-call-and-escalation) and produce the audit record. A break-glass action is not an MR.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"GitOps Source Of Truth" and §"Operator Install Workflow"
+- `codex-opp-agent/connection-details/gitlab-operator-guide.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+- `codex-opp-agent/adr/0015`, `0016`, `0018`, `0019`
+- Memory: `reference_platform_gitops_mr_path`, `reference_spoke_argo_extension_rbac`
+- Issues: #143 (MR conventions doc), #229 (this section)

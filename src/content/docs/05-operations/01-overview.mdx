@@ -1,8 +1,112 @@
 ---
-title: "Overview"
-description: "Section 05-operations: Overview (placeholder)."
+title: "Operations — overview"
+description: "How the platform actually runs day to day: the handoff path, the MR pipeline, the incident loop, and the on-call rotation that ties them together."
 sidebar_label: "Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const opsBox  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const incBox  = { background: "#fee2e2", border: "1px solid #b91c1c", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const incEdge  = { style: { stroke: "#b91c1c", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const opsNodes = [
+  { id: "operator",  position: { x: 0,   y: 0   }, data: { label: "Platform operator\n(human)" }, style: opsBox },
+  { id: "github",    position: { x: 240, y: 0   }, data: { label: "GitHub issues\n(durable record)" }, style: extBox },
+  { id: "gitlab",    position: { x: 480, y: 0   }, data: { label: "platform-gitops MR\n(GitLab)" }, style: extBox },
+  { id: "argo",      position: { x: 720, y: 0   }, data: { label: "Argo CD\n(hub + spoke)" }, style: opsBox },
+  { id: "cluster",   position: { x: 720, y: 150 }, data: { label: "hub-dc-v6\n+ spoke-dc-v6" }, style: agentBox },
+  { id: "alerts",    position: { x: 480, y: 150 }, data: { label: "Prometheus +\nSigNoz alerts" }, style: dataBox },
+  { id: "incident",  position: { x: 240, y: 150 }, data: { label: "Incident issue\n(break-glass record)" }, style: incBox },
+  { id: "postmortem",position: { x: 0,   y: 150 }, data: { label: "Postmortem +\nmemory entry" }, style: dataBox },
+  { id: "runbook",   position: { x: 0,   y: 300 }, data: { label: "Runbook\n(under runbooks/)" }, style: dataBox },
+  { id: "adr",       position: { x: 240, y: 300 }, data: { label: "ADR amendment\n(if architectural)" }, style: dataBox },
+];
+
+export const opsEdges = [
+  { id: "e1", source: "operator",   target: "github",   label: "open issue first", ...reqEdge },
+  { id: "e2", source: "github",     target: "gitlab",   label: "branch + commit", ...reqEdge },
+  { id: "e3", source: "gitlab",     target: "argo",     label: "MR merge → main", ...reqEdge },
+  { id: "e4", source: "argo",       target: "cluster",  label: "pull-mode sync", ...pullEdge },
+  { id: "e5", source: "cluster",    target: "alerts",   label: "metrics + events", ...muted },
+  { id: "e6", source: "alerts",     target: "incident", label: "fires", ...incEdge },
+  { id: "e7", source: "incident",   target: "operator", label: "pages", ...incEdge },
+  { id: "e8", source: "incident",   target: "postmortem", label: "closes into", ...muted },
+  { id: "e9", source: "postmortem", target: "runbook",  label: "lands as", ...muted },
+  { id: "e10", source: "postmortem", target: "adr",     label: "if architectural", ...muted },
+];
+
+This section is the operator's handbook for the active fleet — what the day looks like, what changes when something breaks, how a change gets from a thought to a running cluster, and the seven incidents the lab has actually paid for. It is the page you read on day one and the page you re-skim on every on-call shift.
+
+If you are a brand-new platform admin, read this page, then [day-1 admin handoff](/docs/05-operations/02-day-1-admin-handoff), then [MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics). Everything else is reference material organised by *what just happened*.
+
+## The operating loop
+
+<Whiteboard client:load data={{ nodes: opsNodes, edges: opsEdges }} height={500} />
+
+The arrows are the rules:
+
+- **Every non-trivial change starts with a GitHub issue** in `zeshaq/codex-opp-agent`. The issue carries the milestone, the phase, the governing ADR set, and the validation/rollback plan. This is the durable record per the workspace's GitHub-first tracking convention; chat is ephemeral, the issue is authoritative.
+- **Changes land as MRs against the internal GitLab `platform-gitops` repo.** The repo is GitLab (not GitHub) so the `gh` CLI does not work for opening MRs — you POST to the GitLab API with a PAT. Branch names embed the issue key, commits carry a tracking header, and the MR description follows the documented template. See [MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics).
+- **Argo CD pulls.** Hub and spoke each run their own OpenShift GitOps instance; the spoke is the routine reconciler, the hub coordinates placement. The operator never `oc apply`s as a routine — `oc apply` is break-glass.
+- **The cluster emits signal.** Prometheus on each cluster ships a curated subset of metrics to the hub's federated observability stack; SigNoz on its own VM is the trace/log backend the platform leans on for app-side investigations.
+- **Alerts open incident issues.** The incident issue is the artefact of an on-call shift; it captures the symptom, the diagnosis, the action (and the break-glass record if a live change happened), and the postmortem.
+- **Postmortems land as runbooks and memory entries.** A runbook is the literal recipe the next operator follows under pressure; the memory entry is the one-paragraph "what this taught us" so the lesson survives session boundaries.
+
+## The four operator surfaces
+
+| Surface | What lives there | Authoritative reference |
+|---|---|---|
+| **Active clusters** | `hub-dc-v6` (3-master compact, all-in-one, management) and `spoke-dc-v6` (3 control-plane + 3 physical workers, ODF) | `connection-details/openshift-hub-dc-v6.md`, `connection-details/openshift-spoke-dc-v6.md` |
+| **GitOps source of truth** | Internal GitLab repo `comptech-platform/openshift-ops/openshift-platform-gitops` plus the operator working copy under `clones/platform-gitops/` | `connection-details/platform-admin-handoff.md`, `connection-details/gitlab-operator-guide.md` |
+| **Image supply** | Nexus three-endpoint split: `mirror-registry.*` (oc-mirror), `docker-group.*` (dev pull), `app-registry.*` (CI push) | `connection-details/nexus.md` |
+| **Secrets & evidence** | Vault VM (`vault.sub.comptech-lab.com:8200`) for app/platform credentials, MinIO for backups and CI evidence, `codex-opp-agent/secrets/` for the local mirror of platform creds not yet in Vault | `connection-details/vault-app-secrets.md`, `connection-details/minio.md` |
+
+Each surface has its own access plane, its own rotation schedule, and its own break-glass procedure. Day-1 handoff covers the access details; routine tasks cover the rotations; incidents cover the breakage.
+
+## Day-to-day, by clock time
+
+- **At session start:** read `CURRENT_STATE.md`, `SESSION_LOG.md`, `TODO.md` in `codex-opp-agent`. They are the snapshot from the last operator (often yourself, the day before). Then run the 10-second cluster health snapshot from the [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff).
+- **During focused work:** open or refresh the GitHub issue for the work, edit GitOps under `clones/platform-gitops/`, `kubectl kustomize` both cluster overlays, commit on a branch matching the issue key, open the MR via the GitLab API, watch Argo reconcile, validate, comment on the issue with the validation evidence.
+- **On alerts:** open an incident issue, run the symptom-matching part of the relevant runbook from the [incidents index](/docs/05-operations/04-incidents-and-runbooks/01-overview), capture the before-state, make the smallest correct change, capture the after-state, write the audit record.
+- **At session end:** add a dated session report under `reports/sessions/`, update `CURRENT_STATE.md` / `SESSION_LOG.md` / `TODO.md`, commit the workspace, do not push live state without a backport.
+
+## What this section is and is not
+
+This section is the *operator* handbook. It assumes:
+
+- you have read [section 1 — foundations](/docs/01-foundations/01-overview) (workspace conventions, ADR catalogue, ownership boundaries);
+- you understand the [hub-spoke pull model](/blog/rhacm) at the architectural level;
+- you have shell access from a workspace host that can reach the lab `30.30.0.0/16` network.
+
+It is *not* the developer handbook — apps targeting the Docker runtime VM (paused for OpenShift app delivery per the user's 2026-05-09 decision) follow a separate path covered in section 4. It is also not the compliance auditor handbook — that lives at `codex-opp-agent/connection-details/compliance-implementor-handbook.md` and is consumed by the auditor role.
+
+## What you will find in each subsection
+
+- **[Day-1 admin handoff](/docs/05-operations/02-day-1-admin-handoff)** — the first 100 hours: access plane, what to read, must-watch dashboards.
+- **[platform-gitops MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics)** — the working-copy path, the GitLab API flow, sync-wave conventions, the operator-install pattern.
+- **[Incidents and runbooks](/docs/05-operations/04-incidents-and-runbooks/01-overview)** — seven incidents with symptom → root cause → fix → prevention.
+- **[Routine tasks](/docs/05-operations/05-routine-tasks/01-overview)** — six recurring workflows: secret rotation, operator bumps, fleet onboarding, policy rollout, evidence backfill.
+- **[On-call and escalation](/docs/05-operations/06-on-call-and-escalation)** — paging path, escalation matrix, who-owns-what.
+- **[Known gotchas](/docs/05-operations/07-known-gotchas)** — index of every incident runbook plus the gotchas not severe enough to warrant their own page.
+
+## A note on scope
+
+The active fleet is the v6 pair — `hub-dc-v6` and `spoke-dc-v6`. The pre-v6 `hub-dr` / `spoke-dr` clusters are decommissioned. Any DR-related conversation is about `hub-dr-v6` / `spoke-dr-v6`, which do not exist today. If a runbook mentions a cluster that is not in the active set, treat it as historical context, not as a live target.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- `codex-opp-agent/runbooks/break-glass-procedure.md`
+- `codex-opp-agent/adr/0015`, `0016`, `0018`, `0019`, `0025`
+- Memory: `reference_platform_gitops_mr_path`, `reference_platform_admin_handoff`, `project_workspace_scope`
+- Issues: #127 (handoff), #142 (MCO runbook), #143 (MR conventions doc), #229 (this section tracker)

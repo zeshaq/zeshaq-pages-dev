@@ -1,8 +1,248 @@
 ---
-title: "Day-1 Admin Handoff"
-description: "Section 05-operations: Day-1 Admin Handoff (placeholder)."
-sidebar_label: "Day-1 Admin Handoff"
+title: "Day-1 admin handoff — the first 100 hours"
+description: "Concrete checklist for a new platform operator: the access plane, what to read in what order, the MR conventions, and the dashboards/alerts that must be on-screen during a shift."
+sidebar_label: "Day-1 handoff"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page is the first-100-hours runbook for a platform admin who has just been handed the keys to the active OpenShift v6 fleet. It is a checklist, not a narrative. Tick the items in order; stop and ask before improvising. If you are returning to the role after a session break, you can skip the "before you start" block and resume at the "every-session warm-up".
+
+Sanitization note: all kubeadmin passwords, root tokens, robot pull-secrets, Vault root tokens, MAC addresses, hardware serials, and internal IPv4 addresses are kept in the operator's local `codex-opp-agent/secrets/` mirror and in the corresponding entries in Vault. They are deliberately not published on this page. Where this page says "the *X* host" or "the Vault VM", the address is in `connection-details/<service>.md` inside the workspace.
+
+## Before you start
+
+1. **You have a writable workspace.** The Claude-agent workspace boundary is `/home/ze/claude-agent`, `/home/ze/secrets`, `/home/ze/codex-opp-agent`. Other `/home/ze/*` paths are off-limits unless explicitly named. If your operator account does not have read access to `codex-opp-agent/secrets/` and write access to `codex-opp-agent/`, stop and re-do onboarding.
+2. **You have a GitHub identity in `zeshaq/codex-opp-agent`.** All issues, milestones, ADR review threads, and the operations tracking record live there.
+3. **You have a GitLab identity with developer permission on `comptech-platform/openshift-ops/openshift-platform-gitops`** and a Personal Access Token stored at `codex-opp-agent/secrets/gitlab-zahid-pat`. The PAT is used by the API-driven MR flow; it does not need to be in your shell environment.
+4. **You have `oc`, `kubectl`, `git`, `curl`, `jq`, `skopeo`, and `ssh` on the workstation you operate from.** The workspace assumes these as the minimal toolset; no `oc-mirror` is needed on the operator workstation (it runs on the mirror VM).
+
+## Hour 1: read these, in this order
+
+These are the source-of-truth documents. Skim every one front to back at least once; come back and read in detail when the relevant work surfaces.
+
+| Order | Path | What you take away |
+|---|---|---|
+| 1 | `connection-details/platform-admin-handoff.md` | Cluster endpoints, kubeconfig custody, operator baseline, GitOps flow, image-supply rules, break-glass rules, "stop criteria" list |
+| 2 | `connection-details/gitlab-operator-guide.md` | LAN-only automation, runner taxonomy (11 ct-* groups, 5 planned runner classes), GitLab roles |
+| 3 | `connection-details/compliance-implementor-handbook.md` | PCI-DSS phase chain (PCI-0 -> PCI-5), auditor vs implementor roles, evidence-pack format |
+| 4 | `connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md`, `openshift-gitops-hub-dc-v6.md` | Per-cluster API/console URLs, machine inventory, ODF status, GitOps Applications |
+| 5 | `connection-details/nexus.md`, `vault-app-secrets.md`, `minio.md` | Three-endpoint Nexus split, Vault kv-v2 paths, MinIO buckets and lifecycle |
+| 6 | `connection-details/signoz.md`, `jenkins.md`, `docker-runtime-vm.md` | Supporting VM topology |
+| 7 | `adr/0015`, `0016`, `0018`, `0019`, `0025` | The five ADRs that govern day-to-day operator behaviour |
+| 8 | `runbooks/break-glass-procedure.md` | The procedure you follow when GitOps cannot recover within fifteen minutes |
+
+Allow about 90 minutes for the first pass.
+
+## Hour 2: the access plane
+
+Open shells against both clusters with the local kubeconfigs:
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+K_SPOKE=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+oc --kubeconfig "$K_HUB" whoami
+oc --kubeconfig "$K_SPOKE" whoami
+```
+
+Expected: each command returns the configured identity (`kubeadmin` for first-day bootstrap, a named cluster-admin identity after IdP is wired). If `whoami` fails, the kubeconfig is stale — re-fetch from the bootstrap host (`ze@ocp-bootstrap`) under `/home/ze/ocp-clusters/<cluster>/auth/kubeconfig`.
+
+Confirm GitLab reachability via PAT:
+
+```bash
+PAT=$(tr -d '\r\n' < /home/ze/codex-opp-agent/secrets/gitlab-zahid-pat)
+curl -sSf -H "PRIVATE-TOKEN: $PAT" \
+  http://<gitlab-vm>/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops \
+  | jq '.name, .default_branch'
+```
+
+Expected: project name and `main` as default branch. Anything else is a permission or PAT problem — fix before continuing.
+
+Confirm Vault reachability:
+
+```bash
+VAULT_ADDR=https://vault.sub.comptech-lab.com:8200
+curl -sSf $VAULT_ADDR/v1/sys/health | jq '.initialized, .sealed, .standby'
+```
+
+Expected: `true`, `false`, `false`. If `sealed` is `true`, escalate immediately — the platform's secret plane is offline.
+
+Confirm Nexus three endpoints:
+
+```bash
+for ep in mirror-registry docker-group app-registry; do
+  curl -ksSI https://$ep.apps.sub.comptech-lab.com/v2/ | head -1
+done
+```
+
+Expected: each returns `401 Unauthorized` (reachable, requesting auth). `503` or `5xx` is a Nexus-side problem; `Connection refused` is a DNS / HAProxy problem.
+
+Confirm SigNoz reachability:
+
+```bash
+curl -ksSf https://signoz.apps.sub.comptech-lab.com/api/v1/version | jq '.data.version'
+```
+
+Expected: `v0.122.0` (or whatever the lab is running). Anything but `200` is either a VM-down event or the v0.122 API-shape gotcha — see [SigNoz v0.122 auth runbook](/docs/05-operations/04-incidents-and-runbooks/06-signoz-v0122-auth).
+
+## Hour 3: the cluster health snapshot
+
+The "is the fleet OK?" snapshot is three commands per cluster:
+
+```bash
+oc --kubeconfig "$K_HUB" get nodes -o wide
+oc --kubeconfig "$K_HUB" get clusterversion version
+oc --kubeconfig "$K_HUB" get co \
+  | awk 'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+
+oc --kubeconfig "$K_SPOKE" get nodes -o wide
+oc --kubeconfig "$K_SPOKE" get clusterversion version
+oc --kubeconfig "$K_SPOKE" get co \
+  | awk 'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+```
+
+Expected steady state, as of the latest fleet handoff:
+
+- `hub-dc-v6`: three masters `Ready`, no worker machines, ClusterVersion `4.20.18`, every ClusterOperator `Available=True / Progressing=False / Degraded=False`.
+- `spoke-dc-v6`: three masters and three workers (`gold-1`, `gold-2`, `gpu-01`) `Ready`, ClusterVersion `4.20.18`, COs clean.
+
+Any deviation is the first item on your incident issue.
+
+Plus a one-shot Argo CD sanity check on each cluster:
+
+```bash
+oc --kubeconfig "$K_HUB" -n openshift-gitops get applications.argoproj.io -o wide
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get applications.argoproj.io -o wide
+```
+
+Expected: every Application is `Synced / Healthy`. If something is `OutOfSync` or `Degraded`, the [drift triage flow](/docs/05-operations/04-incidents-and-runbooks/01-overview) starts here.
+
+## Hour 4: image-supply sanity check
+
+The platform is disconnected. Every image must come from an approved local prefix. Run the drift script:
+
+```bash
+cd /home/ze/codex-opp-agent
+scripts/openshift-image-supply-check.sh hub-dc-v6   "$K_HUB"
+scripts/openshift-image-supply-check.sh spoke-dc-v6 "$K_SPOKE"
+```
+
+Expected: zero uncovered external runtime image references, default OperatorHub sources disabled, mirrored CatalogSources and ClusterCatalogs present. The latest known-clean reports live under `reports/`.
+
+If a pod is pulling from `registry.redhat.io` or `quay.io` directly and no IDMS/ITMS covers the source, treat it as image-supply drift and open an issue. Do not re-enable upstream OperatorHub sources to "fix" it.
+
+## Day 1: write your first MR
+
+Pick something tiny — a CHANGELOG fix, a typo in a `kustomization.yaml`, a comment in a `Subscription`. The goal is to walk the MR flow end to end while the failure modes are inexpensive:
+
+1. Open or comment on a GitHub issue describing the change (even one-line fixes get an issue under the GitHub-first tracking convention).
+2. Branch in `/home/ze/claude-agent/clones/platform-gitops/`:
+
+   ```bash
+   cd /home/ze/claude-agent/clones/platform-gitops
+   git pull --ff-only origin main
+   git checkout -b doc-1/first-mr
+   ```
+
+3. Make the change. `kubectl kustomize` both cluster overlays:
+
+   ```bash
+   kubectl kustomize clusters/hub-dc-v6   > /dev/null
+   kubectl kustomize clusters/spoke-dc-v6 > /dev/null
+   ```
+
+4. Commit with the tracking-header block (see [MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics) for the exact shape).
+5. Push and open the MR via the GitLab API. The `gh` CLI does not work for GitLab — use the documented `curl` + PAT path.
+6. Watch Argo reconcile after merge:
+
+   ```bash
+   oc --kubeconfig "$K_SPOKE" -n openshift-gitops get app spoke-dc-v6-cluster-config \
+     -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+   ```
+
+7. Update the issue with the validation evidence and close it.
+
+Day-1 success criterion: you have walked the loop once without surprises. If the MR API call was unfamiliar, repeat the loop with a second trivial change before tackling anything substantive.
+
+## Day 2-3: shadow a real change
+
+If a routine task is on the [TODO](/docs/05-operations/05-routine-tasks/01-overview) — operator bump, policy rollout, evidence backfill — pair on it with the outgoing operator or with the workspace's session-log history. Read the most recent five session reports under `codex-opp-agent/reports/sessions/` to see the conventions in practice.
+
+The session-report convention is one report per session under `reports/sessions/YYYYMMDD-HHMMSS-<slug>.md` capturing what was done, what changed, what was validated, and any residual risk. Adopt the convention before you accumulate the first three sessions of debt.
+
+## Day 4-5: own one incident category
+
+Pick one incident class — the seven runbooks under [incidents](/docs/05-operations/04-incidents-and-runbooks/01-overview) — and walk every step on a non-production reproducer if available, or paper-walk it otherwise. The aim is to own the recovery commands before paged at 3 AM.
+
+The recommended starting category for a new operator is the [Routes CRD incident](/docs/05-operations/04-incidents-and-runbooks/02-acm-gitops-addon-routes-crd) because it is recurring, the diagnostic is one `oc get --raw /openapi/v2`, and the fix is one `oc delete crd`.
+
+## Must-watch dashboards and alerts
+
+Keep these on a second monitor during a shift:
+
+| Surface | What to watch | Why |
+|---|---|---|
+| Hub OpenShift console -> Observe -> Alerts | `Watchdog` + any `Critical` | The Watchdog confirms the alerting pipeline itself is alive |
+| Spoke OpenShift console -> Observe -> Alerts | `Watchdog` + any `Critical` | Same |
+| Argo CD UI (hub and spoke, port-forward or Route) | Sync + Health of every Application | The single fastest failure indicator |
+| SigNoz UI -> Services | Throughput + error rate per service | Catches workload-side regressions ahead of pod-level alerts |
+| `oc get co` (both clusters) | Anything not `Available=True / Progressing=False / Degraded=False` | The cluster-operator view aggregates CRDs/operators/webhooks |
+| `oc get mcp` (spoke) | `Updating=False` outside of a known rollout window | MCP-stuck-on-revert is the #135 incident class |
+
+If you find yourself watching `oc get pods -A -w`, you are watching the wrong layer. The pod view is the symptom; the alerts and Argo health view is the cause.
+
+## Every-session warm-up (re-entry)
+
+Once you have done the first-100-hours pass, every subsequent session opens with:
+
+1. Read `codex-opp-agent/CURRENT_STATE.md`, `SESSION_LOG.md`, `TODO.md` (in that order).
+2. Read the two most recent dated reports under `codex-opp-agent/reports/sessions/`.
+3. Run the cluster health snapshot (hour 3 above).
+4. Run the Argo sanity check.
+5. Run the image-supply drift check (weekly cadence is fine if there has been no install activity).
+6. Skim open incident issues (label `incident` on `zeshaq/codex-opp-agent`).
+7. Pick the next item from `TODO.md`'s "Next Order Of Business" section.
+
+The protocol is the codex-opp-agent workspace's stated convention (read CURRENT_STATE / SESSION_LOG / TODO at start, write a dated session record at end). It is the difference between operating a fleet and groping for context.
+
+## What MUST stay out of GitHub, GitLab, chat, and this page
+
+Per the workspace's "Do not paste ..." rule in the handoff doc:
+
+- kubeadmin passwords;
+- pull secrets (registry.redhat.io, cloud.redhat.com, robot tokens);
+- PATs (GitHub, GitLab, Nexus, Quay);
+- Nexus admin password and per-bot passwords;
+- Vault root token;
+- full `Secret` manifests (the `data:` block);
+- htpasswd hashes (RHACS Central admin, etc.);
+- raw internal IPv4 addresses in public docs (this site is published to Cloudflare Pages — descriptive labels only).
+
+If a credential lands in chat or an issue body by mistake, treat it as a rotation event: rotate the credential, update Vault and the local `secrets/` mirror, and record the rotation in the active session report.
+
+## Stop criteria — when to escalate, not push through
+
+The handoff doc's "Stop Criteria" list is short and absolute. Stop and escalate before continuing if:
+
+- default external OperatorHub sources must be re-enabled to proceed;
+- a package is missing from the mirrored catalog;
+- a pod is pulling from upstream without a mirror rule;
+- MCPs are degraded or stuck updating;
+- Argo CD is not `Synced / Healthy` after the expected reconciliation window;
+- ODF or core storage is degraded;
+- any workflow requires committing or printing a secret;
+- two controllers or two Argo Applications would own the same cluster-scoped resource;
+- a direct live change cannot be backported or justified.
+
+"Escalate" in the lab means: post in the active GitHub issue, page the workspace owner, and wait. Do not improvise.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` (the canonical handoff doc)
+- `codex-opp-agent/connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md`, `openshift-gitops-hub-dc-v6.md`
+- `codex-opp-agent/connection-details/nexus.md`, `vault-app-secrets.md`, `minio.md`, `signoz.md`
+- `codex-opp-agent/runbooks/break-glass-procedure.md`, `secrets-custody-drift-check.md`
+- `codex-opp-agent/adr/0015`, `0016`, `0018`, `0019`, `0025`
+- Issues: #127 (this handoff), #229 (this section)
+- Memory: `reference_platform_admin_handoff`, `feedback_workspace_protocol`, `feedback_github_first_tracking`
