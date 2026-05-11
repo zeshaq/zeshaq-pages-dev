@@ -1,8 +1,234 @@
 ---
-title: "app-registry Push Endpoint"
-description: "Section 02-lab-infrastructure/07-image-supply-nexus: app-registry Push Endpoint (placeholder)."
-sidebar_label: "app-registry Push Endpoint"
+title: "app-registry Push Endpoint (CI Push / Runtime Pull)"
+description: "How app-registry.apps.sub.comptech-lab.com works — the CI push target and runtime pull source for application images, backed by docker-dev-hosted on Nexus port 5002."
+sidebar_label: "app-registry (CI push)"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`app-registry.apps.sub.comptech-lab.com` is the **CI push lane and runtime pull lane** of the [three-endpoint split](./01-three-endpoint-split). It is where Jenkins (and, in the future, GitLab CI) pushes every image build after a successful Trivy scan, and where runtime systems — `docker-runtime-vm` today, OpenShift workloads when that path reopens — pull application images by immutable tag or digest.
+
+This page covers the contract: who pushes, who pulls, the tagging convention, the rotation model, and the runtime-allowlist guarantee that ties this endpoint to ADR 0019.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| Public hostname | `app-registry.apps.sub.comptech-lab.com` |
+| Direct debug hostname | `http://nexus-mirror.sub.comptech-lab.com:5002` |
+| HAProxy backend | nexus VM `:5002` |
+| Nexus repository | `docker-dev-hosted` (hosted) |
+| Repository type | Docker hosted — read+write |
+| TLS | LE wildcard `*.apps.sub.comptech-lab.com` at HAProxy |
+| Auth | Basic auth, Nexus role `nexus-jenkins-ci` (used by `jenkinsbot`) |
+| Cleanup policy | `docker-dev-hosted-retain-30d` |
+| Allow redeploy | `false` — immutable tags |
+
+`docker-dev-hosted` is a Nexus *hosted* repository (writable backing store). It is exposed twice:
+
+- As the **write** target via the `app-registry` hostname → Nexus `:5002`.
+- As a **read** member of `docker-group` (so developers can pull the team's own images via the group URL without needing read on the hosted repo directly).
+
+## Who writes here
+
+The `nexus-jenkinsbot` Nexus user, bound to the `nexus-jenkins-ci` role. The role grants:
+
+- `nx-repository-view-docker-docker-dev-hosted-browse`
+- `nx-repository-view-docker-docker-dev-hosted-read`
+- `nx-repository-view-docker-docker-dev-hosted-add`
+- `nx-repository-view-docker-docker-dev-hosted-edit`
+- `nx-repository-view-docker-docker-dev-hosted-delete`
+
+Push permission is intentionally combined with delete on the same hosted repo. The delete right exists so Jenkins can clean up a tag it created earlier in a build when a later stage fails — for example, a build pushed `:build-12`, the Trivy gate then failed retrospectively because of a vuln in a layer change, and the pipeline should retract that tag rather than leaving it published. The delete right is scoped to `docker-dev-hosted` only; it is not authorization to delete OpenShift platform mirror content (which would require `ocp-mirror` permissions, which `jenkinsbot` does not have).
+
+The credential is in local custody under `secrets/` (Git-ignored, mode-restricted). Jenkins consumes it through the Jenkins credential store under ID `nexus-jenkinsbot`. The value is never written to job definitions, MRs, issues, wiki pages, or chat output.
+
+## Who reads here
+
+- **`docker-runtime-vm`** — pulls every application image it runs, by immutable tag like `app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8` or by `@sha256` digest. This is currently the primary runtime per the user's 2026-05-09 direction (`project_app_dev_direction.md`).
+- **OpenShift cluster nodes** — when the OpenShift app delivery path reopens. The runtime allowlist in ADR 0019 explicitly includes `app-registry.apps.sub.comptech-lab.com/`.
+- **Developers** via the `docker-group.*` group URL (the same hosted repo is a member of that group).
+- **ArgoCD image-update polls** (when wired) to verify the image referenced by a Deployment is reachable.
+
+## Tagging convention
+
+```text
+# Required: an immutable tag
+app-registry.apps.sub.comptech-lab.com/<repo-namespace>/<image>:<build-tag>
+
+# Examples
+app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe:build-8
+app-registry.apps.sub.comptech-lab.com/demo/demo-smoke:build-6
+
+# Optional: also reference by digest in manifests
+app-registry.apps.sub.comptech-lab.com/smoke/readiness-probe@sha256:<digest>
+```
+
+Conventions:
+
+- **`<repo-namespace>` matches a tenant/team boundary.** Current sandbox namespaces: `smoke`, `demo`. Adding a namespace is a Nexus admin operation tied to a tracked decision.
+- **`<image>` matches the GitLab project name.** Easier to trace ownership; the developer handbook reinforces this.
+- **`<build-tag>` is `build-<N>` from Jenkins** (Jenkins build number per job) **or a Git SHA** (`build-${GIT_SHA:0:12}`). The first form is convenient for serial reasoning; the second is reproducible across job recreation.
+- **No `:latest`.** Manifests in OpenShift / Docker runtime never reference mutable tags. The hosted repo's `Allow redeploy = false` setting backs this up at the Nexus layer.
+
+Jenkins computes the tag once at the start of the pipeline and writes it to the build's archived evidence, so a downstream system knows which immutable tag was the build's output even if multiple builds raced.
+
+## Push flow
+
+```bash
+# Minimum env (set per build job)
+IMAGE_REGISTRY=app-registry.apps.sub.comptech-lab.com
+IMAGE_REPOSITORY=smoke/readiness-probe
+IMAGE_TAG=build-$(date -u +%Y%m%d-%H%M%S)
+IMAGE_REF="$IMAGE_REGISTRY/$IMAGE_REPOSITORY:$IMAGE_TAG"
+
+# Login (credentials from Jenkins credential store nexus-jenkinsbot, fed via env)
+printf '%s' "$NEXUS_PASSWORD" | podman login "$IMAGE_REGISTRY" \
+  --username "$NEXUS_USER" \
+  --password-stdin
+unset NEXUS_PASSWORD
+
+# Build (out of scope for this page; typically `podman build` with --pull on docker-group.*)
+podman build -t "$IMAGE_REF" .
+
+# Scan (Trivy via client/server mode; see Trivy integration page)
+trivy image \
+  --server "https://trivy.apps.sub.comptech-lab.com" \
+  --token "$TRIVY_SERVER_TOKEN" \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  "$IMAGE_REF"
+
+# Push
+podman push "$IMAGE_REF"
+
+# Record digest into delivery evidence
+IMAGE_DIGEST="$(podman inspect --format '{{ index .Digest }}' "$IMAGE_REF")"
+echo "$IMAGE_DIGEST" > evidence/image-digest
+```
+
+The shape of the actual Jenkinsfile is in `examples/jenkins/Jenkinsfile.nexus-app` in the codex-opp-agent workspace.
+
+## Pull flow
+
+### From `docker-runtime-vm`
+
+The `docker-runtime-deploy` wrapper on the runtime VM (run as the `docker-deploy` user via narrow sudo) takes an app name and a desired image reference, pulls the immutable tag from `app-registry`, runs the equivalent of `docker compose up -d`, captures a release snapshot for rollback, and updates the health file.
+
+```bash
+sudo /usr/local/sbin/docker-runtime-deploy deploy readiness-probe
+```
+
+The deploy script inside `/usr/local/sbin/docker-runtime-deploy` does a `docker login` to `app-registry.apps.sub.comptech-lab.com` using credentials from `/opt/docker-runtime/env/<app>.env` (env-file bridge custody) and pulls the image referenced in `/opt/docker-runtime/apps/<app>/docker-compose.yml`. The app's Compose file pins the image to an immutable tag.
+
+### From OpenShift
+
+When the OpenShift app path is reopened, workloads will pull by digest from `app-registry`. The runtime allowlist in ADR 0019 includes this prefix. The pull secret distributed to namespaces will carry credentials for `app-registry` only (read-only Nexus identity, scoped to `docker-dev-hosted`).
+
+## Validation
+
+```bash
+# DNS
+dig @<lab-dns> app-registry.apps.sub.comptech-lab.com A +short
+
+# /v2/ probe
+curl -sSI https://app-registry.apps.sub.comptech-lab.com/v2/ | head -1
+
+# Catalog (authenticated)
+curl --netrc-file ~/.netrc-nexus -fsS \
+  https://app-registry.apps.sub.comptech-lab.com/v2/_catalog | jq -r '.repositories[]'
+
+# Tag list for a known repo
+curl --netrc-file ~/.netrc-nexus -fsS \
+  https://app-registry.apps.sub.comptech-lab.com/v2/smoke/readiness-probe/tags/list \
+  | jq -r '.tags[]?'
+
+# Manifest by digest
+curl --netrc-file ~/.netrc-nexus -fsS \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  https://app-registry.apps.sub.comptech-lab.com/v2/smoke/readiness-probe/manifests/build-8 \
+  | jq .
+```
+
+## Cleanup and retention
+
+The cleanup policy `docker-dev-hosted-retain-30d` deletes tags that haven't been pulled in 30 days. Combined with `Allow redeploy = false`, the practical consequence is:
+
+- A successful build tag exists in Nexus indefinitely as long as it is being pulled regularly (runtime VM pulling daily or weekly).
+- A tag that nothing pulls for 30 days ages out.
+- A tag can never be overwritten by a redeploy of the same name.
+
+This is the right tradeoff for the lab: keep what's being used, prune dead builds, refuse mutation. If a tag is being aged out unexpectedly, the issue is in the consumer's pull cadence, not in the cleanup policy.
+
+There is also a Nexus task that deletes blob-store entries no longer referenced by any manifest — typical Nexus housekeeping, scheduled to run nightly outside the active build window.
+
+## Failure modes
+
+### Symptom: build push fails with 400 / "manifest invalid"
+
+**Root cause.** Common cause is pushing to the wrong repository name format. The hosted repo expects paths of the form `<namespace>/<image>:<tag>` — a single-segment image name (`/myapp:build-1`) will be rejected by Nexus's hosted-repo validation in some configurations.
+
+**Fix.** Use a two-segment path. Match the namespace to a known tenant (e.g., `smoke/...`, `demo/...`).
+
+**Prevention.** Pipeline templates encode the path shape; CI templates lint Jenkinsfiles for this.
+
+### Symptom: build push fails with 401
+
+**Root cause.** Jenkins credential `nexus-jenkinsbot` is missing, the Nexus user was rotated, or the credential expired in the local custody copy.
+
+**Fix.** Verify the credential exists in Jenkins (`/credentials/store/system/domain/_`). Verify the user can authenticate via `whoAmI`-style API. Rotate from the secrets workspace if needed.
+
+**Prevention.** Credential rotation is a tracked operation tied to Nexus user rotation; rotation runbook in the `secrets-custody-drift-check.md` runbook.
+
+### Symptom: build push fails with 403 on delete
+
+**Root cause.** A delete step in the pipeline (cleanup-after-failure logic) targeted a tag the `nexus-jenkins-ci` role doesn't have delete on. Most likely, the pipeline tried to delete from `ocp-mirror`, not `docker-dev-hosted`.
+
+**Fix.** Constrain the pipeline's delete-on-failure logic to the same registry it pushed to. Never let the pipeline reach `mirror-registry.*` for any reason.
+
+**Prevention.** Pipeline review; CI lint that flags any `mirror-registry` reference outside the install-only paths.
+
+### Symptom: a pushed tag is suddenly missing from a runtime pull
+
+**Root cause.** Either (a) cleanup policy aged it out because nothing pulled it for 30 days, or (b) a manual delete via the Nexus UI. The cleanup case is the common one in lab environments where dev branches push tags that never get deployed.
+
+**Fix.** Rebuild and re-push if the tag is needed. The `:build-N` form is stable inside a build job's history — Jenkins archived evidence lets you re-resolve which Git SHA produced `build-7` and rebuild from that SHA.
+
+**Prevention.** For tags that matter (production deploys), record the digest into a Vault-tracked artifact catalog or — more simply — keep the tag pulled by a periodic sentinel (the runtime VM's normal health-pull cadence achieves this).
+
+### Symptom: a developer tries to push to docker-group.\* and gets 405
+
+This is covered in the [docker-group page](./03-docker-group-pull-endpoint#failure-modes). Push goes to `app-registry`, not `docker-group`.
+
+## OpenShift pull secret bridge
+
+When app workloads return to OpenShift, the recommended path is ESO-managed dockerconfigjson secrets. For a bootstrap bridge, the Nexus operator guide documents a temporary authfile-to-secret flow:
+
+```bash
+NAMESPACE=<app-namespace>
+REGISTRY=app-registry.apps.sub.comptech-lab.com
+AUTHFILE="$(mktemp)"
+trap 'rm -f "$AUTHFILE"' EXIT
+
+printf '%s' "$NEXUS_PASSWORD" | podman --authfile "$AUTHFILE" login "$REGISTRY" \
+  --username "$NEXUS_USER" \
+  --password-stdin
+unset NEXUS_PASSWORD
+
+oc -n "$NAMESPACE" create secret generic nexus-docker-pull \
+  --from-file=.dockerconfigjson="$AUTHFILE" \
+  --type=kubernetes.io/dockerconfigjson \
+  --dry-run=client -o yaml | oc apply -f -
+
+oc -n "$NAMESPACE" secrets link default nexus-docker-pull --for=pull
+```
+
+The rendered Secret must not be committed to Git. The long-term path is ESO + a Vault-backed `kubernetes.io/dockerconfigjson` template, with the value derived from a least-privilege Nexus user.
+
+## References
+
+- `codex-opp-agent/connection-details/nexus.md` — sections "Docker Group Exposure", "Pushing Images", "Jenkins And Automation", "OpenShift Image Pull Secret".
+- `codex-opp-agent/connection-details/jenkins.md` — `nexus-jenkinsbot` credential, starter job evidence.
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md` — runtime allowlist.
+- Memory: `project_nexus_endpoint_split.md`, `project_app_dev_direction.md`.
+- Live validation 2026-05-09: `:build-8` push to `smoke/readiness-probe` succeeded; manifest endpoint returned `HTTP 200`; `:build-6` push to `demo/demo-smoke` succeeded.

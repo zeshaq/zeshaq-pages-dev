@@ -1,8 +1,181 @@
 ---
-title: "mirror-registry Endpoint"
-description: "Section 02-lab-infrastructure/07-image-supply-nexus: mirror-registry Endpoint (placeholder)."
-sidebar_label: "mirror-registry Endpoint"
+title: "mirror-registry Endpoint (Install Lane)"
+description: "How mirror-registry.apps.sub.comptech-lab.com works — the OpenShift platform install path backed by the ocp-mirror hosted repo on Nexus port 5000, populated by oc mirror --v2."
+sidebar_label: "mirror-registry (install)"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Mermaid from "../../../../components/Mermaid";
+
+`mirror-registry.apps.sub.comptech-lab.com` is the **install lane** of the three-endpoint split. It exists for OpenShift platform content — release images, operator catalogs, operators, operands, and approved base images — populated from upstream registries through `oc mirror --v2` and consumed by disconnected OpenShift clusters during install and runtime.
+
+This page goes deeper than the [three-endpoint split overview](./01-three-endpoint-split): what's behind the endpoint, what runs on it, how it's populated, how cluster nodes consume it, and the rules that keep it off the application path.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| Public hostname | `mirror-registry.apps.sub.comptech-lab.com` |
+| Direct debug hostname | `http://mirror-registry.sub.comptech-lab.com:5000` |
+| HAProxy backend | nexus VM `:5000` |
+| Nexus repository | `ocp-mirror` (hosted) |
+| Repository type | Docker hosted (read-write, but writes restricted to the bootstrap admin) |
+| TLS | LE wildcard `*.apps.sub.comptech-lab.com` at HAProxy |
+| Auth | Basic auth via Nexus realm (admin push, cluster-node read) |
+| Cleanup policy | None — platform invariant |
+
+The endpoint terminates at HAProxy in the `*.apps` plane, decrypts, and forwards over the private lab `/24` to Nexus port `5000`, which is the connector for the `ocp-mirror` hosted Docker repository.
+
+## Who writes here
+
+Exactly one writer: the bootstrap host running `oc mirror --v2` against a release manifest. The bootstrap host has internet access; the cluster nodes do not. `oc mirror` copies image layers and manifests from upstream (`registry.redhat.io`, `icr.io`, `quay.io` as appropriate) into Nexus and emits two artifacts the cluster needs to consume that content:
+
+- An `ImageDigestMirrorSet` (IDMS) and/or `ImageTagMirrorSet` (ITMS) Kubernetes manifest, applied to each cluster, that rewrites pulls from upstream-style references to `mirror-registry.apps.*` references at node runtime.
+- One or more `CatalogSource` / `ClusterCatalog` references that point at the mirrored operator catalogs.
+
+Application teams must not push to `ocp-mirror`. The Nexus role `nexus-jenkins-ci` (used by `jenkinsbot`) explicitly excludes this repository.
+
+## Who reads here
+
+- **Cluster nodes (CRI-O)** during install, upgrade, and pod start. Most pulls are by digest because IDMS rewrites mutable upstream references to local digest-pinned references. Some pulls (older operands) still use tags via ITMS.
+- **The OpenShift Image Registry's mirroring layer**, where the cluster internal registry caches certain pulls.
+- **Operator catalog reconciliation**, where the catalog pod fetches its index from a mirrored catalog reference.
+
+Application workloads never pull from this endpoint. If a pod's image starts with `mirror-registry.apps.sub.comptech-lab.com/...` and it's not an operator, operand, or release-mirrored base image, that's a drift signal to investigate.
+
+## How content lands here
+
+<Mermaid client:load chart={`flowchart LR
+  upstream["upstream registries\nregistry.redhat.io\nicr.io\nquay.io"] -->|oc mirror --v2 from bootstrap host| nexus["Nexus VM\nocp-mirror hosted\nport 5000"]
+  nexus -->|HAProxy 443 LE wildcard| edge["mirror-registry.apps.\nsub.comptech-lab.com"]
+  edge -->|cluster pull by digest with IDMS/ITMS rewrites| ocp["OpenShift cluster nodes\nhub-dc-v6, spoke-dc-v6"]
+`} />
+
+The path is one-way at runtime: cluster nodes read; nothing on the cluster writes back. The only writer is the human (or automation) running `oc mirror --v2` on the bootstrap host during a planned install or upgrade window.
+
+A typical `oc mirror --v2` invocation looks like:
+
+```bash
+oc mirror --v2 \
+  --config /home/ze/codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml \
+  --workspace file:///home/ze/oc-mirror-workspace \
+  docker://mirror-registry.apps.sub.comptech-lab.com
+```
+
+The imageset config selects:
+
+- An OpenShift release channel and version range.
+- Specific operator catalog entries (Red Hat operators, certified operators, optionally community).
+- Approved base images mirrored into a dedicated repo namespace under `ocp-mirror`.
+- Extra image lists for operands that are not catalog-resolvable.
+
+After `oc mirror` completes, it writes generated IDMS, ITMS, `CatalogSource`, and `ClusterCatalog` manifests to its workspace; these are then committed to the platform GitOps repo and reconciled onto the clusters by OpenShift GitOps.
+
+## Validation
+
+```bash
+# DNS — should resolve to HAProxy edge in the lab /24
+dig @<lab-dns> mirror-registry.apps.sub.comptech-lab.com A +short
+
+# Docker Registry v2 probe — should return 401 when unauthenticated
+curl -sSI https://mirror-registry.apps.sub.comptech-lab.com/v2/ | head -1
+
+# Authenticated catalog list (using a netrc file)
+curl --netrc-file ~/.netrc-nexus -fsS \
+  https://mirror-registry.apps.sub.comptech-lab.com/v2/_catalog | jq -r '.repositories[]' | head -20
+```
+
+Expected:
+
+- DNS returns the HAProxy private bind address in the lab `/24`.
+- `/v2/` returns `HTTP/2 401` unauthenticated.
+- `_catalog` (authenticated) returns the platform mirror namespace: typically `openshift/release-images`, `openshift/release`, operator-catalog images, and approved base-image namespaces.
+
+## Pull-secret model
+
+The `pull-secret` used by cluster nodes is a `dockerconfigjson` with entries for, at minimum:
+
+```text
+mirror-registry.apps.sub.comptech-lab.com
+app-registry.apps.sub.comptech-lab.com
+image-registry.openshift-image-registry.svc:5000   # internal
+default-route-openshift-image-registry.apps.sub.comptech-lab.com   # default route
+```
+
+The `mirror-registry` entry uses a read-only Nexus identity scoped to `ocp-mirror`. There is no entry for `docker-group.*` on cluster nodes — by design. Cluster runtime is not a developer pull path.
+
+Distribution of this secret across the fleet is governed by ACM/MCE plus External Secrets Operator (where ESO is wired); for clusters that don't have ESO yet, the secret is applied via the platform GitOps repo with a Vault-backed ExternalSecret reference rather than a committed plain Secret.
+
+## Image-reference shape
+
+Pulls and image references look like:
+
+```text
+mirror-registry.apps.sub.comptech-lab.com/openshift/release-images@sha256:<digest>
+mirror-registry.apps.sub.comptech-lab.com/openshift/release@sha256:<digest>
+mirror-registry.apps.sub.comptech-lab.com/<operator-catalog-namespace>/<image>:<tag>
+mirror-registry.apps.sub.comptech-lab.com/<approved-base>/<image>@sha256:<digest>
+```
+
+Convention:
+
+- Use **digest** for platform pulls. Operator catalog refs are tag-resolved by the cluster's catalog manager and then digest-pinned in the resulting Subscription/CSV.
+- Do not invent repository paths. Use the namespaces emitted by `oc mirror --v2`.
+- If an operand pulls from upstream by name and that pull fails (CSI operators are the classic case), the fix is to extend the imageset config to mirror that operand, re-run `oc mirror`, and let the cluster pick up the new IDMS/ITMS entry — not to patch the operator manifest by hand.
+
+This is the lesson from the ODF rollout on `spoke-dc-v6` (ADR 0019 context): operands attempted direct `registry.redhat.io` pulls because the mirror was incomplete; the operand had to be added to the mirror configuration before CSI settled. Don't paper over a missing mirror — fix the mirror.
+
+## What `mirror-registry.*` is not
+
+- **Not a Maven repo.** Use the Nexus Maven repositories for that, on the Nexus UI hostname.
+- **Not an npm registry.** Same: Nexus has npm repository types.
+- **Not a Helm chart repo.** Helm OCI artifacts live elsewhere if/when adopted.
+- **Not a Docker group.** Group repos are `docker-group.*` only; `mirror-registry` is a hosted repo with strict push controls.
+- **Not the place for CI to push.** That is `app-registry.*`.
+- **Not the place for developers to pull base images.** That is `docker-group.*`.
+- **Not a generic platform-team scratch repo.** If the platform team needs to mirror something one-off for testing, do it in a dedicated hosted repository, not in `ocp-mirror`.
+
+## Cleanup, retention, and drift
+
+There is **no automatic cleanup policy** on `ocp-mirror`. The platform invariant is that any digest the cluster might pull must remain in the mirror as long as the cluster references it. Cleanup is a manual, tracked operation tied to a release/operator removal — done with `oc mirror`'s prune semantics on a workstation, then mirrored back.
+
+Drift checks (per ADR 0019) must run periodically and produce:
+
+- A list of all pod / init / ephemeral container image references on each cluster.
+- A list of references not covered by the approved runtime allowlist.
+- Current IDMS/ITMS objects.
+- OperatorHub default-source posture (should be `disabled`).
+- CatalogSource / ClusterCatalog image references.
+
+The expected drift posture is **zero** un-covered references on production clusters and a small, tracked set on lab clusters.
+
+## Failure modes
+
+### Symptom: pod stuck on ImagePullBackOff with a registry.redhat.io reference
+
+**Root cause.** The image is not yet mirrored to `ocp-mirror`, or the IDMS/ITMS rule that should rewrite the upstream reference to a local one is missing or not yet reconciled.
+
+**Fix.** Identify the missing image, add it to the imageset config, re-run `oc mirror --v2`, commit the regenerated IDMS/ITMS to platform GitOps, watch the cluster reconcile, then delete the failing pod to trigger a re-pull.
+
+**Prevention.** Operator and operand mirror configuration must be reviewed end-to-end before each new operator install. The ODF lesson (ADR 0019) is that the operator manifest itself does not name every operand — you have to derive operand images from the catalog and add them explicitly.
+
+### Symptom: a CI build accidentally pushed to mirror-registry.\*
+
+See the corresponding entry in the [three-endpoint split overview](./01-three-endpoint-split#failure-modes-and-gotchas).
+
+### Symptom: cluster nodes can reach the endpoint but pulls fail with 401
+
+**Root cause.** Pull-secret entry for `mirror-registry.apps.sub.comptech-lab.com` is wrong, missing, or expired.
+
+**Fix.** Refresh the pull-secret entry from Vault/ESO, restart any pods stuck on the bad credential. Validate with `crictl pull <ref>` on the affected node if SSH is available.
+
+**Prevention.** Pull-secret rotation procedure must align with Nexus user rotation cadence. Custody lives under the lab `secrets/` tree, distribution lives in Vault.
+
+## References
+
+- `codex-opp-agent/connection-details/nexus.md` — sections "Current Service", "Docker Group Exposure", "Pulling Images", "OpenShift Image Pull Secret".
+- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md` — decision and runtime allowlist.
+- `codex-opp-agent/plans/disconnected-rebuild/02-registry-mirror.md` — operator-side mirror runbook.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — environment-specific imageset.
+- Memory: `feedback_oc_mirror_off_limits.md` — operator boundary.
