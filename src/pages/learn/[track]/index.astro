@@ -1,0 +1,86 @@
+---
+import LearnLayout from "../../../layouts/LearnLayout.astro";
+import DocsTocNode from "../../../components/DocsTocNode.astro";
+import { getCollection } from "astro:content";
+import { buildLearnTree, type NavNode } from "../../../utils/navTree";
+
+export async function getStaticPaths() {
+  const learn = await getCollection("learn", ({ data }) => !data.draft);
+  const tracksMap = new Map<string, typeof learn>();
+  for (const item of learn) {
+    const [trackId] = item.id.split("/");
+    if (!tracksMap.has(trackId)) tracksMap.set(trackId, []);
+    tracksMap.get(trackId)!.push(item);
+  }
+  return Array.from(tracksMap.entries()).map(([trackId, modules]) => ({
+    params: { track: trackId },
+    props: { trackId, modules },
+  }));
+}
+
+const { trackId, modules } = Astro.props;
+
+const TRACK_TITLES: Record<string, string> = {
+  "agentic-ai": "Agentic AI",
+  "cloudflare": "Cloudflare",
+};
+
+const TRACK_TAGLINES: Record<string, string> = {
+  "agentic-ai":
+    "Build agents that loop, use tools, and produce results. From the agent loop and MCP to planning, evaluation, and production.",
+  "cloudflare":
+    "The unified network + edge + security + AI platform. Tunnels, Zero Trust, Magic networking, Workers, Pages, and the rest.",
+};
+
+const trackTitle = TRACK_TITLES[trackId] ?? trackId;
+const trackTagline = TRACK_TAGLINES[trackId] ?? "";
+
+const totalMinutes = modules.reduce(
+  (sum: number, m: { data: { estimated_minutes?: number } }) =>
+    sum + (m.data.estimated_minutes ?? 0),
+  0
+);
+
+// Build a tree for just this track's modules — buildLearnTree groups by folder,
+// so the result is a single top-level group containing the modules. Flatten it.
+const fullTree = buildLearnTree(modules, "/learn");
+const tocNodes: NavNode[] = (fullTree[0]?.children ?? []).filter((n) => n.href || n.children);
+
+// Find the first module to use as the "Start here" target.
+const firstModule = [...modules].sort((a, b) => a.id.localeCompare(b.id))[0];
+const startHref = firstModule
+  ? tocNodes.find((n) => n.label.toLowerCase().includes("overview"))?.href ??
+    tocNodes[0]?.href
+  : undefined;
+---
+
+<LearnLayout title={`${trackTitle} — Learning · Zahid's Blog`} description={trackTagline}>
+  <nav class="track-breadcrumb">
+    <a href="/learn/">← All tracks</a>
+  </nav>
+
+  <section class="mb-8">
+    <h1 class="text-2xl font-semibold mb-2">{trackTitle}</h1>
+    <p class="text-[var(--color-muted)] mb-3">{trackTagline}</p>
+    <p class="text-[var(--color-muted)] text-sm mb-4">
+      <strong>{modules.length}</strong> modules
+      {totalMinutes > 0 && (
+        <>
+          {" · "}~{Math.max(1, Math.round(totalMinutes / 60))}h total reading time
+        </>
+      )}
+    </p>
+    {startHref && (
+      <a href={startHref} class="track-start-btn">Start the track →</a>
+    )}
+  </section>
+
+  <section class="toc">
+    <h2 class="track-toc-heading">Modules</h2>
+    {tocNodes.map((node) => (
+      <div class="toc-section">
+        <DocsTocNode node={node} depth={0} />
+      </div>
+    ))}
+  </section>
+</LearnLayout>

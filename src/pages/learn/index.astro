@@ -1,38 +1,74 @@
 ---
 import LearnLayout from "../../layouts/LearnLayout.astro";
-import DocsTocNode from "../../components/DocsTocNode.astro";
 import { getCollection } from "astro:content";
-import { buildLearnTree, type NavNode } from "../../utils/navTree";
 
 const learn = await getCollection("learn", ({ data }) => !data.draft);
-const tree = buildLearnTree(learn, "/learn");
 
-function countLeaves(n: NavNode): number {
-  if (n.href) return 1;
-  return (n.children ?? []).reduce((acc, c) => acc + countLeaves(c), 0);
+const TRACK_TITLES: Record<string, string> = {
+  "agentic-ai": "Agentic AI",
+  "cloudflare": "Cloudflare",
+};
+
+const TRACK_TAGLINES: Record<string, string> = {
+  "agentic-ai":
+    "Build agents that loop, use tools, and produce results. From the agent loop and MCP to planning, evaluation, and production.",
+  "cloudflare":
+    "The unified network + edge + security + AI platform. Tunnels, Zero Trust, Magic networking, Workers, Pages, and the rest.",
+};
+
+// Group modules by track (the first segment of each item's id).
+const tracksMap = new Map<string, typeof learn>();
+for (const item of learn) {
+  const [trackId] = item.id.split("/");
+  if (!tracksMap.has(trackId)) tracksMap.set(trackId, []);
+  tracksMap.get(trackId)!.push(item);
 }
 
-const totalLeaves = tree.reduce((acc, n) => acc + countLeaves(n), 0);
+const tracks = Array.from(tracksMap.entries())
+  .map(([trackId, modules]) => {
+    const totalMinutes = modules.reduce(
+      (sum, m) => sum + (m.data.estimated_minutes ?? 0),
+      0
+    );
+    return {
+      id: trackId,
+      title: TRACK_TITLES[trackId] ?? trackId,
+      tagline: TRACK_TAGLINES[trackId] ?? "",
+      moduleCount: modules.length,
+      totalMinutes,
+      url: `/learn/${trackId}/`,
+    };
+  })
+  .sort((a, b) => a.title.localeCompare(b.title));
 ---
 
 <LearnLayout title="Learning — Zahid's Blog">
   <section class="mb-10">
     <h1 class="text-2xl font-semibold mb-2">Learning</h1>
     <p class="text-[var(--color-muted)] mb-3">
-      Self-paced tracks for hands-on engineers. Each track is a sequence of numbered modules with
-      diagrams, code, and exercises. Start at module 00 and walk through, or skip to the modules
-      that match what you're trying to ship.
+      Self-paced tracks for hands-on engineers. Each track is a sequence of numbered modules
+      with diagrams, code, and exercises. Pick a track below to see its modules.
     </p>
     <p class="text-[var(--color-muted)] text-sm">
-      <strong>{totalLeaves}</strong> modules across <strong>{tree.length}</strong> track{tree.length === 1 ? "" : "s"}.
+      <strong>{tracks.length}</strong> track{tracks.length === 1 ? "" : "s"} ·
+      <strong>{tracks.reduce((s, t) => s + t.moduleCount, 0)}</strong> modules total.
     </p>
   </section>
 
-  <section class="toc">
-    {tree.map((node) => (
-      <div class="toc-section">
-        <DocsTocNode node={node} depth={0} />
-      </div>
+  <section class="track-cards">
+    {tracks.map((track) => (
+      <a href={track.url} class="track-card">
+        <h2 class="track-card-title">{track.title}</h2>
+        <p class="track-card-tagline">{track.tagline}</p>
+        <p class="track-card-meta">
+          {track.moduleCount} modules
+          {track.totalMinutes > 0 && (
+            <>
+              {" · "}~{Math.max(1, Math.round(track.totalMinutes / 60))}h total
+            </>
+          )}
+        </p>
+      </a>
     ))}
   </section>
 </LearnLayout>
