@@ -1,8 +1,96 @@
 ---
-title: "ADR 0022 — v6 Fleet Purge"
-description: "Section 06-architecture-decisions: ADR 0022 — v6 Fleet Purge (placeholder)."
-sidebar_label: "ADR 0022 — v6 Fleet Purge"
+title: "ADR 0022 — v6 fleet membership and future-DR naming"
+description: "Active fleet is hub-dc-v6 + spoke-dc-v6 only; pre-v6 DR clusters decommissioned; hub-dr-v6 / spoke-dr-v6 are reserved names. Supersedes the cluster-list portion of ADR 0001."
+sidebar_label: "0022 — v6 fleet membership"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-10
+**Status:** Accepted. **Supersedes the cluster-list portion of [ADR 0001](/docs/06-architecture-decisions/03-adr-0001-cluster-list).**
+
+## Context
+
+[ADR 0001](/docs/06-architecture-decisions/03-adr-0001-cluster-list) (2026-05-04, "Maintain A Local Operator Workspace") was written when the lab fleet was the pre-v6 cluster set:
+
+- `hub-dc` — active management hub.
+- `spoke-dc` — active workload cluster.
+- `hub-dr` — management standby.
+- `spoke-dr` — workload standby.
+
+Since 0001 was accepted, the fleet has been **substantially rebuilt**:
+
+- The pre-v6 `hub-dr` and `spoke-dr` clusters are **decommissioned**. They are not in active or standby scope. Their cluster inventory was removed from `CLUSTERS.md` together with this ADR.
+- The pre-v6 `hub-dc` and `spoke-dc` clusters are **transitional** — still inventoried in `CLUSTERS.md` for context but not the active GitOps target.
+- The v6 rebuild clusters `hub-dc-v6` and `spoke-dc-v6` are now the **active fleet**. They are managed via the federated GitOps repository (`comptech-platform/openshift-ops/openshift-platform-gitops` on internal GitLab) per [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) + [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull).
+- Future DR clusters under v6, if/when introduced, will follow the v6 naming as `hub-dr-v6` and `spoke-dr-v6`. They are **not** currently in scope.
+
+The risk this ADR fixes is silent drift between docs: agents and operators continuing to write `hub-dc` / `spoke-dc` in new plans, scripts, runbooks, and session reports because the original ADR named them as the active fleet. Without an explicit supersession, every new doc starts from the wrong baseline.
+
+## Decision
+
+The **active OpenShift fleet membership** for the codex-opp-agent workspace is:
+
+| Cluster | Role | Status |
+|---|---|---|
+| `hub-dc-v6` | management hub (compact, 3 all-in-one masters) | **Active** |
+| `spoke-dc-v6` | workload cluster (3 VM masters + 3 physical workers; ODF) | **Active** |
+| `hub-dr-v6` | future v6 management DR | Not built; reserved name |
+| `spoke-dr-v6` | future v6 workload DR | Not built; reserved name |
+
+**This ADR supersedes the cluster-list portion of [ADR 0001](/docs/06-architecture-decisions/03-adr-0001-cluster-list)** (the bullet list naming `hub-dc` / `spoke-dc` / `hub-dr` / `spoke-dr` as the four-cluster fleet). ADR 0001's other decisions — maintain a local operator workspace, keep `AGENTS.md` / `CLUSTERS.md` / etc. — **remain in force**. Only the cluster-membership statement is updated.
+
+When operating against the fleet:
+
+- **"Active management"** or "the hub" means `hub-dc-v6`.
+- **"Active workload"** or "the spoke" means `spoke-dc-v6`.
+- **The pre-v6 `hub-dr` and `spoke-dr` cluster names must not appear** in new manifests, plans, scripts, runbooks, or session reports.
+- **The pre-v6 `hub-dc` and `spoke-dc` cluster names are acceptable only when referring to historical / transitional context;** new active work targets the v6 rebuild clusters.
+- **`hub-dr-v6` / `spoke-dr-v6` may appear in forward-looking planning text** (e.g., "future cluster paths") but no live work targets them until DR is explicitly reintroduced through a tracked issue and ADR.
+
+## Alternatives considered
+
+**Amend ADR 0001 in place.** Edit the original bullet list to reflect the v6-only fleet. Rejected because ADRs are **immutable historical records**; amending them in place loses the trail of "what was true on 2026-05-04 vs. 2026-05-10." The convention is to write a new ADR that explicitly supersedes the old one and to leave the old text intact.
+
+**Write the supersession as a paragraph in `CURRENT_STATE.md` only.** Lighter ceremony. Rejected because:
+
+- `CURRENT_STATE.md` rotates; it's a living snapshot, not a durable decision.
+- A future operator-agent reads ADRs at session start. Without an ADR, the supersession lives only in memory and chat logs.
+- The drift problem the ADR is fixing is exactly that operators write new things using the old fleet names; only an ADR-level supersession is durable enough to prevent that.
+
+**Leave the DR pair documented as "decommissioned standbys" but reserve them in case we rebuild.** Rejected because:
+
+- The DR pair is not just "decommissioned" — the underlying VMs and physical workers are gone or repurposed.
+- Reserving the *exact* pre-v6 names would re-introduce ambiguity with the v6 active clusters.
+- The future-DR naming follows v6 convention (`hub-dr-v6` / `spoke-dr-v6`) so there's no confusion.
+
+**Use semantic versioning suffixes (`hub-dc-v7`, etc.) instead of `-v6`.** Rejected because the lab's existing rebuild is named "v6," and renaming the suffix would require updating GitOps paths, ACM `ManagedCluster` names, certs, DNS, and operator memory. Continuity wins.
+
+## Validation
+
+Closeout actions taken at acceptance:
+
+- **`codex-opp-agent/CLUSTERS.md`** — `hub-dr` and `spoke-dr` sections removed; Active Scope updated to name `hub-dc-v6` / `spoke-dc-v6`.
+- **`codex-opp-agent/plans/federated-gitops-readiness-gates.md`** — references to "future `hub-dr`" / "future `spoke-dr`" updated to "future `hub-dr-v6`" / "future `spoke-dr-v6`".
+- **ADR Index issue (#131)** — this ADR added with a note on ADR 0001 that the cluster list is superseded by 0022.
+- **Workspace memory** (`/home/ze/.claude/projects/-home-ze-claude-agent/memory/`) updated to v6-only scope with an explicit decommissioned-DR guard. Memory entry: `project_workspace_scope.md`.
+- **ADR 0001 itself is NOT modified.** Historical record preserved.
+
+## Consequences
+
+- **Future readers see ADR 0022 as the source of truth for active fleet membership;** ADR 0001 is the historical anchor for the workspace decision.
+- **Documents and code that still mention old `hub-dr` / `spoke-dr` are flagged as drift-from-current-state** and should be updated when touched. A drift-grep over the workspace is part of routine session closeouts.
+- **Reintroducing DR under v6** (`hub-dr-v6` / `spoke-dr-v6`) requires a new ADR or amendment to record the install, ACM `ManagedCluster` registration, and platform-gitops `clusters/<name>/` directory structure. This ADR reserves the names; it does not authorize the build.
+- **Memory entry `project_workspace_scope.md`** is now the operator-agent's fast-path source of truth for "what clusters are in scope right now." It duplicates the table above for ambient recall.
+
+## References
+
+- Source: `codex-opp-agent/adr/0022-v6-fleet-membership.md`
+- Superseded predecessor (cluster-list portion only): [ADR 0001](/docs/06-architecture-decisions/03-adr-0001-cluster-list)
+- Federation context: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- v6 management baseline: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Platform admin handoff: `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- Compliance implementor handbook: `codex-opp-agent/connection-details/compliance-implementor-handbook.md`
+- Tracker: `zeshaq/codex-opp-agent` #156 (OPS-V6-FLEET-1 — the purge work)
+- ADR Index issue: `zeshaq/codex-opp-agent` #131
+- Memory entry: `project_workspace_scope.md`

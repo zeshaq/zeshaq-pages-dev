@@ -1,8 +1,385 @@
 ---
-title: "ADR 0015 — Federated GitOps"
-description: "Section 06-architecture-decisions: ADR 0015 — Federated GitOps (placeholder)."
-sidebar_label: "ADR 0015 — Federated GitOps"
+title: "ADR 0015 — Federated GitOps repository architecture"
+description: "Split ownership across openshift-platform-gitops, vm-platform-ops, tenant repos, division app monorepos, and division GitOps repos — with build-once-promote-by-digest and runner-class isolation."
+sidebar_label: "0015 — Federated GitOps"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+**Date:** 2026-05-09
+**Status:** Accepted. Constrained by [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull) for OpenShift platform operations.
+
+## Context
+
+The platform is being rebuilt as a BFSI-oriented operating environment. It will eventually include:
+
+- multiple OpenShift clusters (`hub-dc-v6`, `spoke-dc-v6`, future `hub-dr-v6` / `spoke-dr-v6`, plus future OCP clusters for dev / UAT / staging / prod);
+- standalone VM-hosted platform tools (Vault, Nexus, Jenkins, Trivy, SigNoz, HAProxy, PowerDNS, GitLab, MinIO, the monitoring VM, DefectDojo);
+- a Docker runtime VM for applications that do not target OpenShift;
+- application teams delivering Open Liberty, JBoss/EAP, Node.js, and Spring Boot workloads.
+
+The **key operating requirement** is strict ownership separation. A single monorepo holding both OpenShift cluster desired state and application deployment manifests means every application change requires a platform-team review and every platform change has app-team-shaped review noise. Blast radii get mixed. Application teams must not have write access to OpenShift cluster operators, AppProjects, or quota policy.
+
+Other rules:
+
+- Normal OpenShift changes flow through **GitOps** (per [ADR 0025 — GitOps-only operations](#references)).
+- `oc`, console, SSH, and direct API mutation are **break-glass** paths only.
+- **GitLab** is the operational source of truth for platform and application delivery.
+- **GitHub `codex-opp-agent`** remains the planning, ADR, issue, milestone, and handoff guidance source (this site's source).
+
+## Decision
+
+Use a **federated monorepo architecture**. Repositories are grouped by **ownership and blast radius** instead of being collapsed into one big monorepo.
+
+### Repository domains
+
+<Whiteboard client:load data={{ nodes: [
+  { id: "ocp",   position: { x: 0,   y: 0   }, data: { label: "openshift-ops/\nopenshift-platform-gitops\nopenshift-cluster-build" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 } },
+  { id: "infra", position: { x: 260, y: 0   }, data: { label: "infra-ops/\nvm-platform-ops" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 } },
+  { id: "ptools",position: { x: 520, y: 0   }, data: { label: "platform-services/\nplatform-tools-iac\nplatform-tools-config" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 } },
+  { id: "tenants",position:{ x: 780, y: 0   }, data: { label: "tenant-registry/\nopenshift-tenants" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 } },
+  { id: "div1",  position: { x: 0,   y: 200 }, data: { label: "divisions/payments\npayments-apps-monorepo\npayments-gitops" }, style: { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" } },
+  { id: "div2",  position: { x: 260, y: 200 }, data: { label: "divisions/ledger\nledger-apps-monorepo\nledger-gitops" }, style: { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" } },
+  { id: "div3",  position: { x: 520, y: 200 }, data: { label: "divisions/<other>\n<other>-apps-monorepo\n<other>-gitops" }, style: { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" } },
+  { id: "argo",  position: { x: 260, y: 380 }, data: { label: "Argo CD\n(hub + spoke-local)" }, style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "runners",position:{ x: 520, y: 380 }, data: { label: "GitLab Runner\nops / build / sec / deploy" }, style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 220, textAlign: "center" } },
+  { id: "ocp_clusters",position:{ x:0, y: 540 }, data: { label: "OpenShift clusters\n(via Argo CD pull from\nopenshift-platform-gitops)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" } },
+  { id: "vmrt", position:{ x: 280, y: 540 }, data: { label: "VM runtime\n(Ansible from vm-platform-ops\nvia ops/deploy runners)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" } },
+  { id: "dockrt",position:{ x: 560, y: 540 }, data: { label: "Docker runtime VM\n(Compose from app GitOps)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" } },
+], edges: [
+  { id: "ocp_argo", source: "ocp", target: "argo", label: "Argo pulls", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "div1_argo", source: "div1", target: "argo", label: "app GitOps", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "div2_argo", source: "div2", target: "argo", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "div3_argo", source: "div3", target: "argo", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "infra_run", source: "infra", target: "runners", label: "Ansible / Terraform", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "ptools_run",source: "ptools", target: "runners", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "div1_run",  source: "div1", target: "runners", label: "build / sec", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "tenants_argo",source: "tenants", target: "argo", label: "AppProject + namespace", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "argo_ocp", source: "argo", target: "ocp_clusters", label: "reconciles", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "run_vm", source: "runners", target: "vmrt", label: "deploy", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "run_dock",source: "runners", target: "dockrt", label: "deploy", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+] }} height={720} />
+
+The recommended GitLab group layout:
+
+```text
+comptech-platform/
+  openshift-ops/
+    openshift-platform-gitops
+    openshift-cluster-build
+
+  infra-ops/
+    vm-platform-ops
+
+  platform-services/
+    platform-tools-iac
+    platform-tools-config
+
+  tenant-registry/
+    openshift-tenants
+
+divisions/
+  <division>/
+    <division>-apps-monorepo
+    <division>-gitops
+```
+
+The exact GitLab group names can change. The ownership boundaries must stay stable.
+
+### OpenShift platform repository
+
+`openshift-platform-gitops` is owned by the OpenShift platform team only. Application teams do not get write access.
+
+It owns OpenShift cluster desired state and guardrails:
+
+```text
+openshift-platform-gitops/
+  clusters/
+    hub-dc-v6/
+    hub-dr-v6/        # reserved name; not built yet
+    spoke-dc-v6/
+    spoke-dr-v6/      # reserved name; not built yet
+    dev-ocp-01/
+    uat-ocp-01/
+    staging-ocp-01/
+
+  components/
+    gitops/
+    acm/
+    odf/
+    ingress/
+    cert-manager/
+    external-secrets/
+    compliance/
+    logging/
+    monitoring/
+    image-registry/
+    operator-catalogs/
+
+  policies/
+    rbac/
+    quotas/
+    networkpolicies/
+    pod-security/
+    appprojects/
+
+  tenants/
+    <tenant>/
+
+  bootstrap/
+    root-apps/
+    appsets/
+```
+
+The platform repo **defines who may deploy where**. It does not contain application source code and should not contain routine application release manifests beyond tenant boundary registration.
+
+**Tenant registration** includes: namespaces, AppProjects, quotas and limit ranges, baseline NetworkPolicies, service-account / RBAC boundaries, allowed source repositories, allowed destination clusters and namespaces, and pull-secret / External Secrets wiring **by reference only** (no secret values).
+
+### Application team repositories
+
+Each division or application group owns its source and GitOps repositories. Example for the `payments` division:
+
+```text
+divisions/payments/
+  payments-apps-monorepo/
+    openliberty/customer-api/
+    jboss/payment-service/
+    nodejs/payment-ui/
+    springboot/ledger-api/
+
+  payments-gitops/
+    apps/
+      customer-api/
+        dev/
+        uat/
+        staging/
+        prod/
+      payment-service/
+        dev/
+        uat/
+        staging/
+        prod/
+```
+
+App teams may change application source and application deployment intent inside their own GitOps repos, but **AppProjects and namespace policy from `openshift-platform-gitops` constrain** where those changes can land.
+
+### Application CI/CD contract
+
+Standard flow:
+
+```text
+Developer push
+  → GitLab app repo
+  → Jenkins or approved GitLab CI pipeline
+  → build and unit tests
+  → Trivy / SCA scan
+  → container build
+  → push immutable image to Nexus app registry
+  → update application GitOps repo
+  → Argo CD deploys to OpenShift, or runner / Ansible deploys to VM runtime
+  → evidence stored in MinIO or approved evidence target
+```
+
+**Build once and promote the same image digest across environments.**
+
+Good:
+
+```text
+dev → uat → staging → prod  all use the same immutable image digest
+```
+
+Bad:
+
+```text
+rebuild separately for each environment
+```
+
+Stack-specific templates must exist for at least: Open Liberty, JBoss/EAP, Spring Boot, Node.js.
+
+**Jenkins or GitLab CI may build, test, scan, push images, create SBOMs, and update GitOps repositories.** They must not normally run `oc apply`, `oc edit`, or direct cluster mutation for OpenShift deployment. That stays GitOps-driven.
+
+### Nexus and evidence boundary
+
+Use separate Nexus endpoints by purpose:
+
+```text
+docker-group.apps.sub.comptech-lab.com
+  approved base image pulls
+
+app-registry.apps.sub.comptech-lab.com
+  application image pushes
+
+mirror-registry.apps.sub.comptech-lab.com
+  OpenShift platform mirror content for oc-mirror only
+```
+
+See [ADR 0019 — Nexus-only image supply chain](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops) for the runtime allowlist that enforces this.
+
+Build artifacts, Trivy reports, SBOMs, deployment records, and release evidence are retained in **MinIO** or another approved evidence target.
+
+### VM platform operations repository
+
+Existing VM-hosted tools should be brought under Git-tracked operation, but **not** inside the OpenShift platform GitOps repo. Create a federated repo:
+
+```text
+infra-ops/vm-platform-ops/
+  environments/
+    dc-lab/
+      inventory/
+      vms/
+      runners/
+
+  services/
+    haproxy/
+    pdns/
+    gitlab/
+    jenkins/
+    nexus/
+    docker-runtime/
+    gitlab-runner/
+
+  ansible/
+    roles/
+    playbooks/
+
+  terraform/
+    environments/
+    modules/
+
+  policies/
+    approvals/
+    break-glass/
+    drift-checks/
+```
+
+Tool ownership:
+
+- **HAProxy:** frontends, backends, certificates by reference, validation.
+- **PowerDNS:** zones, records, API or `pdnsutil` application.
+- **GitLab:** groups, projects, protected branches, runners, basic settings.
+- **Jenkins:** JCasC, plugin list, folders, jobs, shared libraries.
+- **Nexus:** repositories, blob stores, roles, users / groups, cleanup policies.
+- **Docker runtime:** Compose files, systemd units, image digests, deployment scripts.
+
+**Adopt existing VMs instead of recreating them:** inventory current VM IPs / disks / DNS / service ports / users / config; record desired state in `vm-platform-ops`; import Terraform / OpenTofu state only where safe; convert live config into Ansible templates or API-managed config; run Ansible in check mode first; fix drift through MRs; allow controlled apply only after validation.
+
+### Terraform and Ansible
+
+Teams that manage VM infrastructure use the infra-ops repository, not `openshift-platform-gitops`.
+
+```text
+GitLab MR
+  → validation pipeline
+  → approved merge
+  → ops runner runs Terraform / OpenTofu or Ansible
+  → VM / tool state changes
+  → validation evidence is retained
+```
+
+Terraform state must not be stored in Git. Secrets must come from Vault, GitLab protected variables, or another approved secret manager. Git stores desired state and references only.
+
+### GitLab Runner placement
+
+GitLab Runner is a platform tool and belongs under `vm-platform-ops`. Use **dedicated private runner VMs** on the internal lab network. Do not place runners on GitLab, Jenkins, Nexus, HAProxy, PowerDNS, OpenShift masters, or other critical service nodes.
+
+Recommended runner classes:
+
+| Class | Tags | Purpose |
+|---|---|---|
+| `gitlab-runner-ops-01` | `infra`, `terraform`, `ansible`, `platform` | HAProxy, PDNS, GitLab, Jenkins, Nexus, VM config |
+| `gitlab-runner-build-01` | `build`, `java`, `nodejs`, `openliberty`, `jboss`, `springboot` | app build and unit test jobs |
+| `gitlab-runner-sec-01` | `trivy`, `sbom`, `evidence` | scan jobs and evidence upload |
+| `gitlab-runner-deploy-01` | `vm-deploy` | approved VM-runtime deployment via Ansible |
+
+All runners register and clone through the **internal GitLab LAN endpoint**. The public GitLab browser / API route is for the operator's dashboard viewing only.
+
+**Protected runner access:**
+
+- `openshift-platform-gitops`: validation-only runner access.
+- `vm-platform-ops`: ops runner access.
+- application repos: build and security runner access.
+- VM-runtime deployment repos: deploy runner access.
+
+GitLab Runner is useful as an **independent executor for Terraform/Ansible and for repairing Jenkins**. Jenkins must not be the only system capable of repairing Jenkins.
+
+### OpenShift operations rule
+
+Normal OpenShift changes must be GitOps-driven:
+
+- operators;
+- namespaces;
+- quotas and limit ranges;
+- RBAC;
+- NetworkPolicies;
+- AppProjects;
+- tenant onboarding;
+- ingress and route policy;
+- storage classes;
+- External Secrets wiring;
+- application deployment registration.
+
+`oc`, console, SSH, and direct API changes are break-glass only. Every break-glass change must be backported to Git or explicitly documented as temporary with an expiry and rollback path. See [ADR 0025 — GitOps-only operations and break-glass policy](#references) for the operational rule.
+
+For the v6 rebuild, OpenShift workload-cluster management uses the ACM + OpenShift GitOps Basic pull model from [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull). The hub coordinates ACM placement and ApplicationSet propagation; each managed workload cluster runs OpenShift GitOps locally. Do not replace this with hub-push operations without a future accepted ADR.
+
+## Alternatives considered
+
+**Single monorepo for everything (OpenShift platform + apps + VM ops).** Simplest mental model — one place to look. Rejected because:
+
+- App teams would have CODEOWNERS-blocked write access to platform paths, which is fine, but the **review noise** mixes the two streams: every app change shows up in platform reviewers' notification feed and vice versa.
+- A single Argo CD `repoServer` reading a huge monorepo gets slow and memory-hungry.
+- Blast radius of a wrong MR is the entire fleet, not just one app or one cluster.
+
+**Per-cluster repository.** One repo per OpenShift cluster. Rejected because the cluster components are 80% identical (operators, namespaces, RBAC, NetworkPolicies) — duplicating them across `hub-dc-v6-gitops` and `spoke-dc-v6-gitops` creates drift the first time someone updates one and forgets the other. The federated layout keeps shared components under `components/` and per-cluster overlays under `clusters/<name>/` — Kustomize layered on a single repo.
+
+**Per-application repository.** One Git repo per application. Common pattern. Partly accepted (each application *team* has its own GitOps repo) but not at the per-application level — that would be too many repos for the lab's scale. Division-level repos (one per BFSI division) are the unit of separation.
+
+**Push-model GitOps (CI does `oc apply` directly).** Common in older orgs. Rejected because:
+
+- The cluster has no way to recover its own state if the CI system fails — it depends on CI to repair it.
+- Changes can land out of order (CI fires twice; race wins).
+- The "what is the desired state of this cluster, right now?" question has no clean Git answer.
+- See [ADR 0025 — GitOps-only operations](#references) for the formal rule.
+
+## Consequences
+
+- **The architecture has more repositories than a single monorepo, but each repo has a clear owner and blast radius.**
+- **Application teams can move independently** without platform-repo write access.
+- **OpenShift team retains control** over cluster policy and tenant boundaries.
+- **VM-hosted platform tools become auditable** without polluting OpenShift GitOps desired state.
+- **Runner separation reduces privilege mixing** between infra automation, application builds, scans, and VM deploys.
+- **Promotion and audit evidence become easier to review** because builds, images, GitOps changes, and runtime changes have separate records.
+- **The OpenShift platform GitOps repo is OpenShift-only.** Reinforced by [ADR 0024 — OpenShift-only platform GitOps boundary](#references). Putting a VM-tool config under `openshift-platform-gitops/components/` is forbidden; that's what `vm-platform-ops` is for.
+
+## Implementation milestones
+
+Tracked in `zeshaq/codex-opp-agent` (these milestones define planning and implementation gates; they do not grant application teams access to platform repositories by themselves):
+
+- **Milestone #24 — Federated GitOps Architecture** (#68 federated GitLab group / repo ownership, #69 OpenShift-only platform GitOps boundary, #70 tenant registry and AppProject guardrails, #71 GitOps-only operations and break-glass policy).
+- **Milestone #25 — VM Platform Ops GitOps Adoption** (#72 inventory existing VMs for Git adoption, #73 vm-platform-ops repo structure, #74 adopt HAProxy/PowerDNS, #75 adopt GitLab/Jenkins/Nexus/Docker runtime).
+- **Milestone #26 — Application Delivery Golden Paths** (#76 Open Liberty/JBoss/Spring Boot/Node.js pipeline templates, #77 build-once-promote-by-digest release model, #78 app GitOps repo contract, #79 Trivy/SBOM/MinIO evidence requirements).
+- **Milestone #27 — GitLab Runner Operating Model** (#80 internal runner VM classes and tags, #81 protected runner access model, #82 bootstrap independent ops runner for Terraform/Ansible/Jenkins repair).
+
+## Readiness gates
+
+Detailed go/no-go criteria live in `codex-opp-agent/plans/`:
+
+- `federated-gitops-readiness-gates.md`
+- `federated-gitops-gitlab-access-matrix.md`
+- `federated-gitops-gitlab-implementation-checklist.md`
+
+The readiness gates are **FG-0 Governance Baseline** through **FG-6 Audit and Evidence Readiness**, each tracked by a phase issue (#83 – #88). Do not onboard additional application teams, broad VM automation, or production-like GitLab Runner execution until the relevant gate is closed or the residual risk is explicitly accepted in a tracked issue.
+
+## References
+
+- Source: `codex-opp-agent/adr/0015-federated-gitops-repo-architecture.md`
+- ACM + OpenShift GitOps pull model: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Nexus-only supply chain: [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)
+- OpenShift-only platform repo boundary: `codex-opp-agent/adr/0024-openshift-only-platform-gitops-boundary.md`
+- GitOps-only operations: `codex-opp-agent/adr/0025-gitops-only-operations-break-glass.md`
+- GitLab group / role-group ownership: `codex-opp-agent/adr/0023-federated-gitlab-group-repo-ownership.md`
+- Build-path matrix: `codex-opp-agent/connection-details/build-path-matrix.md`
+- Promotion model: `codex-opp-agent/connection-details/promotion-model.md`
+- App-repo contract: `codex-opp-agent/connection-details/app-repo-contract.md`

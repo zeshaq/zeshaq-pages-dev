@@ -1,8 +1,103 @@
 ---
-title: "ADR 0016 — oc-mirror"
-description: "Section 06-architecture-decisions: ADR 0016 — oc-mirror (placeholder)."
-sidebar_label: "ADR 0016 — oc-mirror"
+title: "ADR 0016 — Workspace execution governance"
+description: "Every task that executes commands, edits files, or touches live systems must have an issue, milestone, phase/gate, and ADR before work begins — and a recorded closeout when it finishes."
+sidebar_label: "0016 — Execution governance"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-09
+**Status:** Accepted.
+
+> **Note on URL.** This page's URL slug is `13-adr-0016-oc-mirror` for historical reasons (the section's filename layout was generated before the ADR title was confirmed). The content below is **ADR 0016 — Workspace Execution Governance**, not an oc-mirror decision. The Nexus / oc-mirror supply-chain decision is [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops).
+
+## Context
+
+The workspace now coordinates many parallel work streams: the OpenShift v6 rebuild, the developer-readiness contract, standalone VM-hosted platform services (Vault, Redis, Kafka, WSO2, Jenkins, SigNoz, monitoring, DefectDojo, Trivy), GitHub planning, ADRs, session memory, and the operator handoff documentation. The operator explicitly requested a **project-wide rule** so that work does not proceed as untracked chat-driven implementation.
+
+The specific failure modes this ADR prevents:
+
+- **Implementation without an issue.** A change goes in, but there's no GitHub issue capturing what was done, why, by whom, what was validated, or what the residual risk is. A future operator who hits a problem can't find the trace.
+- **Work hidden outside a milestone or phase.** Issues exist, but they're scattered across unrelated milestones or no milestone at all. There is no aggregate view of "what is the lab working on this quarter."
+- **Decisions made without an ADR.** Significant architectural choices live only in commit messages or chat logs, then get rediscovered (or re-litigated) months later.
+- **Completed work not reflected back into GitHub.** The local session log records what happened, but the GitHub issue stays open or closes silently without a closeout note.
+- **Later sessions rediscovering intent, scope, validation, or residual risks.** Without explicit closeout notes, every new session repeats the discovery phase.
+
+The governance objects for this ADR were created **before** implementation, in accordance with the rule the ADR establishes:
+
+- Milestone: `codex-opp-agent` #29 **Workspace Governance**.
+- Phase issue: `codex-opp-agent` #106 **WG1: require issue, milestone, phase, and ADR before implementation**.
+
+This is deliberately a meta-rule: the ADR enforcing the "issue + milestone + phase + ADR" requirement was itself drafted under an issue, in a milestone, with a phase prefix.
+
+## Decision
+
+Every task that requires:
+
+- command execution against live systems,
+- file edits to tracked artifacts,
+- live cluster / VM / DNS / HAProxy / GitLab / Jenkins / Nexus / MinIO / Vault changes,
+- planning changes (new ADR, new runbook, new memory entry),
+- operational validation that materially supports an implementation or gate,
+
+must have **tracking before execution or implementation begins**.
+
+### Required pre-implementation tracking
+
+1. **A GitHub issue exists for the work.**
+2. **The issue is assigned to a GitHub milestone.**
+3. **The work has an explicit phase, gate, or issue prefix** — e.g. `WG1` (Workspace Governance 1), `DH1` (Developer Handbook 1), `FG-1` (Federated GitOps 1), `Gate H1` (Hub Gate H1), `PCI-2` (PCI-DSS Phase 2).
+4. **An ADR exists and is accepted, or the issue explicitly cites an existing accepted ADR** that governs the work.
+
+### Required post-implementation closeout
+
+1. **Update the GitHub issue with the implementation result.**
+2. **Include in the closeout:** files changed, live systems touched, validation performed (with command output or screenshots that don't expose secrets), residual risks, next steps.
+3. **Update local session memory:** `CURRENT_STATE.md`, `TODO.md`, `SESSION_LOG.md`, and a detailed `reports/sessions/YYYY-MM-DD-<topic>.md` record.
+4. **Update the ADR, runbook, assessment, or related plan** when the change alters process, architecture, topology, risk posture, or repeatable operations.
+
+## Scope
+
+This rule applies to Codex / operator work in this repository and to live platform work driven from this repository. It applies to:
+
+- code or documentation edits,
+- GitHub issue / milestone / project / phase changes,
+- live cluster checks or remediation,
+- VM, DNS, HAProxy, GitLab, Jenkins, Nexus, MinIO, Vault, or other platform changes,
+- validation runs that materially support an implementation or gate.
+
+**The only allowed pre-tracking activity** is discovery needed to identify or create the tracking objects themselves. Once tracking is identified, no command execution, implementation, or validation may proceed until the issue, milestone, phase/gate, and ADR requirements are satisfied.
+
+**Purely conversational answers** that do not execute commands, edit files, query live systems, or alter tracking state do not need a new issue. Reading documentation does not require a new issue.
+
+## Alternatives considered
+
+**Trust the operator to write things down after the fact.** The pre-ADR baseline. Rejected — it's exactly the failure mode the ADR exists to prevent. Post-hoc documentation has consistently turned out to be sparse, missing residual risks, and missing the validation evidence that auditors care about.
+
+**Require only an issue, no milestone / phase / ADR.** Lighter ceremony. Rejected because:
+
+- "An issue exists" doesn't anchor work to a strategic stream. Milestones are how the operator sees what is in flight.
+- Phase/gate prefixes (`WG1`, `FG-1`, `PCI-2`) are how issue titles become discoverable in `gh issue list`.
+- ADRs are how *decisions* get preserved — issues capture work, ADRs capture decisions, and the two are different.
+
+**Require all four (issue + milestone + phase + ADR) for every change, including doc fixes.** Rejected as too heavy. Doc fixes that don't change architecture or operational behavior can cite an existing ADR; they don't need a new ADR each time. The rule is "issue + milestone + phase + (new or cited ADR)" — *cited* is enough when the work falls under an existing decision.
+
+**Defer the rule until the lab is more mature.** Rejected because the cost of *not* having the rule grows as the workspace grows; a single-operator workspace with months-long gaps between sessions is exactly the case where written tracking matters most.
+
+## Consequences
+
+- **Future work has a higher planning cost**, but better continuity and audit traceability. The first action of any non-trivial task is "find or create the issue."
+- **Existing issues may be reused** when the requested work clearly falls under their scope. The rule doesn't require a *new* issue, just *an* issue.
+- **Existing ADRs may be cited** instead of creating a new ADR when no new decision or operating model is introduced.
+- **If an operator asks for urgent remediation and tracking is missing**, create or identify the tracking objects first, then proceed. This adds minutes, not hours, and preserves the audit trail.
+- **Successful implementation is not complete** until the GitHub issue and local session memory are updated. The session is not considered closed until the closeout is written.
+- **This rule is enforced primarily by the operator-agent (Claude Code).** The operator-agent reads `AGENTS.md` and the ADR Index at session start and reminds the operator when the rule is being skipped.
+
+## References
+
+- Source: `codex-opp-agent/adr/0016-workspace-execution-governance.md`
+- Workspace milestone: `zeshaq/codex-opp-agent` #29 (Workspace Governance)
+- Phase issue: `zeshaq/codex-opp-agent` #106 (WG1)
+- Subagent-first workflow rule: `codex-opp-agent/adr/0002-subagent-first-workflow.md`
+- Parallel-agent isolation rule: `codex-opp-agent/adr/0017-parallel-agent-worktree-isolation.md`
+- The operator workspace itself: [ADR 0001](/docs/06-architecture-decisions/03-adr-0001-cluster-list)

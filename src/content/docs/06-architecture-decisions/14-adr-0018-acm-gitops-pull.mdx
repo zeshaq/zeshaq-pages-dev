@@ -1,8 +1,175 @@
 ---
-title: "ADR 0018 — ACM GitOps Pull"
-description: "Section 06-architecture-decisions: ADR 0018 — ACM GitOps Pull (placeholder)."
-sidebar_label: "ADR 0018 — ACM GitOps Pull"
+title: "ADR 0018 — ACM + OpenShift GitOps pull model for v6"
+description: "Hub coordinates ACM placement and ApplicationSet propagation; each managed workload cluster runs OpenShift GitOps locally and reconciles from internal GitLab. Supersedes ADR 0003."
+sidebar_label: "0018 — ACM pull model v6"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+**Date:** 2026-05-09
+**Status:** Accepted. **Supersedes** [ADR 0003 (historical)](#references). Constrains [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) on OpenShift platform operations.
+
+## Context
+
+The v6 rebuild has a healthy `hub-dc-v6` compact management cluster and a healthy `spoke-dc-v6` workload cluster. At the time this ADR was accepted, `hub-dc-v6` ran only a bootstrap OpenShift GitOps Application from internal GitLab. It did **not yet** define ACM, spoke registration, management ApplicationSets, ODF for the workload cluster, or workload-cluster overlays. The ADR's job is to fix the shape of that work before it starts.
+
+Previous hub-heavy GitOps operation put too much pressure on the management cluster. The older `hub-dc` / `spoke-dc` design already used the **Red Hat Advanced Cluster Management + OpenShift GitOps Basic pull pattern**, where managed clusters reconcile local Argo CD Applications. That lesson is still valid for the v6 rebuild.
+
+The operating requirements:
+
+- **GitLab is the operational source of truth** for platform and application delivery.
+- GitHub `codex-opp-agent` remains planning / ADR / issue / milestone / handoff guidance only.
+- Normal OpenShift changes must be GitOps-driven.
+- `oc`, console, SSH, direct API mutation are break-glass paths only (see [ADR 0025](#references)).
+- Application teams must not have write access to the OpenShift platform operations repository.
+- `spoke-dc-v6` ODF / LSO must not be recreated manually.
+
+## Decision
+
+Use **ACM + OpenShift GitOps Basic pull model** as the v6 baseline for workload-cluster management.
+
+<Whiteboard client:load data={{ nodes: [
+  { id: "gl",   position: { x: 360, y: 0   }, data: { label: "GitLab\nopenshift-platform-gitops\n(internal LAN)" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 } },
+  { id: "hub",  position: { x: 360, y: 150 }, data: { label: "hub-dc-v6\nACM + MCE\nGitOpsCluster + ApplicationSet" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 } },
+  { id: "mc",   position: { x: 80,  y: 320 }, data: { label: "ManagedCluster\n+ Placement\n+ PlacementDecision" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "mw",   position: { x: 360, y: 320 }, data: { label: "ManifestWork\n(per spoke namespace)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "report",position:{ x: 640, y: 320 }, data: { label: "MulticlusterApplicationSet\nReport (status)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 220, textAlign: "center" } },
+  { id: "kl",   position: { x: 200, y: 490 }, data: { label: "klusterlet on\nspoke-dc-v6" }, style: { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "argo", position: { x: 460, y: 490 }, data: { label: "spoke-local Argo CD\n(destination: kubernetes.default.svc)" }, style: { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 260, textAlign: "center" } },
+  { id: "wks",  position: { x: 360, y: 640 }, data: { label: "spoke-dc-v6 workloads\n(operators, ODF, LSO,\nworkload namespaces)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" } },
+], edges: [
+  { id: "hub_gl", source: "hub", target: "gl", label: "reads bootstrap + management state", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "hub_mc", source: "hub", target: "mc", label: "owns", style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "hub_mw", source: "hub", target: "mw", label: "ApplicationSet creates", style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "mc_mw", source: "mc", target: "mw", label: "decision feeds", style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "kl_hub", source: "kl", target: "hub", label: "register + pull ManifestWork", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "argo_gl",source: "argo", target: "gl", label: "Argo CD pulls (https)", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "kl_argo",source: "kl", target: "argo", label: "applies\nApplication CR", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "argo_wks",source: "argo", target: "wks", label: "reconciles", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "wks_report",source: "wks", target: "report", label: "status →", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+] }} height={780} />
+
+### Hub responsibilities
+
+`hub-dc-v6` owns **management coordination only**:
+
+- ACM/MCE installation and configuration.
+- `ManagedCluster`, `ManagedClusterSet`, and placement policy.
+- `GitOpsCluster` wiring between ACM placement decisions and OpenShift GitOps.
+- Hub-local OpenShift GitOps bootstrap and hub-local platform resources.
+- ApplicationSet definitions that generate lightweight managed-cluster application objects.
+
+`hub-dc-v6` **must not directly push** routine spoke platform configuration, operator installs, storage resources, or application workloads into `spoke-dc-v6`. The hub creates an `Application` (via ApplicationSet) targeted at the spoke; the spoke's local Argo CD reconciles it.
+
+### Spoke responsibilities
+
+Each managed workload cluster runs OpenShift GitOps locally. For `spoke-dc-v6`, the local Argo CD pulls from the **internal GitLab platform repository** and reconciles local desired state with:
+
+```yaml
+destination:
+  server: https://kubernetes.default.svc
+```
+
+Managed workload applications must use the **Red Hat pull-model annotations** and ACM propagation flow. The hub-side `Application` is a coordination object; the **spoke-local Argo CD instance is the reconciler**.
+
+**Do not use Argo CD Agent** for this baseline. It may be reconsidered later only through a separate accepted ADR and after current Red Hat support, maturity, and operational load implications are reviewed.
+
+### Repository baseline
+
+The active platform GitOps repository is:
+
+```text
+http://<internal-gitlab-host>/comptech-platform/openshift-ops/openshift-platform-gitops.git
+```
+
+The local operator clone is `/home/ze/platform-gitops` (per [the platform-gitops clone-path convention](#references)).
+
+Expected high-level shape:
+
+```text
+openshift-platform-gitops/
+  clusters/
+    hub-dc-v6/
+      bootstrap/
+      platform/
+    spoke-dc-v6/
+      cluster-config/
+      operators/
+      storage/
+
+  components/
+    acm/
+    gitops/
+    odf/
+    lso/
+    appprojects/
+    tenants/
+
+  appsets/
+    managed-cluster-config/
+    managed-cluster-operators/
+```
+
+Historical repositories and old `spoke-dc` manifests are reference material only. They must not be copied directly into v6 without updating topology, operator channels, versions, placements, credentials, and ownership metadata.
+
+### Sequencing
+
+Use this order before returning to `spoke-dc-v6` ODF:
+
+1. Keep `hub-dc-v6` bootstrap GitOps healthy.
+2. Add ACM/MCE and required hub management namespaces through GitOps.
+3. Register or import `spoke-dc-v6` into ACM.
+4. Install or enable OpenShift GitOps on `spoke-dc-v6` through tracked management GitOps, not console drift.
+5. Seed required internal GitLab credentials **by reference only**; do not commit credentials.
+6. Create pull-model ApplicationSets for managed-cluster configuration.
+7. Validate placement decisions, ManifestWork propagation, spoke-local Argo CD Applications, and `MulticlusterApplicationSetReport` status.
+8. Add LSO and ODF desired state for `spoke-dc-v6`.
+9. Let spoke-local Argo CD install LSO/ODF and reconcile storage resources.
+
+## Alternatives considered
+
+**Hub-push GitOps (Argo CD on the hub reconciles spoke clusters directly).** The pre-v6 baseline for some shorter periods. Rejected because:
+
+- Every spoke change goes through the hub's Argo CD; the hub `repoServer` becomes the throughput bottleneck.
+- Spoke clusters can't recover their own state when the hub is unhealthy.
+- ACM placement and GitOps don't compose as cleanly — ACM has `ManifestWork` for the same purpose, and the hub's Argo CD ends up doing duplicate work.
+
+**Argo CD Agent (Argo CD's experimental "agent" mode).** Attractive because it formalizes the hub/spoke split. Rejected for the v6 baseline because:
+
+- Red Hat support for Argo CD Agent in OpenShift GitOps was not at the maturity the lab needs at the time of acceptance.
+- The lab wants a single pattern across hubs and spokes (Argo CD instance on each), not a separate "agent" runtime.
+- May be revisited in a future ADR.
+
+**No GitOps; do everything via `oc apply` from CI.** Considered pre-v6 and rejected for the reasons in [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) and [ADR 0025](#references). Push-mode operations leave the cluster unable to reconcile its own state.
+
+**Use Argo CD only on the hub; use ACM Subscription / Channel for application delivery.** Older pattern. Rejected because Argo CD's ApplicationSet + the ACM Placement-Decision generator gives a cleaner declarative path than Subscription/Channel.
+
+## Guardrails and gotchas
+
+- **Placement must select only the intended active workload clusters.** Don't let unreachable DR clusters or standby hubs match active placement labels.
+- **An unavailable managed cluster can receive an ACM unavailable taint**, leave placement decisions, and trigger unexpected ApplicationSet / ManifestWork pruning. (See [ACM memory entry on the routes-CRD incident](#references) for a related failure mode.) Use **explicit labels and separate placements** for active, standby, and future clusters.
+- **Every managed cluster must have network access** to internal GitLab and any registry endpoints it needs.
+- **Repository credentials** must be local secrets or managed by an approved secret manager; Git stores references only.
+- **Operator install resources, namespaces, StorageClasses, LocalVolumeSets, StorageClusters, AppProjects, tenant boundaries, and workload registrations** must be represented in Git before they are applied.
+- **Break-glass changes** require a tracked issue, reason, expiry or rollback plan, and follow-up Git backport (see [ADR 0025](#references)).
+
+## Consequences
+
+- **More moving parts than a hub-push model**, but reconciliation load distributes to managed clusters and `hub-dc-v6` does not become the executor for every spoke workload change.
+- **Each managed cluster must run and operate its own OpenShift GitOps instance.** This adds per-cluster bootstrap and credential-management work, but it keeps spoke operations available even when the hub is only coordinating status and placement.
+- **ODF/LSO on `spoke-dc-v6` remains blocked** until this management GitOps baseline exists and the relevant desired-state overlays are reviewed.
+- **Supersedes [ADR 0003](#references)** for the v6 rebuild. ADR 0003 remains useful as historical context for the previous `hub-dc` / `spoke-dc` pull-model implementation.
+- **Constrains [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops):** the federated repository architecture remains accepted, but OpenShift platform operations inside that architecture must use this ACM + OpenShift GitOps pull model unless a future ADR changes the cluster-management pattern.
+
+## References
+
+- Source: `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md`
+- Superseded predecessor: `codex-opp-agent/adr/0003-gitops-basic-pull-model.md`
+- Federation context: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- Nexus-only supply chain (binds the same v6 platform repo): [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)
+- GitOps-only operations rule: `codex-opp-agent/adr/0025-gitops-only-operations-break-glass.md`
+- platform-gitops clone path: operator-memory `reference_platform_gitops_mr_path.md`
+- ACM routes-CRD incident: operator-memory `project_acm_gitops_addon_routes_crd.md`
+- RHACM background: [the RHACM blog post](/blog/rhacm)

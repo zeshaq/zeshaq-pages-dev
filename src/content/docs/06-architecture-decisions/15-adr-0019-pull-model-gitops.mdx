@@ -1,8 +1,138 @@
 ---
-title: "ADR 0019 — Pull-Model GitOps"
-description: "Section 06-architecture-decisions: ADR 0019 — Pull-Model GitOps (placeholder)."
-sidebar_label: "ADR 0019 — Pull-Model GitOps"
+title: "ADR 0019 — Nexus-only image supply chain for OpenShift"
+description: "Three Nexus endpoints (mirror-registry, docker-group, app-registry), a runtime allowlist, IDMS/ITMS in GitOps, and disabled default OperatorHub sources — the disconnected supply chain for OpenShift."
+sidebar_label: "0019 — Nexus-only supply chain"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+**Date:** 2026-05-09
+**Status:** Accepted.
+
+> **Note on URL.** This page's slug is `15-adr-0019-pull-model-gitops` for historical reasons (the file layout was generated before titles were finalized). The content below is **ADR 0019 — Nexus-Only Image Supply Chain**. The pull-model GitOps decision is [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull).
+
+## Context
+
+The v6 OpenShift rebuild is intended to operate in **disconnected or internet-unreliable conditions**. `hub-dc-v6` and `spoke-dc-v6` must not depend on upstream registries at workload runtime.
+
+The ODF rollout on `spoke-dc-v6` proved the cost of getting this wrong: ODF CSI operands attempted direct `registry.redhat.io` pulls because the **release image mirror existed but operator and operand mirror configuration was incomplete**. Specific operand digests were not in Nexus. Pulls failed, CSI never settled, and the operator had to copy the missing exact digests into Nexus by hand before storage could come up.
+
+The active registry layout is three Nexus endpoints, each with a distinct purpose:
+
+- **`mirror-registry.apps.sub.comptech-lab.com`** — OpenShift platform content mirrored by `oc mirror`.
+- **`docker-group.apps.sub.comptech-lab.com`** — developer and build-tool base-image pulls through Nexus.
+- **`app-registry.apps.sub.comptech-lab.com`** — CI-produced application image pushes and runtime pulls.
+
+The OpenShift internal image registry is enabled only where the platform team explicitly accepts the dependency (e.g., when a workload needs `imageStreams`).
+
+## Decision
+
+All OpenShift platform, operator, and workload images must be available from **local Nexus or an explicitly approved internal registry** before they are used by a cluster.
+
+### The three Nexus endpoints
+
+<Whiteboard client:load data={{ nodes: [
+  { id: "mirror",position:{ x: 0,   y: 0   }, data: { label: "mirror-registry.*\noc-mirror only\n(OpenShift platform mirror)" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 } },
+  { id: "dock",  position:{ x: 280, y: 0   }, data: { label: "docker-group.*\nbuild-time base image pulls\n(through Nexus proxy)" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 } },
+  { id: "app",   position:{ x: 560, y: 0   }, data: { label: "app-registry.*\nCI-produced app images\n(push + runtime pull)" }, style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 } },
+  { id: "mirrorin",position:{ x: 0,  y: 180 }, data: { label: "oc-mirror\n(operator workstation)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "ci",    position:{ x: 420, y: 180 }, data: { label: "Jenkins / GitLab CI\n(build, scan, push)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" } },
+  { id: "ocp",   position:{ x: 280, y: 360 }, data: { label: "OpenShift clusters\n(IDMS/ITMS rewrite pulls\nto Nexus at node runtime)" }, style: { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 280, textAlign: "center" } },
+  { id: "dev",   position:{ x: 280, y: 530 }, data: { label: "Docker runtime VM\n+ dev workstations\n(pull from docker-group only)" }, style: { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" } },
+], edges: [
+  { id: "ocm_mirror", source: "mirrorin", target: "mirror", label: "push platform content", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "ci_app",     source: "ci", target: "app", label: "push immutable\nbuilt image", style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } },
+  { id: "ci_dock",    source: "ci", target: "dock", label: "pull base", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "ocp_mirror", source: "ocp", target: "mirror", label: "pull (IDMS-rewritten)", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "ocp_app",    source: "ocp", target: "app", label: "pull app image", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+  { id: "dev_dock",   source: "dev", target: "dock", label: "pull base", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } },
+] }} height={680} />
+
+The three endpoints are **separate by purpose** and only the matching content goes through each. `oc mirror` writes only to `mirror-registry.*`. CI only pushes app images to `app-registry.*`. Developers and the Docker runtime VM only pull base images through `docker-group.*`. Mixing these breaks the auditability the ADR exists to deliver.
+
+### Baseline controls
+
+1. **Mirror OpenShift releases, operator catalogs, operators, operands, and approved base images into Nexus.** The set must include not just the operator image but also the operand images each operator references — the ODF outage was caused by missing operand digests.
+2. **Commit generated `ImageDigestMirrorSet`, `ImageTagMirrorSet`, `CatalogSource`, and `ClusterCatalog` resources** to the active platform GitOps source when they are durable cluster configuration.
+3. **Disable default external OperatorHub sources** after mirrored catalogs are installed.
+4. **Prefer digest-pinned image references** for platform and application promotion.
+5. **Keep application build inputs separate from OpenShift platform mirror content.** The three endpoints are not interchangeable.
+6. **Run recurring drift checks** for pod images, init containers, ephemeral containers, mirror resources, OperatorHub state, and catalog-source images. The script `scripts/openshift-image-supply-check.sh` is the canonical drift report.
+7. **Add admission enforcement only after the allowlist is validated.** An incorrect allowlist can block OpenShift system workloads and operators; first measure, then enforce.
+
+### Runtime allowlist
+
+The initial allowed runtime registry prefixes are:
+
+```text
+mirror-registry.apps.sub.comptech-lab.com/
+docker-group.apps.sub.comptech-lab.com/
+app-registry.apps.sub.comptech-lab.com/
+image-registry.openshift-image-registry.svc:5000/
+default-route-openshift-image-registry.apps.sub.comptech-lab.com/
+```
+
+External source names — `registry.redhat.io`, `quay.io`, `docker.io`, `ghcr.io`, `icr.io`, `registry.connect.redhat.com` — are acceptable **only when a matching mirror rule (IDMS/ITMS) exists AND the exact digest is present in Nexus.**
+
+### GitOps boundary
+
+The active OpenShift platform GitOps repository is:
+
+```text
+http://<internal-gitlab-host>/comptech-platform/openshift-ops/openshift-platform-gitops.git
+```
+
+Image mirror and catalog configuration is **platform-owned desired state**. Application teams must not directly modify those resources. Application teams publish workload images into approved registries and submit deployment intent through their own GitOps boundaries.
+
+### Validation
+
+For each active cluster, the workspace must produce a repeatable report showing:
+
+- all pod, init-container, and ephemeral-container image references;
+- image references not covered by the approved runtime allowlist;
+- current `ImageDigestMirrorSet` and `ImageTagMirrorSet` objects;
+- OperatorHub default source posture (must be disabled);
+- CatalogSource and ClusterCatalog image references;
+- known follow-up actions for external references.
+
+This report (`scripts/openshift-image-supply-check.sh`) must show **0 uncovered references** before the cluster is considered supply-chain clean.
+
+## Alternatives considered
+
+**Quay on OpenShift as the primary registry.** Attractive because Quay is OpenShift-native and supports advanced features (replication, signing, security scanning). Rejected because:
+
+- Quay-on-OpenShift adds another OpenShift dependency the lab does not yet have appetite for.
+- Nexus is already the lab's package manager (npm, maven, apt, docker-pull-through cache, Helm); putting `app-registry.*` on Nexus reuses an existing operational surface.
+- The lab will keep Quay in scope as a future option but the v6 baseline uses Nexus.
+
+**Single registry endpoint for all three purposes.** Cheaper to operate. Rejected because:
+
+- An accidental `oc-mirror` push from a developer machine could overwrite an OpenShift platform image. The three-endpoint split forces explicit access control.
+- Audit logs become much clearer when "platform mirror push" and "CI image push" are on separate paths.
+- Memory entry `project_nexus_endpoint_split.md` formalizes this split for operator-agent recall.
+
+**Allow external registry pulls and rely on egress firewall.** What the previous lab cycle effectively did. Rejected because the ODF operand-digest incident proved the failure mode is real: an upstream registry hiccup at install time breaks operators that should have been local.
+
+**No allowlist; trust the operator.** Rejected because the operator is exactly the person likely to miss a `redhat.io` reference in an obscure init container. The drift report exists to catch what humans miss.
+
+## Consequences
+
+- **Operational work is added before new operators or application runtimes are introduced.** The drift report must be clean; the IDMS/ITMS for the new operator must exist in GitOps; the operand digests must be in Nexus. This pays for itself the first time the lab loses internet.
+- **OpenShift resources may continue to show external source names** because IDMS/ITMS rewrites pulls at *node runtime*. A source name (e.g. `registry.redhat.io/...`) is not automatically a failure; it is a failure only when the mirror rule or mirrored digest is missing. The drift report distinguishes the two.
+- **Hard admission policy is intentionally a later gate.** The first phase is to measure and document drift, then enforce once platform and tenant allowlists are proven. A premature enforcement policy can block kube-system / openshift-* workloads and require a console-recovery.
+- **The three Nexus endpoints are immutable boundaries.** Application images go to `app-registry.*` and only `app-registry.*`. `oc-mirror` writes only to `mirror-registry.*`. Memory entries (`feedback_oc_mirror_off_limits.md`) reinforce the rule for operator-agent recall.
+- **Build paths follow the matrix in `build-path-matrix.md`** — different build flows (Jenkins for OpenShift-native, GitLab CI for VM-runtime apps, etc.) all push to the same `app-registry.*` regardless of executor.
+
+## References
+
+- Source: `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md`
+- Federation context: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- v6 pull-model GitOps: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Nexus operating notes: `codex-opp-agent/connection-details/nexus.md`
+- Image registry allowlist policy: `codex-opp-agent/connection-details/image-registry-allowlist.md`
+- Image digest overlay pattern: `codex-opp-agent/connection-details/image-digest-overlay.md`
+- App registry pull-secret: `codex-opp-agent/connection-details/app-registry-pullsecret.md`
+- Build-path matrix: `codex-opp-agent/connection-details/build-path-matrix.md`
+- Memory entries: `feedback_oc_mirror_off_limits.md`, `project_nexus_endpoint_split.md`
