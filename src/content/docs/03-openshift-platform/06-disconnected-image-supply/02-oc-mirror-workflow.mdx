@@ -1,0 +1,344 @@
+---
+title: "oc-mirror v2 workflow"
+description: "How the dc-lab oc-mirror VM stages the disconnected image set: ImageSetConfiguration, pull-secret merge, dry-run, full mirror, and generated cluster resources."
+sidebar_label: "oc-mirror workflow"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Mermaid from "../../../../components/Mermaid";
+
+`oc mirror --v2` is the Red Hat tool that walks an `ImageSetConfiguration`, resolves every required image (release payload, operator catalog, operator bundles, additional images), copies them into a target registry, and emits the cluster-side CRs needed to make the cluster pull from the mirror. This page documents how that pipeline runs in the dc-lab v6 fleet — what the inputs are, what the outputs are, and how to operate it.
+
+The workstation that runs `oc mirror` is a dedicated VM named `oc-mirror` on the lab management subnet. It is the only host with both internet egress to the upstream registries and authenticated push access to the Nexus mirror.
+
+## Sequence of a mirror run
+
+<Mermaid client:load chart={`sequenceDiagram
+  participant Op as Operator
+  participant Mw as oc-mirror VM
+  participant Up as Upstream registries
+  participant Hx as HAProxy edge
+  participant Nx as Nexus mirror
+  Op->>Mw: edit ImageSetConfiguration
+  Op->>Mw: oc mirror --v2 --dry-run
+  Mw->>Up: resolve manifests (read-only)
+  Mw-->>Op: mapping.txt + warning summary
+  Op->>Mw: oc mirror --v2 (full run)
+  Mw->>Up: pull blobs by digest
+  Mw->>Hx: push blobs (HTTPS)
+  Hx->>Nx: forward to nexus :5000
+  Nx-->>Mw: HTTP 201 / digest receipts
+  Mw-->>Op: cluster-resources/ tarball\n(IDMS, ITMS, CatalogSource, ClusterCatalog)
+  Op->>Op: review + commit CRs to platform-gitops
+`} />
+
+## The workspace layout
+
+Everything lives under one directory on the `oc-mirror` VM:
+
+```
+/home/ze/ocp-mirror-workspaces/dc-lab/
+  imageset-config.yaml                 # the pinned input
+  pull-secret.merged.json              # local-only, never committed
+  full-operators-dryrun-workspace/     # dry-run output
+  working-dir/                         # full-run output (mirror state)
+  cluster-resources/                   # generated CRs for the cluster
+  logs/
+    oc-mirror-full-<run-id>.log
+    oc-mirror-progress-<run-id>.log
+  tools/
+    run-oc-mirror-fast.sh              # wrapper with progress logging
+```
+
+The `working-dir/` tree is incremental — running again only mirrors what changed since the last successful run. The `logs/` directory records per-run output for evidence; long-lived runs are launched inside a tmux session (`oc-mirror-full`) so the SSH session can drop.
+
+## Input 1: ImageSetConfiguration
+
+The single source of truth for what gets mirrored is `imageset-config.yaml`. It is committed under `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`.
+
+Top-level shape:
+
+```yaml
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  platform:
+    architectures: [amd64]
+    channels:
+      - name: stable-4.20
+        minVersion: 4.20.18
+        maxVersion: 4.20.18
+        type: ocp
+    graph: false                       # no update graph for the first install mirror
+  additionalImages:
+    - name: registry.redhat.io/ubi9/ubi:latest
+    - name: registry.redhat.io/ubi9/ubi-minimal:latest
+    - name: registry.access.redhat.com/ubi9/nodejs-22-minimal:latest
+    - name: icr.io/appcafe/open-liberty:25.0.0.6-kernel-slim-java17-openj9-ubi-minimal
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.20
+      packages: [ ... pinned packages ... ]
+    - catalog: registry.redhat.io/redhat/certified-operator-index:v4.20
+      packages: [ ... pinned packages ... ]
+```
+
+### The pinning rule
+
+Every package is pinned with `minVersion == maxVersion`. Example:
+
+```yaml
+- name: advanced-cluster-management
+  defaultChannel: release-2.16
+  channels:
+    - name: release-2.16
+      minVersion: 2.16.1
+      maxVersion: 2.16.1
+```
+
+This is intentional and enforced. The reasoning ties directly to ADR 0019 and the *operator-version-lock* plan:
+
+- A pinned range yields a **deterministic mapping count** between runs. Today's lock produces exactly **702 image mappings**. If you rerun without editing the file and you get a different count, you know upstream content changed and you investigate before mirroring.
+- Pinning lets us reason about "what's installed" at the operator-version level without scraping cluster state.
+- Channel-only mirrors (no `min/max`) explode in scope every time Red Hat re-promotes a CSV into a channel — a mirror run that finished yesterday in 4 hours can take 20 hours tomorrow.
+
+### Operator scope (current lock)
+
+The current lock pins 35+ operator packages plus the ODF dependency subgraph. Highlights:
+
+| Source | Package | Channel | Version |
+| --- | --- | --- | --- |
+| redhat-operator-index:v4.20 | openshift-gitops-operator | latest | 1.20.3 |
+| redhat-operator-index:v4.20 | advanced-cluster-management | release-2.16 | 2.16.1 |
+| redhat-operator-index:v4.20 | multicluster-engine | stable-2.11 | 2.11.1 |
+| redhat-operator-index:v4.20 | lvms-operator | stable-4.20 | 4.20.0 |
+| redhat-operator-index:v4.20 | local-storage-operator | stable | 4.20.0-202604140241 |
+| redhat-operator-index:v4.20 | odf-operator | stable-4.20 | 4.20.10-rhodf |
+| redhat-operator-index:v4.20 | redhat-oadp-operator | stable | 1.5.5 |
+| redhat-operator-index:v4.20 | openshift-cert-manager-operator | stable-v1 | 1.19.0 |
+| redhat-operator-index:v4.20 | openshift-external-secrets-operator | stable-v1 | 1.1.0 |
+| redhat-operator-index:v4.20 | openshift-pipelines-operator-rh | pipelines-1.22 | 1.22.0 |
+| redhat-operator-index:v4.20 | rhacs-operator | stable | 4.10.2 |
+| redhat-operator-index:v4.20 | compliance-operator | stable | 1.9.0 |
+| redhat-operator-index:v4.20 | quay-operator | stable-3.17 | 3.17.1 |
+| redhat-operator-index:v4.20 | loki-operator | stable-6.5 | 6.5.0 |
+| redhat-operator-index:v4.20 | tempo-product | stable | 0.20.0-3 |
+| redhat-operator-index:v4.20 | opentelemetry-product | stable | 0.144.0-3 |
+| redhat-operator-index:v4.20 | servicemeshoperator3 | stable-3.3 | 3.3.2 |
+| redhat-operator-index:v4.20 | kiali-ossm | stable | 2.22.2 |
+| redhat-operator-index:v4.20 | kubevirt-hyperconverged | stable | 4.20.11 |
+| certified-operator-index:v4.20 | cloudnative-pg | stable-v1 | 1.29.0 |
+| certified-operator-index:v4.20 | open-liberty-certified | v1.6 | 1.6.1 |
+
+A handful of large packages — `rhods-operator` (OpenShift AI) and `gpu-operator-certified` (NVIDIA) — are intentionally **deferred** so the control-plane mirror does not block on multi-tens-of-GiB pulls. Reintroduce them with a tracked issue once the GPU enablement scope is decided.
+
+### ODF dependency expansion
+
+`odf-operator` is the user-visible package; its CSV depends on a fan-out of CSI operands. Each one is listed explicitly in the ImageSetConfiguration even though `odf-operator` would "imply" them — because oc-mirror v2 does not auto-expand bundle dependencies, only their direct CSV references. The current lock includes:
+
+- `cephcsi-operator`, `mcg-operator`, `ocs-client-operator`, `ocs-operator`, `odf-csi-addons-operator`, `odf-dependencies`, `odf-external-snapshotter-operator`, `odf-prometheus-operator`, `recipe`, `rook-ceph-operator` — all pinned to `4.20.10-rhodf`.
+
+This is exactly the breakdown that closed the 2026-05-10 ODF dependency refresh: **193 release images + 425 operator images + 4 additional images** mirrored successfully against the active ImageSet.
+
+## Input 2: merged pull secret
+
+The merged pull secret is a single `.docker/config.json`-shaped file with credentials for **every registry oc-mirror needs to read from** plus the destination Nexus credentials.
+
+```
+/home/ze/ocp-mirror-workspaces/dc-lab/pull-secret.merged.json
+```
+
+Contents (shape only, never the raw bytes):
+
+```json
+{
+  "auths": {
+    "cloud.openshift.com":            { "auth": "..." },
+    "quay.io":                        { "auth": "..." },
+    "registry.connect.redhat.com":    { "auth": "..." },
+    "registry.redhat.io":             { "auth": "..." },
+    "registry.access.redhat.com":     { "auth": "..." },
+    "icr.io":                         { "auth": "..." },
+    "mirror-registry.apps.sub.comptech-lab.com": { "auth": "..." }
+  }
+}
+```
+
+How it gets built:
+
+1. Source upstream auths from the canonical workstation-local pull secret:
+   `/home/ze/secrets/openshift-pull-secret.json` (downloaded from Red Hat cloud.redhat.com).
+2. Add the local `mirror-registry.apps...` credential using `podman login --authfile <path>` against the Nexus hosted repo.
+3. Save as `pull-secret.merged.json` and `chmod 0600`. Never committed to Git, never pasted into chat, never copied to the cluster.
+
+The operational rule is:
+
+```bash
+# DO use the explicit --authfile path:
+oc mirror --v2 --authfile /home/ze/ocp-mirror-workspaces/dc-lab/pull-secret.merged.json ...
+
+# DO NOT export REGISTRY_AUTH_FILE — it leaks the path into subshells
+# and is the most common cause of "wrong-namespace authfile loaded" failures.
+```
+
+## Input 3: TLS trust
+
+Today's mirror endpoint uses the lab's Let's Encrypt wildcard certificate (`*.apps.sub.comptech-lab.com`) so no custom CA bundle is needed on the `oc-mirror` VM — the certificate chain is in the system trust store.
+
+The renewal date is tracked in `mirror-manifest.md`: **2026-07-27 09:45:17 UTC**. Renewal failure does not break a mirror run already underway but will break any new push or the next-day re-run.
+
+If the mirror endpoint is ever moved behind an internal OpenSSL CA (a long-tail option recorded in ADR 0005), the `install-config.yaml` for new clusters must include that CA in `additionalTrustBundle` and the `oc-mirror` VM's `/etc/pki/ca-trust/source/anchors/` must trust it.
+
+## Running a dry-run
+
+A dry-run **does not** push anything to Nexus. It downloads manifest metadata only, resolves the full image set, and writes a `mapping.txt`. The accepted dry-run is run before every full mirror cycle.
+
+```bash
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+
+umask 0022
+
+oc mirror --v2 \
+  --config imageset-config.yaml \
+  --workspace file://full-operators-dryrun-workspace \
+  docker://mirror-registry.apps.sub.comptech-lab.com \
+  --authfile pull-secret.merged.json \
+  --dry-run
+```
+
+Result lives at:
+
+```
+full-operators-dryrun-workspace/working-dir/dry-run/mapping.txt
+```
+
+Validate the mapping count against the expected value:
+
+```bash
+wc -l full-operators-dryrun-workspace/working-dir/dry-run/mapping.txt
+# Expected for the current lock: 702 image mappings
+```
+
+If the count differs, diff the file against the last known-good run. Typical drift reasons:
+
+- Red Hat re-promoted a CSV into a channel and a new bundle digest appeared.
+- A CVE rebuild changed a base-image digest.
+- A new package was added to the ImageSet but the dependency wasn't fully expanded — this is the cue to add the missing operand explicitly.
+
+## Running a full mirror
+
+The full run pushes blobs to Nexus and writes the workspace state.
+
+```bash
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+
+# launch under tmux so the SSH session can drop
+tmux new-session -d -s oc-mirror-full ./tools/run-oc-mirror-fast.sh
+```
+
+The wrapper at `tools/run-oc-mirror-fast.sh`:
+
+- Generates a run-id `YYYYMMDD-HHMMSS`.
+- Invokes `oc mirror --v2` with the same args as the dry-run minus `--dry-run`.
+- Records `rx_mib_s`, `tx_mib_s`, workspace used/free space, and the most recent `oc mirror` log line every 30 seconds to:
+  ```
+  logs/oc-mirror-progress-<run-id>.log
+  ```
+- Writes the full stdout/stderr to:
+  ```
+  logs/oc-mirror-full-<run-id>.log
+  ```
+
+A typical successful run for the current lock processes 702 images at roughly **7-12 MiB/s** inbound from upstream registries and finishes in **3-6 hours** on a healthy WAN.
+
+### Watching it run
+
+```bash
+tmux attach -t oc-mirror-full
+# or
+tail -f /home/ze/ocp-mirror-workspaces/dc-lab/logs/oc-mirror-progress-<run-id>.log
+```
+
+The progress log is structured for `grep` / `awk` parsing — disk space and bandwidth are columnar.
+
+## Outputs: generated cluster resources
+
+After a successful run the workspace contains a `cluster-resources/` directory with several YAML files. These are the only artifacts that leave the `oc-mirror` VM and go into GitOps.
+
+```
+cluster-resources/
+  idms-oc-mirror.yaml                 # ImageDigestMirrorSet (release + operands)
+  itms-oc-mirror.yaml                 # ImageTagMirrorSet (additionalImages with tags)
+  cs-redhat-operator-index-v4-20.yaml # CatalogSource for the mirrored Red Hat index
+  cs-certified-operator-index-v4-20.yaml
+  signature-config-map.yaml           # release signature config (4.13+)
+```
+
+Each is reviewed before being committed to the platform-gitops repository. Specifically:
+
+- The `mirrors:` arrays in IDMS must contain entries for `quay.io/openshift-release-dev`, `registry.redhat.io/...`, `icr.io/appcafe`, `ghcr.io/cloudnative-pg`, and whatever else the package set required. A common review failure mode is a missing entry for a transitive image — see the *failure-mode digest* on page 01.
+- The CatalogSource `image:` references the locally-mirrored index by digest. Tag-based references are explicitly avoided.
+- The signature ConfigMap is required for **disconnected cluster verification of release payloads** when the cluster runs with `release-image-signatures` enabled (default in 4.13+).
+
+These CRs land in the cluster through the platform GitOps repository — they are not applied by `oc apply` from a workstation. See [03-idms-itms-and-cluster-pull](/docs/openshift-platform/disconnected-image-supply/idms-itms-and-cluster-pull) for the cluster side.
+
+## Verifying the mirror
+
+After the full run finishes, validate from two angles.
+
+### From a workstation
+
+```bash
+# /v2/ should require auth — proves the endpoint is reachable
+curl -sSI https://mirror-registry.apps.sub.comptech-lab.com/v2/ | head -1
+# expect: HTTP/2 401
+
+# release image digest is resolvable
+oc adm release info \
+  mirror-registry.apps.sub.comptech-lab.com/openshift/release-images@sha256:<digest>
+```
+
+### From `ocp-bootstrap` (the install host)
+
+```bash
+podman pull \
+  mirror-registry.apps.sub.comptech-lab.com/ubi9/ubi-minimal@sha256:<digest>
+# success proves the install host can pull by digest
+```
+
+## Operating notes from session evidence
+
+These are paraphrased from real session reports in `codex-opp-agent/reports/sessions/`:
+
+- **Always `--dry-run` before the full run.** The dry-run is fast (minutes) and catches >90% of "upstream changed" failures before they cost mirror bandwidth.
+- **Re-run is safe.** `oc mirror --v2` is content-addressed and incremental. Aborting in the middle and re-running picks up where it left off.
+- **NVIDIA tag-plus-digest warnings are normal.** The `nvcr.io` images publish both a tag and a digest in their manifest references; oc-mirror warns and proceeds.
+- **Don't move the workspace mid-run.** The `working-dir/` keeps absolute paths in its state. Moving it mid-run requires a clean re-run.
+- **Don't share the merged authfile.** It is local-only by mode and by policy. If you need a fresh one, regenerate it; don't copy.
+
+## Common failures and fixes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `auth required` on push | wrong authfile loaded (often via stale `REGISTRY_AUTH_FILE` env var) | `unset REGISTRY_AUTH_FILE`; use `--authfile` explicitly |
+| `manifest unknown` mid-run for a single image | upstream garbage-collected the digest | re-run; if persistent, bump the pinned version in `imageset-config.yaml` |
+| `x509: certificate signed by unknown authority` | system trust store missing Let's Encrypt R12 chain (rare on fresh RHEL) | `update-ca-trust` and re-run; verify the cert chain on HAProxy edge has not been replaced with a self-signed |
+| Push connects but stalls at 0 B/s | HAProxy backend draining / Nexus blob-store at IO limit | check Nexus task health in UI; resume after Nexus recovers |
+| `cluster-resources/` empty after run | `--workspace` not pointing to a writable directory | check umask (`0022`), free space, and that the `oc-mirror` user owns the workspace path |
+| Run silently mirrors fewer than 702 images | upstream registry returned partial 200s; oc-mirror logs warnings but exits 0 | inspect log for `WARN` count; re-run; consider opening an upstream support case |
+
+## What this page does not cover
+
+- **Re-mirroring for an upgrade** (e.g. 4.20.18 → 4.20.20): same workflow, different `min/max`. See [05-upgrade-and-channel-management](/docs/openshift-platform/operator-lifecycle/upgrade-and-channel-management) for the OLM side and the upgrade matrix.
+- **First-time `oc-mirror` VM build**: install of `oc`, `openshift-install`, `oc-mirror`, RHEL trust setup. See `codex-opp-agent/plans/disconnected-rebuild/02-registry-mirror.md` §Execution update.
+- **Recovery if the Nexus mirror is rebuilt from scratch**: see [06-air-gap-rebuild-procedure](/docs/openshift-platform/disconnected-image-supply/air-gap-rebuild-procedure).
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/02-registry-mirror.md` — registry plan.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current mirror state.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml` — the pinned input.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — version-lock table.
+- `codex-opp-agent/connection-details/nexus.md` — endpoint and auth model.
+- ADR 0019 — Nexus-only image supply chain.
+- Memory: *feedback_oc_mirror_off_limits.md*.

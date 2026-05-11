@@ -1,0 +1,220 @@
+---
+title: "CatalogSources, ClusterCatalog, and the legacy ICSP boundary"
+description: "How OLM finds operators when OperatorHub points at the lab Nexus mirror instead of the public Red Hat indexes, and why we run zero ICSPs."
+sidebar_label: "CatalogSource & ICSP"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+## What OLM does in a disconnected cluster
+
+The Operator Lifecycle Manager (OLM) discovers available operators by reading **operator catalog index images**. In a connected cluster these are the public Red Hat catalogs pulled from `registry.redhat.io/redhat/redhat-operator-index:v4.20` and friends. In our disconnected fleet, those catalogs are mirrored into Nexus and the cluster is configured to read the local copies instead.
+
+The fleet uses two indexes:
+
+| Index | Upstream image | Mirrored to | Holds |
+| --- | --- | --- | --- |
+| `redhat-operator-index` | `registry.redhat.io/redhat/redhat-operator-index:v4.20` | `mirror-registry.../redhat/redhat-operator-index:v4.20` | OpenShift GitOps, ACM, MCE, LVMS, ODF, OADP, ESO, cert-manager, Pipelines, RHACS, Compliance, Quay, Loki, Tempo, OTel, Service Mesh 3, Kiali, KubeVirt HCO, etc. |
+| `certified-operator-index` | `registry.redhat.io/redhat/certified-operator-index:v4.20` | `mirror-registry.../redhat/certified-operator-index:v4.20` | CloudNativePG, Open Liberty Certified |
+
+The `community-operator-index` and `redhat-marketplace-index` are intentionally NOT mirrored. Neither is in scope for the dc-lab fleet under the current operator lock.
+
+## Disabling the default OperatorHub sources
+
+The first thing a disconnected cluster does is **turn off OLM's default catalog sources**. Otherwise OLM will try to pull `registry.redhat.io/...index:v4.20` directly and fail.
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: OperatorHub
+metadata:
+  name: cluster
+spec:
+  disableAllDefaultSources: true
+```
+
+This single field disables `redhat-operators`, `certified-operators`, `community-operators`, and `redhat-marketplace` as default `CatalogSource` objects. The result is a clean OperatorHub UI showing only the catalog sources we explicitly create.
+
+This object is committed to the platform GitOps repository for each cluster:
+
+```
+platform-gitops/clusters/hub-dc-v6/platform/operator-hub/operatorhub-cluster.yaml
+platform-gitops/clusters/spoke-dc-v6/platform/operator-hub/operatorhub-cluster.yaml
+```
+
+ADR 0019 §Decision 3 mandates this: *"Disable default external OperatorHub sources after mirrored catalogs are installed."* The order matters — disable AFTER the local catalogs are validated, otherwise the cluster has no operators discoverable at all.
+
+## The mirrored CatalogSource
+
+`oc mirror --v2` emits a CatalogSource per mirrored index. The one for Red Hat operators looks like:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: cs-redhat-operator-index-v4-20
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: mirror-registry.apps.sub.comptech-lab.com/redhat/redhat-operator-index@sha256:<digest>
+  displayName: Red Hat Operators (mirrored)
+  publisher: Red Hat
+  updateStrategy:
+    registryPoll:
+      interval: 30m
+```
+
+Key points:
+
+- The `image:` field points at the **digest** of the mirrored index, not a tag. This is deliberate — tag-based catalog image references trigger surprise updates when the tag is re-pushed (which happens often on `v4.20`-style channel indexes).
+- `sourceType: grpc` is the standard for index images.
+- `registryPoll.interval: 30m` is OLM's check for "did the index image digest change?" Since we control the mirror, this poll mostly serves as a self-test that the cluster can still reach Nexus.
+- `namespace: openshift-marketplace` is required — OLM only consults catalog sources in this namespace plus any namespaces matching the OperatorGroup of a Subscription.
+
+The certified-operators catalog is identical in shape with a different `name`, `image`, and `displayName`.
+
+## Pinning the catalog image by digest
+
+The CatalogSource `image:` must always be a digest reference (`@sha256:...`), never a tag (`:v4.20`). The reason is exactly the same as for application overlays (see [image-digest-overlay.md](https://github.com/zeshaq/codex-opp-agent/blob/main/connection-details/image-digest-overlay.md)):
+
+- Tags are mutable; the next `oc mirror` run could overwrite `:v4.20` with a fresh index that adds packages we don't want or removes ones we do.
+- Digests are content-addressed; the cluster's view of "available operators" doesn't change until we explicitly point at a new digest.
+
+When `oc mirror` produces a new catalog image (e.g. after a CVE rebuild), the CatalogSource manifest in GitOps is updated by hand to the new digest, the MR is reviewed against the diff of available packages, and Argo CD syncs it. This is the **manual gate** that prevents the operator inventory from drifting under us.
+
+## CatalogSource health
+
+After applying:
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-marketplace get catalogsource
+# expected output:
+# NAME                                DISPLAY                   TYPE   PUBLISHER   AGE
+# cs-redhat-operator-index-v4-20      Red Hat Operators...      grpc   Red Hat     12d
+# cs-certified-operator-index-v4-20   Certified Operators...    grpc   Red Hat     12d
+
+oc --kubeconfig "$K" -n openshift-marketplace get pod | grep cs-redhat
+# expected: cs-redhat-operator-index-v4-20-xxxxx 1/1 Running
+```
+
+The CatalogSource controller starts a gRPC pod per catalog. That pod serves the index over gRPC to the `catalog-operator` in OLM, which reads it to build the OperatorHub view. If the gRPC pod is unhealthy, OperatorHub shows zero operators from that source.
+
+Investigating a stuck CatalogSource:
+
+```bash
+oc --kubeconfig "$K" -n openshift-marketplace describe catalogsource cs-redhat-operator-index-v4-20
+oc --kubeconfig "$K" -n openshift-marketplace logs <cs-redhat-operator-index-v4-20-pod>
+```
+
+Common findings:
+
+- `image pull error` — IDMS rule missing for the catalog repo path; verify `mirror-registry.../redhat/redhat-operator-index` is mirrored.
+- `database disk image is malformed` — corrupted index; re-mirror.
+- `gRPC connection refused` — index pod crashed; check resource limits.
+
+## ClusterCatalog (OCP 4.15+ replacement)
+
+OCP 4.15 introduced **`ClusterCatalog`** as the next-generation replacement for `CatalogSource` under the new OLMv1 architecture. On OCP 4.20, both work side by side — `CatalogSource` is still the production mechanism for OLMv0 operators (essentially all current operators) and `ClusterCatalog` is available for operators packaged for OLMv1.
+
+The dc-lab v6 fleet runs OCP 4.20.18 with **OLMv0 / CatalogSource as the production path**. `ClusterCatalog` is captured here for completeness but is not in active use for any operator in the version lock.
+
+If a future operator only ships as an OLMv1 bundle, the equivalent ClusterCatalog shape is:
+
+```yaml
+apiVersion: olm.operatorframework.io/v1
+kind: ClusterCatalog
+metadata:
+  name: redhat-operators-v4-20
+spec:
+  source:
+    type: Image
+    image:
+      ref: mirror-registry.apps.sub.comptech-lab.com/redhat/redhat-operator-index@sha256:<digest>
+      pullSecret:
+        name: mirror-pull-secret
+        namespace: openshift-catalogd
+```
+
+The `oc mirror --v2` output of recent versions emits ClusterCatalog alongside CatalogSource on 4.15+; the lab currently uses the CatalogSource and ignores the ClusterCatalog file unless OLMv1 is enabled.
+
+## Why we run zero ICSPs
+
+`ImageContentSourcePolicy` (ICSP) is the **pre-4.13 mechanism** that IDMS replaced. ICSPs are still functional on 4.20 for backwards compatibility, but:
+
+- They are deprecated and will be removed in a future OCP release.
+- `oc mirror --v2` does not emit them.
+- The lab's IDMS coverage is complete; running both creates conflicting rewrite rules.
+- ADR 0019 §Decision 2 lists IDMS / ITMS / CatalogSource / ClusterCatalog as the GitOps-committed resources; ICSP is absent.
+
+If you see an `ImageContentSourcePolicy` on a v6 cluster, it is drift. It came from either:
+
+- A copy-paste from an OCP 4.12 procedure.
+- An `oc mirror v1` invocation against the cluster.
+- An old runbook that wasn't updated for 4.13+.
+
+Remove it. Replace with the equivalent IDMS entry if the same source-to-mirror rewrite isn't already present in the existing IDMS.
+
+## Verifying OperatorHub is clean
+
+After all of the above is in place:
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+# Default sources are off
+oc --kubeconfig "$K" get operatorhub cluster -o yaml | grep disableAllDefaultSources
+# expected: disableAllDefaultSources: true
+
+# Only our local catalogs exist
+oc --kubeconfig "$K" -n openshift-marketplace get catalogsource
+# expected: only cs-redhat-operator-index-v4-20 and cs-certified-operator-index-v4-20
+
+# No ICSPs
+oc --kubeconfig "$K" get imagecontentsourcepolicy
+# expected: No resources found
+
+# OperatorHub UI shows only mirrored packages
+oc --kubeconfig "$K" get packagemanifest -n openshift-marketplace \
+  --no-headers | wc -l
+# expected: ~35 (one per pinned package)
+```
+
+## Subscription side: pointing at the mirrored source
+
+A workload Subscription names the local CatalogSource explicitly:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+spec:
+  channel: release-2.16
+  installPlanApproval: Manual
+  name: advanced-cluster-management
+  source: cs-redhat-operator-index-v4-20         # <-- the mirrored catalog
+  sourceNamespace: openshift-marketplace
+  startingCSV: advanced-cluster-management.v2.16.1
+```
+
+`source:` and `sourceNamespace:` are the only two fields that change between a connected-cluster and disconnected-cluster Subscription. We always use `Manual` `installPlanApproval` so OLM never auto-installs a version we didn't approve. See [02-version-pinning-strategy](/docs/openshift-platform/operator-lifecycle/version-pinning-strategy) for the rest of the operator-side rules.
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| OperatorHub UI is empty | `disableAllDefaultSources: true` applied before mirrored catalogs created | apply the CatalogSource YAMLs first; confirm gRPC pod ready; only then disable defaults (the lab GitOps order does this automatically via sync waves) |
+| CatalogSource pod in `CrashLoopBackOff` | mirrored index image is missing layers (incomplete mirror) | re-run `oc mirror` for the catalog source; check `mirror-manifest.md` for last successful run id |
+| Subscription stuck `UpgradePending` | OLM cannot find target CSV in the catalog | check the catalog's served packages: `oc -n openshift-marketplace exec <cs-pod> -- grpcurl -plaintext :50051 api.Registry/ListPackages` |
+| `PackageManifest` count is much higher than expected | accidentally added `community-operator-index` to the ImageSet, or default sources came back | confirm default sources disabled; check `mirror-manifest.md` for current scope |
+| `failed to fetch image manifest: 404` from CatalogSource pod | catalog image digest in CatalogSource manifest doesn't match what's in Nexus | re-bake CatalogSource manifest from latest `oc mirror` output, commit, sync |
+
+## References
+
+- ADR 0019 §Decision 2-3 (mirrored CRs + default-sources-off).
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml` — the package set that the catalogs include.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current generated CatalogSource references.
+- OLM docs (Red Hat): *Adding a CatalogSource to a cluster* — the upstream procedure this page derives from.
+- [02-oc-mirror-workflow](/docs/openshift-platform/disconnected-image-supply/oc-mirror-workflow) — how the catalog images get mirrored in the first place.

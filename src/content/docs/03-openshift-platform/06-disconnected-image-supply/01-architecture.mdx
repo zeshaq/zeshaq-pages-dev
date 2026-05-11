@@ -1,0 +1,134 @@
+---
+title: "Disconnected image supply: architecture"
+description: "How OpenShift gets every container image it needs without reaching the public internet — the oc-mirror -> mirror-registry -> IDMS/ITMS -> CatalogSource pipeline."
+sidebar_label: "Architecture"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const clusterBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const writeEdge = { style: { stroke: "#b45309", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b45309" }, labelStyle: { fill: "#b45309", fontSize: 11 }, labelBgStyle: { fill: "#fffbeb" } };
+
+export const supplyNodes = [
+  { id: "internet",   position: { x: 0,   y: 0   }, data: { label: "Internet\nregistry.redhat.io\nquay.io / icr.io / ghcr.io / nvcr.io" }, style: extBox },
+  { id: "ocmirror",   position: { x: 280, y: 0   }, data: { label: "oc-mirror VM\n(workstation)" }, style: ctrlBox },
+  { id: "imageset",   position: { x: 280, y: 130 }, data: { label: "ImageSetConfiguration\n(pinned versions)" }, style: dataBox },
+  { id: "nexus",      position: { x: 560, y: 0   }, data: { label: "Nexus mirror VM\nmirror-registry.apps...\nDocker hosted repo" }, style: ctrlBox },
+  { id: "haproxy",    position: { x: 560, y: 130 }, data: { label: "HAProxy edge\n(TLS terminator)" }, style: dataBox },
+  { id: "idms",       position: { x: 100, y: 290 }, data: { label: "IDMS / ITMS\n(cluster CR)" }, style: dataBox },
+  { id: "catsrc",     position: { x: 320, y: 290 }, data: { label: "CatalogSource\ncs-redhat-operator-index-v4-20" }, style: dataBox },
+  { id: "icsp",       position: { x: 540, y: 290 }, data: { label: "Generated\nclusterCatalog\n(OCP 4.15+: ClusterCatalog)" }, style: dataBox },
+  { id: "cluster",    position: { x: 280, y: 440 }, data: { label: "OpenShift cluster\nhub-dc-v6 / spoke-dc-v6" }, style: clusterBox },
+  { id: "kubelet",    position: { x: 80,  y: 580 }, data: { label: "kubelet on node\n(crio pulls)" }, style: agentBox },
+  { id: "olm",        position: { x: 320, y: 580 }, data: { label: "OLM catalog-operator\n(installs from catalog)" }, style: agentBox },
+  { id: "workloads",  position: { x: 560, y: 580 }, data: { label: "Workload pods\n(operators + apps)" }, style: agentBox },
+];
+
+export const supplyEdges = [
+  { id: "e1", source: "internet", target: "ocmirror", label: "pull by digest\n(infrequent, gated)", ...muted },
+  { id: "e2", source: "imageset", target: "ocmirror", label: "input", ...muted },
+  { id: "e3", source: "ocmirror", target: "nexus",    label: "push via HAProxy", ...writeEdge },
+  { id: "e4", source: "ocmirror", target: "idms",     label: "generates CRs", ...reqEdge },
+  { id: "e5", source: "ocmirror", target: "catsrc",   label: "generates", ...reqEdge },
+  { id: "e6", source: "ocmirror", target: "icsp",     label: "generates", ...reqEdge },
+  { id: "e7", source: "haproxy",  target: "nexus",    label: "5000 backend", ...muted },
+  { id: "e8", source: "idms",     target: "cluster",  label: "applied", ...reqEdge },
+  { id: "e9", source: "catsrc",   target: "cluster",  label: "applied", ...reqEdge },
+  { id: "e10", source: "icsp",    target: "cluster",  label: "applied", ...reqEdge },
+  { id: "e11", source: "cluster", target: "kubelet",  label: "node pulls", ...muted },
+  { id: "e12", source: "cluster", target: "olm",      label: "installs operators", ...muted },
+  { id: "e13", source: "cluster", target: "workloads",label: "schedules", ...muted },
+  { id: "e14", source: "kubelet", target: "nexus",    label: "rewritten pull (IDMS)", ...pullEdge },
+  { id: "e15", source: "olm",     target: "nexus",    label: "bundle + index pull", ...pullEdge },
+  { id: "e16", source: "workloads", target: "nexus",  label: "image pull", ...pullEdge },
+];
+
+This page is the map of the entire disconnected image supply chain for the dc-lab v6 fleet. The ADR that frames every rule on this page is **[ADR 0019: Nexus-Only Image Supply Chain](https://github.com/zeshaq/codex-opp-agent/blob/main/adr/0019-nexus-only-image-supply-chain.md)** — every container image executed on `hub-dc-v6` or `spoke-dc-v6` must be available from the local Nexus mirror before a pod or operator is allowed to pull it.
+
+## Reading the diagram
+
+<Whiteboard client:load data={{ nodes: supplyNodes, edges: supplyEdges }} height={720} />
+
+The flow has three logical stages and one strict invariant.
+
+1. **Acquire** (top-left): a workstation VM named `oc-mirror` reaches the public registries (`registry.redhat.io`, `quay.io`, `icr.io`, `ghcr.io`, `nvcr.io`, `registry.connect.redhat.com`, `registry.access.redhat.com`) over the internet. This is the **only** host in the lab that ever touches the public image surface. Everything downstream pulls from the lab.
+2. **Stage** (top-right): `oc mirror --v2` pushes every release image, operator bundle, operator index, and additional image into the Nexus VM at `mirror-registry.apps.sub.comptech-lab.com`, routed by the HAProxy edge and terminated against the lab's Let's Encrypt wildcard certificate.
+3. **Deliver** (centre + bottom): `oc-mirror` emits a tarball of cluster resources — `ImageDigestMirrorSet`, `ImageTagMirrorSet`, `CatalogSource`, and (on 4.15+) `ClusterCatalog` objects. Those CRs land in the cluster through GitOps. Once present, `crio` on every node and `catalog-operator` in OLM rewrite every upstream image reference to the Nexus equivalent at pull time.
+
+The invariant: **no production pod on a fleet cluster pulls from a public registry at runtime.** The IDMS-style rewrite makes the upstream name in a manifest cosmetic; the actual byte-stream comes from Nexus. This is what makes the fleet survive an offline weekend.
+
+## Three Nexus endpoints, three roles
+
+The single Nexus VM exposes three Docker Registry HTTP API v2 endpoints, each with a different purpose. They share the same TLS certificate (the lab wildcard) but are physically separate Nexus repositories with different cleanup policies and different role-based access.
+
+| Public hostname | Purpose | Nexus repo | HAProxy backend | Who pushes | Who pulls |
+| --- | --- | --- | --- | --- | --- |
+| `mirror-registry.apps.sub.comptech-lab.com` | OpenShift platform mirror — release payload + operator index + operator bundles + additional images | `ocp-mirror` (hosted) | port `5000` | `oc-mirror` VM only | OpenShift nodes (crio) + OLM |
+| `docker-group.apps.sub.comptech-lab.com` | Developer + CI base-image pulls (UBI, Open Liberty, Node.js, Docker Hub passthrough) | `docker-group` (group: `docker-dev-hosted` + `icr-proxy` + `redhat-proxy` + `dockerhub-proxy`) | port `5001` | nothing (group is read-only) | Jenkins / Tekton / developer workstations |
+| `app-registry.apps.sub.comptech-lab.com` | CI-produced application image push and runtime pull (legacy Path A) | `docker-dev-hosted` (hosted) | port `5002` | Jenkins / Tekton | Argo-deployed workload pods |
+
+This separation is non-negotiable per ADR 0019 §5 and the operator handoff memory entry *"Nexus three-endpoint split — install, dev pull, app push"*. Crossing the streams (e.g., pushing an app image to `mirror-registry`) is a class of incident, not a tactical workaround: the OpenShift Image Set tooling owns the layout under `mirror-registry/openshift/...` and assumes it is the only author.
+
+## What "image supply" includes
+
+| Class | Examples | Lives where |
+| --- | --- | --- |
+| OpenShift release payload | `openshift/release-images@sha256:...`, machine-os-content, MCO daemonset images | `mirror-registry/openshift/release-images` |
+| Operator catalog index | `cs-redhat-operator-index-v4-20`, `cs-certified-operator-index-v4-20` | `mirror-registry/...catalog/redhat-operator-index:v4.20` |
+| Operator bundles + operands | `advanced-cluster-management`, `odf-operator`, every CSV-referenced image | `mirror-registry/redhat/...`, `mirror-registry/odf4/...` |
+| Additional images | UBI9 base, Node.js 22 minimal, Open Liberty 25.0.0.6 ICR base | `mirror-registry/ubi9/...`, `mirror-registry/appcafe/open-liberty` |
+| Developer base images | UBI9 (passthrough), upstream Node.js (passthrough), Dockerhub passthrough | `docker-group.apps...` (proxy repos) |
+| Built application images | `team-platform/sample`, `smoke/readiness-probe` | `app-registry.apps...` |
+
+The first four classes are platform-owned and live on `mirror-registry`. The last two are application-owned and live on `docker-group` and `app-registry`. The boundary is stable: app teams cannot push to `mirror-registry`, and platform code does not push to `app-registry`.
+
+## Why this design, not the alternatives
+
+| Alternative | Why we did not pick it |
+| --- | --- |
+| **In-cluster registry as day-zero mirror** | Circular dependency: the cluster cannot install without an image source, but the in-cluster registry only exists after install. ADR 0019 §3 forbids this for the day-zero mirror. The in-cluster `image-registry.openshift-image-registry.svc:5000` is allowed only for BuildConfig output. |
+| **Mirroring release+operators directly to each cluster's local registry** | N clusters × N petabytes of duplication. The cluster registries are storage-light by design (LVMS on hub, ODF on spoke is for workloads). |
+| **Direct internet pulls at runtime** | The lab WAN is slow and unreliable; an upstream outage stalls operator installs and image-stream tags. This is also explicitly disallowed by ADR 0019 — runtime registries must be in the approved allowlist. |
+| **Quay Operator as the platform mirror** | Quay is an in-cluster operand. Same circular dependency as the in-cluster registry. We do run Quay later for app images (DEV-OCP-2.5 / #186), but it is a downstream choice, not the day-zero mirror. |
+| **Skopeo + manual `docker push` instead of oc-mirror** | Skopeo is fine for one image. oc-mirror v2 handles the OpenShift release catalogue + N operator bundles + index regeneration + IDMS/ITMS emission in one idempotent pipeline. The tool exists to solve this exact problem. |
+
+## Where each piece is documented
+
+- **oc-mirror workflow on the workstation:** [02-oc-mirror-workflow](/docs/openshift-platform/disconnected-image-supply/oc-mirror-workflow).
+- **The cluster-side CRs that make rewriting work:** [03-idms-itms-and-cluster-pull](/docs/openshift-platform/disconnected-image-supply/idms-itms-and-cluster-pull).
+- **CatalogSource and the legacy ICSP boundary:** [04-catalogsources-and-icsp](/docs/openshift-platform/disconnected-image-supply/catalogsources-and-icsp).
+- **The two-layer registry allowlist (VAP + RHACS):** [05-image-supply-allowlist-with-nexus](/docs/openshift-platform/disconnected-image-supply/image-supply-allowlist-with-nexus).
+- **End-to-end rebuild recovery procedure:** [06-air-gap-rebuild-procedure](/docs/openshift-platform/disconnected-image-supply/air-gap-rebuild-procedure).
+
+## Failure-mode digest
+
+The session log under `codex-opp-agent/SESSION_LOG.md` and the issue tracker have these recurring symptoms; the design above is largely a reaction to them.
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| ODF CSI pods enter `ImagePullBackOff` with `registry.redhat.io/odf4/...` error | ODF operand image not in the mirror, even though the operator bundle was | Mirror the exact CSV-listed operand digest; regenerate IDMS | Pin operand sub-packages (`mcg-operator`, `ocs-operator`, `cephcsi-operator`, etc.) explicitly in `ImageSetConfiguration` |
+| Pod uses `ghcr.io/cloudnative-pg/...` and pull fails on spoke | IDMS rewrite missing for ghcr.io; allowlist passes but no Nexus copy exists | Add the digest to next mirror run; add ghcr.io to IDMS source list | Add cnpg-style operators to the mirrored set before installing Subscription |
+| Pull from `mirror-registry` returns 401 from a workload pod | Pod's namespace has no pull secret linked to its ServiceAccount | `oc secrets link <sa> nexus-docker-pull --for=pull` | ESO + Vault bridging the pull-secret per namespace; see Section 4 — Secrets / ESO |
+| `oc mirror --v2` aborts with `manifest unknown` mid-run | Upstream digest disappeared (CVE rebuild, garbage collection) | Refresh `oc-mirror` cache, re-run; consider bumping pinned version | Pin `minVersion == maxVersion` in ImageSetConfiguration so a re-run gives byte-identical output until the file changes |
+| RHACS deploy-time policy blocks otherwise mirrored image | Allowlist entry missing on RHACS Central side (the host-only granularity layer) | Edit `DESIRED_REGISTRIES` and rerun `rhacs-update-img-allowlist.sh` | Two-layer allowlist always edited together — see page 05 |
+
+## References
+
+- ADR 0019: [Nexus-Only Image Supply Chain](https://github.com/zeshaq/codex-opp-agent/blob/main/adr/0019-nexus-only-image-supply-chain.md).
+- `codex-opp-agent/connection-details/nexus.md` — endpoint inventory + curl validations.
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` — two-layer allowlist (this site links to it as page 05).
+- `codex-opp-agent/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays.
+- `codex-opp-agent/plans/disconnected-rebuild/02-registry-mirror.md` — day-zero registry plan.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current mirror inventory.
+- Memory entry: *project_nexus_endpoint_split.md* — three-endpoint split rationale.
+- Memory entry: *feedback_oc_mirror_off_limits.md* — `oc-mirror` reserved for OpenShift install; app work goes through Nexus only.
