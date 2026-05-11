@@ -50,6 +50,29 @@ All three users share one demo password: **`Hkj38djf&&&`**.
 Login is single sign-on through WSO2 — the bank doesn't manage usernames
 or passwords inside the app itself.
 
+## Technology choices
+
+Every layer of this app uses something the bank's operations team
+already runs in production elsewhere — nothing exotic, nothing that
+needs a new vendor relationship to support. The two backend services
+are built on **Open Liberty**, IBM / Red Hat's enterprise Java
+application server, which is the same runtime the bank uses for the
+existing payment platform. The reverse proxy is plain **NGINX**, the
+most widely deployed web server in the world. Identity is handled by
+**WSO2 Identity Server**, which the bank already operates as part of
+its identity strategy.
+
+| Layer | What it uses | Why this choice |
+| --- | --- | --- |
+| Backend services | **Open Liberty** (Java application server, MicroProfile 6.1) | Same runtime the bank's existing platform already runs. Long-term enterprise support from Red Hat. Built-in health and metrics endpoints — no extra agent required. |
+| Web frontends | **React** (single-page apps), built with Vite, styled with Tailwind CSS | Industry-standard frontend stack. Light, fast to load, easy to hand off to any frontend team. |
+| Reverse proxy / canary / hardening | **NGINX** | The de-facto edge proxy. Used here for header-based canary routing, rate limiting, branded error pages, and the security headers. Zero learning curve for ops teams. |
+| Identity & single sign-on | **WSO2 Identity Server** | The bank's existing identity platform. Two service-provider entries, one tenant, regular OpenID Connect — no custom auth code in the apps. |
+| Container runtime | **OpenShift** (Kubernetes-based, by Red Hat) | The bank's existing container platform. Standard images, standard deployment objects. |
+| Public TLS certificate | **Let's Encrypt** (issued automatically by cert-manager) | A globally-trusted certificate, refreshed automatically — no procurement cycle, no manual cert rotation. |
+| Source control & build | **GitLab** for source, **Nexus** for the image registry | The bank's existing development pipeline. The same Git repository the developers push to is the same source Argo CD reads to keep the cluster in sync. |
+| Deployment pipeline | **Argo CD** (GitOps) | One commit to the Git repository becomes one change on the cluster, automatically. No engineer ever logs in to the running environment to make a change. |
+
 ## How a payment moves
 
 1. **Zahid logs in** on the customer page (gets redirected to WSO2, signs in, comes back signed in).
