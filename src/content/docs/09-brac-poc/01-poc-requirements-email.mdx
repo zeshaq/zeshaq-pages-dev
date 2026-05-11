@@ -1,0 +1,94 @@
+---
+title: "Brac POC — requirements email"
+sidebar_label: "Requirements email"
+description: "The original POC requirements email from BRAC Bank PLC covering OpenShift, observability, identity, CI/CD, Trivy, Redis HA, Kafka, middleware, and JBoss."
+last_reviewed: 2026-05-11
+draft: false
+---
+
+> Source: email from BRAC Bank PLC, captured 2026-05-11. Reproduced verbatim.
+
+Dear Valued Vendor,
+
+Greetings from BRAC Bank PLC.
+
+Thank you for participating Support Service for 13 Products
+
+This is to inform you that we require a focused (POC) or test **deployment** covering the specific technical areas outlined below. This exercise will serve as a key qualifying factor based on implementation quality and technical justification.
+
+Environment Provisioning:
+
+BRAC Bank can provide the necessary **platform/environment** if requested. Alternatively, bidders may use their own environment to complete the evaluation. Please inform us of your preference and specify if any further information is required from our side to proceed.
+
+## 1. OpenShift Platform
+
+- **Infrastructure:** Automate the provisioning of a 3-node OpenShift cluster on VMs using **Terraform**.
+- **Storage:** Configure **OpenShift Data Foundation (ODF)** with Block and Object storage classes.
+- **Compliance:** Utilize the **Compliance Operator** to scan against **PCI-DSS** standards and generate an automated remediation report.
+- **Image Security:** Implement an **Advanced Cluster Security (ACS)** policy to block the deployment of any container image containing "Critical" vulnerabilities.
+- **Observability & Logging:**
+  - Configure custom alerts within the native **Prometheus/Grafana** stack.
+  - Deploy a logging pipeline to aggregate **System, Infrastructure, and Audit** logs, forwarding them to an external mock destination.
+
+## 2. Logging & Observability (OpenTelemetry Stack)
+
+- **Instrumentation:** Deploy a sample microservice instrumented with the **OpenTelemetry (OTel) SDK** and without SDK.
+- **Data Pipeline:** Build a telemetry pipeline for logs, metrics, and traces using **OTel, Kafka, and SigNoz**.
+- **Traffic Management:** Implement trace sampling, log filtering, and metrics segregation.
+- **Storage Lifecycle:** Configure **ClickHouse** with a 2-day hot retention policy and automated cold archiving to external object storage.
+- **Dashboards:**
+  - **Application Performance:** Create a dashboard tracking HTTP request duration/count, active requests, and DB connection usage.
+  - **Runtime (.NET Focus):** Monitor GC heap size, collection counts, and thread pool activity.
+  - **System:** Monitor process CPU utilization and memory usage.
+  - **Tracing:** Build a dedicated tracing dashboard visualizing service dependencies, latency, throughput, and span details.
+
+## 3. Identity & API Management (WSO2)
+
+- **Architecture:** Deploy a **Distributed WSO2 APIM** setup (separated Control Plane and Data Plane).
+- **Persistence & HA:** Configure WSO2 APIM and WSO2 IS in **High Availability (HA)** mode using external production-grade databases (replacing default H2).
+- **Integration:**
+  - Publish APIs with defined policies and integrate WSO2 IS as the **Identity Key Manager**.
+  - Configure **SSO** using **SAML and OIDC**, including Identity Federation.
+- **Security & Ops:** Perform vulnerability remediation, security hardening, and centralized monitoring/logging for both products.
+
+## 4. CI/CD & DevOps Tooling
+
+- **GitLab:** Implement Backup/Restore procedures, **High Availability**, and **DC-DR (Disaster Recovery)** replication.
+- **Jenkins:**
+  - Establish HA and DC-DR configurations.
+  - **Monorepo Optimization:** Write conditional **Jenkinsfiles** to trigger builds or security scans only for specific applications within a monorepo based on directory-level changes.
+  - **Hybrid CD:** Orchestrate deployments across both **OpenShift/Kubernetes** and legacy **VM environments**.
+- **ArgoCD:**
+  - Configure Projects and Applications following GitOps best practices.
+  - Automate application deployment to OpenShift/Kubernetes clusters.
+- **Sonatype Nexus:**
+  - Deploy with an external database and configure HA/Backup.
+  - Manage multi-format repositories (Maven/Java, PyPI/Python, npm/Node.js, and Docker).
+
+## 5. Trivy
+
+We want to see our scanning report in one dashboard for SCA and SBOM Generation.
+
+## 6. High-Availability Data Store (Redis)
+
+- **Sentinel Topology:** Deploy a Redis HA cluster using Openshift Platform.
+- **Failover Validation:** Perform a "hard kill" on the nodes and demonstrate:
+  1. Automatic promotion of a Replica.
+  2. How the application client (using a mock script) reconnects.
+
+## 7. Event Streaming & Governance (Apache Kafka)
+
+- **KRaft Deployment:** Provision a 3-node Kafka cluster using the **KRaft** (ZooKeeper-less) consensus protocol.
+- **Schema Registry:** Integrate a Schema Registry. Produce a message that violates a defined **Avro/JSON schema** and demonstrate the Registry's ability to reject the invalid produce request.
+- **Kafka Connect:** Configure a mock **Source/Sink Connector** (e.g., FileStream or mock DB) and demonstrate a Dead Letter Queue (DLQ) implementation for failed messages.
+
+## 8. Middleware & Web Tier (Open Liberty + NGINX)
+
+- **L7 Load Balancing:** Deploy two Open Liberty instances behind an **NGINX Reverse Proxy**.
+- **Traffic Steering:** Configure NGINX to perform a **Header-based Canary deployment** (e.g., traffic with header `version: beta` goes to Instance B, all else to Instance A).
+- **MicroProfile Observability:** Enable the `microprofile-health` and `metrics` features in Liberty. Expose these endpoints through NGINX and visualize the "JVM Thread Count" and "Liveness" status.
+- **Hardening:** Demonstrate NGINX configuration for **HSTS, custom error pages**, and rate-limiting to prevent brute-force on the application context.
+
+## 9. Enterprise App Platform (JBoss)
+
+- **Managed Domain Mode:** Set up a JBoss EAP **Domain Controller** with at least one **Host Controller** and two **Server Groups**.
