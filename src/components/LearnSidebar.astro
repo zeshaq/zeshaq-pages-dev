@@ -2,6 +2,7 @@
 import { getCollection } from "astro:content";
 import NavNode from "./NavNode.astro";
 import { buildLearnTree, type NavNode as NavNodeT } from "../utils/navTree";
+import { parseLearnPath, trackTitle } from "../utils/tracks";
 
 interface Props {
   currentPath: string;
@@ -12,6 +13,9 @@ const { currentPath } = Astro.props;
 const learn = await getCollection("learn", ({ data }) => !data.draft);
 
 const tree: NavNodeT[] = buildLearnTree(learn, "/learn");
+
+const ctx = parseLearnPath(currentPath);
+const showTrackBackLink = ctx.isModule && ctx.trackId;
 ---
 
 <aside class="sidebar">
@@ -20,6 +24,14 @@ const tree: NavNodeT[] = buildLearnTree(learn, "/learn");
       <a href="/learn" class="sidebar-brand" onclick="event.stopPropagation()">Learning</a>
       <span class="sidebar-hamburger" aria-hidden="true">≡</span>
     </summary>
+
+    {showTrackBackLink && (
+      <div class="sidebar-contextual">
+        <a href={`/learn/${ctx.trackId}/`} class="sidebar-context-link">
+          ← back to {trackTitle(ctx.trackId!)} modules
+        </a>
+      </div>
+    )}
 
     <div class="sidebar-filter-wrap">
       <input
@@ -46,7 +58,10 @@ const tree: NavNodeT[] = buildLearnTree(learn, "/learn");
       </ul>
       <ul class="sidebar-extra">
         <li>
-          <a class="nav-link" href="/">← Back to Blog</a>
+          <a class="nav-link" href="/learn/">← all tracks</a>
+        </li>
+        <li>
+          <a class="nav-link" href="/">← back to blog</a>
         </li>
       </ul>
     </nav>
