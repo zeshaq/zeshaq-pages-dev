@@ -1,8 +1,202 @@
 ---
-title: "PowerDNS Architecture"
-description: "Section 02-lab-infrastructure/03-dns: PowerDNS Architecture (placeholder)."
-sidebar_label: "PowerDNS Architecture"
+title: "PowerDNS architecture"
+description: "The dual-homed single-VM PowerDNS deployment: authoritative + recursor on one host, what each daemon does, and how queries flow from lab VMs to the lab zone and onward to the public internet."
+sidebar_label: "PDNS architecture"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const clientBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const vmBox     = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const procBox   = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center" };
+export const extBox    = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const dataBox   = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted   = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dashed  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const pdnsNodes = [
+  { id: "labvm",  position: { x: 0,   y: 0   }, data: { label: "Lab VM\n(any platform VM,\nany OCP node)" }, style: clientBox },
+  { id: "client", position: { x: 220, y: 0   }, data: { label: "Workstation\nor browser" }, style: clientBox },
+  { id: "pubdns", position: { x: 480, y: 0   }, data: { label: "Public DNS users\n(internet)" }, style: clientBox },
+
+  { id: "vm",     position: { x: 220, y: 160 }, data: { label: "pdns.local VM\nUbuntu 24.04 (single host)" }, style: vmBox },
+
+  { id: "rec",    position: { x: 30,  y: 290 }, data: { label: "pdns-recursor 4.9.3\n(lab resolver address)" }, style: procBox },
+  { id: "auth",   position: { x: 270, y: 290 }, data: { label: "pdns 4.8.3 (Authoritative)\n(auth address; loopback)" }, style: procBox },
+  { id: "rd",     position: { x: 510, y: 290 }, data: { label: "pdns 4.8.3 (Authoritative)\n(public auth address)" }, style: procBox },
+
+  { id: "sqlite", position: { x: 270, y: 430 }, data: { label: "/var/lib/powerdns/pdns.sqlite3\n(gsqlite3 backend)" }, style: dataBox },
+
+  { id: "public", position: { x: 30,  y: 430 }, data: { label: "8.8.8.8 / 1.1.1.1\n(recurse \".\")" }, style: extBox },
+];
+
+export const pdnsEdges = [
+  { id: "lv-rec",  source: "labvm",  target: "rec",  label: "lookup any name", ...reqEdge },
+  { id: "ws-rec",  source: "client", target: "rec",  ...reqEdge },
+  { id: "rec-auth",source: "rec",    target: "auth", label: "forward sub.comptech-lab.com", ...dashed },
+  { id: "rec-pub", source: "rec",    target: "public", label: "recurse .", ...dashed },
+  { id: "pub-rd",  source: "pubdns", target: "rd",   label: "auth queries", ...muted },
+  { id: "auth-db", source: "auth",   target: "sqlite", label: "read/write", ...muted },
+  { id: "rd-db",   source: "rd",     target: "sqlite", label: "read", ...muted },
+];
+
+DNS in this lab is one VM, two daemons, one SQLite file. That sentence is the whole architecture; the rest of this page expands on what each piece does and why. The dual-homed single-host shape was inherited from the previous lab generation and intentionally kept: it is the smallest viable design that still gives lab clients a real recursor without coupling them to a public resolver, and still answers authoritatively for the `sub.comptech-lab.com` zone.
+
+This page covers the architecture. The other DNS subsection pages cover the zone contents, the forwarder configuration, and the failure modes / recovery procedures.
+
+## The host
+
+| Item | Value |
+| --- | --- |
+| VM hostname | `pdns.local` (no PTR; reach by IP) |
+| OS | Ubuntu 24.04.4 LTS |
+| Kernel | 6.8.x |
+| Interfaces | dual-homed: one public NIC (one address), one private NIC (two addresses on the lab `/16`) |
+| Admin user | `ze` |
+| Daemon (authoritative) | PowerDNS Authoritative 4.8.3 |
+| Daemon (recursive) | PowerDNS Recursor 4.9.3 |
+| Host stub resolver | `systemd-resolved` on `127.0.0.53:53` |
+| Authoritative backend | `gsqlite3` (single SQLite file at `/var/lib/powerdns/pdns.sqlite3`) |
+
+The public NIC carries an externally reachable address. The private NIC carries two addresses on the lab `/16`: one used by the authoritative daemon (the historical auth address for the lab zone) and one used by the recursor (the address every lab VM points at for resolution). Two daemons, three IPs, one VM.
+
+## Diagram
+
+<Whiteboard client:load data={{ nodes: pdnsNodes, edges: pdnsEdges }} height={560} />
+
+The defining shape:
+
+- **Lab VMs and the workstation** point at the recursor address — *not* the authoritative address.
+- The **recursor** forwards anything ending in `sub.comptech-lab.com` to the authoritative daemon on the **same VM** (over loopback), and recurses everything else to public resolvers (`8.8.8.8`, `1.1.1.1`).
+- **Public-internet DNS users** (anyone resolving the lab's external zone) hit the authoritative daemon directly via the public NIC. They never use the recursor.
+- The **SQLite file** is read by both auth daemons (same process, two binds) and is the entire source of truth for the zone.
+
+## Two daemons, side by side
+
+Both daemons are active on the same host (`systemctl status pdns pdns-recursor` returns both as `active (running)`).
+
+| Item | `pdns` (Authoritative) | `pdns-recursor` |
+| --- | --- | --- |
+| Version | 4.8.3 | 4.9.3 |
+| Listens on | loopback + public auth address + private auth address | loopback + private recursor address |
+| Role | Holds and serves the `sub.comptech-lab.com` zone | Default lab resolver — what every lab VM points to as DNS |
+| Talks to | the SQLite backend | the local authoritative daemon (for the lab zone) + public resolvers (for everything else) |
+| Config file | `/etc/powerdns/pdns.conf` | `/etc/powerdns/recursor.conf` + `recursor.d/*.conf` |
+| API port (admin) | `127.0.0.1:8081` with a key in `pdns.conf` | n/a |
+| Web UI / API for clients | none | none |
+
+This split matters because clients are not supposed to send recursive queries to an authoritative server. PowerDNS Authoritative does not do recursion at all — if you ask it for `google.com`, it returns `REFUSED`. The recursor is the front door for recursive queries; the authoritative is the source of truth for `sub.comptech-lab.com`. The same VM runs both because the lab is small enough not to need separation, but they remain functionally distinct.
+
+## The authoritative side
+
+The authoritative config (`/etc/powerdns/pdns.conf`) key fields:
+
+```ini
+launch=gsqlite3
+gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+gsqlite3-pragma-synchronous=0
+
+local-address=127.0.0.1,<public-auth-ip>,<private-auth-ip>
+local-port=53
+
+webserver=yes
+webserver-address=127.0.0.1
+webserver-port=8081
+api=yes
+api-key=<API_KEY>  # NOT printed in this file
+```
+
+Key choices:
+
+- **`launch=gsqlite3`** — the simplest backend that supports the PowerDNS HTTP API. A SQLite file is overkill simple; perfectly fine for a few hundred records and a single operator.
+- **`gsqlite3-pragma-synchronous=0`** — disables fsync on every write. Trades durability for write performance. Acceptable for a lab; for a real shared zone you'd reverse this.
+- **`webserver=yes` + `api=yes` on `127.0.0.1:8081`** — the API key is in `pdns.conf` and is loopback-only. Record changes are made via this API, never by editing the SQLite directly. The API binding is intentionally not exposed on `0.0.0.0`.
+- **No AXFR, no DNS NOTIFY, no replication.** This is a single-node design. If high-availability matters, that's a future ADR.
+
+The authoritative daemon does NOT recurse. Querying it for a name outside the zone returns `REFUSED` — that is correct, and is the design.
+
+## The recursor side
+
+The recursor config (`/etc/powerdns/recursor.conf` plus `/etc/powerdns/recursor.d/10-lab-forwarder.conf`):
+
+```ini
+local-address=127.0.0.1,<private-recursor-ip>
+local-port=53
+
+allow-from=127.0.0.0/8,<lab-/16>
+
+# Lab subdomain → local authoritative (loopback)
+forward-zones=sub.comptech-lab.com=127.0.0.1:53
+
+# Everything else → public resolvers
+forward-zones-recurse=.=8.8.8.8;1.1.1.1
+```
+
+Key choices:
+
+- **`allow-from`** — only loopback and the lab `/16` are allowed to query. From outside the lab the recursor refuses. This is what keeps the recursor from being an open resolver on the internet.
+- **`forward-zones=sub.comptech-lab.com=127.0.0.1:53`** — when a lab VM asks for `vault.sub.comptech-lab.com`, the recursor forwards the query to the local authoritative daemon over loopback rather than trying to recurse on the public root. This avoids leaking lab names through public resolvers and avoids depending on whether the public delegation for the zone is up to date.
+- **`forward-zones-recurse=.=8.8.8.8;1.1.1.1`** — everything outside the lab zone is forwarded with the recursive bit to Google + Cloudflare. The recursor does not perform full iterative resolution from the root; it forwards. This is fine for a lab.
+
+The recursor has no HTTP API exposed to clients.
+
+## What clients see
+
+Every Ubuntu cloud-init VM and every OpenShift node points at the recursor address as the only resolver, with `~sub.comptech-lab.com` as a search/route domain. Internal-only resolver behavior is therefore:
+
+- `dig @<lab-recursor> vault.sub.comptech-lab.com` → answered by the local authoritative daemon (the recursor forwards over loopback).
+- `dig @<lab-recursor> google.com` → answered by `8.8.8.8` via the recursor's forwarder.
+- `dig @<lab-auth> google.com` → `REFUSED` (auth doesn't recurse). This is normal.
+- From outside the lab `/16`, `dig @<lab-recursor> ...` → no response (`allow-from` denies).
+
+This matters when debugging: "DNS works on this VM but not from another VM" usually means a VM was misconfigured to point at the authoritative address rather than the recursor address. Symptom: external names fail with `REFUSED`, lab names work. Fix: change the resolver to the recursor address.
+
+## SQLite zone storage
+
+The zone file isn't a file — it's rows in `pdns.sqlite3`. To enumerate or edit:
+
+```bash
+# enumerate zones
+sudo pdnsutil list-all-zones
+
+# show all records for the lab zone
+sudo pdnsutil show-zone sub.comptech-lab.com
+
+# add an A record (e.g., a new platform VM)
+sudo pdnsutil add-record sub.comptech-lab.com new-vm A 3600 <ip>
+
+# replace an entire RRset
+sudo pdnsutil replace-rrset sub.comptech-lab.com new-vm A 3600 <ip>
+
+# delete an RRset
+sudo pdnsutil delete-rrset sub.comptech-lab.com new-vm A
+```
+
+`pdnsutil` writes the SQLite directly and bumps the SOA serial automatically. Because the SQLite is the live store, changes are immediate — no zone reload, no rsync.
+
+The HTTP API on `127.0.0.1:8081` is the alternative. The API is what GitHub Actions / `acme.sh` use for ACME DNS-01 challenges (e.g., the `wildcard-mon.pem` LE cert for `*.mon.sub.comptech-lab.com` is issued via `acme.sh --dns dns_pdns` against this API).
+
+## Why this single-VM design is acceptable
+
+- **Lab scale.** A few hundred records, a single operator, no SLO. PowerDNS on SQLite handles this with zero tuning.
+- **One source of truth.** The SQLite file is the entire authoritative state. Backups are trivial (copy the file). Audit is trivial (`pdnsutil show-zone`).
+- **No public delegation drama.** The recursor's `forward-zones=sub.comptech-lab.com=127.0.0.1:53` line means lab clients don't need the public delegation for `sub.comptech-lab.com` to be working — they hit the local authoritative directly.
+- **The recursor is intentional.** Clients ask the recursor, never the authoritative. That gives clients a real resolver (caching, NXDOMAIN, TTLs) without coupling them to a specific public resolver.
+
+## What this design is *not*
+
+- **Not HA.** Lose the VM, lose lab DNS. Recovery is a SQLite restore from backup; mitigation for a longer outage is on the failure-modes page.
+- **Not a public secondary.** No AXFR allowed, no NOTIFY targets. The public delegation for `sub.comptech-lab.com` resolves against the authoritative bind on the public NIC, but there is no secondary nameserver.
+- **Not a DNSSEC-validating resolver.** `DNSSEC=no` on host stubs. Lab traffic is internal; the trade-off is fewer moving parts.
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md`
+- ADRs 0005 (rebuild network/ingress/PKI), 0026 (IPv6 baseline)
+- Memory: `reference_pdns_vm.md`, `reference_lab_infrastructure.md`
+- PowerDNS Authoritative docs: <https://doc.powerdns.com/authoritative/>
+- PowerDNS Recursor docs: <https://doc.powerdns.com/recursor/>

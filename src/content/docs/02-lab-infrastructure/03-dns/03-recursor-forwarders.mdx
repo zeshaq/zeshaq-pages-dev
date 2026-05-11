@@ -1,8 +1,147 @@
 ---
-title: "Recursor Forwarders"
-description: "Section 02-lab-infrastructure/03-dns: Recursor Forwarders (placeholder)."
-sidebar_label: "Recursor Forwarders"
+title: "Recursor and forwarders"
+description: "The PowerDNS Recursor configuration — allow-from, forward zones to the local authoritative, recurse-everything-else to public resolvers, and the gotchas with negative caching and stubs."
+sidebar_label: "Recursor and forwarders"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The recursor is the resolver every lab VM points at. This page is about what it does, how it's configured, and the gotchas operators hit most often.
+
+## Why a recursor at all (rather than just authoritative)
+
+PowerDNS Authoritative does not perform recursion. Asking it for `google.com` returns `REFUSED` — that is correct, that is the design. Lab clients need a resolver that:
+
+1. Knows how to answer recursive queries for any name on the public internet.
+2. Knows that names under `sub.comptech-lab.com` go to the lab's own authoritative daemon, not out to the public root.
+3. Doesn't expose itself as an open resolver to the internet.
+
+That is exactly what PowerDNS Recursor 4.9.3 does in this lab.
+
+## Configuration files
+
+| File | Purpose |
+| --- | --- |
+| `/etc/powerdns/recursor.conf` | Main config — listen addresses, allow-from, packet cache, threading |
+| `/etc/powerdns/recursor.d/10-lab-forwarder.conf` | Lab-specific overrides — forward zones, forward-zones-recurse |
+| `/etc/powerdns/recursor.lua` | Optional Lua script for filtering / rewriting (unused for current zone shape) |
+
+The `.d/` layout is conventional for PowerDNS — drop-ins live next to the main file and are merged at start. Lab convention: put any lab-specific edits into the drop-in, leave the upstream-shipped `recursor.conf` close to default. That makes upgrades easy (the drop-in survives; the main file can be diffed against the upstream).
+
+## The drop-in, annotated
+
+```ini
+# /etc/powerdns/recursor.d/10-lab-forwarder.conf
+
+# Listen on loopback (for the local authoritative to query) and on the
+# private recursor address (what every lab VM points to).
+local-address=127.0.0.1,<private-recursor-ip>
+local-port=53
+
+# Only accept queries from loopback and the lab /16. Outside callers
+# get no response at all. This is what keeps the recursor from being an
+# open resolver on the internet.
+allow-from=127.0.0.0/8,<lab-/16>
+
+# Forward anything ending in sub.comptech-lab.com to the local
+# authoritative daemon (loopback). This avoids leaking lab names to
+# public resolvers and avoids any dependency on whether the public
+# delegation for the zone is up to date.
+forward-zones=sub.comptech-lab.com=127.0.0.1:53
+
+# Everything else: forward to Google + Cloudflare with the recursive bit
+# set. The recursor does NOT iterate from the root in this lab; it just
+# forwards.
+forward-zones-recurse=.=8.8.8.8;1.1.1.1
+```
+
+Four lines of "what differs from default." Read top to bottom:
+
+1. **Where it listens** — loopback and the private recursor address. The public NIC carries the authoritative daemon's public address; the recursor is intentionally private only.
+2. **Who it answers** — loopback and the lab `/16`. From any other source, the recursor silently refuses (or responds `REFUSED`, depending on the source). This is the open-resolver guard.
+3. **Lab zone forwarding** — `forward-zones=sub.comptech-lab.com=127.0.0.1:53` is the keystone line. It says "for any name in this zone, ask the local authoritative daemon, don't try the root." This means the lab zone doesn't depend on the public delegation working, and lab names never leak out to `8.8.8.8`.
+4. **Everything else** — `forward-zones-recurse=.=8.8.8.8;1.1.1.1`. The `;` separates fallbacks (PowerDNS calls them "fallback nameservers"); the recursor uses one, retries the next on timeout/failure.
+
+## Choosing the upstream resolvers
+
+`8.8.8.8` (Google) + `1.1.1.1` (Cloudflare) is the current upstream pair. Reasons:
+
+- Both are anycast and reliably fast from this lab's egress.
+- Both honor DNSSEC validation if downstream clients want it (the recursor itself doesn't *enforce* DNSSEC here).
+- Two distinct operators reduce the risk of a single resolver outage taking the lab off the internet.
+
+Alternatives that have been considered and rejected:
+
+- **Run a real iterative recursor.** PowerDNS Recursor can iterate from the root if `forward-zones-recurse` is not set. Skipped: cold cache means slower first-resolve, and there's no upside in this lab.
+- **Use the upstream ISP's resolvers.** Skipped: less reliable in this region and harder to debug.
+- **Use the public delegation for `sub.comptech-lab.com`.** Skipped: the local-forward path is faster and doesn't depend on the public NS records being correctly delegated.
+
+## Negative caching, briefly
+
+A query that returns `NXDOMAIN` is cached by the recursor for the SOA's `MINIMUM` field (the "negative TTL"). For the lab zone the SOA minimum is configured at the authoritative daemon. The practical effect:
+
+- If you `dig` a name *before* its record is added, the `NXDOMAIN` sticks in the recursor for a few minutes.
+- After adding the record, `dig @<lab-recursor>` may still return `NXDOMAIN`; querying the authoritative bind directly answers correctly.
+
+Flush it explicitly:
+
+```bash
+sudo rec_control wipe-cache <fqdn>$    # the $ anchor matters — wipes exact + subnames
+sudo rec_control wipe-cache .$         # flush everything (cold start; use sparingly)
+```
+
+This is exactly what the post-allocation validation step in `dns-records.md` calls out: "validated after flushing pre-existing negative cache entries."
+
+## What lab VMs configure on the client side
+
+Every Ubuntu cloud-init VM ends up with `systemd-resolved` configured to use the recursor address. A typical drop-in placed by cloud-init:
+
+```ini
+# /etc/systemd/resolved.conf.d/lab-dns.conf
+[Resolve]
+DNS=<lab-recursor-ip>
+Domains=~sub.comptech-lab.com
+DNSSEC=no
+```
+
+That puts the recursor as the only resolver. The route domain `~sub.comptech-lab.com` ensures bare names like `vault` resolve as `vault.sub.comptech-lab.com` if you've also got that in the `search` list. `DNSSEC=no` because the recursor doesn't enforce it; turning DNSSEC on at the stub when the upstream doesn't validate just produces SERVFAIL on names that haven't been signed.
+
+## What OpenShift nodes see
+
+OpenShift nodes' resolver configuration is set by the agent-based installer's NMState input and is the same shape: the lab recursor address as the only resolver. Cluster-internal Service DNS is handled separately by CoreDNS inside the cluster; the host-level resolver only needs to reach `api.<cluster>.sub.comptech-lab.com`, `api-int.<cluster>.sub.comptech-lab.com`, and the operator/release image hostnames.
+
+When a node boots, RHCOS / `systemd-resolved` uses the configured resolver, which points to the lab recursor; queries for the cluster API VIP go through the recursor → authoritative → SQLite path described above.
+
+## Recursor packet cache, threading, and limits
+
+The lab uses default settings for:
+
+- `threads=2` (default)
+- `pdns-distributes-queries=no` (recursor handles its own thread distribution)
+- `packetcache-ttl=86400` and `max-cache-ttl=86400` (defaults; cap upstream TTLs at one day)
+- `serve-stale-extensions=0` (no stale serving)
+
+These were left at defaults because the lab traffic profile is small and predictable. If query volume grew (e.g., a new app loaded a hostname inside a tight loop), the first thing to bump would be `max-packetcache-entries` and `max-cache-entries`.
+
+## Loopback path internal detail
+
+The `forward-zones=sub.comptech-lab.com=127.0.0.1:53` line forwards to `127.0.0.1:53`. There is only one listener on that port that can answer authoritatively for the lab zone: the local PowerDNS Authoritative daemon's loopback bind. The recursor sends a forwarded query, the authoritative answers from SQLite, the recursor caches the answer. From a packet-level perspective the exchange is entirely inside the host — no NIC, no MTU concerns, no encryption — and that's by design. The auth daemon's loopback bind is **not** reachable from any other host on the lab `/16`; only the recursor on the same VM talks to it.
+
+`systemd-resolved` on the same host listens on `127.0.0.53:53` as a stub. The recursor's `127.0.0.1:53` does not conflict with it (different addresses); local processes on the VM that look at `/etc/resolv.conf` end up going via `systemd-resolved` → recursor or directly to the recursor depending on the override.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Lab VM resolves nothing | Resolver pointed at the *authoritative* address by mistake | Reset `/etc/systemd/resolved.conf.d/lab-dns.conf` to the recursor address, restart `systemd-resolved` | Always use the recursor address in cloud-init `network-config` and netplan |
+| Lab name resolves, public name doesn't | Recursor lost upstream connectivity (`8.8.8.8`/`1.1.1.1` unreachable) | Check `rec_control top-servers`; check egress routing | Alert on recursor cache miss rate; monitor egress |
+| Public name resolves, lab name doesn't | Local authoritative daemon down, or SQLite read failure | `systemctl status pdns`; check `/var/lib/powerdns/pdns.sqlite3` exists and is readable; `journalctl -u pdns` | Backup SQLite daily; alert on `pdns.service` failures |
+| `NXDOMAIN` returned for a record that *exists* | Recursor's negative cache | `rec_control wipe-cache <fqdn>$` | Run validation against `<lab-auth>` directly when adding records to bypass the negative cache |
+| Anyone outside the lab can query the recursor | `allow-from` not set, or set too wide | Tighten `allow-from` to `127.0.0.0/8,<lab-/16>` exactly | Audit `recursor.d/*.conf` for `allow-from` on every change |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md`
+- Memory: `reference_pdns_vm.md`
+- PowerDNS Recursor docs: <https://doc.powerdns.com/recursor/settings.html>
+- `rec_control(1)` manpage on the pdns VM

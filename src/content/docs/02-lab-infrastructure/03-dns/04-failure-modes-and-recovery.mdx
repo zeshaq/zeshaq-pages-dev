@@ -1,0 +1,181 @@
+---
+title: "Failure modes and recovery"
+description: "DNS is a single-VM dependency. What breaks, what to check first, and how to recover — covering both the recursor side and the authoritative side."
+sidebar_label: "Failure modes and recovery"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The lab DNS plane is one VM with two daemons. That has the obvious cost: if the VM dies, lab DNS stops. This page documents the symptoms operators actually see when something goes wrong, what to check first, and how to recover. It is meant to be readable in five minutes during an incident.
+
+## "DNS is down" — first triage
+
+Run these on the operator workstation (or on any lab VM with `dig` available) in order:
+
+```bash
+# Does the recursor answer at all?
+dig @<lab-recursor> google.com A +short +time=2 +tries=1
+
+# Does the authoritative answer at all?
+dig @<lab-auth> sub.comptech-lab.com SOA +short +time=2 +tries=1
+
+# Does the VM respond to ICMP?
+ping -c 2 -W 1 <pdns-vm-ip>
+
+# Is the VM up at the libvirt level?
+virsh list --all | grep pdns
+```
+
+The four outcomes map to four root causes:
+
+| Recursor | Auth | Ping | libvirt | Likely cause |
+| --- | --- | --- | --- | --- |
+| ok | ok | ok | running | DNS is fine; the problem is somewhere else |
+| no reply | ok | ok | running | `pdns-recursor` daemon down |
+| ok | no reply | ok | running | `pdns` authoritative daemon down |
+| no reply | no reply | ok | running | Both daemons down (rare) or firewall change |
+| no reply | no reply | no reply | running | VM-level networking broken |
+| no reply | no reply | no reply | stopped | VM died |
+
+## Daemon-level recovery
+
+If only the recursor is down:
+
+```bash
+ssh ze@<pdns-vm>
+systemctl status pdns-recursor
+journalctl -u pdns-recursor -n 200 --no-pager
+# If config issue is obvious, fix the .conf and:
+systemctl restart pdns-recursor
+# Verify
+dig @127.0.0.1 google.com A +short
+```
+
+If only the authoritative is down:
+
+```bash
+ssh ze@<pdns-vm>
+systemctl status pdns
+journalctl -u pdns -n 200 --no-pager
+# Confirm SQLite is readable
+ls -l /var/lib/powerdns/pdns.sqlite3
+sudo -u pdns sqlite3 /var/lib/powerdns/pdns.sqlite3 "select count(*) from records;"
+# Restart
+systemctl restart pdns
+# Verify
+dig @127.0.0.1 sub.comptech-lab.com SOA +short
+```
+
+Common one-off causes:
+
+- A `.conf` edit left invalid syntax → `systemd` reports `failed`. Fix the file, restart.
+- SQLite file permissions changed (e.g., after a manual root edit) → `chown pdns:pdns /var/lib/powerdns/pdns.sqlite3`, restart.
+- Disk full → check `df /var`; rotate logs; the SQLite needs a few MB of headroom.
+
+## SQLite corruption recovery
+
+If `pdns` starts but answers with errors, or `pdnsutil show-zone sub.comptech-lab.com` returns "no zone," check the SQLite:
+
+```bash
+sudo -u pdns sqlite3 /var/lib/powerdns/pdns.sqlite3 "PRAGMA integrity_check;"
+```
+
+Expected: `ok`. If the integrity check fails:
+
+1. **Stop the daemon** so it doesn't write into the corrupt DB.
+2. **Restore from backup.** Backups are the entire SQLite file copied somewhere safe. The lab convention is:
+
+   ```bash
+   ssh ze@<pdns-vm>
+   sudo systemctl stop pdns
+   sudo cp /var/lib/powerdns/pdns.sqlite3 /var/lib/powerdns/pdns.sqlite3.corrupt-$(date -u +%Y%m%d-%H%M%S)
+   sudo cp <backup-location>/pdns.sqlite3.<date> /var/lib/powerdns/pdns.sqlite3
+   sudo chown pdns:pdns /var/lib/powerdns/pdns.sqlite3
+   sudo systemctl start pdns
+   sudo pdnsutil show-zone sub.comptech-lab.com | head
+   ```
+
+3. **Replay any record changes** made since the backup. The reference is `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md` — every record addition is supposed to be journaled there with a serial number, so you can replay from the diff between the backup serial and `HEAD`.
+
+If there is no backup, the dns-records doc itself is enough to rebuild the zone with `pdnsutil add-record` against an empty SQLite (re-initialize with `pdnsutil create-zone sub.comptech-lab.com`).
+
+## VM-level recovery
+
+If the VM itself is dead, the recovery is:
+
+1. **Confirm libvirt state on the host:** `virsh list --all | grep pdns`. If `shut off`, try `virsh start <pdns-vm>` first. Watch with `virsh console <pdns-vm>`.
+2. **If the qcow2 is intact but the VM can't boot,** rebuild a fresh pdns VM from the Ubuntu base image, then restore the SQLite from backup. The cloud-init for the pdns VM is small (Ubuntu + the two PowerDNS packages + the two config files). The SQLite holds the actual zone.
+3. **If the qcow2 is gone,** rebuild the VM from scratch using the same hostname / IP / MAC convention. Apply the configs and restore the SQLite. End state is identical.
+
+The recovery time depends on whether you have a recent SQLite backup. With a current backup the operation is ~10 minutes (boot Ubuntu, `apt install pdns-server pdns-backend-sqlite3 pdns-recursor`, drop in the configs and the SQLite, restart). Without one, you replay from `dns-records.md`.
+
+## What lab clients see during a DNS outage
+
+- **Existing TCP connections** keep working — they have IPs already.
+- **New connections** that use hostnames fail at the `getaddrinfo` step. Curl reports "could not resolve host"; SSH reports "Could not resolve hostname"; Kafka clients fail to refresh metadata.
+- **OpenShift API access** through `api.<cluster>.sub.comptech-lab.com:6443` fails. Routes inside the cluster keep working only as long as the cluster's CoreDNS already cached the relevant lookups (e.g., for `image-registry`) — eventually pulls will fail too.
+- **HAProxy itself** keeps routing traffic to backends it has already resolved; new client connections that need DNS to find HAProxy fail.
+
+The blast radius is broad. This is the reason DNS HA is the single most likely future ADR for this lab — secondary nameserver on a different host, AXFR replication, or PowerDNS Lightning Stream against MariaDB. None of those exist yet.
+
+## "It works on one VM but not another"
+
+Most common cause: that VM's resolver is pointing at the wrong address.
+
+Quick check on the affected VM:
+
+```bash
+resolvectl status | head -20      # look for the DNS server line
+cat /etc/systemd/resolved.conf.d/lab-dns.conf
+cat /etc/resolv.conf
+```
+
+If `DNS=` shows the *authoritative* address instead of the *recursor* address, that's the bug. Lab names will work (the authoritative has them) but public names will return `REFUSED` (the authoritative doesn't recurse). Fix the drop-in, `systemctl restart systemd-resolved`, retest.
+
+This is the single most common DNS support call in the lab. The two addresses are similar enough to confuse a hand-edit.
+
+## "I added a record but it doesn't resolve"
+
+Two common causes:
+
+1. **Negative cache.** The recursor cached `NXDOMAIN` from your earlier `dig` *before* you added the record. Either query the authoritative directly (`dig @<lab-auth> <name>.sub.comptech-lab.com A`), or flush the negative cache (`rec_control wipe-cache <fqdn>$`). See [the recursor page](/docs/02-lab-infrastructure/03-dns/03-recursor-forwarders) for detail.
+2. **Wrong zone serial / partial commit.** If you used the HTTP API and didn't commit the change correctly, the SOA can be ahead of the record set. `pdnsutil show-zone sub.comptech-lab.com | grep <name>` will tell you if the record is actually in the DB; if not, re-add via `pdnsutil`.
+
+## Backups
+
+Current backup convention (lightweight, single-VM):
+
+- **What:** `/var/lib/powerdns/pdns.sqlite3` (entire file). The SQLite is the entire authoritative state.
+- **Where:** copy to a sibling host or to the operator workstation; the lab does not yet replicate it to MinIO. Future work.
+- **How often:** before any change run, and on a daily timer. A few hundred KB; trivial to keep many copies.
+- **Verify:** `sqlite3 <backup> "PRAGMA integrity_check;"` returns `ok`.
+- **Test restore:** never tested in anger in this lab. A drill is overdue; the recovery procedure above is plausible but unproven against a real corrupted-DB scenario.
+
+The PowerDNS Recursor doesn't need a backup; its `recursor.conf` and `recursor.d/*.conf` are tiny and recoverable from the operator workstation.
+
+## "DNS Works locally but not from another VM"
+
+If `dig @127.0.0.1 ...` works on the pdns VM itself but a sibling VM's `dig @<lab-recursor> ...` fails, check:
+
+- **`allow-from`** — `cat /etc/powerdns/recursor.d/10-lab-forwarder.conf` should include the lab `/16`. If it was tightened to just `127.0.0.0/8`, outside clients are silently denied.
+- **NIC binding** — `local-address` must include the lab-side address, not just loopback. If a recent edit removed it, the recursor stopped listening on the lab address.
+- **Host firewall** — `ufw status` or `iptables -L INPUT` on the pdns VM. Port `53/udp` and `53/tcp` must be open from the lab `/16`.
+
+## Public-side gotcha: the auth daemon on the public NIC
+
+The authoritative also listens on the public NIC for external queries. It answers for `sub.comptech-lab.com` and **refuses** for anything else (correct). What it does *not* do is rate-limit external queries — if an internet scanner pounds on it, the SQLite read amplifier is not infinite but it is also not zero. Future work: add `recursive-cache-size`-equivalent throttling at the authoritative side or restrict the public NIC to specific source ranges.
+
+## Things to monitor (planned, not all in place)
+
+- `pdns` and `pdns-recursor` `systemctl` state (Prometheus node exporter + textfile or a service-state collector).
+- Recursor cache hit ratio (`rec_control get cache-hits cache-misses`).
+- Authoritative QPS and slow-query count.
+- SQLite file size (alert if drops unexpectedly — sign of corruption).
+- Successful response from a synthetic `dig @<lab-recursor> <known-lab-record>` and `dig @<lab-recursor> www.google.com` from a probe (Blackbox Exporter from the monitoring VM).
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md`
+- Memory: `reference_pdns_vm.md`
+- PowerDNS Recursor docs: <https://doc.powerdns.com/recursor/running.html>
+- PowerDNS Authoritative docs: <https://doc.powerdns.com/authoritative/running.html>
