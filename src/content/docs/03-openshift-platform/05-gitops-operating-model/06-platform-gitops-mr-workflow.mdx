@@ -1,8 +1,235 @@
 ---
-title: "platform-gitops MR Workflow"
-description: "Section 03-openshift-platform/05-gitops-operating-model: platform-gitops MR Workflow (placeholder)."
-sidebar_label: "platform-gitops MR Workflow"
+title: "platform-gitops Layout and MR Workflow"
+description: "Directory layout of the platform-gitops repo, the clusters/<cluster>/ pattern, where each operator and operand lives, and the GitLab MR mechanics for landing a change."
+sidebar_label: "platform-gitops Layout + MR Workflow"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`platform-gitops` is the runtime desired-state repository for OpenShift on the v6 fleet. It lives on internal GitLab as `comptech-platform/openshift-ops/openshift-platform-gitops`. The layout is one directory per cluster under `clusters/`; everything inside is reconciled by that cluster's Argo CD. This page is the directory tour and the GitLab MR workflow.
+
+## Repo URLs and clones
+
+| Path | Purpose |
+| --- | --- |
+| `comptech-platform/openshift-ops/openshift-platform-gitops` (GitLab project) | Source of truth |
+| `http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git` | LAN endpoint — used by Argo CD, automation, CI, and the GitLab API |
+| `https://gitlab.apps.sub.comptech-lab.com/comptech-platform/openshift-ops/openshift-platform-gitops` | Public browser/API route — human dashboard only, not for automation |
+| `/home/ze/platform-gitops/` | Operator-workstation clone (the user's hands-on copy) |
+| `/home/ze/claude-agent/clones/platform-gitops/` | Agent-staging clone (workspace-boundary compliant working copy) |
+
+Sync at session start:
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+git pull --ff-only origin main
+```
+
+## Top-level layout
+
+```text
+openshift-platform-gitops/
+├── CHANGELOG.md
+├── README.md
+└── clusters/
+    ├── hub-dc-v6/
+    └── spoke-dc-v6/
+```
+
+That's it at the top. There is no shared `components/`, `appsets/`, or `tenants/` directory at the root in the current layout — every cluster owns its own tree. (ADR 0018 anticipated a `components/` and `appsets/` shared tree; the current implementation keeps things per-cluster for explicitness. Sharing can be re-introduced later if the fleet grows.)
+
+## Inside `clusters/hub-dc-v6/`
+
+```text
+clusters/hub-dc-v6/
+├── kustomization.yaml
+├── bootstrap/
+├── gitops-control/
+├── operators/
+│   ├── cert-manager-operator/
+│   ├── external-secrets-operator/
+│   ├── lvms-operator/
+│   └── rhacs-operator/
+├── platform/
+│   ├── acm/
+│   ├── admission-policies/
+│   ├── catalogs/
+│   ├── fleet-registration/
+│   └── image-mirrors/
+├── secrets/
+│   ├── eso/
+│   └── vault-auth/
+├── security/
+│   └── rhacs/
+└── storage/
+    └── lvms/
+```
+
+What each directory holds:
+
+- **`kustomization.yaml`** — the root that pulls everything together. Argo's `hub-dc-v6-bootstrap` Application points here.
+- **`bootstrap/`** — the original day-1 baseline (namespace, ResourceQuota, LimitRange, default-deny NetworkPolicy, baseline ConfigMap for `platform-bootstrap` namespace). Surviving from the very first hub install.
+- **`gitops-control/`** — the **glue**: hub Argo CD AppProject, the `cluster-admin` binding for the application controller SA, the bootstrap Application itself (self-referential), and the `spoke-cluster-config-pull` ApplicationSet.
+- **`operators/<name>/`** — one directory per OLM operator with `{kustomization,namespace,operatorgroup,subscription}.yaml`. Some operators that need extra config also carry `installplan.yaml` or pinned `csv.yaml` references.
+- **`platform/acm/`** — ACM `Namespace`, `OperatorGroup`, `Subscription`, `MultiClusterHub`.
+- **`platform/admission-policies/`** — `OperatorHub/cluster` (disabling defaults), future `ValidatingAdmissionPolicy` resources.
+- **`platform/catalogs/`** — mirrored `CatalogSource` (`cs-redhat-operator-index-v4-20`, `cs-certified-operator-index-v4-20`) and `ClusterCatalog` resources.
+- **`platform/fleet-registration/`** — the seven manifests covered in [§4.2 ManagedCluster registration](/docs/03-openshift-platform/04-acm-multicluster/02-managedcluster-registration/) (Namespace, ManagedCluster, KlusterletAddonConfig, ManagedClusterSetBinding, Placement, GitOpsCluster, acm-placement ConfigMap).
+- **`platform/image-mirrors/`** — `ImageDigestMirrorSet` and `ImageTagMirrorSet` resources from oc-mirror output.
+- **`secrets/eso/`** — `ClusterSecretStore` and (where used) `ExternalSecret` resources. **No materialized Secrets** are committed.
+- **`secrets/vault-auth/`** — the spoke-side `ServiceAccount` + `Role`/`RoleBinding` for Vault Kubernetes auth (used as a token source for ESO).
+- **`security/rhacs/`** — `Central`, htpasswd config, network policies for `stackrox`.
+- **`storage/lvms/`** — `LVMCluster` for the hub's node-local LVM PVCs (RHACS storage).
+
+## Inside `clusters/spoke-dc-v6/`
+
+The spoke tree is larger because it carries more operators:
+
+```text
+clusters/spoke-dc-v6/
+├── kustomization.yaml
+├── backup/                # OADP DPA, BSL, Schedule
+├── bootstrap/
+├── cert-manager/          # Internal lab CA + Ingress wildcard cert (PCI-4.3)
+├── compliance/            # Compliance Operator ScanSettingBinding, TailoredProfile
+├── file-integrity/        # FileIntegrity CR + alerts (PCI-4.2)
+├── operators/             # 21 operator directories — see below
+├── platform/
+│   ├── admission-policies/
+│   ├── argocd-extensions/ # The single ClusterRole for spoke RBAC extensions
+│   ├── catalogs/
+│   └── image-mirrors/
+├── platform-services/
+│   ├── logging/           # LokiStack
+│   ├── observability/     # COO UIPlugins
+│   ├── pipelines-tasks/   # Reusable Tekton Tasks (Path B CI)
+│   ├── pipelines-templates/  # Tekton Pipeline templates + EventListener
+│   ├── quay/              # QuayRegistry CR
+│   └── tracing/           # TempoStack + OpenTelemetry collector
+├── secrets/
+│   ├── app-registry-pull/
+│   ├── eso/
+│   └── vault-auth/
+├── security/
+│   ├── ingresscontroller-default-tls.yaml
+│   └── rhacs/             # SecuredCluster
+├── storage/
+│   ├── local-storage/     # LocalVolumeSet
+│   └── odf/               # StorageCluster, NooBaa
+└── tenants/
+    ├── _template/         # Tenant onboarding template (do not list directly)
+    └── apps-platform-sample/   # Placeholder/testbed tenant
+```
+
+The 21 operator directories under `operators/` cover the full spoke install set from [§3.2 spoke-dc-v6](/docs/03-openshift-platform/03-cluster-topology/02-spoke-dc-v6/): LSO, ODF, ESO, RHACS, OADP, cert-manager, Pipelines, Compliance, File Integrity, Container Security, Security Profiles, Cluster Observability, Loki, Cluster Logging, Tempo, OpenTelemetry, NetObserv, Service Mesh 3, Kiali, Quay, Gatekeeper, Kube Descheduler, CloudNative-PG, Open Liberty.
+
+Distinguishing principle:
+
+- **`operators/<name>/`** — the OLM install (namespace, OG, Subscription, sometimes wave-0 RBAC). Wave 5-10.
+- **`platform-services/<name>/`** — the operand CR(s) and operating config that depend on the installed operator. Wave 20-50.
+- **`platform/<...>/`** — cluster-foundational config that is **not** owned by a specific operator (catalogs, image mirrors, argocd-extensions, admission policies).
+
+## Tenant onboarding pattern
+
+`clusters/spoke-dc-v6/tenants/_template/` is the onboarding template. It is **not** listed in the cluster `kustomization.yaml` — it's only a reference shape. Per [ADR 0024](/docs/06-architecture-decisions/), the contents are:
+
+- `namespace.yaml` — tenant namespace with PSA labels
+- `resourcequota.yaml` — class-based quota (small / medium / large)
+- `limitrange.yaml` — default pod resource limits
+- `networkpolicy-default-deny.yaml` — baseline deny-all
+- `networkpolicy-allow-platform-egress.yaml` — egress to ESO, Vault, mirror-registry, ingress controller as needed
+- `serviceaccount.yaml` — tenant-namespace SA used by the tenant's pipelines / workloads
+- `appproject.yaml` — Argo CD AppProject scoping tenant deployments to the tenant namespace
+- `repository-secret.yaml` — `ExternalSecret` pulling the tenant's GitOps repo credential from Vault
+
+A new tenant is created by copying `_template/` to `tenants/<team>/`, filling in the placeholders, and adding the new directory to `clusters/spoke-dc-v6/kustomization.yaml`. Per ADR 0024 this needs platform-team CODEOWNER review.
+
+After tenant registration is approved, the tenant's own `*-gitops` repo is granted write access to the tenant namespace through the AppProject. From then on per-release Deployment/Route/Service manifests live in the tenant repo, not in `platform-gitops`.
+
+## MR workflow
+
+The mechanics are GitLab-side, not GitHub-side:
+
+### Branch naming
+
+`<issue-key>/<short-slug>`. Examples:
+
+- `rhacs-1/operator-subscriptions-with-hub-lvms`
+- `cert-mgr-1/install-on-both-clusters`
+- `pci-3.a/container-security-operator`
+- `dev-ocp-3b.1/tekton-pipeline-template`
+
+The issue key matches the GitHub issue's title prefix (the planning side is GitHub; the merge side is GitLab — different systems, same naming).
+
+### Pre-commit validation
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+kubectl kustomize clusters/hub-dc-v6 > /tmp/hub.yaml
+kubectl kustomize clusters/spoke-dc-v6 > /tmp/spoke.yaml
+git diff --check
+```
+
+Both kustomize builds must complete clean. Server-side dry-run is fine but produces a benign "namespace not found" trailer for namespaced resources whose Namespace is in the same apply — Argo resolves this via sync-wave 10.
+
+### Commit author
+
+The clone is configured with author `Zahid Platform Admin <zahid@comptech-lab.com>`. Don't override per-commit.
+
+### MR creation via GitLab API
+
+`gh` does not target GitLab. Use the GitLab API directly with the PAT at `/home/ze/codex-opp-agent/secrets/gitlab-zahid-pat`:
+
+```bash
+curl --request POST \
+  --header "PRIVATE-TOKEN: $(cat /home/ze/codex-opp-agent/secrets/gitlab-zahid-pat)" \
+  --header "Content-Type: application/json" \
+  --data @- \
+  http://30.30.30.5/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops/merge_requests <<EOF
+{
+  "source_branch": "<issue-key>/<short-slug>",
+  "target_branch": "main",
+  "title": "<issue-key>: <short title>",
+  "description": "<body — markdown — link to the GitHub issue>",
+  "remove_source_branch": true,
+  "squash": true
+}
+EOF
+```
+
+The MR body should link to the GitHub planning issue. CI runs validation (kustomize, structural lint, RHACS policy check, VAP guardrails); approvals are per the access matrix CODEOWNERS rules.
+
+### After merge
+
+Argo CD on the hub watches `main` and reconciles within `requeueAfterSeconds: 30` (default for ApplicationSet) or on the configured polling interval (default 3 minutes). The spoke Argo gets the new manifests via the same path (its Application points at `clusters/spoke-dc-v6/` on `main`).
+
+Validation after sync:
+
+```bash
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get app spoke-dc-v6-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+
+# Per-namespace operator-install validation
+oc --kubeconfig "$K_SPOKE" -n <operator-namespace> get sub,installplan,csv,pods
+```
+
+Expected: the Application's revision matches the merged commit SHA; sync is `Synced Healthy`.
+
+## What does NOT belong in this repo
+
+Per [ADR 0024](/docs/06-architecture-decisions/), the OpenShift-only boundary:
+
+- **VM-hosted tool config** — HAProxy, PowerDNS, GitLab itself, Jenkins, Nexus, MinIO, SigNoz, Trivy, Docker runtime VM, GitLab Runner VMs, Vault VMs. Those live under `comptech-platform/infra-ops/` (`vm-platform-ops` etc.).
+- **Application source code** — division `*-apps-monorepo` repos.
+- **Application release manifests** — division `*-gitops` repos own per-environment overlays.
+- **Materialized Secret manifests** — `ExternalSecret` references are allowed; the materialized Kubernetes Secret is not.
+
+If something lands here that belongs elsewhere, the platform maintainers remove it and re-open the MR against the correct repo.
+
+## References
+
+- platform-gitops `README.md` and `CHANGELOG.md` (in the repo).
+- `adr/0015-federated-gitops-repo-architecture.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0024-openshift-only-platform-gitops-boundary.md`, `adr/0025-gitops-only-operations-break-glass.md`.
+- `connection-details/platform-admin-handoff.md` — operator install workflow.
+- `connection-details/gitlab-operator-guide.md` — GitLab operator-level details (group layout, branch protection, runner classes).
+- Memory: `reference_platform_gitops_mr_path.md`, `reference_gitops_sources.md`.

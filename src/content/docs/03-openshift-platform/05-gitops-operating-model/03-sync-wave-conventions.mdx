@@ -1,8 +1,191 @@
 ---
-title: "Sync-Wave Conventions"
-description: "Section 03-openshift-platform/05-gitops-operating-model: Sync-Wave Conventions (placeholder)."
+title: "Sync-Wave Conventions and Hooks"
+description: "How the v6 platform-gitops orders resource apply with argocd.argoproj.io/sync-wave annotations, the standard wave numbers per resource type, and the few PreSync/PostSync hooks in use."
 sidebar_label: "Sync-Wave Conventions"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Argo CD's sync-wave annotation `argocd.argoproj.io/sync-wave` is how the v6 fleet keeps dependency order — RBAC before Subscriptions, Subscriptions before operands, namespaces before everything in them. There is one convention used across both clusters; ad-hoc wave numbers break operator install. This page is the table.
+
+## The wave table
+
+| Wave | Resource kinds | Reason |
+| --- | --- | --- |
+| **0** | RBAC: `ClusterRole`, `ClusterRoleBinding`, `Role`, `RoleBinding` for Argo CD itself (hub cluster-admin binding; spoke `argocd-platform-extensions` ClusterRole + binding; per-namespace `argocd-*-bootstrap-manager`) | RBAC has to land **before** Argo CD tries to apply anything that needs the new permissions. Wave 0 is the lowest. |
+| **5** | `Namespace`, `OperatorGroup` | Operator install requires a namespace and OperatorGroup to exist first. |
+| **10** | `Subscription`, `CatalogSource`, `ClusterCatalog`, `ImageDigestMirrorSet`, `ImageTagMirrorSet`, signature `ConfigMap` | The operator install. Mirror resources land at the same wave because they have no inter-dependencies with operators (OLM uses them at pull time). |
+| **20** | Operator's primary CR: `MultiClusterHub`, `LVMCluster`, `StorageCluster`, `LokiStack`, `TempoStack`, `Central` (RHACS), `Quayregistry`, `TektonConfig`, `Istio`, `Kiali`, `DataProtectionApplication`, `ClusterLogForwarder` | The "tell the operator what to build" CR. Requires CSV `Succeeded`. |
+| **25-30** | First-class operand objects: `LocalVolumeSet`, `ManagedCluster`, `KlusterletAddonConfig`, `ManagedClusterSetBinding`, `ClusterSecretStore`, `ExternalSecret`, `SecuredCluster`, `ObjectBucketClaim`, `Backup` (OADP), `BackupSchedule` | Things that depend on the CR being processed by the operator. |
+| **40** | Per-spoke addon config: `ManagedClusterAddon` overrides | Requires `ManagedCluster` `Available=True`. |
+| **50** | `Placement` | Requires `ManagedClusterSetBinding`. |
+| **60** | `GitOpsCluster` | Requires `Placement` so it can find decisions. |
+| **70** | `ApplicationSet` | Requires `GitOpsCluster` so cluster secrets exist + acm-placement ConfigMap. |
+| **100+** | Reserved for tenant-level resources (tenant onboarding manifests, AppProjects, namespaces) | Anything tenant-specific runs after all platform foundations. |
+
+## How Argo CD interprets the waves
+
+Argo CD groups resources by wave, applies them in ascending order, and waits for **all** resources in a wave to reach `Synced + Healthy` before moving to the next wave. A failure in wave 10 blocks wave 20, etc.
+
+Resources without the annotation default to wave `0`. The v6 convention is to **always** annotate — explicit wave even if the default would work, to make the intent reviewable in a merge request.
+
+## Concrete example: a new operator install MR
+
+Adding the `external-secrets-operator` to `clusters/spoke-dc-v6/operators/external-secrets-operator/` requires three manifests at three waves:
+
+```yaml
+# namespace.yaml — wave 5
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  labels:
+    pod-security.kubernetes.io/enforce: privileged   # ESO needs privileged
+---
+# operatorgroup.yaml — wave 5
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: external-secrets-operator
+  namespace: external-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  targetNamespaces:
+    - external-secrets
+---
+# subscription.yaml — wave 10
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: external-secrets-operator
+  namespace: external-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  channel: stable-v1
+  installPlanApproval: Automatic
+  name: openshift-external-secrets-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: external-secrets-operator.v1.1.0
+```
+
+Then in a sibling directory `secrets/eso/`:
+
+```yaml
+# externalsecretsconfig.yaml — wave 20 (the operator's primary CR)
+apiVersion: operator.openshift.io/v1alpha1
+kind: ExternalSecretsConfig
+metadata:
+  name: cluster
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec: {}
+---
+# clustersecretstore-vault.yaml — wave 25 (depends on ESO operand)
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: vault-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+spec:
+  provider:
+    vault:
+      server: https://vault.sub.comptech-lab.com:8200
+      path: secret
+      version: v2
+      auth:
+        kubernetes:
+          mountPath: kubernetes-spoke-dc-v6
+          role: spoke-dc-v6-platform
+          serviceAccountRef:
+            name: vault-auth
+            namespace: external-secrets
+```
+
+And one wave higher, the consumers:
+
+```yaml
+# externalsecret-rhacs-init-bundle.yaml — wave 30 (depends on ClusterSecretStore)
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: rhacs-init-bundle
+  namespace: stackrox
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-platform
+    kind: ClusterSecretStore
+  target:
+    name: collector-tls
+  dataFrom:
+    - extract:
+        key: platform/rhacs/spoke-dc-v6/init-bundle
+```
+
+Reading the wave gap: 5 (namespace) → 10 (Subscription, operator pods come up) → 20 (operator CR creates webhook + controller) → 25 (`ClusterSecretStore` connects to Vault) → 30 (consumers, which now have a working ClusterSecretStore).
+
+## What goes wrong if the wave is wrong
+
+- **Wave too low** — Argo tries to apply an operand CR before the operator's webhook is up. The apply fails with `no matches for kind "..." in group "..."` (CRD doesn't exist yet) or `Error: webhooks.<name>: connect: connection refused`.
+- **Wave too high** — Argo waits for the previous wave to be Healthy. If the operator's CR has dependencies that won't be reconciled until a higher wave, the sync hangs.
+- **Same wave as dependency** — Order within a wave is **unspecified**. Argo will apply both at once and one will fail. Avoid this; use a different wave for each dependency tier.
+
+## Sync hooks: PreSync, Sync, PostSync, SyncFail, PostDelete
+
+The v6 fleet uses sync hooks **sparingly**. Hooks fire at specific points in the sync cycle and are themselves resources annotated `argocd.argoproj.io/hook: <hook-type>`.
+
+Current uses (and the only places hooks should appear in `platform-gitops` today):
+
+### PreSync — idempotent setup that needs operator-pre-install state
+
+Not currently used in v6 platform-gitops. The `oc-mirror`-driven catalog refresh is run **before** the MR is opened, so the cluster always has the new digests before Argo tries to install.
+
+### PostSync — finalizing operands after the operator settles
+
+A typical PostSync candidate would be the RHACS `init-bundle` generation: after `Central` reaches `Running`, a PostSync Job hits the Central API to generate a fresh init-bundle and pushes it to Vault. The v6 fleet does this out-of-band (manual run of `scripts/rebuild/rhacs-enable-app-policies.sh`) rather than as a PostSync hook — easier to audit and re-run.
+
+### SyncFail — alerting
+
+Not currently used. SyncFail hooks tend to be alert-only (post to Slack/Teams), and the v6 lab doesn't push alerts off-cluster for sync failures yet.
+
+### PostDelete — cleanup
+
+`hook-delete-policy: HookSucceeded` lets a hook resource auto-clean after it runs. Tekton `PipelineRun` cleanup uses this pattern when CI pipelines are managed by Argo CD.
+
+## When sync-wave is not enough
+
+For resources that have a **runtime** dependency that sync-wave can't express — e.g., "the Vault Raft must be healthy before the ESO `ClusterSecretStore` will succeed" — the right tools are:
+
+- **Argo CD retry policy** — `syncPolicy.retry.limit: 5, backoff: { duration: 30s, factor: 2, maxDuration: 5m }`. Retries the sync if it fails, with exponential backoff.
+- **Operator readiness** — let the operator's controller handle the retry inside its reconcile loop. ESO retries the Vault auth handshake on each `refreshInterval`; we don't have to hook into Argo for that.
+
+Sync-wave is for **declarative install ordering** — make sure the CRD exists before its CRs land — not for **runtime convergence**.
+
+## Validation
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+
+# See the per-wave timeline of a sync
+oc --kubeconfig "$K" -n openshift-gitops describe app spoke-dc-v6-cluster-config | \
+  awk '/Sync Result/,/^$/' | head -60
+
+# Check that every operator install has its wave annotations
+git -C /home/ze/claude-agent/clones/platform-gitops grep -L 'sync-wave' \
+  clusters/spoke-dc-v6/operators/*/subscription.yaml
+# expected: no output (every subscription has a wave)
+```
+
+## References
+
+- platform-gitops examples — every `Subscription`, `OperatorGroup`, `Namespace`, `OperandCR` has a sync-wave annotation; grep `clusters/` for examples.
+- `connection-details/platform-admin-handoff.md` — operator install workflow (waves are part of the recipe).
+- Memory: `reference_platform_gitops_mr_path.md` — convention "sync-wave 10 for operator install, CRs at sync-wave 20+".

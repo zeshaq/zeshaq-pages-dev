@@ -1,8 +1,184 @@
 ---
-title: "Pull Model Overview"
-description: "Section 03-openshift-platform/05-gitops-operating-model: Pull Model Overview (placeholder)."
-sidebar_label: "Pull Model Overview"
+title: "GitOps Operating Model — Architecture"
+description: "The ACM + OpenShift GitOps Basic pull model in detail: hub Argo + spoke Argo + ApplicationSet + ManifestWork, what initiates what, and why pull beats hub-render at fleet scale."
+sidebar_label: "Pull Model Architecture"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const hubBox  = { background: "#dbeafe", border: "1.5px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1e3a8a", width: 200, textAlign: "center", fontWeight: 600 };
+export const spokeBox = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const archNodes = [
+  { id: "gitlab", position: { x: 360, y: 0 },   data: { label: "Internal GitLab\ncomptech-platform/openshift-ops/\nopenshift-platform-gitops" }, style: extBox },
+
+  { id: "hub", position: { x: 80,  y: 130 }, data: { label: "hub-dc-v6" }, style: hubBox },
+  { id: "hubArgo", position: { x: 80,  y: 250 }, data: { label: "Hub Argo CD\n(OLM CSV, cluster-admin)" }, style: ctrlBox },
+  { id: "hubBootstrap", position: { x: 80,  y: 380 }, data: { label: "Application:\nhub-dc-v6-bootstrap\n→ clusters/hub-dc-v6/" }, style: dataBox },
+  { id: "appset", position: { x: 320, y: 380 }, data: { label: "ApplicationSet:\nspoke-cluster-config-pull\n(clusterDecisionResource gen.)" }, style: ctrlBox },
+  { id: "appPull", position: { x: 320, y: 500 }, data: { label: "Application (per spoke)\nproject: default\nlabel: pull-to-ocm-managed=true" }, style: dataBox },
+
+  { id: "acm", position: { x: 540, y: 250 }, data: { label: "ACM ManifestWork\n(wraps Application)" }, style: ctrlBox },
+
+  { id: "spoke", position: { x: 700, y: 130 }, data: { label: "spoke-dc-v6" }, style: spokeBox },
+  { id: "klust", position: { x: 700, y: 250 }, data: { label: "klusterlet\nwork agent" }, style: agentBox },
+  { id: "spokeArgo", position: { x: 700, y: 380 }, data: { label: "Spoke Argo CD\n(gitops-addon Deployment)\nleast-privilege" }, style: agentBox },
+  { id: "spokeApp", position: { x: 700, y: 500 }, data: { label: "Application:\nspoke-dc-v6-cluster-config\n→ clusters/spoke-dc-v6/" }, style: dataBox },
+];
+
+export const archEdges = [
+  // Hub side
+  { id: "e-h-ha", source: "hub", target: "hubArgo", ...muted },
+  { id: "e-ha-hb", source: "hubArgo", target: "hubBootstrap", label: "owns", ...muted },
+  { id: "e-hb-gl", source: "hubBootstrap", target: "gitlab", label: "pulls clusters/hub-dc-v6/", ...pullEdge },
+  { id: "e-ha-aps", source: "hubArgo", target: "appset", label: "owns", ...muted },
+  { id: "e-aps-pull", source: "appset", target: "appPull", label: "generates per spoke", ...reqEdge },
+  // Pull through ACM
+  { id: "e-pull-acm", source: "appPull", target: "acm", label: "wrap (pull-to-ocm=true)", ...reqEdge },
+  { id: "e-acm-klust", source: "acm", target: "klust", label: "ManifestWork dispatch", ...reqEdge },
+  // Spoke pulls
+  { id: "e-sp-sa", source: "spoke", target: "spokeArgo", ...muted },
+  { id: "e-klust-sa", source: "klust", target: "spokeArgo", label: "applies Application", ...muted },
+  { id: "e-sa-sapp", source: "spokeArgo", target: "spokeApp", label: "owns", ...muted },
+  { id: "e-sapp-gl", source: "spokeApp", target: "gitlab", label: "pulls clusters/spoke-dc-v6/", ...pullEdge },
+  // klusterlet outbound
+  { id: "e-klust-out", source: "klust", target: "acm", label: "outbound pull (long-poll)", ...pullEdge },
+];
+
+The fleet's operating model is **ACM + OpenShift GitOps Basic pull** (per [ADR 0018](/docs/06-architecture-decisions/)). Both clusters run an Argo CD instance that reconciles its own desired state from the same GitLab repository, with the hub Argo coordinating placement and ApplicationSet generation but **never directly applying spoke manifests**. The spoke is its own reconciler. This page is the architecture in one diagram and one set of definitions.
+
+## The architecture
+
+<Whiteboard client:load data={{ nodes: archNodes, edges: archEdges }} height={620} />
+
+The defining property: every dashed-green arrow is initiated from the inside out. The klusterlet on the spoke calls the hub. The spoke Argo CD calls GitLab. The hub Argo CD calls GitLab. Nothing on the hub initiates a connection to the spoke API server. This is what makes the pattern survive NAT, firewalls, transient WAN, and (in larger fleets) air-gapped sites between sync windows.
+
+## The two Argo CD instances
+
+| Instance | Where | Install | Privilege | Reconciles |
+| --- | --- | --- | --- | --- |
+| **Hub Argo CD** | `hub-dc-v6` `openshift-gitops` namespace | OLM CSV `openshift-gitops-operator.v1.20.3` | `cluster-admin` ClusterRoleBinding | `clusters/hub-dc-v6/` (against `kubernetes.default.svc`) plus the per-spoke `Application` objects (which it **does not apply**) |
+| **Spoke Argo CD** | `spoke-dc-v6` `openshift-gitops` namespace | Deployment installed by ACM gitops-addon | Least-privilege ClusterRole `argocd-platform-extensions` | `clusters/spoke-dc-v6/` (against `kubernetes.default.svc`) |
+
+The hub uses a bound `cluster-admin` because it has to install ACM, MCE, all platform operators, RHACS Central, and write cluster-scoped resources — a least-privilege ClusterRole would be a fast-moving target as new operators land. The compensating controls are: the hub Argo's `AppProject/hub-dc-v6-platform` `sourceRepos` allowlist restricts it to the LAN GitLab URL only; CODEOWNERS in GitLab restricts who can merge; `argocd-platform-extensions` doesn't exist on the hub because it isn't needed.
+
+The spoke uses a **least-privilege ClusterRole** because it is exposed by ACM's pull pattern. The addon-installed Argo's service account `acm-openshift-gitops-argocd-application-controller` has get/list/watch on everything plus full verbs on a fixed allowlist of API groups (see [§5.5 spoke extension RBAC](/docs/03-openshift-platform/05-gitops-operating-model/05-spoke-rbac-extensions/)).
+
+## The Application objects, in three roles
+
+The same Argo `Application` CR plays three different roles depending on where it lives and what labels it carries:
+
+### Role 1 — hub bootstrap Application
+
+`hub-dc-v6-bootstrap` lives in the hub Argo's `openshift-gitops` namespace and reconciles `clusters/hub-dc-v6/` against `kubernetes.default.svc` (i.e., the hub itself).
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hub-dc-v6-bootstrap
+  namespace: openshift-gitops
+spec:
+  project: hub-dc-v6-platform
+  source:
+    repoURL: http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git
+    targetRevision: main
+    path: clusters/hub-dc-v6
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+```
+
+This is the only object an operator has to `oc apply` by hand (after the OpenShift GitOps operator is installed). From there everything else flows through GitOps.
+
+### Role 2 — ApplicationSet-generated "Application as ManifestWork wrapper"
+
+The hub Argo's `spoke-cluster-config-pull` ApplicationSet generates one `Application` per spoke. Critical features of the generated Application:
+
+- `metadata.labels.apps.open-cluster-management.io/pull-to-ocm-managed-cluster: "true"` — tells ACM to wrap it as ManifestWork.
+- `metadata.annotations.argocd.argoproj.io/skip-reconcile: "true"` — tells the hub Argo CD to **not** reconcile it. The hub Argo is the owner-of-record only; ACM ships it to the spoke.
+- `metadata.annotations.apps.open-cluster-management.io/ocm-managed-cluster: "{{name}}"` — tells ACM which spoke to target.
+- `spec.project: default` — lands on the spoke, where `hub-dc-v6-platform` AppProject doesn't exist; `default` does.
+- `spec.destination.server: https://kubernetes.default.svc` — points at the spoke's local API once it lands there.
+
+### Role 3 — spoke-side Application
+
+When the ManifestWork lands on the spoke, the wrapped Application is materialized in the spoke's `openshift-gitops` namespace. The spoke Argo CD finds it and reconciles it normally — pulling `clusters/spoke-dc-v6/` from GitLab and applying to the local API.
+
+Net effect: from the spoke Argo's perspective, it has a single Application called `spoke-dc-v6-cluster-config` that reconciles `clusters/spoke-dc-v6/`. From the hub's perspective, the same Application was generated by an ApplicationSet and shipped via ManifestWork.
+
+## What initiates what
+
+| Connection | Initiated by | Direction |
+| --- | --- | --- |
+| `klusterlet` → hub registration controller | klusterlet (spoke) | outbound from spoke |
+| `klusterlet` work agent → ACM ManifestWork pull | klusterlet (spoke) | outbound from spoke |
+| Hub Argo → GitLab `clusters/hub-dc-v6/` | hub Argo | outbound from hub |
+| Spoke Argo → GitLab `clusters/spoke-dc-v6/` | spoke Argo | outbound from spoke |
+| Spoke Argo → spoke API server | spoke Argo | local (in-cluster) |
+| Hub Argo → hub API server | hub Argo | local (in-cluster) |
+| Hub Argo → spoke API server | **never** | n/a |
+
+The last row is the whole point. Without it, the hub doesn't need spoke kubeconfigs, doesn't need to reach the spoke's API, doesn't need a hole punched through a NAT for spoke API access.
+
+## Sync-wave ordering, in summary
+
+OpenShift GitOps respects `argocd.argoproj.io/sync-wave` annotations. The convention used across `platform-gitops`:
+
+| Wave | Role |
+| --- | --- |
+| 0 | RBAC scaffolding (ClusterRoles, ClusterRoleBindings, hub Argo cluster-admin binding, spoke argocd-platform-extensions, the AppProject manager Role for the bootstrap namespace) |
+| 5 | Namespace, OperatorGroup |
+| 10 | Subscription (operator install) |
+| 20 | Operator CR (MultiClusterHub, ClusterCatalog, IDMS/ITMS, StorageCluster, LokiStack, …) |
+| 30 | First-class operand objects (ManagedCluster, KlusterletAddonConfig, ManagedClusterSetBinding) |
+| 40 | Per-spoke addon config |
+| 50 | Placement |
+| 60 | GitOpsCluster |
+| 70 | ApplicationSet |
+
+Details and the full per-resource table in [§5.3 sync-wave conventions](/docs/03-openshift-platform/05-gitops-operating-model/03-sync-wave-conventions/).
+
+## What this isn't
+
+This model is **not** the Argo CD Agent (now Argo CD ApplicationSet pull controller in newer versions). Argo CD Agent installs an "agent" Argo on the spoke that talks to a "principal" Argo on the hub via a dedicated bidirectional channel, and disables the hub Argo's normal application controller in the process. [ADR 0018](/docs/06-architecture-decisions/) explicitly rejects this for the v6 baseline:
+
+> Do not use Argo CD Agent for this baseline. It may be reconsidered later only through a separate accepted ADR and after current Red Hat support, maturity, and operational load implications are reviewed.
+
+The two distinctions:
+
+| | ACM + OpenShift GitOps Basic pull (this fleet) | Argo CD Agent |
+| --- | --- | --- |
+| Spoke Argo install | ACM gitops-addon Deployment | Argo CD Agent install |
+| ManifestWork dispatch | Yes — ACM's app-lifecycle pillar wraps Apps | No — Agent has its own dispatch channel |
+| Hub Argo behavior | Normal — owns hub-side AppSet, doesn't reconcile spoke Apps | Demoted to "principal", doesn't run application-controller for spoke targets |
+| Cluster registration | ACM `ManagedCluster` | Argo CD Agent registration |
+| Maturity in OpenShift | Stable since OCP 4.16 | Newer, less Red Hat-tested |
+
+We chose Basic pull because it leans on ACM components that are already needed for cluster lifecycle, governance, and the multicluster console.
+
+## References
+
+- `adr/0003-gitops-basic-pull-model.md` — pre-v6 origin of the pull model.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — current decision for the v6 fleet.
+- `connection-details/openshift-gitops-hub-dc-v6.md` — hub Argo CD instance + bootstrap Application.
+- `connection-details/platform-admin-handoff.md` — operating workflow summary.
+- platform-gitops `clusters/hub-dc-v6/gitops-control/` — the hub-side glue (AppProject, ApplicationSet, cluster-admin binding).
+- Memory: `feedback_acm_gitops_pull_pattern.md`, `reference_gitops_sources.md`.
