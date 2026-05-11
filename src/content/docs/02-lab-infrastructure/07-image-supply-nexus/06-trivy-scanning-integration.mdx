@@ -6,7 +6,38 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const gate = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const fail = { background: "#fee2e2", border: "1px solid #b91c1c", borderRadius: 8, padding: 8, color: "#7f1d1d", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const failEdge = { style: { stroke: "#b91c1c", strokeDasharray: "4,3", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const scanNodes = [
+  { id: "gitlab",  position: { x: 0,   y: 20  }, data: { label: "GitLab repo\n(developer push)" }, style: stage },
+  { id: "jenkins", position: { x: 200, y: 20  }, data: { label: "Jenkins job" }, style: ctrl },
+  { id: "dgr",     position: { x: 400, y: 0   }, data: { label: "docker-group.apps.\nsub.comptech-lab.com" }, style: stage },
+  { id: "local",   position: { x: 400, y: 80  }, data: { label: "Local image on\nbuild agent" }, style: stage },
+  { id: "trivy",   position: { x: 620, y: 80  }, data: { label: "Trivy server VM" }, style: ctrl },
+  { id: "gate",    position: { x: 820, y: 80  }, data: { label: "Scan passes?\n(HIGH/CRITICAL\ngate)" }, style: gate },
+  { id: "push",    position: { x: 1020,y: 30  }, data: { label: "podman push to\napp-registry.apps.*" }, style: stage },
+  { id: "fail",    position: { x: 1020,y: 130 }, data: { label: "Fail build,\nreport to MinIO" }, style: fail },
+  { id: "minio",   position: { x: 1240,y: 30  }, data: { label: "MinIO\ndeveloper-ci-evidence" }, style: stage },
+];
+
+export const scanEdges = [
+  { id: "e1", source: "gitlab",  target: "jenkins", label: "webhook",           ...reqEdge },
+  { id: "e2", source: "jenkins", target: "dgr",     label: "pull base",         ...reqEdge },
+  { id: "e3", source: "jenkins", target: "local",   label: "build",             ...reqEdge },
+  { id: "e4", source: "local",   target: "trivy",   label: "trivy --server",    ...reqEdge },
+  { id: "e5", source: "trivy",   target: "gate",    label: "scan result",       ...reqEdge },
+  { id: "e6", source: "gate",    target: "push",    label: "yes",               ...reqEdge },
+  { id: "e7", source: "gate",    target: "fail",    label: "no",                ...failEdge },
+  { id: "e8", source: "push",    target: "minio",   label: "evidence + report", ...reqEdge },
+];
 
 The Trivy VM is the security-scanning gate between a built image and the `app-registry` push. Every Jenkins job that produces an image runs a Trivy scan against the local image (or against the registry reference after a candidate push), interprets the result, and either pushes the immutable tag or fails the build. The same scan output is uploaded as evidence to MinIO and, in the future, imported into DefectDojo as the AppSec dashboard.
 
@@ -23,16 +54,7 @@ Without the gate, the image supply chain would publish provably-Nexus-sourced bu
 
 ## Where the scan sits in the build
 
-<Mermaid client:load chart={`flowchart LR
-  gitlab["GitLab repo\n(developer push)"] -->|webhook| jenkins["Jenkins job"]
-  jenkins -->|pull base| dgr["docker-group.apps.\nsub.comptech-lab.com"]
-  jenkins -->|build| local["Local image\non build agent"]
-  local -->|trivy --server| trivy["Trivy server VM"]
-  trivy -->|HIGH or CRITICAL gate| gate{{"Scan passes?"}}
-  gate -->|yes| push["podman push to\napp-registry.apps.*"]
-  gate -->|no| fail["fail build,\nreport to MinIO"]
-  push -->|evidence + report| minio["MinIO\ndeveloper-ci-evidence"]
-`} />
+<Whiteboard client:load data={{ nodes: scanNodes, edges: scanEdges }} height={260} />
 
 The flow:
 

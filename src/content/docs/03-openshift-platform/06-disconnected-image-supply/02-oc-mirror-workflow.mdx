@@ -6,7 +6,6 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
 
 `oc mirror --v2` is the Red Hat tool that walks an `ImageSetConfiguration`, resolves every required image (release payload, operator catalog, operator bundles, additional images), copies them into a target registry, and emits the cluster-side CRs needed to make the cluster pull from the mirror. This page documents how that pipeline runs in the dc-lab v6 fleet — what the inputs are, what the outputs are, and how to operate it.
 
@@ -14,24 +13,14 @@ The workstation that runs `oc mirror` is a dedicated VM named `oc-mirror` on the
 
 ## Sequence of a mirror run
 
-<Mermaid client:load chart={`sequenceDiagram
-  participant Op as Operator
-  participant Mw as oc-mirror VM
-  participant Up as Upstream registries
-  participant Hx as HAProxy edge
-  participant Nx as Nexus mirror
-  Op->>Mw: edit ImageSetConfiguration
-  Op->>Mw: oc mirror --v2 --dry-run
-  Mw->>Up: resolve manifests (read-only)
-  Mw-->>Op: mapping.txt + warning summary
-  Op->>Mw: oc mirror --v2 (full run)
-  Mw->>Up: pull blobs by digest
-  Mw->>Hx: push blobs (HTTPS)
-  Hx->>Nx: forward to nexus :5000
-  Nx-->>Mw: HTTP 201 / digest receipts
-  Mw-->>Op: cluster-resources/ tarball\n(IDMS, ITMS, CatalogSource, ClusterCatalog)
-  Op->>Op: review + commit CRs to platform-gitops
-`} />
+1. Operator edits the `ImageSetConfiguration` on the `oc-mirror` VM.
+2. Operator runs `oc mirror --v2 --dry-run`. The VM resolves manifests against the upstream registries (read-only) and returns a `mapping.txt` + warning summary.
+3. After review, operator runs `oc mirror --v2` (full run).
+4. The VM pulls blobs by digest from upstream registries.
+5. The VM pushes the blobs over HTTPS to the HAProxy edge, which forwards to Nexus on port 5000.
+6. Nexus returns `HTTP 201` plus digest receipts to the VM.
+7. `oc mirror` emits a `cluster-resources/` tarball (IDMS, ITMS, `CatalogSource`, `ClusterCatalog`).
+8. Operator reviews and commits the generated CRs to `platform-gitops`.
 
 ## The workspace layout
 

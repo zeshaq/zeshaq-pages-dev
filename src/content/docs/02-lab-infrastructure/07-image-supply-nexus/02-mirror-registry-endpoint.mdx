@@ -6,7 +6,26 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const ext = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const mirrorNodes = [
+  { id: "upstream", position: { x: 0,   y: 30 }, data: { label: "Upstream registries\nregistry.redhat.io\nicr.io / quay.io" }, style: ext },
+  { id: "nexus",    position: { x: 220, y: 30 }, data: { label: "Nexus VM\nocp-mirror hosted\nport 5000" }, style: ctrl },
+  { id: "edge",     position: { x: 440, y: 30 }, data: { label: "mirror-registry.apps.\nsub.comptech-lab.com\n(HAProxy 443)" }, style: ctrl },
+  { id: "ocp",      position: { x: 660, y: 30 }, data: { label: "OpenShift cluster nodes\nhub-dc-v6, spoke-dc-v6" }, style: stage },
+];
+
+export const mirrorEdges = [
+  { id: "e1", source: "upstream", target: "nexus", label: "oc mirror --v2\nfrom bootstrap host", ...reqEdge },
+  { id: "e2", source: "nexus",    target: "edge",  label: "HAProxy 443 + LE wildcard", ...reqEdge },
+  { id: "e3", source: "edge",     target: "ocp",   label: "pull by digest\nIDMS / ITMS rewrites", ...reqEdge },
+];
 
 `mirror-registry.apps.sub.comptech-lab.com` is the **install lane** of the three-endpoint split. It exists for OpenShift platform content — release images, operator catalogs, operators, operands, and approved base images — populated from upstream registries through `oc mirror --v2` and consumed by disconnected OpenShift clusters during install and runtime.
 
@@ -46,11 +65,7 @@ Application workloads never pull from this endpoint. If a pod's image starts wit
 
 ## How content lands here
 
-<Mermaid client:load chart={`flowchart LR
-  upstream["upstream registries\nregistry.redhat.io\nicr.io\nquay.io"] -->|oc mirror --v2 from bootstrap host| nexus["Nexus VM\nocp-mirror hosted\nport 5000"]
-  nexus -->|HAProxy 443 LE wildcard| edge["mirror-registry.apps.\nsub.comptech-lab.com"]
-  edge -->|cluster pull by digest with IDMS/ITMS rewrites| ocp["OpenShift cluster nodes\nhub-dc-v6, spoke-dc-v6"]
-`} />
+<Whiteboard client:load data={{ nodes: mirrorNodes, edges: mirrorEdges }} height={220} />
 
 The path is one-way at runtime: cluster nodes read; nothing on the cluster writes back. The only writer is the human (or automation) running `oc mirror --v2` on the bootstrap host during a planned install or upgrade window.
 

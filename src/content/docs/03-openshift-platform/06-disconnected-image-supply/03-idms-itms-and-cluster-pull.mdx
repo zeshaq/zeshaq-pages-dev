@@ -6,7 +6,6 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
 
 `oc mirror --v2` ends by emitting two CRs that turn the mirror into something OpenShift's image puller can use: **`ImageDigestMirrorSet`** (IDMS) and **`ImageTagMirrorSet`** (ITMS). This page explains how they wire into the node pull path, what each does, why both exist, and the rules we follow when applying them.
 
@@ -23,22 +22,13 @@ IDMS/ITMS solve this by telling the cluster's container runtime: *"when you see 
 
 ## How a pull becomes a Nexus pull
 
-<Mermaid client:load chart={`sequenceDiagram
-  participant K as kubelet
-  participant CR as crio
-  participant Cfg as /etc/containers/registries.conf.d/
-  participant Nx as Nexus mirror
-  participant Up as Upstream registry (unreachable)
-  K->>CR: pull registry.redhat.io/foo@sha256:X
-  CR->>Cfg: read mirror rules (compiled from IDMS/ITMS)
-  Cfg-->>CR: prefer mirror-registry.apps.../foo for registry.redhat.io/foo
-  CR->>Nx: GET /v2/foo/manifests/sha256:X
-  Nx-->>CR: 200 (manifest + signature)
-  CR->>Nx: GET /v2/foo/blobs/sha256:Y (layers)
-  Nx-->>CR: 200 (each blob)
-  Note over CR,Up: upstream is never contacted
-  CR-->>K: image ready
-`} />
+1. kubelet asks `crio` to pull `registry.redhat.io/foo@sha256:X`.
+2. `crio` reads the compiled mirror rules from `/etc/containers/registries.conf.d/` (rendered from the applied IDMS/ITMS by the Machine Config Operator).
+3. The rule says "prefer `mirror-registry.apps.sub.comptech-lab.com/foo` for `registry.redhat.io/foo`."
+4. `crio` requests `GET /v2/foo/manifests/sha256:X` from the Nexus mirror; Nexus returns the manifest + signature.
+5. `crio` then pulls each blob (`GET /v2/foo/blobs/sha256:Y`) from the mirror.
+6. The upstream registry is never contacted (it's unreachable on the disconnected network).
+7. `crio` reports the image ready to the kubelet.
 
 ## IDMS vs ITMS: the difference
 

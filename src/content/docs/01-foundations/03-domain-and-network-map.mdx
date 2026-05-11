@@ -7,7 +7,6 @@ draft: false
 ---
 
 import Whiteboard from "../../../components/Whiteboard";
-import Mermaid from "../../../components/Mermaid";
 
 export const clientBox = { background: "#fafafa", border: "1.5px dashed #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
 export const edgeBox = { background: "#fde68a", border: "1.5px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
@@ -88,18 +87,11 @@ The reason for splitting authoritative and recursive is operational, not technic
 
 The Mermaid below traces how a lab VM resolves a name like `nexus-mirror.apps.sub.comptech-lab.com`:
 
-<Mermaid client:load chart={`sequenceDiagram
-  autonumber
-  participant V as Lab VM
-  participant R as PowerDNS recursor
-  participant A as PowerDNS authoritative
-  V->>R: A? nexus-mirror.apps.sub.comptech-lab.com
-  Note over R: forward-zones rule:<br/>sub.comptech-lab.com -> 127.0.0.1:53
-  R->>A: A? nexus-mirror.apps.sub.comptech-lab.com
-  A-->>R: A -> HAProxy edge address
-  R-->>V: A -> HAProxy edge address
-  V->>V: open TLS :443 to HAProxy edge
-`} />
+1. A lab VM asks the PowerDNS recursor for an `A` record (e.g., `nexus-mirror.apps.sub.comptech-lab.com`).
+2. The recursor's forward-zones rule for `sub.comptech-lab.com` sends the query to the local authoritative server (`127.0.0.1:53`).
+3. The authoritative server returns the HAProxy edge address.
+4. The recursor passes the answer back to the VM.
+5. The VM opens TLS `:443` to the HAProxy edge.
 
 For names outside `sub.comptech-lab.com`, the recursor uses `forward-zones-recurse=.=8.8.8.8;1.1.1.1` and goes upstream. From the client's perspective the recursor is the one resolver it ever needs to know about.
 

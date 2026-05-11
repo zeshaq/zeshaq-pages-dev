@@ -6,7 +6,6 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
 
 ## Deploy in 5 commands
 
@@ -55,34 +54,22 @@ Per [issue #202 (DEV-OCP-5.3)](https://github.com/zeshaq/codex-opp-agent/issues/
 
 ## Timing breakdown
 
-<Mermaid client:load chart={`sequenceDiagram
-    participant Dev as Developer
-    participant GL as GitLab
-    participant Jen as Jenkins
-    participant Agt as jenkins-agent-0
-    participant Trv as Trivy server
-    participant Nx as Nexus app-registry
-    participant Mn as MinIO
-    participant Mr as overlay MR
-    participant Argo as Hub Argo
-    participant Sp as Spoke Argo
-    participant K as Kubelet
-    Dev->>GL: git push main (t=0s)
-    GL->>Jen: notifyCommit webhook (t+5s)
-    Jen->>Agt: schedule build on developer-build agent
-    Agt->>Nx: podman pull base (cached: ~5s)
-    Agt->>Agt: podman build (t+30s..t+90s)
-    Agt->>Trv: trivy image --severity CRITICAL (t+90s..t+120s)
-    Agt->>Nx: podman push (t+120s..t+150s)
-    Agt->>Mn: mc cp build.log + sbom + scan (t+150s..t+160s)
-    Agt->>Mr: gitlab API: open MR with overlay patch (t+165s)
-    Mr->>Mr: CODEOWNERS auto-merge / reviewer merges (t+200s)
-    Mr->>Argo: AppSet refresh detects new main (t+200s..t+380s)
-    Argo->>Sp: ManifestWork (t+380s..t+400s)
-    Sp->>K: apply Deployment with new digest
-    K->>K: pull image + roll out (t+400s..t+430s)
-    Dev->>Dev: curl /health (t+430s, 200 OK)
-`} />
+| t (s) | Step |
+| --- | --- |
+| 0 | Developer `git push main`. |
+| +5 | GitLab fires the `notifyCommit` webhook to Jenkins. |
+| +5..+10 | Jenkins schedules the build on `jenkins-agent-0`. |
+| +10..+15 | Agent runs `podman pull` for the base image (cached). |
+| +30..+90 | Agent runs `podman build`. |
+| +90..+120 | Agent calls the Trivy server (`trivy image --severity CRITICAL`). |
+| +120..+150 | Agent runs `podman push` to Nexus `app-registry`. |
+| +150..+160 | Agent uploads `build.log`, SBOM, and scan to MinIO. |
+| +165 | Agent opens an overlay MR via the GitLab API (digest bump). |
+| +165..+200 | CODEOWNERS auto-merge (or reviewer merges). |
+| +200..+380 | Hub Argo CD AppSet refresh detects new main. |
+| +380..+400 | Hub Argo dispatches ManifestWork to the spoke Argo. |
+| +400..+430 | Spoke Argo applies the new Deployment; kubelet pulls and rolls out. |
+| +430 | `curl /health` returns `200 OK`. |
 
 Typical full-cycle: **6-7 minutes**. The longest leg is the AppSet refresh window (3 min default); shortenable with `argocd appset get --refresh` if you need a faster demo.
 

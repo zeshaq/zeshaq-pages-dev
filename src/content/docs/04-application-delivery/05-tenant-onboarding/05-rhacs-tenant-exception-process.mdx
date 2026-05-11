@@ -6,7 +6,43 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ctrl = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const gate = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const done = { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#14532d", width: 170, textAlign: "center", fontSize: 12 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const excNodes = [
+  { id: "start",   position: { x: 240, y: 0   }, data: { label: "Tenant identifies\npolicy violation" }, style: stage },
+  { id: "fix",     position: { x: 240, y: 100 }, data: { label: "Fix in manifest?" }, style: gate },
+  { id: "done",    position: { x: 0,   y: 100 }, data: { label: "Fix and re-deploy" }, style: done },
+  { id: "file",    position: { x: 240, y: 200 }, data: { label: "Tenant files MR:\napps/_exceptions/<team>-<app>-<policy>.md" }, style: ctrl },
+  { id: "review",  position: { x: 240, y: 300 }, data: { label: "Platform-admin reviews\nJustification + Compensating Control" }, style: gate },
+  { id: "back",    position: { x: 520, y: 300 }, data: { label: "Tenant fixes manifest" }, style: stage },
+  { id: "apply",   position: { x: 240, y: 400 }, data: { label: "Platform-admin patches\nRHACS policy exclusions" }, style: ctrl },
+  { id: "verify",  position: { x: 240, y: 500 }, data: { label: "RHACS UI / API confirms\nexclusion live" }, style: stage },
+  { id: "redeploy",position: { x: 240, y: 600 }, data: { label: "Tenant re-deploys;\ndeployment succeeds" }, style: stage },
+  { id: "expire",  position: { x: 240, y: 700 }, data: { label: "Auto-expire 90 days\nfrom approval" }, style: stage },
+  { id: "renew",   position: { x: 240, y: 800 }, data: { label: "Still needed?" }, style: gate },
+];
+
+export const excEdges = [
+  { id: "e1",  source: "start",    target: "fix",                                 ...reqEdge },
+  { id: "e2",  source: "fix",      target: "done",     label: "Yes",              ...reqEdge },
+  { id: "e3",  source: "fix",      target: "file",     label: "No, real exception", ...reqEdge },
+  { id: "e4",  source: "file",     target: "review",                              ...reqEdge },
+  { id: "e5",  source: "review",   target: "back",     label: "Reject",           ...reqEdge },
+  { id: "e6",  source: "review",   target: "apply",    label: "Accept",           ...reqEdge },
+  { id: "e7",  source: "apply",    target: "verify",                              ...reqEdge },
+  { id: "e8",  source: "verify",   target: "redeploy",                            ...reqEdge },
+  { id: "e9",  source: "redeploy", target: "expire",                              ...reqEdge },
+  { id: "e10", source: "expire",   target: "renew",                               ...reqEdge },
+  { id: "e11", source: "renew",    target: "file",     label: "Yes (renew)",      ...reqEdge },
+  { id: "e12", source: "renew",    target: "done",     label: "No",               ...reqEdge },
+];
 
 The platform enforces a minimal set of **five built-in** RHACS Central deploy-time policies on every namespace matching `apps-.*`. The defaults are intentional and tight; an exception is a per-(app, namespace, policy) carve-out with a justification, a compensating control, and an expiry date.
 
@@ -42,20 +78,7 @@ Legitimate exceptions are rare. A canonical example: a vendor's container legiti
 
 ## The process
 
-<Mermaid client:load chart={`flowchart TD
-  start([Tenant identifies a policy violation]) --> fix{Fix in manifest?}
-  fix -- Yes --> done([Fix and re-deploy])
-  fix -- No, real exception --> file[Tenant files MR: apps/_exceptions/<team>-<app>-<policy>.md]
-  file --> review[Platform-admin reviews Justification + Compensating Control]
-  review -- Reject --> back[Tenant fixes manifest]
-  review -- Accept --> apply[Platform-admin patches RHACS policy exclusions field]
-  apply --> verify[RHACS UI / API confirms exclusion live]
-  verify --> redeploy[Tenant re-deploys; deployment succeeds]
-  redeploy --> expire[Auto-expire 90 days from approval]
-  expire --> renew{Still needed?}
-  renew -- Yes --> file
-  renew -- No --> done
-`} />
+<Whiteboard client:load data={{ nodes: excNodes, edges: excEdges }} height={900} />
 
 ### 1. File the exception in GitLab
 

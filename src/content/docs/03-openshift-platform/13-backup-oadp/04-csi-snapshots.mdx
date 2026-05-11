@@ -7,7 +7,6 @@ draft: false
 ---
 
 import Whiteboard from "../../../../components/Whiteboard";
-import Mermaid from "../../../../components/Mermaid";
 
 export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
 export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
@@ -168,24 +167,15 @@ For CloudNativePG, the operator manages its own backup hooks and the lab convent
 
 The order of operations a Backup goes through when it touches a snapshottable PVC:
 
-<Mermaid client:load chart={`sequenceDiagram
-  participant U as User
-  participant V as Velero
-  participant CSI as csi plugin
-  participant K as K8s API
-  participant D as CSI driver
-
-  U->>V: kubectl apply Backup CR
-  V->>K: list PVCs in selected namespaces
-  V->>CSI: snapshot each PVC
-  CSI->>K: create VolumeSnapshot in app ns
-  K->>D: drive snapshot (per VolumeSnapshotClass)
-  D-->>K: VolumeSnapshotContent ready
-  K-->>CSI: snapshot handle available
-  CSI->>V: store handle in backup metadata
-  V->>V: write backup tarball to BSL (MinIO)
-  V->>K: Backup.status.phase = Completed
-`} />
+1. The user applies a `Backup` CR (`kubectl apply -f backup.yaml`).
+2. Velero lists PVCs in the selected namespaces against the Kubernetes API.
+3. Velero delegates each snapshottable PVC to the `csi` plugin.
+4. The `csi` plugin creates a `VolumeSnapshot` in the application namespace.
+5. The Kubernetes API drives the snapshot through the matching `VolumeSnapshotClass`, which calls the appropriate CSI driver.
+6. The CSI driver returns once the `VolumeSnapshotContent` is `ReadyToUse`.
+7. The snapshot handle bubbles back through the `csi` plugin to Velero, which records it in the backup metadata.
+8. Velero writes the backup tarball (CR snapshots + cluster-scoped resources + snapshot handles) to the Backup Storage Location on MinIO.
+9. Velero sets `Backup.status.phase = Completed`.
 
 If the snapshot driver is slow (or stuck), Velero will wait up to `DataProtectionApplication.spec.configuration.velero.defaultItemOperationTimeout` (4h in this lab) before failing the Backup. That is intentionally long because real-world ODF Ceph RBD snapshots of a multi-TiB volume can take 10+ minutes.
 

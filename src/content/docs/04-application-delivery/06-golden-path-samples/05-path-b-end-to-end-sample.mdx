@@ -6,7 +6,6 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
 
 ## Deploy in 5 commands
 
@@ -54,34 +53,21 @@ It exercises:
 
 ## Path-B timing breakdown
 
-<Mermaid client:load chart={`sequenceDiagram
-    participant Dev as Developer
-    participant GL as GitLab
-    participant EL as EventListener
-    participant PR as PipelineRun
-    participant Bld as buildah Task
-    participant Trv as trivy-scan Task
-    participant Qy as Quay
-    participant Mn as MinIO
-    participant Mr as overlay MR
-    participant Argo as Argo
-    participant K as Kubelet
-    Dev->>GL: git push main (t=0s)
-    GL->>EL: webhook (t+2s)
-    EL->>PR: create PipelineRun (t+3s)
-    PR->>PR: git-clone (t+3s..t+10s)
-    PR->>Bld: buildah build (t+10s..t+70s)
-    PR->>Trv: trivy image --severity CRITICAL (t+70s..t+100s)
-    PR->>Qy: push image (t+100s..t+115s)
-    PR->>Mn: evidence upload (t+115s..t+120s)
-    PR->>Mr: open MR via GitLab API (t+120s..t+125s)
-    Mr->>Mr: auto-merge (t+150s)
-    Mr->>Argo: refresh detects new main (t+150s..t+330s)
-    Argo->>K: apply Deployment
-    K->>Qy: pull image via quay-pull Secret
-    K->>K: roll out (t+330s..t+360s)
-    Dev->>Dev: curl /health (t+360s, 200 OK)
-`} />
+| t (s) | Step |
+| --- | --- |
+| 0 | Developer `git push main`. |
+| +2 | GitLab fires the webhook to the Tekton `EventListener`. |
+| +3 | EventListener creates the `PipelineRun`. |
+| +3..+10 | `git-clone` Task. |
+| +10..+70 | `buildah build` Task. |
+| +70..+100 | `trivy-scan` Task (`--severity CRITICAL`). |
+| +100..+115 | Push image to in-cluster Quay. |
+| +115..+120 | Evidence upload to MinIO. |
+| +120..+125 | Open overlay MR via the GitLab API (digest bump). |
+| +150 | MR auto-merges. |
+| +150..+330 | Argo CD refresh detects the new `main`. |
+| +330..+360 | Argo applies Deployment; kubelet pulls the image via the `quay-pull` Secret and rolls out. |
+| +360 | `curl /health` returns `200 OK`. |
 
 ## Repo layout (tenant source + tenant overlay)
 

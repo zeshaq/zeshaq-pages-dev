@@ -6,7 +6,6 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-import Mermaid from "../../../../components/Mermaid";
 
 The platform ships **one** `ApplicationSet` per spoke cluster, in `platform-gitops/clusters/<cluster>/appsets/`. That single ApplicationSet:
 
@@ -91,22 +90,14 @@ The `path.segments` slice is `['apps', '<team>', '<app>', 'overlays', '<env>']`.
 
 ### Path-segment templating sequence
 
-<Mermaid client:load chart={`sequenceDiagram
-    participant Git as GitLab app monorepo
-    participant Gen as git generator
-    participant ACM as clusterDecisionResource
-    participant Tmpl as template
-    participant Hub as hub Argo CD
-    participant Spoke as spoke Argo CD
-    Git->>Gen: directories match apps/*/*/overlays/*
-    Gen->>Tmpl: emit param tuple (path, segments)
-    ACM->>Tmpl: emit param tuple (clusterName)
-    Tmpl->>Hub: render Application team-<team>-<app>-<env>
-    Hub->>Hub: wrap as ManifestWork(spoke=<clusterName>)
-    Spoke->>Hub: gRPC pull manifestwork
-    Spoke->>Spoke: reconcile Application
-    Spoke->>Spoke: kustomize build + apply
-`} />
+1. The git generator scans each tenant app monorepo on GitLab for directories matching `apps/*/*/overlays/*`.
+2. For each match it emits a param tuple of the matching path and its path segments.
+3. The `clusterDecisionResource` generator emits a param tuple of `clusterName` from the ACM `Placement` it is bound to.
+4. The matrix template combines both tuples and renders one Argo `Application` named `team-<team>-<app>-<env>` per (overlay × allowed cluster).
+5. The hub Argo CD wraps each Application as a `ManifestWork` targeting the matching spoke.
+6. The spoke Argo CD pulls the `ManifestWork` over gRPC.
+7. The spoke reconciles the wrapped Application locally.
+8. The spoke runs `kustomize build` on the overlay path and applies the result.
 
 ## ACM Placement and the GitOpsCluster wiring
 

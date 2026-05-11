@@ -7,7 +7,6 @@ draft: false
 ---
 
 import Whiteboard from "../../../../components/Whiteboard";
-import Mermaid from "../../../../components/Mermaid";
 
 export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
 export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
@@ -288,29 +287,16 @@ GitLab signs the webhook body with the same token; the GitLab interceptor verifi
 
 ## The sequence in detail
 
-<Mermaid client:load chart={`sequenceDiagram
-  participant D as Developer
-  participant G as GitLab
-  participant R as Route
-  participant EL as EventListener
-  participant GI as GitLab interceptor
-  participant CEL as CEL interceptor
-  participant TT as TriggerTemplate
-  participant PR as PipelineRun
-  participant P as Pipeline
-
-  D->>G: git push origin main
-  G->>R: POST /<host> + X-Gitlab-Token
-  R->>EL: forward
-  EL->>GI: verify HMAC against gitlab-webhook-secret
-  GI->>GI: check event type = Push Hook
-  GI->>CEL: pass body + extensions
-  CEL->>CEL: filter on project.tag_list
-  CEL->>CEL: overlay team + app
-  CEL->>TT: bind + render
-  TT->>PR: create PipelineRun
-  PR->>P: instantiate
-`} />
+1. Developer runs `git push origin main`.
+2. GitLab POSTs the webhook to the EventListener's Route with an `X-Gitlab-Token` header.
+3. The Route forwards to the in-cluster EventListener service.
+4. The GitLab interceptor verifies the HMAC against `gitlab-webhook-secret`.
+5. The GitLab interceptor checks the event type is `Push Hook`.
+6. The body + extensions pass to the CEL interceptor.
+7. The CEL interceptor filters on `project.tag_list` and overlays the `team` + `app` labels.
+8. The CEL interceptor binds and renders the TriggerTemplate.
+9. The TriggerTemplate creates a `PipelineRun`.
+10. The `PipelineRun` instantiates the target Pipeline.
 
 The flow takes ~200ms from webhook POST to PipelineRun creation on the wire. Pipeline execution is then governed by the Tasks themselves.
 
