@@ -1,66 +1,65 @@
 ---
-title: "Brac POC — bank-payment Open Liberty app"
+title: "Brac POC — bank-payment app"
 sidebar_label: "Bank Payment app"
-description: "Executive overview: a two-microservice payment app with two React SPAs, gated by WSO2 IS, delivered onto OpenShift via GitOps in a single afternoon."
+description: "Two-microservice payment app with two web frontends, single sign-on through WSO2, an in-cluster canary release, a live health view, and standard web hardening — delivered onto OpenShift via GitOps."
 last_reviewed: 2026-05-11
 draft: false
 ---
 
 import Whiteboard from "../../components/Whiteboard.tsx";
 
-> Built 2026-05-11 for the BRAC engagement. The [scope email](/brac-poc/demo-scope-email)
-> asks for an end-to-end story across IAM, API exposure, mTLS and
-> canary. This app delivers the IAM leg with two domain services,
-> two SPAs, and a Let's Encrypt cert — all the runtime config flows
-> through GitOps.
+> Demo asset for the BRAC engagement. A working bank-payment workflow
+> with customer and approver roles, single sign-on, a canary release of
+> the customer page, a real-time health view of the backend services,
+> and three of the standard web-hardening controls every audit asks
+> for.
+
+## At a glance
+
+| | |
+| --- | --- |
+| **Where it runs** | OpenShift cluster `spoke-dc-v6` |
+| **Customer page** | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com` |
+| **Approver page** | `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` |
+| **Health view** | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com/obs/` |
+| **Login** | WSO2 Identity Server, tenant `bank-payment` |
+| **TLS** | Public Let's Encrypt wildcard — trusted by every browser, no setup |
+| **Delivery** | One Git repo, one Argo CD application, automatic sync |
 
 ## What got built
 
-A payment workflow with split duty between **customers** (initiate
-transfers) and an **approver** (settles them):
+Four pieces, one namespace:
 
-| App | Role |
-| --- | --- |
-| `payment-client-svc` | Customer API + system of record for accounts and transfers (Open Liberty 26, MP-JWT 2.1). |
-| `payment-approver-svc` | Admin-only API. Forwards the admin's bearer down to client-svc, so the audit trail captures the actual deciding human. |
-| `client-frontend` | React SPA for `zahid` / `shaikat` — balance, send-payment, history. |
-| `approver-frontend` | React SPA for `admin` — pending queue, approve / decline, audit. |
+| Piece | Role | Who uses it |
+| --- | --- | --- |
+| **payment-client-svc** | Customer payment service. Owns the accounts and the transfer history. | All users (under the hood) |
+| **payment-approver-svc** | Admin service. Reviews and decides on pending transfers. | Admin only |
+| **client-frontend** | Customer web page. Shows balance, send-payment form, transaction history. | `zahid`, `shaikat` |
+| **approver-frontend** | Admin web page. Shows the queue, approve / decline buttons, audit log. | `admin` |
 
-Identity is one WSO2 IS tenant (`bank-payment`) with three users
-sharing one password. The two SPAs are separate OIDC service
-providers; tokens are issued via authorization-code + PKCE and
-consumed by the backends as id_tokens.
+## Who logs in
 
-## How it was built
+All three users share one demo password: **`Hkj38djf&&&`**.
 
-Top-to-bottom on **spoke-dc-v6** in one afternoon, in this order:
+| User | Account | Balance | Role |
+| --- | --- | --- | --- |
+| `zahid` | `5005-0001-23` | 50,000 BDT | customer |
+| `shaikat` | `5005-0004-56` | 75,000 BDT | customer |
+| `admin` | — | — | approver |
 
-1. **Tenant scaffolded via platform-gitops** — Namespace, RBAC,
-   LimitRange, ResourceQuota, default-deny NetworkPolicy, Argo
-   `Application` pointed at the new app repo's `manifests/base/`.
-2. **WSO2 IS tenant bootstrapped by REST API** — `bank-payment`
-   tenant, three users, two OIDC SPs with redirect-URI regex for
-   prod and localhost, all from JSON specs checked into the repo.
-3. **Two Liberty services + two SPAs** — JAX-RS resources, the
-   `<mpJwt>` block tuned to WSO2's claim shape, CORS configured per
-   SPA origin, role derivation that grants `admin` to the username
-   `admin` since WSO2's tokens carry no `groups` claim by default.
-4. **GitOps reconciles** — every commit lands on the cluster
-   through Argo with `selfHeal=true`. No `oc apply` against the
-   cluster during the build; even the wildcard cert flows through
-   cert-manager + the platform-gitops repo.
-5. **Browser-trusted TLS** — cert-manager issues a Let's Encrypt
-   wildcard for `*.apps.spoke-dc-v6.sub.comptech-lab.com` via DNS-01
-   over RFC2136 against the lab PowerDNS. The spoke
-   IngressController's `defaultCertificate` consumes the Secret,
-   so every Route is trusted in browsers automatically.
+Login is single sign-on through WSO2 — the bank doesn't manage usernames
+or passwords inside the app itself.
 
-The image supply chain is the only out-of-GitOps step: `buildah`
-builds four images locally and pushes to Nexus
-(`app-registry.apps.sub.comptech-lab.com/bank-payment/<name>:latest`);
-Argo's reconcile loop then rolls out the workloads.
+## How a payment moves
 
-## Request flow
+1. **Zahid logs in** on the customer page (gets redirected to WSO2, signs in, comes back signed in).
+2. **He picks a recipient** from the dropdown — accounts are listed by name and account number, no balances exposed across customers.
+3. **He submits a payment** for an amount — the funds are *reserved* against his balance immediately so he can't double-spend during review.
+4. **Admin logs in** on the approver page. The pending queue auto-refreshes every five seconds.
+5. **Admin clicks Approve** — funds move into the recipient's balance and the transfer is logged with the admin's name on the audit trail.
+6. *Decline* refunds the sender. Either decision is one-shot — the app won't let the same transfer be settled twice.
+
+## System view
 
 export const stage = {
   background: "#fafafa", border: "1px solid #9ca3af",
@@ -69,6 +68,11 @@ export const stage = {
 };
 export const ctrl = {
   background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const canary = {
+  background: "#fefce8", border: "1.5px solid #ca8a04",
   borderRadius: 8, padding: 10, color: "#1f2937",
   width: 170, textAlign: "center", fontWeight: 600, fontSize: 12,
 };
@@ -84,47 +88,106 @@ export const ext = {
 };
 
 export const flowNodes = [
-  { id: "zahid",   data: { label: "zahid / shaikat" },                        position: { x:   0, y:  10 }, style: stage },
-  { id: "admin",   data: { label: "admin" },                                  position: { x: 660, y:  10 }, style: stage },
-  { id: "cspa",    data: { label: "client-frontend\npayments.*" },            position: { x:   0, y: 130 }, style: ctrl },
-  { id: "aspa",    data: { label: "approver-frontend\napprover.*" },          position: { x: 660, y: 130 }, style: ctrl },
-  { id: "wso2is",  data: { label: "WSO2 IS\nbank-payment tenant" },           position: { x: 330, y:  70 }, style: ext },
-  { id: "csvc",    data: { label: "payment-client-svc\nclient-api.*" },       position: { x:   0, y: 320 }, style: agent },
-  { id: "asvc",    data: { label: "payment-approver-svc\napprover-api.*" },   position: { x: 660, y: 320 }, style: agent },
-  { id: "ledger",  data: { label: "in-memory ledger\nzahid 50k · shaikat 75k" }, position: { x: 330, y: 470 }, style: stage },
+  { id: "users",   data: { label: "zahid · shaikat" },                  position: { x:   0, y:  10 }, style: stage },
+  { id: "admin",   data: { label: "admin" },                            position: { x: 720, y:  10 }, style: stage },
+  { id: "wso2",    data: { label: "WSO2 IS\nbank-payment tenant" },     position: { x: 360, y:  60 }, style: ext },
+  { id: "proxy",   data: { label: "NGINX reverse proxy\n(canary + hardening + obs)" }, position: { x:   0, y: 170 }, style: ctrl },
+  { id: "aspa",    data: { label: "approver-frontend" },                position: { x: 720, y: 170 }, style: ctrl },
+  { id: "v1",      data: { label: "client-frontend\nv1 (stable)" },     position: { x:-160, y: 320 }, style: ctrl },
+  { id: "v2",      data: { label: "client-frontend\nv2 (canary)" },     position: { x: 160, y: 320 }, style: canary },
+  { id: "csvc",    data: { label: "payment-client-svc" },               position: { x:   0, y: 470 }, style: agent },
+  { id: "asvc",    data: { label: "payment-approver-svc" },             position: { x: 720, y: 470 }, style: agent },
+  { id: "ledger",  data: { label: "in-memory ledger\nzahid 50k · shaikat 75k" }, position: { x: 360, y: 600 }, style: stage },
 ];
 
 export const flowEdges = [
-  { id: "zahid-cspa", source: "zahid", target: "cspa", style: { stroke: "#1f2937" } },
-  { id: "admin-aspa", source: "admin", target: "aspa", style: { stroke: "#1f2937" } },
-  { id: "cspa-wso2",  source: "cspa",  target: "wso2is", label: "OIDC code+PKCE", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "aspa-wso2",  source: "aspa",  target: "wso2is", label: "OIDC code+PKCE", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "cspa-csvc",  source: "cspa",  target: "csvc",   label: "Bearer id_token", style: { stroke: "#1f2937" } },
-  { id: "aspa-asvc",  source: "aspa",  target: "asvc",   label: "Bearer id_token", style: { stroke: "#1f2937" } },
-  { id: "asvc-csvc",  source: "asvc",  target: "csvc",   label: "internal\n(admin token forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
+  { id: "u-proxy", source: "users", target: "proxy", style: { stroke: "#1f2937" } },
+  { id: "a-aspa",  source: "admin", target: "aspa",  style: { stroke: "#1f2937" } },
+  { id: "u-wso2",  source: "users", target: "wso2",  label: "sign in", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "a-wso2",  source: "admin", target: "wso2",  label: "sign in", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "px-v1",   source: "proxy", target: "v1",    label: "default", style: { stroke: "#1f2937" } },
+  { id: "px-v2",   source: "proxy", target: "v2",    label: "X-Canary: v2", style: { stroke: "#ca8a04" }, animated: true },
+  { id: "v1-csvc", source: "v1",    target: "csvc",  style: { stroke: "#1f2937" } },
+  { id: "v2-csvc", source: "v2",    target: "csvc",  style: { stroke: "#1f2937" } },
+  { id: "as-asvc", source: "aspa",  target: "asvc",  style: { stroke: "#1f2937" } },
+  { id: "asvc-csvc", source: "asvc", target: "csvc", label: "internal\n(admin's session forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
   { id: "csvc-ledger", source: "csvc", target: "ledger", style: { stroke: "#1f2937" } },
 ];
 
-<Whiteboard nodes={flowNodes} edges={flowEdges} height={620} client:only="react" />
+<Whiteboard nodes={flowNodes} edges={flowEdges} height={760} client:only="react" />
 
-## Status
+## Canary release of the customer page
 
-| | |
+Two versions of the customer page run side-by-side. Visitors get the
+stable v1 unless they explicitly ask for v2.
+
+| | v1 (stable) | v2 (canary) |
+| --- | --- | --- |
+| Appearance | White background | Light-yellow background, "v2 (canary)" tag next to the title |
+| Who reaches it | Everyone by default | Only requests that carry an explicit `X-Canary: v2` opt-in header |
+| Replicas | 2 | 1 |
+| Switching is | Instant on the next page load, no redeploy | Instant on the next page load |
+
+**To show v2 in a demo:** install the **ModHeader** browser extension,
+add a single rule (`Name: X-Canary`, `Value: v2`), reload. Disable the
+rule to flip back to v1.
+
+The routing decision is visible in the **`x-served-by`** response
+header — open Chrome's dev tools → Network → click the page request →
+Headers → Response Headers, and you'll see which version served you.
+
+## Live health view
+
+`/obs/` shows two cards, one per backend service, refreshed every five
+seconds.
+
+| Metric | What it tells you |
 | --- | --- |
-| **Live** | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com` (customer) · `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` (approver) |
-| **Cert** | Let's Encrypt wildcard, trusted in browsers without lab-CA install |
-| **State** | In-memory; client-svc pinned to a single replica until persistence lands |
-| **Repo** | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
+| **Liveness** | Is the service process responding at all? Goes red if it isn't. |
+| **Readiness** | Is the service ready to take traffic? Goes red during a restart. |
+| **JVM thread count** | How busy is the service internally? A sudden spike is a useful early-warning signal. |
+| **Heap used (MB)** | How much memory the service is holding. |
+| **CPU (recent %)** | Live CPU usage. |
 
-## What's next
+The view is unauthenticated for the demo — in production it would sit
+behind the same login wall as the rest of the bank's internal tooling.
 
-- **Persistence** — JDBC + PostgreSQL or a PVC-backed JSON snapshot;
-  the model is already split `Account` / `Transfer`, the swap is
-  mechanical.
-- **API Gateway** — put WSO2 APIM in front of both backends; the
-  OpenAPI specs in `wso2/api-definitions/` already carry the
-  `x-wso2-*` annotations APIM expects.
-- **Service Mesh + mTLS** — add the namespace to the mesh and a
-  VirtualService for the canary story; no app code changes.
-- **Audit pipeline** — emit a Kafka event per approver decision for
+## Web hardening at the edge
+
+Three controls applied in front of every request, configured in one
+NGINX file:
+
+| Control | What it does | How to verify in 10 seconds |
+| --- | --- | --- |
+| **HSTS** (Strict-Transport-Security) | Browser remembers for 1 year that this site is HTTPS-only. Even typing `http://` won't downgrade. | F12 → Network → reload → click request → Headers → look for `strict-transport-security`. |
+| **Branded error pages** | 404 / 429 / 5xx all return a bank-branded page instead of nginx's grey default. | Fire 30 rapid requests at the health view — the 429 page renders. |
+| **Per-source rate limiting** | Caps how fast one source can hit a path. Stops dictionary attacks on login forms and stops scrapers hammering the health view. | Run `for i in {1..30}; do curl -sS -o /dev/null -w '%{http_code} ' …/obs/client/metrics; done` — you'll see a mix of `200`s and `429`s. |
+
+Two additional headers ship alongside HSTS: **X-Content-Type-Options:
+nosniff** (browsers can't misinterpret file types) and **Referrer-Policy:
+strict-origin-when-cross-origin** (other sites don't see internal paths
+in their referrer logs).
+
+## Where everything lives
+
+| | URL |
+| --- | --- |
+| Customer page | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com` |
+| Approver page | `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` |
+| Health view | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com/obs/` |
+| Customer API | `https://client-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
+| Approver API | `https://approver-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
+| WSO2 IS console | `https://is.apps.sub.comptech-lab.com/t/bank-payment/console` |
+| Git repo | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
+
+## Roadmap (intentionally not yet built)
+
+- **Persistent storage** for accounts + transfer history. The demo uses
+  in-memory state, so a service restart wipes the ledger.
+- **API Gateway** in front of the two services — the gateway
+  definitions are already in the repo, waiting on WSO2 APIM.
+- **Service mesh with mTLS** for the canary story end-to-end (the
+  in-cluster traffic between services would be encrypted and identity-
+  verified, not just edge-encrypted).
+- **Audit event stream** — every approver decision emitted to Kafka for
   downstream reconciliation.
