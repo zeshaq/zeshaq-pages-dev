@@ -1,0 +1,185 @@
+---
+title: "Backend conventions"
+description: "The naming + shape conventions for HAProxy backends — vm-be for VM targets, rke2-be for legacy RKE2 targets, *-pp for PROXY-protocol stepping stones. Health checks, mode tcp vs http, and the symmetry that keeps the file readable."
+sidebar_label: "Backend conventions"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The ~40 backend blocks in `haproxy.cfg` follow a small number of strict naming + shape conventions. Sticking to them is what keeps the file's complexity bounded — every new service slots in by mechanical copy from an existing block.
+
+## Naming rule
+
+```
+<service>-<location>-be
+```
+
+- `<service>` is the name of the platform service: `jenkins`, `gitlab`, `signoz`, `trivy`, `defectdojo`, `monitoring`, `minio-api`, `minio-console`, `nexus-mirror`, `mirror-registry`, `docker-group`, `app-registry`, `wso2-is`, `wso2-apim-mgmt`, `wso2-apim-gateway`, etc.
+- `<location>` is where the backend lives: `vm` for a platform VM, `rke2` for a legacy RKE2-hosted service (kept for archeology / cutover), `dr` for a DR replica.
+- `-be` suffix is consistent across the file.
+
+A few examples:
+
+| Backend name | Target |
+| --- | --- |
+| `jenkins-vm-be` | Jenkins controller VM |
+| `gitlab-vm-be` | GitLab CE VM |
+| `signoz-vm-be` | SigNoz VM |
+| `minio-api-vm-be` | MinIO server's S3 API port |
+| `minio-console-vm-be` | MinIO server's web console |
+| `nexus-rke2-be` | Nexus front-end on the (current) Nexus VM, kept under the legacy `rke2` label for now |
+| `nexus-docker-rke2-be` | Nexus's Docker hosted endpoint (port 5000), labeled `rke2` for history |
+| `defectdojo-vm-be` | DefectDojo VM (this *replaced* a `defectdojo-rke2-be` that was returning 503) |
+| `wso2-is-vm-be` | WSO2 Identity Server VM |
+| `wso2-apim-mgmt-vm-be` | WSO2 APIM management UI port |
+| `wso2-apim-gateway-vm-be` | WSO2 APIM gateway port |
+| `redisinsight-dr-rke2-be` | Legacy DR RedisInsight |
+
+Plus the stepping-stone backends (`*-tls-pp`, `*-pp`) used by the outer SNI-routing frontend, and a few utility backends (`haproxy-self-be`, `public-apps-https-be`).
+
+## Stepping stones (`*-tls-pp`)
+
+The outer `public-apps-https` frontend uses these to forward a TCP stream over PROXY protocol to the inner TLS-terminating frontend:
+
+```haproxy
+backend vm-tls-pp
+    mode tcp
+    server vm-tls 127.0.0.1:8443 send-proxy
+
+backend wso2-tls-pp
+    mode tcp
+    server wso2-tls 127.0.0.1:8443 send-proxy
+```
+
+(In practice both end up at the same `127.0.0.1:8443` inner bind, but the separate backend names let the outer frontend log distinctly and lets future changes diverge them without renaming.)
+
+## Real backends — the three shapes
+
+### Shape A: HTTP backend with health check
+
+For services that speak plain HTTP behind the inner TLS termination:
+
+```haproxy
+backend jenkins-vm-be
+    mode http
+    option httpchk GET /login
+    http-check expect status 200,302,401
+    server jenkins-0 <ip>:8080 check
+```
+
+- `mode http` because the inner frontend gave us plain HTTP.
+- `option httpchk` + `http-check expect` for a simple liveness probe.
+- `server <name> <ip>:<port> check` — single backend, no load balancing.
+
+Used by: Jenkins, SigNoz UI, Trivy server UI, DefectDojo, monitoring/Grafana, GitLab CE (Jenkins/Grafana speak HTTP; the wildcard cert handles HTTPS at the edge).
+
+### Shape B: HTTPS-to-VM backend
+
+For services where the VM itself terminates TLS (often because the app expects its own cert chain, like Nexus or MinIO):
+
+```haproxy
+backend minio-console-vm-be
+    mode http
+    option httpchk GET /minio/health/live
+    http-check expect status 200
+    server minio <ip>:9001 ssl verify none check
+```
+
+- `ssl verify none` — backend uses TLS but the lab does not validate the backend cert. This is acceptable because the connection is host-local (HAProxy → VM on the same `/16`), and the wildcard cert that matters is the one the client sees.
+- Port is the VM's TLS port (9001 for MinIO Console, 9000 for MinIO API).
+
+Used by: MinIO Console, MinIO API, Nexus (when the VM is configured for HTTPS).
+
+### Shape C: Pure TCP passthrough (no HAProxy decryption)
+
+For services that need true end-to-end TLS, where HAProxy is a simple SNI-aware switch:
+
+```haproxy
+backend wso2-is-vm-be
+    mode tcp
+    option tcplog
+    server wso2-is-0 <ip>:443 check check-ssl verify none
+```
+
+- `mode tcp` end-to-end.
+- The outer `public-apps-https` frontend forwards directly to this backend (without the loopback re-decrypt hop).
+- WSO2 IS, WSO2 APIM gateway, Kafka SNI hosts use this shape.
+
+## Health checks
+
+Three approaches, depending on backend:
+
+| Approach | When | Snippet |
+| --- | --- | --- |
+| **HTTP GET** | The backend speaks HTTP/HTTPS and has a known endpoint that returns 200 quickly | `option httpchk GET /healthz` + `http-check expect status 200` |
+| **TCP connect** | The backend isn't HTTP, but TCP-reachable means "up" | `server <name> <ip>:<port> check` (no `option httpchk`) |
+| **None** | Health-check is overkill or the protocol is too fussy to probe cheaply | `server <name> <ip>:<port>` without `check` |
+
+Health checks fire by default every 2 seconds with a `fall 3` / `rise 2`. The defaults are fine at lab scale; the checks don't generate enough load to matter, and they make the HAProxy stats page useful.
+
+## Connection settings: timeouts, options
+
+Per-backend overrides are rare. Most backends inherit the `defaults` block:
+
+```haproxy
+defaults
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+    timeout queue   30s
+```
+
+Two exceptions:
+
+- **GitLab CE** sometimes wants a higher `timeout server` for long git clones. Override per-backend if needed.
+- **Long-running websockets** (e.g., Jenkins SSE, SigNoz live tail) need `timeout tunnel 1h` at the backend or the `vm-tls` frontend. Several backends set this explicitly.
+
+## Why no load balancing
+
+Almost every backend has exactly one `server` line. There is no HAProxy-side load balancing in the platform fleet because:
+
+1. Most services are single-VM (Jenkins, SigNoz, DefectDojo, Trivy, MinIO, Nexus, GitLab — one instance each).
+2. Services that are HA (Vault, Kafka, Redis) use **DNS round-robin** for client discovery, and the application protocol (Raft, KRaft, Sentinel) handles which member is the active/master. HAProxy doesn't see the HA cluster as a single backend.
+3. OpenShift's own ingress is handled by the in-cluster router, not HAProxy.
+
+This keeps every backend block to "one server, one port, maybe one health check." The HAProxy file stays grep-able.
+
+## The `*-rke2-be` historical category
+
+Several backends are named `*-rke2-be` even though they now point at VMs:
+
+- `nexus-rke2-be` — actually points at the Nexus VM, not RKE2.
+- `nexus-docker-rke2-be` — same.
+- `vault-rke2-be` — legacy RKE2 Vault, *deprecated* now that the Vault OSS VMs are live.
+
+The naming is historical. During the v6 OpenShift rebuild (per ADRs 0018, 0019) several services migrated off RKE2 onto VMs; the backend names were kept stable to avoid having to rewire the SNI ACLs in lockstep. Each `*-rke2-be` block still in service is on the path to a VM, just under its old label. Renaming them is queued behind more pressing work.
+
+## Symmetry with WSO2 backends
+
+WSO2 IS and APIM expose six edge hostnames (`is`, `apim`, `publisher`, `devportal`, `admin`, `gateway` under `.apps.sub.comptech-lab.com`) that fan out to two backend VMs (IS and APIM) with different routing across the APIM hostnames. The convention:
+
+| Hostname | Backend |
+| --- | --- |
+| `is.apps.sub.comptech-lab.com` | `wso2-is-vm-be` |
+| `apim.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` (management console) |
+| `publisher.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` (same port; same VM; UI determined by path) |
+| `devportal.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` |
+| `admin.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` |
+| `gateway.apps.sub.comptech-lab.com` | `wso2-apim-gateway-vm-be` (different port — APIM gateway, not the management plane) |
+
+All six hostnames route via the outer `is_wso2_host` ACL into the pure-passthrough `wso2-tls-pp` and onward, because WSO2 is the most fussy about TLS being end-to-end.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Backend listed `DOWN` on stats but service is fine | Health check path is wrong (e.g., `/login` returns 302 but check expects 200) | Fix `http-check expect` to allow the right status set | Test the health check path with `curl -k -o /dev/null -s -w '%{http_code}'` before adding it |
+| Backend `UP` but client gets 502 | Backend `mode` mismatched with frontend (`mode tcp` + `mode http`) | Match modes; both `tcp` for passthrough, both `http` for decrypted | Pair `mode` choice on each new frontend/backend together |
+| Backend works on lab side but not from the public side | `public-apps-dr-*` DR frontend missing a `use_backend` for the new ACL | Mirror the SNI ACL into the DR frontend | Treat primary + DR as one edit unit |
+| Renaming a backend breaks reload | Old `use_backend` references still point at the old name | Update every `use_backend <old-name>` in the same edit | Use a single `grep` for the old backend name across the file before renaming |
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- Memory: `reference_haproxy_vm.md`
+- HAProxy 2.8 docs: <https://docs.haproxy.org/2.8/configuration.html>

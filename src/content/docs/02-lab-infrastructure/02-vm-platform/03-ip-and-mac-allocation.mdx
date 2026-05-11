@@ -1,0 +1,143 @@
+---
+title: "IP and MAC allocation"
+description: "The deterministic MAC/IP convention that keeps VM allocation grep-able and collision-free, the canonical allocation table layout, and the read-only checks operators run before defining any new VM."
+sidebar_label: "IP and MAC allocation"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The lab has one IP plan and one MAC plan, and both fit in a single markdown file. This page documents the allocation convention, the structure of the canonical table, the pre-allocation checks, and the gotchas to watch for.
+
+## The convention
+
+Two rules cover almost every VM in the fleet:
+
+1. **IP allocation follows role + last octet.** Platform VMs live in a single platform `/24` inside the lab `/16`. OpenShift nodes and VIPs live in a separate `/24` inside the same `/16`. Inside each `/24` the last octet is assigned roughly chronologically and recorded in `allocation-table.md`.
+2. **MAC follows IP.** Each platform VM gets a MAC of the form `52:54:00:30:30:<HH>` where `<HH>` is the last octet of the platform-`/24` IP. A VM with last-octet `.32` gets MAC `52:54:00:30:30:32`. The byte is written in the same base on both sides — easy to grep, easy to verify.
+
+That MAC convention has one purpose: when you `virsh domiflist | grep <mac>` you can see at a glance which VM a stray MAC belongs to. It also means the seed ISO and the libvirt XML can be machine-generated from the IP alone.
+
+OpenShift master VMs follow the same convention with a different middle segment: `52:54:00:75:10:<HH>` for hub masters and `52:54:00:75:30:<HH>` for spoke masters. Physical workers' MACs come from iLO Redfish, not from a deterministic formula.
+
+## Canonical allocation table layout
+
+The authoritative file is `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`. It groups rows by service family. Public schema for each section:
+
+```
+| Role | Hostname | MAC | IP | DNS name | Status |
+```
+
+Service families currently in the table:
+
+- Vault OSS VMs (transit-seal + 3 Raft voters + a DNS RR client endpoint)
+- Kafka KRaft VMs (3 brokers/controllers + a DNS RR bootstrap endpoint)
+- Redis/Sentinel VMs (3 nodes + DNS RR client and sentinel endpoints)
+- Redis/Kafka WAL utility VM (one-off; both a private NIC and a routed real NIC — explicit exception to the private-only pattern)
+- WSO2 APIM and Identity Server VMs (two VMs + a fan-out of HAProxy edge hostnames)
+- Jenkins controller VM
+- Jenkins build agent VM
+- SigNoz observability VM
+- Trivy scanner/server VM
+- DefectDojo dashboard/API VM
+- monitoring-0 observability learning VM
+- Developer docker-runtime VM
+- MinIO VM
+- Nexus VM and oc-mirror worker VM
+- PowerDNS VM (dual-homed: auth on one address, recursor on a second)
+- HAProxy edge VM
+- GitLab CE VM
+- Hub OpenShift control plane VMs (3 masters, compact — no workers)
+- Spoke OpenShift control plane VMs (3 VM masters) and worker NICs (3 physical workers with iLO-derived MACs)
+
+DNS round-robin endpoints (no dedicated address) defined on top of the per-node rows:
+
+| Hostname | Targets |
+| --- | --- |
+| `vault.sub.comptech-lab.com` | three main Vault Raft voters |
+| `kafka-bootstrap.sub.comptech-lab.com` | three Kafka VMs |
+| `redis.sub.comptech-lab.com` | three Redis VMs |
+| `redis-sentinel.sub.comptech-lab.com` | three Redis VMs |
+
+> Internal-only specifics (exact addresses, MACs, current operational status per VM) are kept in `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`.
+
+## What is reserved but not provisioned
+
+Two "bootstrap" slots inside the OpenShift `/24` (one per cluster) are reserved as IP/MAC pairs but **not** provisioned in the current install flow. The hub and spoke both use the rendezvous-on-master agent-based compact-install pattern, so the bootstrap nodes never come up. The slots stay reserved against accidental reuse if the install method ever changes.
+
+`hub-dc-v6` has **no worker entries** — it is an approved compact 3-node VM-only management cluster. That's recorded in the table by absence.
+
+## Why deterministic MACs
+
+The Vault, Kafka, Redis, and OpenShift VMs all live in HA groups. If a hypervisor host fails and a VM has to be re-defined on a sibling, the recipe must be:
+
+```
+allocation-table.md says <vm> = <ip> = <mac>
+↓
+new XML on the new hypervisor pins exactly that <mac> on br30
+↓
+DNS already points to <ip>
+↓
+clients reconnect to the same name → same IP → same MAC
+```
+
+If MACs were random, the new VM would come up with a fresh ARP entry; the lab router and every neighbor would do a fresh ARP cycle. With deterministic MACs the ARP entry is stable across re-defines, and the recovery looks the same as a long restart from the network's point of view.
+
+Same logic applies to physical NICs: the spoke worker MACs come from iLO Redfish and are recorded in `allocation-table.md` exactly as iLO reports them, so a NIC swap propagates through the table rather than through trial-and-error.
+
+## Pre-allocation checks (before every new VM)
+
+Run these before adding a row to the allocation table and before defining a new domain. None of them write state; they confirm the proposed allocation doesn't collide.
+
+```bash
+# 1) Is the IP responding to anyone?
+ping -c 2 -W 1 <proposed-ip>
+
+# 2) Does any libvirt domain already claim that MAC?
+for h in <hypervisor-list>; do
+  ssh "$h" "virsh list --all --name | while read n; do \
+    [ -n \"\$n\" ] && virsh domiflist \"\$n\" | grep '<proposed-mac>'; \
+  done"
+done
+
+# 3) Does DNS already answer for the proposed hostname?
+dig @<lab-dns-recursor> <hostname>.sub.comptech-lab.com A +short
+
+# 4) Does the ARP table show the IP in use anywhere?
+ip neigh show | rg "<proposed-ip>"
+
+# 5) Has the allocation file ever recorded this hostname/IP?
+rg -n "<proposed-ip>\b|<hostname>\b" \
+  /home/ze/codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md
+```
+
+If any of those return a positive hit, the allocation is wrong and the table needs revisiting. Only after all five are clean does a row get added to the table.
+
+## How the table is maintained
+
+- **One file, one PR.** All allocations go through `allocation-table.md`. No shadow lists, no per-service ad-hoc files.
+- **Status column.** Each row's `Status` column reflects current reality: `Approved` (table entry exists, VM not yet built), `Applied` (VM running but not fully validated), `Applied; <validated state>` (VM built + validated). This is what an operator should grep when deciding whether an allocation is "real."
+- **Retired entries stay in.** When a VM is retired, its row stays in the table marked `Retired YYYY-MM-DD` so the address+MAC remain reserved against accidental reuse. Reclaiming an address requires a separate ADR or a documented decision.
+- **No live secrets, no kubeadmin, no pull-secrets.** The table records names, addresses, MACs, hostnames, role. That's it. Credentials live in `secrets/`.
+
+## OpenShift-specific note
+
+OpenShift nodes are agent-based-installed using NMState configuration that pins the MAC to the IP inside the cluster too — so the cluster's view of "which NIC is this node" lines up with `allocation-table.md`. If a worker NIC gets swapped, both the table *and* the NMState manifest under `cluster-resources/` have to be updated, and the agent-config has to be re-rendered before the worker can rejoin.
+
+Spoke physical workers' MACs were corrected in-place during issue #93 — the table records the actual iLO-discovered MACs rather than guesses. That correction step is documented in `allocation-table.md` itself.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Two VMs respond to the same IP | One operator added a row, another defined the VM without pulling the latest table | `virsh destroy` the new one; reconcile the table on the operator workspace | Re-pull `codex-opp-agent` before allocating; commit the row before defining the VM |
+| MAC collision in libvirt | A retired VM was redefined on a different hypervisor without checking | Use `virsh nodedev-list --tree` or `virsh domiflist` across all hypervisors before defining | Always run the pre-allocation MAC check across every hypervisor |
+| Lab router sees the IP but the VM doesn't | NIC was attached to a different bridge by mistake (e.g., libvirt's NATed `default`) | Fix the libvirt XML, redefine, restart | Copy the `<interface>` block from a sibling VM rather than letting `virt-install` decide |
+| OpenShift node won't rejoin after NIC swap | NMState in agent-config has the old MAC | Update agent-config NMState entry, regenerate ISO, re-`oc adm node-image` if needed | Pin MACs in NMState exactly as `allocation-table.md` says, never trust the kernel-assigned one |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
+- ADR 0005 (rebuild network/ingress/PKI)
+- Memory: `reference_lab_infrastructure.md`

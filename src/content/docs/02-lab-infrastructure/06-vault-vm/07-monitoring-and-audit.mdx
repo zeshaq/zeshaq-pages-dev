@@ -1,0 +1,246 @@
+---
+title: "Monitoring and audit"
+description: "What Vault tells you about itself — audit devices for every request, Prometheus-format metrics on the listener, Raft autopilot state, and the lab's planned monitoring path."
+sidebar_label: "Monitoring and audit"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Vault produces three streams of operational signal: audit logs (every request, every response), Prometheus metrics (process and Raft state), and the autopilot health state. This page covers what's emitted, how to read it, and the gaps the lab still has.
+
+## Audit devices
+
+Vault's **audit device** records every request and response. Without an enabled audit device, Vault refuses to start writing secrets in production-ready mode (or rather, it allows it but the operator should not).
+
+The lab enables a file-based audit device on each voter:
+
+```bash
+vault audit enable file file_path=/var/log/vault/audit.log
+```
+
+After enable:
+
+- Every API call is appended to `/var/log/vault/audit.log` as a single JSON line.
+- The line includes request data (method, path, namespace) and response data — but values are **HMAC'd**, not plaintext. You can see *that* a secret was read, not what its value was.
+- Log rotation is required: the file grows unbounded otherwise.
+
+### Log rotation
+
+`/etc/logrotate.d/vault`:
+
+```
+/var/log/vault/audit.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 vault vault
+    postrotate
+        kill -HUP $(pidof vault) > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+Vault re-opens the audit log on SIGHUP (`kill -HUP`), so logrotate can move the active file aside without losing entries.
+
+### Why audit is mandatory
+
+| Requirement | Audit gives |
+| --- | --- |
+| Compliance — "show me who read which secret when" | Yes (HMAC'd values; identity from auth context) |
+| Incident response — was this secret accessed after the suspected compromise? | Yes |
+| Operator-error recovery — what did we touch in the last hour? | Yes |
+| Performance debugging | Some — request rate by path, latency |
+
+The gate in `vault-oss-vm-plan.md` is explicit: "At least one enabled audit device before production secret use."
+
+### Reading audit log
+
+Each line is JSON. Two passes for typical investigation:
+
+```bash
+# Count requests by path in the last hour
+sudo grep -F "$(date -u -d '1 hour ago' '+%Y-%m-%dT%H')" /var/log/vault/audit.log \
+  | jq -r '.request.path' \
+  | sort | uniq -c | sort -rn
+
+# Find all KV reads that returned "permission denied"
+sudo jq -c 'select(.response.error == "permission denied" and (.request.path | startswith("secret/data/"))) | [.time, .request.path, .auth.display_name] | @tsv' /var/log/vault/audit.log
+
+# All distinct principals (display names) that authenticated in the last 24h
+sudo jq -r 'select(.time > "'"$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')"'") | .auth.display_name' /var/log/vault/audit.log | sort -u
+```
+
+The audit log is the source of truth for "who-did-what." Read access to it is operator-restricted (file mode `0640`, root + vault group).
+
+### Future: shipping audit to a centralized store
+
+Currently logs live on each voter's local disk. A planned improvement is to ship them to Loki (so the lab observability VM can query them) and/or to a dedicated audit S3 bucket on MinIO with WORM-like retention. Neither is wired today.
+
+## Prometheus metrics
+
+Vault exposes metrics in Prometheus format at `/v1/sys/metrics?format=prometheus`. To read them without a token requires enabling the `unauthenticated_metrics_access = true` flag on the listener, which the lab does not do — metrics access requires the `metrics` policy.
+
+```bash
+export VAULT_TOKEN=<token-with-metrics-policy>
+curl -ks --header "X-Vault-Token: $VAULT_TOKEN" \
+  https://vault.sub.comptech-lab.com:8200/v1/sys/metrics?format=prometheus | head -40
+```
+
+The `metrics` policy:
+
+```hcl
+path "sys/metrics" {
+  capabilities = ["read", "list"]
+}
+```
+
+Granted to a dedicated metrics service token used by the lab's Prometheus / Alloy scrape job.
+
+### Key metrics
+
+| Metric | Why it matters |
+| --- | --- |
+| `vault_core_active` | Is this node the active (leader)? 1 = yes |
+| `vault_core_unsealed` | Is this node unsealed? 1 = yes |
+| `vault_runtime_num_goroutines` | Goroutine count — abnormal growth = bug |
+| `vault_runtime_alloc_bytes` | Heap allocated — should be stable |
+| `vault_raft_leader_lastContact` | How long since this node last heard from the leader (ms) |
+| `vault_raft_replication_appendentries_logs` | Raft replication rate |
+| `vault_secret_kv_count` | Total KV entries (after enable) |
+| `vault_token_create_count` | Token issuance rate (auth load) |
+| `vault_audit_log_request_failure` | Audit failures — should be zero |
+| `vault_consul_storage_*` | Should be zero (we use Raft, not Consul) |
+
+### Where they're scraped
+
+Planned: monitoring-0 VM (Prometheus + Alloy) scrapes each Vault voter through the `/v1/sys/metrics` endpoint with the metrics token. Currently not wired in production.
+
+## Raft autopilot
+
+Raft autopilot is Vault's automated cluster-health helper. Read its state:
+
+```bash
+vault operator raft autopilot state
+```
+
+Healthy output looks like:
+
+```
+Healthy:                         true
+Failure Tolerance:               1
+Voters:
+   ID            Address                                              Active      Healthy   Last Contact
+   vault-0       vault-0.sub.comptech-lab.com:8201                    true        true      0s
+   vault-1       vault-1.sub.comptech-lab.com:8201                    false       true      ...
+   vault-2       vault-2.sub.comptech-lab.com:8201                    false       true      ...
+```
+
+What to watch:
+
+- **`Healthy: true`** — cluster is fine. `false` means at least one voter is in trouble.
+- **`Failure Tolerance: 1`** — with three voters, the cluster survives one failure. If this drops to 0, the next voter loss takes the cluster down.
+- **`Last Contact`** — how recently each voter's heartbeat landed. Large gaps mean network or load issues.
+
+`vault operator raft list-peers` is the simpler view (just the voter list).
+
+## Health endpoint
+
+`/v1/sys/health` returns a small JSON with the node's seal state, version, replication mode, and active/standby status. Useful for cheap Blackbox probes:
+
+```bash
+curl -ks https://vault.sub.comptech-lab.com:8200/v1/sys/health
+# {"initialized":true,"sealed":false,"standby":false,"performance_standby":false,"replication_performance_mode":"disabled","replication_dr_mode":"disabled","server_time_utc":...,"version":"1.21.1","cluster_name":"...","cluster_id":"..."}
+```
+
+HTTP status codes:
+
+| Status | Means |
+| --- | --- |
+| 200 | Initialized, unsealed, active |
+| 429 | Standby (HA passive) |
+| 472 | DR replication secondary (not used in this lab) |
+| 473 | Performance standby (Enterprise; not used) |
+| 501 | Not initialized |
+| 503 | Sealed |
+
+Blackbox exporter probes should accept 200 *and* 429 (standby is a valid state).
+
+## Synthetic probe (planned)
+
+The lab plans a small synthetic check from the monitoring VM:
+
+1. Authenticate with a long-lived scoped token (`monitoring-readonly` policy).
+2. Read a known canary secret (`secret/apps/platform/monitoring-canary/dev/value`).
+3. Assert the value matches an expected fingerprint.
+4. Emit a Prometheus metric: `vault_synthetic_read_ok{path="..."}`.
+
+Failure of the synthetic check is the strongest signal — it catches not just "Vault is up" but "Vault can serve a real secret to a real reader."
+
+Currently the synthetic check is not deployed; it's on the monitoring backlog.
+
+## Alerting (planned)
+
+Each of the following should trigger an alert when it's wired:
+
+| Condition | Severity |
+| --- | --- |
+| Any voter sealed for > 1m | Critical |
+| `Healthy: false` from autopilot | Critical |
+| Failure Tolerance = 0 | Critical |
+| Last contact > 5s for any voter | Warning |
+| Audit log file growth stops | Warning (audit device broken) |
+| Snapshot job failure | Warning |
+| Cert expiry in < 14 days | Warning |
+| Goroutine count > 5x baseline | Warning |
+
+Alerts route to Alertmanager on monitoring-0 → notification channel (TBD).
+
+## Operator visual: the UI
+
+`https://vault.sub.comptech-lab.com:8200/ui/` is the official UI. Useful for:
+
+- Browsing the path tree (read-only operator use).
+- Token introspection (`vault token lookup` equivalent in the UI).
+- Re-running a UI auth flow against a specific mount.
+
+Not useful for:
+
+- Bulk operations.
+- Anything Git-able (use the CLI + GitOps).
+- Audit log review (the UI doesn't render the audit log; use the file).
+
+## Audit + ESO interaction
+
+When ESO syncs a secret, every read shows up in the audit log under the ESO SA's display name. Pattern:
+
+```
+"display_name": "kubernetes-spoke-dc-v6-app-eso"
+"path": "secret/data/apps/platform/eso-smoke/dev"
+```
+
+This means:
+
+- ESO churn (a flapping `ExternalSecret` re-reading the same secret in a loop) is visible in audit and metrics.
+- An accidental cross-tenant policy expansion shows up immediately as reads against unexpected paths.
+
+The audit log is the lab's main lever against silent policy drift.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Audit log grew to fill `/var/log` | Logrotate not running or misconfigured | Verify `systemctl status logrotate.timer`; run logrotate manually | Test logrotate on every install |
+| Audit log empty after enable | `vault audit enable` ran on a single voter; other voters need their own enable | Run `vault audit enable file ...` on every voter | Treat audit enable as a per-node operation (it is) |
+| Prometheus scrape returns 403 | Metrics token expired or revoked | Re-issue token with `metrics` policy | Long-lived metrics token + rotation runbook |
+| `Healthy: false` after a planned reboot | Voter still rejoining Raft after restart | Wait a minute; check `list-peers` | Don't alert on autopilot for the first 60s after a known restart |
+| Synthetic probe fails | Canary path doesn't exist, or canary secret was rotated without updating the probe | Re-seed canary, restart probe | Document canary value source-of-truth |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md` (production-readiness gates)
+- HashiCorp audit devices: <https://developer.hashicorp.com/vault/docs/audit>
+- HashiCorp Telemetry / Prometheus: <https://developer.hashicorp.com/vault/docs/internals/telemetry>
+- HashiCorp Raft Autopilot: <https://developer.hashicorp.com/vault/docs/concepts/integrated-storage/autopilot>

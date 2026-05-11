@@ -1,0 +1,164 @@
+---
+title: "Cloud-init base image: how new VMs join the fleet"
+description: "The Ubuntu 24.04 cloud-init base image, the user-data convention, and how a new platform VM goes from libvirt define to SSH-as-zahid in a few minutes."
+sidebar_label: "Cloud-init base image"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Every supporting VM in the lab — Vault, Jenkins, SigNoz, monitoring-0, Trivy, DefectDojo, docker-runtime, Kafka, Redis, WSO2, MinIO, Nexus, the DNS host, the HAProxy edge — was created from the same Ubuntu 24.04 cloud-init base image, with the same MAC/IP allocation pattern and the same SSH key set. This page documents that single shared build path so any new VM in this fleet starts from the same place.
+
+## What is in scope
+
+This section is about *non-OpenShift* VMs. OpenShift nodes use RHCOS, the Agent-based Installer, and a different bootstrap path entirely (Ignition, machine-config operator, etc.). That work lives in §6 "OpenShift platform" of the docs site.
+
+The VMs covered here all share four properties:
+
+1. They run **Ubuntu 24.04 LTS** as their guest OS.
+2. They live on the lab Linux bridge `br30` with **static addressing inside the lab `/16`**.
+3. They are bootstrapped from a single qcow2 base image plus a small per-VM cloud-init seed.
+4. They are administered through a single SSH user `ze` (and lab admin `zahid` where applicable per the service-specific ADR).
+
+## The base image
+
+| Item | Value |
+| --- | --- |
+| Path on each hypervisor | `/var/lib/libvirt/images/ubuntu-24.04-base.qcow2` |
+| OS | Ubuntu 24.04.4 LTS (`noble`) |
+| Kernel | 6.8.x |
+| QEMU agent | Installed |
+| Default user | `ubuntu` (replaced at first boot by cloud-init) |
+| Initial size | small (resized at clone time, typically to `100G` OS + a data disk) |
+| Image lineage | Built from the upstream Ubuntu cloud image |
+
+It is a *generic* cloud-image qcow2 — no lab-specific provisioning is baked in. Lab-specific bootstrap (package install, user creation, firewall, service install) is done by cloud-init at first boot of each cloned VM. This keeps the base image swappable when Ubuntu issues a new image; the cloud-init layer is where the per-VM truth lives.
+
+## VM creation flow (one diagram's worth of words)
+
+For any new VM (`<vm>`):
+
+1. **Allocate** an IP and MAC by editing `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`. The deterministic MAC convention is `52:54:00:30:30:<last-octet-of-IP-in-hex>` — e.g., a `.32` IP gets MAC `52:54:00:30:30:32`. This makes the allocation table greppable.
+2. **Clone the base qcow2** onto the chosen hypervisor: `cp /var/lib/libvirt/images/ubuntu-24.04-base.qcow2 /var/lib/libvirt/images/<vm>.qcow2`, then `qemu-img resize` it to the per-VM OS disk size (typically `100G`).
+3. **Create a data disk** if the role needs one (Jenkins home, Docker data dir, Vault raft path, MinIO buckets, ClickHouse storage, Loki/Tempo storage…). Mount it at the service's expected path during cloud-init.
+4. **Render cloud-init** for the VM — `user-data`, `meta-data`, `network-config` — and seed an ISO with `cloud-localds` or attach a `noCloud` datasource via libvirt.
+5. **`virsh define` + `virsh start`** with the deterministic MAC pinned to the `br30` interface.
+6. **Wait** for cloud-init to finish (`cloud-init status --wait` over the serial console or once SSH is up).
+7. **DNS records** are applied through the PowerDNS API for the private FQDN (and the `*.apps.sub.comptech-lab.com` edge name if it gets an HAProxy route).
+8. **HAProxy** gets an updated backend block if the VM is publicly addressable.
+9. **Apply the service-specific provisioning** (Jenkins LTS apt repo, Docker Engine + Compose, Vault binary checksum-verify, MinIO server, …) — this can be folded into cloud-init `runcmd` or done as a follow-up role.
+
+## The cloud-init shape
+
+The user-data uses the standard cloud-init schema. The minimal set the lab uses for every new VM:
+
+```yaml
+#cloud-config
+hostname: <vm>
+fqdn: <vm>.sub.comptech-lab.com
+manage_etc_hosts: true
+
+users:
+  - name: ze
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... ze@workstation
+      - ssh-ed25519 AAAA... ze@mac-laptop
+      - ssh-ed25519 AAAA... ocp-bootstrap
+
+ssh_pwauth: false
+disable_root: true
+
+write_files:
+  - path: /etc/systemd/resolved.conf.d/lab-dns.conf
+    content: |
+      [Resolve]
+      DNS=<lab-dns-recursor-ip>
+      Domains=~sub.comptech-lab.com
+      DNSSEC=no
+
+packages:
+  - qemu-guest-agent
+  - htop
+  - jq
+
+runcmd:
+  - [ systemctl, enable, --now, qemu-guest-agent ]
+  - [ systemctl, restart, systemd-resolved ]
+```
+
+Then per role, the runcmd extends:
+
+- **Jenkins**: add LTS apt repo, install OpenJDK 21, install Jenkins, mount `/var/lib/jenkins` data disk.
+- **SigNoz**: install Docker Engine + Compose, clone the SigNoz repo at the pinned tag, mount `/var/lib/docker` data disk, `docker compose up -d`.
+- **monitoring-0**: install Grafana, Prometheus, Alertmanager, Loki, Tempo, Pyroscope, Alloy, Node Exporter as native systemd services.
+- **Vault VMs**: download Vault `1.21.1` from HashiCorp's release archive, checksum-verify, place under `/usr/local/bin/vault`, install the dedicated `vault` user, render `/etc/vault.d/vault.hcl` for the role (Raft voter vs transit-seal), enable `vault.service`.
+- **MinIO**: install the `minio` binary, mount the data disk at `/srv/minio`, render the systemd unit, start.
+
+The exact `runcmd` lists for each role live in the corresponding `plans/disconnected-rebuild/environments/dc-lab/*-vm-plan.md` files.
+
+## SSH and identity
+
+There is exactly one SSH user across the fleet: `ze`. Two laptop keys plus the `ocp-bootstrap` host key are pre-authorized via cloud-init. Root login is disabled, password auth is disabled, and `sudo NOPASSWD` is configured so the `ze` user can run privileged commands without prompts (this is a single-operator lab; `sudo`-with-password would only slow recovery work).
+
+Service-specific app admin usernames (`zahid` on Jenkins, `zahid` on Grafana, `zahid` on SigNoz, `zahid` on DefectDojo) are a separate identity — they live inside the application, not in the OS. Their passwords are kept in **local-only ignored** files under `codex-opp-agent/secrets/<service>/`.
+
+## What cloud-init never does
+
+| Concern | Why not |
+| --- | --- |
+| Write secret values | Cloud-init logs are visible to anyone who can read `/var/log/cloud-init-output.log`. Any secret needed at first boot is pulled from Vault later, not seeded from user-data. |
+| Open broad ingress firewalls | Per-VM firewall rules are role-specific; cloud-init sets only the SSH allowlist. Vault opens `8200/tcp` only to approved clients via its own role; Jenkins opens `8080/tcp` only to the HAProxy private address; MinIO opens `9000/tcp` similarly. |
+| Hardcode lab DNS into `/etc/hosts` | The recursor on the DNS VM is the single source of truth. The only host-level override is for VMs that need to resolve `localhost` to their own service. |
+| Install GUI / desktop packages | Every VM is headless; serial console + SSH only. |
+
+## Hypervisor side: `br30` and libvirt
+
+The Linux bridge `br30` is the lab's data-plane bridge. Every cloud-init VM gets exactly one NIC on this bridge with a deterministic MAC. The bridge itself is configured outside cloud-init (in the hypervisor host's netplan); libvirt sees it as a `bridge`-type network.
+
+A typical libvirt domain XML excerpt:
+
+```xml
+<interface type='bridge'>
+  <mac address='52:54:00:30:30:32'/>
+  <source bridge='br30'/>
+  <model type='virtio'/>
+</interface>
+```
+
+There is no NAT, no DHCP from libvirt — VM addresses are static and assigned by cloud-init's `network-config`. The lab `/16` gateway address is the upstream router; the lab DNS recursor address is the only resolver every VM points at.
+
+## Verifying a new VM came up clean
+
+```bash
+# from the hypervisor, after `virsh start`
+virsh console <vm>               # watch cloud-init complete
+virsh domiflist <vm>             # confirm the pinned MAC matches the allocation table
+
+# from any lab VM, after DNS records are in place
+dig @<lab-dns-recursor-ip> <vm>.sub.comptech-lab.com A +short
+ssh ze@<vm>.sub.comptech-lab.com 'hostname && uname -r && cloud-init status'
+```
+
+Expected: `cloud-init status` returns `status: done`. If it returns `running` for longer than a minute or two on a freshly cloned image, check `/var/log/cloud-init-output.log` for a stalled `runcmd`.
+
+## Cloud-init history workspace (read-only)
+
+There is a historical `/home/ze/cloud-init/` workspace on the operator workstation that holds older `ip-allocations.yaml`, retired VM specs, and pre-rebuild material. Per the operator workspace boundary memory, that path is **read-only scrap** — useful for archeology, never for new work. New VM allocations go into `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`, full stop.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `virsh start` succeeds but no IP on `br30` | Wrong bridge name or `network-config` typo in cloud-init | Re-render network-config, regenerate the seed ISO, `virsh destroy`+`start` | Always copy `network-config` from a known-good VM of the same role |
+| Cloud-init stuck at `running` for 10+ minutes | `runcmd` step pulling from an upstream that the lab can't reach without the local mirror | Console in, kill the stuck command, fix the run line to use the local mirror/proxy | Don't pull upstream apt or container content in cloud-init when local equivalents exist; pin to local mirrors for non-trivial packages |
+| Two VMs answer on the same IP | Allocation table not updated before `virsh start`; or someone reused a retired allocation | `virsh destroy` the duplicate; reconcile the allocation table | `ping` the planned address and `virsh domiflist | grep <mac>` across all hypervisors before defining a new VM |
+| SSH login refuses key | cloud-init wrote authorized_keys with a different user OR `/etc/ssh/sshd_config` was tightened after first boot | Console in as `ubuntu`/`ze`, fix the keyfile, restart `sshd` | Standardize on `ze` user in every cloud-init template; review sshd_config drift |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/*-vm-plan.md` (Vault, Jenkins, SigNoz, monitoring, Trivy, DefectDojo, Docker runtime, Kafka, Redis, WSO2)
+- ADRs 0009 (Jenkins VM), 0010 (SigNoz VM), 0012 (monitoring VM), 0013 (DefectDojo VM)
+- Memory: `reference_lab_infrastructure.md`, `feedback_workspace_boundary.md`

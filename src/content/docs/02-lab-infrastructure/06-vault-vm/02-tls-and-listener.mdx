@@ -1,0 +1,158 @@
+---
+title: "TLS and listener configuration"
+description: "The Vault listener configuration on each VM, certs sourced from the offline lab CA, and the cluster-internal Raft listener at :8201."
+sidebar_label: "TLS and listener"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Vault speaks TLS on both its client-facing port (`:8200`) and its peer-to-peer Raft port (`:8201`). This page documents the listener configuration, how TLS material is sourced, and the gotchas.
+
+## The listener block
+
+The full listener stanza on each Vault voter:
+
+```hcl
+listener "tcp" {
+  address          = "0.0.0.0:8200"
+  cluster_address  = "0.0.0.0:8201"
+  tls_cert_file    = "/etc/vault.d/tls/vault.crt"
+  tls_key_file     = "/etc/vault.d/tls/vault.key"
+  tls_min_version  = "tls12"
+  tls_prefer_server_cipher_suites = true
+}
+
+api_addr     = "https://<this-node-fqdn>:8200"
+cluster_addr = "https://<this-node-fqdn>:8201"
+
+storage "raft" {
+  path    = "/var/lib/vault/raft"
+  node_id = "<this-node>"
+}
+
+ui            = true
+disable_mlock = true
+```
+
+Annotated:
+
+- **`address = 0.0.0.0:8200`** — the client-facing port, every NIC. Firewall narrows the real reachability.
+- **`cluster_address = 0.0.0.0:8201`** — the Raft port for inter-node traffic. Same address binding; different port.
+- **`tls_cert_file` / `tls_key_file`** — point at PEM files under `/etc/vault.d/tls/`. The cert covers both `vault-<n>.sub.comptech-lab.com` and `vault.sub.comptech-lab.com` so the DNS RR endpoint resolves to a valid SAN regardless of which voter answers.
+- **`tls_min_version = "tls12"`** — TLS 1.0/1.1 rejected.
+- **`api_addr` / `cluster_addr`** — per-node FQDNs. HA redirects to active node use `api_addr`; Raft peer connections use `cluster_addr`.
+- **`ui = true`** — the web UI on `https://vault.sub.comptech-lab.com:8200/ui/`.
+- **`disable_mlock = true`** — set per HashiCorp's production-hardening guide for systems where mlock isn't appropriate (typically because swap is disabled instead). The lab disables swap as part of its hardening baseline.
+
+## Certificates
+
+The Vault TLS material is issued from the **lab offline OpenSSL CA/intermediate**, not from Let's Encrypt. Reasons:
+
+- Vault clients (ESO inside OpenShift, operator CLI, snapshot jobs) all run inside the lab. Lab-private trust is fine.
+- `vault.sub.comptech-lab.com` is a private DNS RR name — public CAs won't issue for it.
+- Including the per-voter FQDNs *and* the round-robin name in a single SAN list is straightforward with the lab CA; with Let's Encrypt it would mean multi-step provisioning per voter.
+
+The certificate Subject Alternative Names look like:
+
+```
+DNS: vault-<n>.sub.comptech-lab.com
+DNS: vault.sub.comptech-lab.com
+IP:  <node-ip>
+```
+
+Generated via `openssl x509 -req` against the lab intermediate. The CA bundle that clients trust (ESO `caBundle`, operator CLI `VAULT_CACERT`) is the lab intermediate's chain.
+
+## File layout
+
+```
+/etc/vault.d/
+  vault.hcl                          # main config
+  tls/
+    vault.crt                        # cert + intermediate (chain)
+    vault.key                        # private key (root-readable only)
+    ca.crt                           # lab CA cert (for client trust verification)
+```
+
+Permissions:
+
+```bash
+chown -R root:vault /etc/vault.d/tls
+chmod 0750 /etc/vault.d/tls
+chmod 0640 /etc/vault.d/tls/vault.crt /etc/vault.d/tls/ca.crt
+chmod 0600 /etc/vault.d/tls/vault.key
+```
+
+`vault.crt` is the leaf + intermediate concatenated (the chain Vault should present to clients). `ca.crt` is the root of trust for clients to verify *against*; Vault itself reads it for `tls_client_ca_file` if mutual TLS were enabled (it isn't, currently).
+
+## Renewal
+
+Lab CA certs are long-lived (~2 years on the intermediate; ~10 years on the root). Vault leaf certs are typically 12-month with manual renewal. The renewal procedure:
+
+1. Generate a new CSR on each voter (or one CSR with the multiple SANs and copy).
+2. Sign with the lab intermediate.
+3. Copy the new leaf + chain to `/etc/vault.d/tls/vault.crt`.
+4. `systemctl reload vault` — Vault reloads the cert without dropping clients.
+
+`systemctl reload vault` re-reads the listener config including TLS material. There is no `vault reload` CLI; the signal goes via systemd.
+
+## Raft TLS (`:8201`)
+
+The cluster_address listener at `:8201` uses the same cert/key. Voter-to-voter communication is mutually authenticated by the cert (both ends present the lab CA-signed cert, both ends verify). No separate cluster-only cert.
+
+`cluster_address` defaults to `address` if not set, but explicitly setting it makes the config greppable.
+
+## Firewall
+
+Host firewall on each Vault VM (`ufw` or `iptables`):
+
+| Direction | Source | Dest | Port | Action |
+| --- | --- | --- | --- | --- |
+| in | lab `/16` clients + DNS RR consumers | this voter | `8200/tcp` | allow |
+| in | other Vault voters | this voter | `8201/tcp` | allow |
+| in | operator admin subnet | this voter | `22/tcp` (SSH) | allow |
+| in | * | * | * | deny |
+| out | * | * | * | allow (NOTE: tighten if compliance requires) |
+
+The `8201/tcp` restriction is the important one: cluster Raft traffic should only come from the other voter VMs. If a non-voter VM tries to open `:8201`, Vault won't accept it (the TLS auth would fail anyway), but the firewall is the first line.
+
+The `8200/tcp` source allowance is broad ("any lab client") because ESO from OpenShift, operator CLI from the workstation, and the snapshot job from a voter itself all hit `:8200`. A more granular firewall would split into "ESO source IPs" and "operator CIDR," but the lab currently treats the whole `/16` as trusted-enough for that port.
+
+## `disable_mlock = true` — why
+
+Vault's default behavior is to `mlock` its memory so secret material cannot be paged to swap. The lab disables swap entirely (per the VM hardening baseline), and the `mlock` call inside containers and certain hosts can fail; `disable_mlock = true` says "I've ensured swap is off by other means; don't try `mlock`." This is the recommended posture per HashiCorp's production-hardening guide when swap is already off.
+
+If swap were re-enabled on a Vault VM, `disable_mlock` would need to be `false` (the default) and `LimitMEMLOCK=infinity` set in the systemd unit. The lab does not do this.
+
+## What clients verify
+
+Clients (ESO, operator CLI, snapshot jobs) verify the Vault cert chain against the lab CA. Two ways:
+
+1. **`VAULT_CACERT=/path/to/lab-ca.crt`** at the CLI. Operator runbooks point this at the local CA copy.
+2. **`caBundle: <base64 lab CA>`** in ESO's `ClusterSecretStore` / `SecretStore`. The base64'd CA lives in `clusters/<cluster>/secrets/eso/clustersecretstore-vault.yaml` and is the same value across all ESO consumers.
+
+If `caBundle` is missing or wrong, ESO logs "x509: certificate signed by unknown authority" against the Vault sync. The fix is always "put the lab CA in the caBundle," never "set `tls_skip_verify`."
+
+## Mutual TLS (not in use)
+
+Vault supports mTLS — clients present a cert; Vault verifies via `tls_client_ca_file`. The lab does not enable this currently:
+
+- Auth is by Kubernetes ServiceAccount JWTs (for ESO) or by the operator's Vault token, not by client certs.
+- Adding mTLS would mean issuing client certs to every ESO operand and every operator. More work, not enough benefit for lab scale.
+
+If the lab tightens further (compliance regime requiring client cert auth at the transport layer too), `tls_client_ca_file = /etc/vault.d/tls/ca.crt` and `tls_require_and_verify_client_cert = true` would enable it.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| ESO reports `x509: certificate signed by unknown authority` | `caBundle` in `SecretStore` doesn't match the lab CA chain | Re-encode lab CA, update `caBundle`, re-sync | Maintain the `caBundle` in one place (`clustersecretstore-vault.yaml`); copy verbatim into tenant `SecretStore`s |
+| Operator CLI gets `tls: failed to verify` | `VAULT_CACERT` unset or pointing at wrong file | `export VAULT_CACERT=/path/to/lab-ca.crt` | Bake `VAULT_CACERT` into operator shell profile or wrapper script |
+| Voter can't join Raft | TLS on `:8201` mismatched between voters (e.g., one node has a stale leaf cert) | Re-distribute the leaf cert + restart on the failing voter | Renew certs as a fleet operation, not one voter at a time |
+| Client gets RR-rotated to a voter with an expired cert | One voter wasn't renewed; round-robin gives that voter periodically | Renew the lagging voter; client retries usually succeed | Monitor cert expiry across all voters with a Blackbox/exec probe |
+| TLS 1.3 client fails to connect | Cert is RSA but the lab is moving toward ECC — usually fine; some clients have stricter cipher preferences | Verify `openssl s_client -connect vault.sub.comptech-lab.com:8200` works from a known-good client | Test all clients (ESO, CLI, Jenkins, custom code) after any cert change |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md`
+- HashiCorp Vault listener docs: <https://developer.hashicorp.com/vault/docs/configuration/listener/tcp>
+- HashiCorp Vault production-hardening: <https://developer.hashicorp.com/vault/docs/concepts/production-hardening>

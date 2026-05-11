@@ -1,0 +1,210 @@
+---
+title: "libvirt and br30: the hypervisor side"
+description: "How the hypervisor hosts run libvirt+KVM, how the lab Linux bridge br30 carries the /16 data plane, and the conventions for storage pools, NICs, and domain definitions."
+sidebar_label: "libvirt and br30"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The cloud-init base image is half the story. The other half is what libvirt does with it: which bridge it attaches the VM to, where the disk lives, how the MAC gets pinned, and how the hypervisor host fits into the lab `/16`. This page is about the hypervisor-side conventions.
+
+## Hypervisor stack
+
+| Layer | Software |
+| --- | --- |
+| Host OS | Ubuntu 24.04 LTS |
+| Virtualization | KVM/QEMU (`/dev/kvm` from the host kernel) |
+| Management | libvirt (`libvirtd`) |
+| Networking | Linux bridge `br30` defined in host netplan; libvirt sees it as a `bridge`-type network |
+| Image format | qcow2, backed by the local filesystem (no shared storage for the platform VM fleet) |
+| Domain definition style | static XML defined via `virsh define <vm>.xml`; no `virt-install` magic in normal operations |
+
+Hypervisors are unremarkable Linux boxes. No vCenter, no oVirt, no Proxmox. Everything is `virsh` + cloud-init + a few shell scripts. This keeps the rebuild path simple: spin up Ubuntu, install libvirt, define `br30`, drop in the base qcow2 — the lab can be rehydrated on any KVM-capable host.
+
+## The `br30` bridge
+
+`br30` is a **Linux bridge**, not an OVS bridge, not a libvirt-managed virtual network. The host's physical NIC (or a VLAN sub-interface of it) is bridged into `br30`. Every VM NIC on `br30` lives directly on the lab `/16`; there is no NAT between VMs and the lab's L2.
+
+A typical host-side netplan stanza looks like:
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    eno1:
+      dhcp4: false
+      dhcp6: false
+  bridges:
+    br30:
+      interfaces: [eno1]
+      addresses: [<host-lab-ip>/16]
+      gateway4: <lab-gateway-ip>
+      nameservers:
+        addresses: [<lab-dns-recursor-ip>]
+        search: [sub.comptech-lab.com]
+      parameters:
+        stp: false
+        forward-delay: 0
+```
+
+`stp: false` and `forward-delay: 0` matter because there is exactly one bridge — there is no loop to avoid, and spanning tree on a single-bridge lab just adds startup latency.
+
+### What is on `br30`
+
+| Range | Use |
+| --- | --- |
+| lab `/16` | The whole lab data plane |
+| lab `/16` `.1` | Gateway (upstream router) |
+| platform `/24` (one zone of the `/16`) | Platform VM allocation zone — PDNS, HAProxy, Vault, MinIO, Nexus, Jenkins, GitLab, observability VMs, etc. |
+| OpenShift `/24` (separate zone of the `/16`) | Reserved for OpenShift node IPs and cluster VIPs (hub + spoke) |
+| Rest of the `/16` | Available for ad-hoc / future platform VMs |
+
+The two zones are convention, not enforced subnets — everything is still one `/16` L2 broadcast domain. The split keeps `dig`/`grep`/runbooks legible: any `.30.x` address is a platform VM, any `.75.x` address is OpenShift.
+
+IPv6 is intentionally **off** across the bridge (per ADR 0005 and ADR 0026's IPv6-baseline scoping note — IPv6 is enabled inside OVN-Kubernetes pod networks but not on the host bridge).
+
+## libvirt network definition for `br30`
+
+libvirt sees `br30` as a `bridge`-type network. A typical libvirt network XML:
+
+```xml
+<network>
+  <name>br30</name>
+  <forward mode='bridge'/>
+  <bridge name='br30'/>
+</network>
+```
+
+That is the whole definition. libvirt doesn't manage DHCP on this bridge (there is none — addresses are static via cloud-init). libvirt doesn't NAT (forward mode is `bridge`, not `nat`). All libvirt does is plumb each VM's tap device into the existing Linux bridge.
+
+`virsh net-list --all` should show `br30` `active` and `autostart yes` on every hypervisor that hosts platform VMs.
+
+## Domain XML conventions
+
+Each VM has its own XML file checked in to the operator's local workspace (not into Git; these contain MAC addresses and host paths). The conventions:
+
+```xml
+<domain type='kvm'>
+  <name><vm></name>
+  <memory unit='MiB'>16384</memory>
+  <vcpu>4</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='/var/lib/libvirt/images/<vm>.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='/var/lib/libvirt/images/<vm>-data.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/libvirt/images/<vm>-seed.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <interface type='bridge'>
+      <mac address='52:54:00:30:30:XX'/>
+      <source bridge='br30'/>
+      <model type='virtio'/>
+    </interface>
+
+    <serial type='pty'>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+  </devices>
+</domain>
+```
+
+Conventions to preserve:
+
+- **`q35` machine + virtio NIC/disk** — the modern x86 machine type. Don't use `pc-i440fx` for new VMs; you lose PCIe.
+- **`host-passthrough` CPU** — no need for live migration across heterogeneous hosts (no live migration in this lab), so passthrough gives the guest every CPU feature the host has.
+- **`discard='unmap'`** on every qcow2 disk — lets the guest reclaim space inside its filesystem and have it return to the host's underlying filesystem.
+- **virtio everywhere** for disk and NIC; SATA only for the cloud-init seed CD-ROM.
+- **Serial console enabled** — `virsh console <vm>` is the recovery channel when SSH is broken. Cloud-init's `output: { all: ">> /dev/console" }` setting in the base image prints all first-boot work to the serial console so you can see what's happening.
+- **QEMU guest agent channel** — pairs with `qemu-guest-agent` installed by cloud-init. Lets the host gather guest IP info, trigger graceful shutdowns, freeze filesystems for snapshots.
+
+## Storage pool layout
+
+Single hypervisor, single storage pool, single directory:
+
+| Path | Contents |
+| --- | --- |
+| `/var/lib/libvirt/images/` | Base qcow2, per-VM qcow2 disks, per-VM seed ISOs |
+| `/var/lib/libvirt/dnsmasq/` | unused (no libvirt DHCP) |
+| `/var/log/libvirt/qemu/<vm>.log` | Per-VM stderr/console log |
+
+There is no shared storage. Each hypervisor holds the disks for the VMs it runs. The trade-off is no live migration; the upside is no shared-storage SPOF for the platform fleet. (OpenShift's ODF on the workload cluster is a separate story — that is cluster storage, not VM storage.)
+
+Backup strategy for the platform VMs themselves is *not* qcow2 snapshots — it is in-application:
+
+- Vault: encrypted Raft snapshots to MinIO (`vault operator raft snapshot save`).
+- Jenkins: `JENKINS_HOME` tar to MinIO.
+- GitLab: GitLab's own backup tool + Object backups to MinIO.
+- MinIO: bucket replication / `mc mirror` to an offline copy.
+- DefectDojo, SigNoz: docker compose state + database dumps.
+
+The qcow2 disks themselves are treated as cattle. Lose a hypervisor, rebuild from the base image + the application backups; don't try to restore the qcow2.
+
+## Why not a libvirt-managed virtual network
+
+libvirt has its own NAT-mode virtual network (`default`, `192.168.122.0/24`). It is fine for laptops; it is wrong for a lab. Reasons:
+
+- Lab DNS, lab DHCP, lab firewalling all live one level up (on the lab router and the DNS VM). Letting libvirt NAT inside the host would introduce a second layer of address translation and a second DHCP domain.
+- VMs on a NATed virtual network can't reach each other across hypervisors except through the host. Multi-hypervisor service clusters (Vault Raft, Kafka KRaft, Redis Sentinel) would have to traverse host NAT.
+- The HAProxy edge expects to reach platform-`/24` VMs directly; routing through libvirt's NAT `/24` would break the SNI-passthrough pattern.
+
+A single Linux bridge with static addressing is the right primitive for this scale.
+
+## Adding a hypervisor
+
+When a new hypervisor host comes online:
+
+1. **Install Ubuntu 24.04** and the standard packages: `qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst genisoimage cloud-image-utils`.
+2. **Configure `br30`** in host netplan as shown above. Restart networking; confirm the host has its lab IP on `br30`.
+3. **Drop the base image** into `/var/lib/libvirt/images/ubuntu-24.04-base.qcow2`.
+4. **Define the libvirt network**: `virsh net-define <br30.xml>`, `virsh net-autostart br30`, `virsh net-start br30`.
+5. **Define and start the first VM** to confirm cloud-init reaches the lab resolver and pulls its packages from the local mirrors.
+
+`virsh capabilities` and `virsh nodeinfo` are the read-only sanity checks before defining anything.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| New VM has no network, no IP, but the bridge is up | libvirt domain XML pointed at `default` (NAT) instead of `br30` | Edit the `<interface>` block, redefine the domain, destroy/start | Copy a known-good domain XML from a sibling VM rather than letting `virt-install` invent one |
+| VM lives but can't resolve any name | `network-config` in cloud-init seeded the wrong DNS, or the lab resolver IP is wrong | SSH in via the host bridge IP, fix `/etc/systemd/resolved.conf.d/lab-dns.conf`, restart `systemd-resolved` | Always use the lab recursor (the DNS VM's `.53` address), never the authoritative `.0` |
+| Two hypervisors run a VM with the same MAC | Allocation table not consulted; deterministic MAC reused | `virsh destroy` the duplicate, regenerate seed with a new MAC if needed, update allocation table | One-line `grep <mac>` of the allocation table before every new VM define |
+| Disk performance unexpectedly poor | qcow2 with `cache='writethrough'` set, or no `discard='unmap'` | Switch to `cache='none'` or default, add `discard='unmap'` | Stick to the conventions above for every new domain XML |
+| `virsh console` shows garbled output during cloud-init | Base image lacks `console=ttyS0` in the kernel cmdline | Boot the VM once, edit `/etc/default/grub`, re-run `update-grub`, reboot | Bake `console=ttyS0,115200` into the base image lineage |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
+- ADRs 0005 (rebuild network/ingress/PKI), 0026 (IPv6 baseline for OVN-Kubernetes — clarifies that IPv6 is enabled inside OpenShift pods, not on host bridges)
+- Memory: `reference_lab_infrastructure.md`

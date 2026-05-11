@@ -1,0 +1,185 @@
+---
+title: "Auth methods and policies"
+description: "How clients authenticate to Vault — Kubernetes auth mount per OpenShift cluster, operator tokens, snapshot-job tokens — and the policy shape that scopes each role."
+sidebar_label: "Auth methods and policies"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers how clients become authenticated to Vault: the Kubernetes auth mounts (per OpenShift cluster), the operator token model, and the policies that scope what each authenticated role can do.
+
+## The cast of clients
+
+| Client | How it auths | Token TTL | Policy |
+| --- | --- | --- | --- |
+| ESO platform store (per cluster) | Kubernetes auth, role `<cluster>-eso` | 1h (renewable to 4h) | `ocp-<cluster>-eso` (platform-scoped) |
+| ESO tenant store (per tenant) | Kubernetes auth, role `apps-<cluster>-<division>` | 1h (renewable to 4h) | `apps-<division>-read` (division-scoped) |
+| Operator CLI | Vault token or `vault login` user/pass | per operator | `admin` or `operator-readonly` |
+| Vault snapshot job (on a voter) | Vault token, scoped | per job | `snapshot-readonly` |
+| Future Jenkins/Tekton | Approle or Kubernetes auth, depending on the build path | per use | per-job |
+
+## Kubernetes auth mounts
+
+Vault has one Kubernetes auth mount **per OpenShift cluster**:
+
+| Mount path | Cluster |
+| --- | --- |
+| `auth/kubernetes-hub-dc-v6/` | `hub-dc-v6` |
+| `auth/kubernetes-spoke-dc-v6/` | `spoke-dc-v6` |
+
+Each mount is configured with that cluster's API endpoint and TokenReview reviewer credential:
+
+```bash
+vault write auth/kubernetes-spoke-dc-v6/config \
+  kubernetes_host="https://api.spoke-dc-v6.sub.comptech-lab.com:6443" \
+  kubernetes_ca_cert=@/path/to/spoke-cluster-api-ca.crt \
+  token_reviewer_jwt=@/path/to/spoke-tokenreview-jwt
+```
+
+When ESO sends a ServiceAccount JWT to Vault, Vault calls back to that cluster's API server (`TokenReview` endpoint) to verify the JWT is current and not revoked. The cluster's TokenReview reviewer credential is itself a long-lived JWT for a ServiceAccount with `auth/tokenreview` permission on the cluster side.
+
+Per-cluster mount means:
+
+- A JWT issued by the hub cluster cannot be used to auth against the spoke's role list (different mount path).
+- TokenReview goes to the correct cluster — no cross-cluster JWT validation drama.
+
+## Role naming convention
+
+Inside each Kubernetes auth mount, roles bind ServiceAccount names+namespaces to Vault policies:
+
+| Role pattern | What it does |
+| --- | --- |
+| `<cluster>-eso` | Platform-scoped ESO role. Binds the platform ESO controller's ServiceAccount. Reads `ocp/platform/*` and `ocp/<cluster>/*`. |
+| `apps-<cluster>-<division>` | Tenant-scoped ESO role. Binds `app-eso` SA in any namespace matching `apps-<division>-*`. Reads only `apps/<division>/*`. |
+
+Example role bindings:
+
+```json
+# Tenant role for the "platform" division on the spoke
+{
+  "bound_service_account_names":      ["app-eso"],
+  "bound_service_account_namespaces": ["apps-platform-*"],
+  "token_policies":                   ["apps-platform-read"],
+  "token_ttl":                        "1h",
+  "token_max_ttl":                    "4h",
+  "audience":                         "vault"
+}
+```
+
+Notes:
+
+- `bound_service_account_names` lists the SA names that may use this role. Always `app-eso` for tenant stores; the platform store uses a different SA (`external-secrets-operator-controller-manager`).
+- `bound_service_account_namespaces` is a list of namespace globs. `apps-platform-*` matches `apps-platform-sample`, `apps-platform-readiness-probe`, etc.
+- `token_ttl` / `token_max_ttl` cap how long the issued Vault token can live before re-auth. ESO re-auths frequently; 1h/4h is plenty.
+- `audience: vault` makes ESO request a JWT specifically intended for Vault, not for the cluster API server.
+
+The convention is documented in `codex-opp-agent/connection-details/vault-app-secrets.md` and `vault-oss-vm-plan.md`.
+
+## Platform vs tenant policy
+
+### Platform policy (`ocp-<cluster>-eso`)
+
+The platform ESO controller, running cluster-wide, reads platform secrets (operator credentials, registry pull secrets, image-mirror credentials, htpasswd hashes). Its policy lets it read **shared** paths:
+
+```hcl
+path "secret/data/ocp/platform/*" {
+  capabilities = ["read"]
+}
+path "secret/data/ocp/<cluster>/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/ocp/platform/*" {
+  capabilities = ["list", "read"]
+}
+path "secret/metadata/ocp/<cluster>/*" {
+  capabilities = ["list", "read"]
+}
+```
+
+This is a relatively privileged policy (it reads platform-wide secrets) but it's namespaced under `ocp/` and never touches `apps/`.
+
+### Tenant policy (`apps-<division>-read`)
+
+Per-division. Read-only, scoped to that division's path subtree:
+
+```hcl
+path "secret/data/apps/<division>/*" {
+  capabilities = ["read"]
+}
+path "secret/metadata/apps/<division>/*" {
+  capabilities = ["list", "read"]
+}
+```
+
+One policy per division (`apps-platform-read`, `apps-payments-read`, `apps-retail-read`, …), shared across clusters (no cluster name in the policy name — the role pins which cluster + namespace glob may use the policy).
+
+This means:
+
+- A division's apps in any cluster see the same Vault paths.
+- A division's apps cannot read another division's paths (no glob covers `apps/<other>/*`).
+- A platform ESO controller cannot read tenant paths (no path under `apps/` in its policy).
+
+The boundary is enforced by *policy*, not by mount or namespace — Vault OSS has no namespaces feature, so strict path prefixes carry the segmentation.
+
+## Operator auth
+
+Operators authenticate with a Vault token at the CLI:
+
+```bash
+export VAULT_ADDR=https://vault.sub.comptech-lab.com:8200
+export VAULT_CACERT=/path/to/lab-ca.crt
+vault login -method=token token="$VAULT_TOKEN"
+vault token lookup    # confirm policies attached
+```
+
+Or with user/pass (`vault login -method=userpass username=zahid`) if the userpass auth backend is enabled (it is, for break-glass).
+
+Operator policies:
+
+- **`admin`** — full root-equivalent policy for the small set of human operators. Used to onboard divisions, create roles, manage policies.
+- **`operator-readonly`** — read-only across `secret/metadata/*`. Useful for inventory ("what paths exist?") without reading values.
+
+## Snapshot job auth
+
+The Vault Raft snapshot job runs on one of the voters. It uses a **scoped token** with the smallest possible policy:
+
+```hcl
+path "sys/storage/raft/snapshot" {
+  capabilities = ["read"]
+}
+```
+
+That's it. The token can take snapshots and nothing else. It's stored in local-only ignored custody on the voter VM (`/etc/vault.d/snapshot-token`, root-readable), and the snapshot job's systemd timer mounts it as an env var.
+
+Token rotation: when the operator-driven rotation cadence rolls around, generate a new scoped token (`vault token create -policy=snapshot-readonly -ttl=8760h`), drop it in custody, restart the timer.
+
+## What does *not* run as root
+
+Snapshot jobs, ESO syncs, every operand: none of them ever uses a Vault root token. Root is reserved for:
+
+- Initial cluster setup (init, first unseal).
+- Policy or role changes during operator runbooks.
+- Recovery from `vault operator init` if Vault is being rebuilt.
+
+Root tokens are kept in offline custody. Out-of-band rotation per the operator's runbook.
+
+## Audit on auth
+
+Every successful or failed auth attempt is logged by the audit device (covered in detail on the monitoring + audit page). The audit log records `auth/kubernetes-<cluster>/login` calls, which role was used, which SA was the subject, and the resulting policy set. This is the trail for "which operand read which secret when."
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| ESO sync fails with `permission denied` on a path | Role's policy doesn't grant `read` on that path | Update the policy to cover the path, or move the secret under a path the existing policy covers | One policy per division; new paths under the existing prefix |
+| ESO sync fails with `403` from Vault Kubernetes auth | TokenReview reviewer credential for that cluster is expired | Re-issue the reviewer JWT, update the auth mount config | Long-lived reviewer JWTs; rotate explicitly with a runbook |
+| Operator gets `policy "admin" not found` | `admin` policy was renamed or deleted | Re-create the policy; review what changed | Treat policy edits like GitOps changes; reviewers required |
+| Tenant SA in `apps-payments-foo` can read `apps/platform/*` | Role's namespace glob is too broad (e.g., `apps-*` instead of `apps-payments-*`) | Tighten `bound_service_account_namespaces` | Always include the division name in the namespace glob |
+| Cross-cluster token reuse | A spoke-issued JWT was offered to the hub auth mount and accepted | This would only succeed if the mount config was wrong; verify `kubernetes_host` matches the cluster API | Audit the auth mounts after every cluster install |
+
+## References
+
+- `codex-opp-agent/connection-details/vault-app-secrets.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md`
+- HashiCorp Vault Kubernetes auth: <https://developer.hashicorp.com/vault/docs/auth/kubernetes>
+- HashiCorp Vault policies: <https://developer.hashicorp.com/vault/docs/concepts/policies>

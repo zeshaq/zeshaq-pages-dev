@@ -1,0 +1,215 @@
+---
+title: "Rotation and disaster recovery"
+description: "Raft snapshots to MinIO, isolated restore drills, lost-node replacement, root token rotation, and the lab's open work on backup/restore validation."
+sidebar_label: "Rotation and DR"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Vault on three Raft voters tolerates the loss of one voter without downtime. Beyond that — loss of two voters, loss of the seal Vault, full lab rebuild — recovery depends on snapshots, custody of unseal shares, and a tested restore drill. This page covers the procedures.
+
+## Snapshot cadence and target
+
+Vault's integrated Raft storage exports a point-in-time snapshot via:
+
+```bash
+vault operator raft snapshot save <file>
+```
+
+The snapshot is a single tar.gz with the entire Raft state at the moment of capture. Encryption and storage in MinIO are layered on top.
+
+### The snapshot job
+
+A small systemd timer + script on one of the voters runs the snapshot once daily (and on demand):
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+VAULT_TOKEN="$(cat /etc/vault.d/snapshot-token)"
+export VAULT_TOKEN
+export VAULT_ADDR=https://127.0.0.1:8200
+export VAULT_CACERT=/etc/vault.d/tls/ca.crt
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+OUT="$TMP/raft-$(date -u +%Y%m%d-%H%M%S).snap"
+vault operator raft snapshot save "$OUT"
+
+# Verify the snapshot is a valid tarball
+file "$OUT" | grep -q 'gzip compressed data'
+
+# Upload to MinIO
+mc cp "$OUT" lab/vault-snapshots/
+
+# Local copy retention (operator decides)
+cp "$OUT" /var/lib/vault-snapshots/local/
+find /var/lib/vault-snapshots/local/ -mtime +14 -delete
+```
+
+Two retention layers:
+
+- **MinIO `vault-snapshots/`** — long-term archive, operator-managed.
+- **Local `/var/lib/vault-snapshots/local/`** — last 14 days, useful for quick rollback without an S3 round-trip.
+
+The snapshot token is **scoped** (`snapshot-readonly` policy — read on `sys/storage/raft/snapshot` and nothing else). Never use a root token here.
+
+### Cadence
+
+| What | When |
+| --- | --- |
+| Scheduled snapshot | Once per day via systemd timer |
+| Manual snapshot | Before any potentially destructive operation (policy bulk edit, mount move, upgrade) |
+| Pre-upgrade snapshot | First step of any Vault binary upgrade |
+
+## Restore drill
+
+The restore drill validates that a snapshot is actually usable. **Required before Vault is treated as production-trusted** per the readiness gates in `vault-oss-vm-plan.md`.
+
+### Steps
+
+1. **Spin up an isolated Vault VM.** A fresh Ubuntu with Vault 1.21.1 installed but uninitialized. Different network segment from production — restore must not interfere with the live cluster.
+
+2. **Initialize it** with the same seal strategy as production (`vault operator init` against a stand-in transit-seal). Save the new init output to scratch custody.
+
+3. **Pull a recent snapshot** from MinIO:
+
+   ```bash
+   mc cp lab/vault-snapshots/<recent>.snap /tmp/raft.snap
+   ```
+
+4. **Restore:**
+
+   ```bash
+   export VAULT_TOKEN=<scratch-root-token>
+   vault operator raft snapshot restore -force /tmp/raft.snap
+   ```
+
+5. **Re-seal cycle.** The restored Vault will be sealed (the restored Raft includes the seal config but the local node hasn't been keyed up). Provide the unseal material (this is what makes the drill realistic — restore depends on having the unseal flow).
+
+6. **Verify:**
+
+   ```bash
+   vault status
+   vault auth list
+   vault secrets list
+   vault kv get secret/apps/<known-test>/dev/hello
+   ```
+
+7. **Destroy the drill VM.** Don't leave it running.
+
+The drill *cannot* skip the seal step. If you can't perform the unseal flow, you cannot restore from backup — that's the whole point of the seal strategy.
+
+### Current state
+
+The drill is **not yet performed** at v6 generation. It is one of the open gates in `vault-oss-vm-plan.md`. Tracked under the relevant Vault readiness issue.
+
+## Lost-node replacement
+
+If one Raft voter dies (VM gone, disk gone, both):
+
+1. **Capture the current state** — `vault operator raft list-peers` confirms which two voters are still up.
+2. **Bring up a new VM** with the same name + IP + MAC as the dead one (`vault-1`, say).
+3. **Restore the Vault binary, config, and TLS material.** Same as initial install.
+4. **Wipe `/var/lib/vault/raft`** if any state survived (you want a clean voter).
+5. **Start `vault.service`.** The voter will be sealed.
+6. **Auto-unseal will fire** if the seal Vault is up and the voter can reach it.
+7. **Join the cluster:**
+
+   ```bash
+   vault operator raft join https://vault-0.sub.comptech-lab.com:8200
+   ```
+
+8. **Verify:**
+
+   ```bash
+   vault operator raft list-peers     # should show three voters again
+   vault operator raft autopilot state # should report Healthy
+   ```
+
+The cluster's Raft autopilot will absorb the new voter automatically once it joins.
+
+## Lost seal Vault (`vault-seal-0`)
+
+The seal Vault is single-node Shamir 5/3. Losing it has two consequences:
+
+1. **Existing voters keep running** as long as none of them restart. Auto-unseal is only needed at startup.
+2. **A restarted voter cannot unseal** until `vault-seal-0` is back.
+
+Recovery options:
+
+- **Rebuild from a `vault-seal-0` snapshot.** The seal Vault also takes Raft snapshots (it's a single-node Raft cluster). Restore the snapshot to a fresh VM and unseal with the existing Shamir shares.
+- **Re-key the seal Vault.** If snapshots are gone too, the seal Vault has to be re-initialized. The main Vault's sealed root key was encrypted by the *old* seal transit key; without that key, the main Vault's data is undecryptable. The only recovery in that case is restoring the main Vault from a snapshot using a freshly initialized seal Vault (which means re-keying), which means the unseal flow re-keys too.
+
+This is why the seal Vault's Shamir shares are kept in **offline custody, separated from the main Vault VMs**. If both the seal Vault and the main Vault data are lost, the offline shares are the last line.
+
+## Total loss recovery
+
+Worst case: all VMs gone, all qcow2 disks gone. Recovery sequence:
+
+1. **Rebuild the hypervisors and lab base infrastructure** (DNS, network, MinIO).
+2. **Bring up a fresh `vault-seal-0`.** Initialize with Shamir using the saved offline shares. Unseal.
+3. **Bring up `vault-0`, `vault-1`, `vault-2`** with their seal config pointing at the new (re-initialized) seal Vault.
+4. **Wait — the main Vault is sealed and has no data.** That's fine.
+5. **Use the saved root token from the last init** to log in. (Root tokens persist across the seal flow.)
+6. **Restore from the most recent main-Vault snapshot:**
+
+   ```bash
+   vault operator raft snapshot restore -force /path/to/raft.snap
+   ```
+
+7. **The restored data includes the auth mounts, policies, KV-v2 contents.** ESO can reconnect.
+
+This sequence is documented but not drilled. The first real drill is overdue (per the production-readiness gate).
+
+## Rotation: root token, unseal shares, snapshot token
+
+| Asset | Cadence | Procedure |
+| --- | --- | --- |
+| Vault root token | Per operator-defined schedule (currently ad-hoc) | `vault token create -policy=root -ttl=...` then revoke the old token |
+| Shamir unseal shares | Only if compromise suspected | `vault operator rekey -init` followed by a re-share ceremony |
+| Snapshot scoped token | Operator-defined | `vault token create -policy=snapshot-readonly -ttl=8760h`, drop into `/etc/vault.d/snapshot-token`, restart timer |
+| Transit seal key | Only if compromise suspected | Re-key the transit/key on the seal Vault; main Vault needs a "rewrap" using `vault write sys/sealwrap/rewrap` |
+| TLS leaf certs | 12-month manual | Re-issue from lab CA; copy to `/etc/vault.d/tls/vault.crt`; `systemctl reload vault` |
+
+The lab does **not** auto-rotate root tokens. Root is rare-use; rotation is operator-initiated when a token's audit trail looks suspect or when an operator leaves the team.
+
+## What MinIO needs to be working
+
+- For **scheduled snapshots:** MinIO accessible from the voter running the snapshot job.
+- For **restore:** snapshot file accessible somewhere (MinIO ideal; local copy acceptable as fallback).
+- For **DR drills:** MinIO and a target VM with sufficient CPU/RAM.
+
+If MinIO is down, snapshots queue locally (on the voter's `/var/lib/vault-snapshots/local/`). When MinIO comes back, the queue can be uploaded manually:
+
+```bash
+ls /var/lib/vault-snapshots/local/
+mc cp /var/lib/vault-snapshots/local/raft-*.snap lab/vault-snapshots/
+```
+
+## "We're paranoid" extra step: encrypt the snapshot
+
+Vault's Raft snapshot is *unencrypted* on disk after `snapshot save`. The current lab posture relies on:
+
+- MinIO IAM scoping (only the `vault-snapshots-rw` user can write; only operator with that key can read).
+- Lab network isolation.
+
+A future tightening (track under DR follow-up): encrypt the snapshot with `age` or `openssl enc` before pushing to MinIO, keep the decryption key offline. Then a MinIO compromise alone doesn't yield the secret data.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Snapshot job fails with 403 | Snapshot token's policy doesn't grant `sys/storage/raft/snapshot` | Re-issue token with correct policy | Use the named `snapshot-readonly` policy verbatim |
+| Snapshot job runs but MinIO write fails | MinIO `vault-snapshots-rw` IAM dropped the policy | Reattach the policy on MinIO | Track IAM as configuration, audit on schedule |
+| Restore drill won't unseal | Wrong seal Vault transit key (mismatched seal config) | The drill snapshot is from a different seal generation — verify provenance | Tag snapshots with the seal-key generation when re-keying happens |
+| Lost voter rejoins but Autopilot reports unhealthy | New voter's clock skew vs cluster | NTP sync; restart Vault on the new voter | Always check `chrony status` on a new VM before joining |
+| Snapshot fills `/tmp` | Snapshot job didn't clean up temp file | Add `trap 'rm -rf "$TMP"' EXIT` (or fix the existing one) | Test the snapshot job under disk-full conditions before relying on it |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md` (production readiness gates, backup/restore section)
+- HashiCorp Raft snapshot: <https://developer.hashicorp.com/vault/docs/commands/operator/raft#snapshot>
+- HashiCorp seal/rekey: <https://developer.hashicorp.com/vault/docs/commands/operator/rekey>
+- Memory: `reference_lab_infrastructure.md`

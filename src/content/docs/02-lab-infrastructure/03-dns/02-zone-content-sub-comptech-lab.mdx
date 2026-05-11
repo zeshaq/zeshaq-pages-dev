@@ -1,0 +1,139 @@
+---
+title: "Zone content for sub.comptech-lab.com"
+description: "What lives inside the authoritative zone — record families, hostname conventions, DNS round-robin endpoints, and how new records get added safely."
+sidebar_label: "Zone content"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page documents what is inside the `sub.comptech-lab.com` zone: which record families exist, the hostname conventions, the DNS round-robin entries, and the workflow for adding a record.
+
+## Record families
+
+The zone is structured around four "families" of records, each with predictable naming and targets:
+
+| Family | Pattern | Target |
+| --- | --- | --- |
+| **OpenShift cluster API/ingress** | `api.<cluster>.sub.comptech-lab.com`, `api-int.<cluster>.sub.comptech-lab.com`, `*.apps.<cluster>.sub.comptech-lab.com` | API VIP / ingress VIP inside the OpenShift `/24` |
+| **OpenShift node hostnames** | `<cluster>-master-<n>.sub.comptech-lab.com`, `<cluster>-worker-<n>.sub.comptech-lab.com`, `<cluster>-bootstrap.sub.comptech-lab.com` | Static node IPs inside the OpenShift `/24` |
+| **Platform VM direct names** | `<vm>-0.sub.comptech-lab.com`, `<vm>.sub.comptech-lab.com` (alias) | Static IPs inside the platform `/24` |
+| **Platform VM edge names** | `<svc>.apps.sub.comptech-lab.com`, plus the `mon` subdomain (`*.mon.sub.comptech-lab.com`) | HAProxy public edge address |
+
+Across both clusters the zone holds records for:
+
+- Hub control plane (compact) — `hub-dc-v6` API/API-int/apps wildcard + three master node A records.
+- Spoke control plane + workers — `spoke-dc-v6` API/API-int/apps wildcard + three master + three worker node A records.
+- Vault — four direct VM names + a round-robin client endpoint name.
+- Kafka — three direct VM names + a round-robin bootstrap endpoint name.
+- Redis — three direct VM names + two round-robin endpoint names (client and sentinel).
+- WSO2 IS and APIM — two direct VM names + six edge names (`is`, `apim`, `publisher`, `devportal`, `admin`, `gateway` under `.apps`).
+- Jenkins — direct + alias + edge.
+- SigNoz — direct + edge.
+- Trivy — direct + alias + edge.
+- DefectDojo — direct + alias + edge.
+- monitoring-0 — direct + alias + edge (`monitoring.apps` + `grafana.apps` alias) + `*.mon` subzone.
+- docker-runtime — direct + alias (no edge, intentional — per-app exposure decision).
+- MinIO — direct + console edge.
+- Nexus — direct + four endpoint edges: `nexus-mirror`, `mirror-registry`, `docker-group`, `app-registry` under `.apps`.
+- GitLab — direct + edge.
+- DNS records for the DNS host itself (private auth address + private recursor address).
+
+## Hostname conventions
+
+A consistent set of naming rules makes the zone greppable:
+
+1. **VM-direct names use `-0` index** even when there's only one of that role (`signoz-0`, `jenkins-0`, `defectdojo-0`). HA groups get `-0`/`-1`/`-2` (`vault-0..2`, `kafka-0..2`, `redis-0..2`). Future second instances slot in cleanly.
+2. **VM "convenience aliases" drop the index** (`signoz.sub.comptech-lab.com` → same IP as `signoz-0.sub.comptech-lab.com`). Used by humans and runbooks; not for HA logic.
+3. **Edge names live under `.apps.sub.comptech-lab.com`** so they share the existing wildcard certificate. There is no separate certificate per service.
+4. **Cluster API / ingress** names use the literal cluster name (`api.spoke-dc-v6.sub.comptech-lab.com`) and that cluster's own `.apps` wildcard (`*.apps.spoke-dc-v6.sub.comptech-lab.com`). These are *different* certificates from the platform `*.apps.sub.comptech-lab.com` wildcard — they're served by the OpenShift router, not HAProxy.
+5. **HA round-robin endpoints** drop the index entirely (`vault.sub.comptech-lab.com`, `redis.sub.comptech-lab.com`, `kafka-bootstrap.sub.comptech-lab.com`). Multiple A records resolve to the underlying nodes.
+
+## DNS round-robin endpoints
+
+PowerDNS Authoritative returns all matching A records when multiple exist for a name. The lab uses this for client-side load balancing on three services:
+
+| Endpoint | Targets | Used by |
+| --- | --- | --- |
+| `vault.sub.comptech-lab.com` | three Vault Raft voters | ESO `SecretStore`/`ClusterSecretStore` configs, `vault` CLI, any client that needs to find the active Vault node |
+| `kafka-bootstrap.sub.comptech-lab.com` | three Kafka KRaft brokers | Kafka clients (the `bootstrap.servers` of any producer/consumer) |
+| `redis.sub.comptech-lab.com`, `redis-sentinel.sub.comptech-lab.com` | three Redis/Sentinel nodes | Redis clients (debug / direct) and Sentinel clients |
+
+Trade-offs:
+
+- **No health checking.** DNS RR doesn't know which target is healthy. Vault's HA redirect, Kafka's metadata refresh, and Redis Sentinel's master discovery all handle the "you connected to the wrong one, here's the right one" case at the application protocol layer. DNS just gives every client a starting point.
+- **Cache-friendly.** A single A query returns all three records; clients pick one. No state on the server side.
+- **Replaceable.** Each of these can be promoted to a real load balancer (HAProxy frontend, VIP, or in-cluster service) later without changing client config — the hostname stays the same.
+
+## Edge name routing
+
+Every name under `*.apps.sub.comptech-lab.com` resolves to the HAProxy public edge address. From a client's perspective, that's how `jenkins.apps`, `signoz.apps`, `nexus-mirror.apps`, etc. all share one address. The HAProxy edge inspects the TLS SNI to pick a backend; details are on the HAProxy subsection pages.
+
+The `mon` subdomain (`*.mon.sub.comptech-lab.com`) was added 2026-05-09 for monitoring-0 hostnames that wanted a public name *outside* the wildcard certificate's coverage. It resolves to the same HAProxy public address; HAProxy serves a separate `wildcard-mon.pem` LE cert for it through SNI-based cert selection.
+
+## How a record gets added
+
+The canonical path:
+
+1. **Decide the name and target.** For a platform VM, that means: direct name + optional alias + optional edge name. For an OpenShift node, the cluster-internal naming convention.
+2. **Sanity check against the allocation table.** `rg -n "<proposed-ip>" allocation-table.md` should show the row.
+3. **Add the record** via `pdnsutil`:
+
+   ```bash
+   sudo pdnsutil add-record sub.comptech-lab.com <name> A 3600 <ip>
+   ```
+
+   Or via the PowerDNS HTTP API:
+
+   ```bash
+   curl -s -H "X-API-Key: <KEY>" -X PATCH \
+     http://127.0.0.1:8081/api/v1/servers/localhost/zones/sub.comptech-lab.com \
+     -d '{"rrsets":[{
+       "name":"<name>.sub.comptech-lab.com.",
+       "type":"A",
+       "ttl":3600,
+       "changetype":"REPLACE",
+       "records":[{"content":"<ip>","disabled":false}]
+     }]}'
+   ```
+
+4. **Validate from a lab VM:**
+
+   ```bash
+   dig @<lab-recursor> <name>.sub.comptech-lab.com A +short
+   ```
+
+5. **Update `dns-records.md`** in the planning repo with the new row and the validation timestamp.
+
+The SQLite is the live store — there is no zone reload step. The SOA serial bumps automatically.
+
+## Negative caching
+
+A subtle gotcha: if you `dig` a name *before* the record exists, the recursor caches the `NXDOMAIN` for the SOA's negative TTL (usually a few minutes to an hour). After adding the record, you might see `NXDOMAIN` for a while even though the authoritative daemon answers correctly. Workarounds:
+
+- Query the authoritative directly: `dig @<lab-auth> <name>.sub.comptech-lab.com A +short`. Bypasses the recursor's negative cache.
+- Flush the recursor cache: `sudo rec_control wipe-cache <name>.sub.comptech-lab.com$`.
+- Wait it out — the negative TTL is finite.
+
+The post-allocation validation step in `dns-records.md` includes "flush pre-existing negative cache entries" exactly for this reason.
+
+## Zone serial discipline
+
+Each batch of record changes bumps the SOA serial. The pattern in `dns-records.md` records the serial after each major change (e.g., "Zone serial after mirror TLS records: 2026050812"). This is useful for two reasons:
+
+- It's an easy "as-of" timestamp without resorting to `git log`.
+- It lets downstream secondary nameservers (if any get added later) know whether they're current.
+
+The serial format the lab uses is `YYYYMMDDNN` (date + 2-digit sequence within the day). PowerDNS will auto-bump if you don't set a serial explicitly; `pdnsutil increase-serial sub.comptech-lab.com` forces a bump.
+
+## What does *not* go in the zone
+
+- **`*.apps.<cluster>.sub.comptech-lab.com`** for OpenShift apps — handled by `*.apps.spoke-dc-v6.sub.comptech-lab.com` already; individual app records aren't added.
+- **OpenShift internal Service DNS.** That's CoreDNS inside the cluster (`<svc>.<ns>.svc.cluster.local`), entirely separate.
+- **Reverse PTRs.** No PTR records are maintained for the lab `/16`; if you need to reverse-resolve, you use `getent hosts` or the allocation table.
+- **MX, TXT, DKIM, SPF.** No mail traffic; the lab does not run a mail server. Public TXT records for ACME DNS-01 challenges are written transiently by `acme.sh` via the HTTP API and removed after issuance.
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- Memory: `reference_pdns_vm.md`, `reference_lab_infrastructure.md`

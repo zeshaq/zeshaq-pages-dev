@@ -1,0 +1,148 @@
+---
+title: "HAProxy edge: architecture overview"
+description: "The single HAProxy VM that fronts public+private TLS for ~40 lab service hostnames. SNI passthrough on :443 to a loopback re-decrypt at 127.0.0.1:8443 with the Let's Encrypt wildcard, then host-header routing into per-VM backends."
+sidebar_label: "Architecture overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const clientBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const procBox   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 210, textAlign: "center", fontWeight: 600 };
+export const innerBox  = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const beBox     = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const vmBox     = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted   = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dashed  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const haNodes = [
+  { id: "client", position: { x: 320, y: 0   }, data: { label: "Client\nbrowser / curl / docker pull" }, style: clientBox },
+
+  { id: "pub",    position: { x: 50,  y: 130 }, data: { label: "public-apps-https\n:443 on public edge IP(s)" }, style: procBox },
+  { id: "prv",    position: { x: 320, y: 130 }, data: { label: "public-apps-https\n:443 on private edge IP" }, style: procBox },
+  { id: "rke",    position: { x: 600, y: 130 }, data: { label: "rke2-api / rke2-supervisor\n:6443 / :9345" }, style: procBox },
+
+  { id: "vmtls",  position: { x: 220, y: 280 }, data: { label: "vm-tls frontend\n127.0.0.1:8443 (PROXY proto)\nWildcard cert decrypt" }, style: innerBox },
+
+  { id: "rt",     position: { x: 220, y: 410 }, data: { label: "host-header → backend\nrouting" }, style: innerBox },
+
+  { id: "gitlab", position: { x: 0,   y: 540 }, data: { label: "gitlab-vm-be" }, style: beBox },
+  { id: "minio",  position: { x: 130, y: 540 }, data: { label: "minio-api-vm-be\nminio-console-vm-be" }, style: beBox },
+  { id: "nexus",  position: { x: 280, y: 540 }, data: { label: "vm-tls-be (Nexus)\nmirror/group/app-registry" }, style: beBox },
+  { id: "vms",    position: { x: 440, y: 540 }, data: { label: "vm-tls-be (other VMs)\nJenkins/SigNoz/Trivy/.." }, style: beBox },
+  { id: "wso2",   position: { x: 600, y: 540 }, data: { label: "wso2-is-vm-be\nwso2-apim-*-vm-be" }, style: beBox },
+
+  { id: "vmstop", position: { x: 320, y: 670 }, data: { label: "Backend VM\n:443 (TLS again)" }, style: vmBox },
+];
+
+export const haEdges = [
+  { id: "c-pub", source: "client", target: "pub", label: "TLS :443\n(public hostname)", ...reqEdge },
+  { id: "c-prv", source: "client", target: "prv", label: "TLS :443\n(lab-side)", ...reqEdge },
+  { id: "pub-vmtls", source: "pub", target: "vmtls", label: "SNI matches *.apps.* → PROXY", ...dashed },
+  { id: "prv-vmtls", source: "prv", target: "vmtls", ...dashed },
+  { id: "vmtls-rt", source: "vmtls", target: "rt", label: "decrypted bytes,\nread Host header", ...muted },
+  { id: "rt-gitlab", source: "rt", target: "gitlab", ...muted },
+  { id: "rt-minio",  source: "rt", target: "minio",  ...muted },
+  { id: "rt-nexus",  source: "rt", target: "nexus",  ...muted },
+  { id: "rt-vms",    source: "rt", target: "vms",    ...muted },
+  { id: "rt-wso2",   source: "rt", target: "wso2",   ...muted },
+  { id: "be-vm",     source: "vms", target: "vmstop", label: "re-encrypt to VM:443\n(SNI passthrough end-to-end)", ...dashed },
+];
+
+The HAProxy edge VM is the single TLS terminator for the lab's *platform* VM fleet — Jenkins, SigNoz, Trivy, DefectDojo, MinIO console, Nexus (all three Docker endpoints), GitLab, WSO2, monitoring-0/Grafana, and the rest. It is intentionally **not** the edge for OpenShift cluster traffic; that goes through the in-cluster OpenShift router (per ADR 0005 and the `feedback_haproxy_scope.md` memory). This page covers what HAProxy does at the architectural level; subsequent pages drill into frontends, the SNI passthrough pattern, backend conventions, and the certificate model.
+
+## The host
+
+| Item | Value |
+| --- | --- |
+| VM | `haproxy.local` (no PTR; reach by IP) |
+| OS | Ubuntu 24.04.4 LTS |
+| Kernel | 6.8.x |
+| HAProxy | `haproxy 2.8.16-0ubuntu0.24.04.2` (Ubuntu LTS package) |
+| Service | `systemctl status haproxy` |
+| Config root | `/etc/haproxy/` |
+| Cert root | `/etc/haproxy/certs/` |
+| Error pages | `/etc/haproxy/errors/` |
+
+The HAProxy install is the Ubuntu LTS package, not a custom build — the lab does not need newer features than 2.8 provides, and patches arrive through the normal `apt update` path.
+
+## What's in `/etc/haproxy/`
+
+| File | Role |
+| --- | --- |
+| `haproxy.cfg` | The active config (~21 KB, ~40 frontend/backend/listen blocks) |
+| `haproxy.cfg.orig` | The Ubuntu-shipped original (~1.3 KB; kept for diff/restore) |
+| `haproxy.cfg.bak.<timestamp>.<reason>` | Dated backups; 47+ kept. The lab convention is to `cp` before every edit |
+| `certs/wildcard-apps.pem` | Let's Encrypt wildcard for `*.apps.sub.comptech-lab.com` |
+| `certs/wildcard-mon.pem` | Let's Encrypt wildcard for `*.mon.sub.comptech-lab.com` (newer; added 2026-05-09) |
+| `errors/` | Custom HTTP error pages |
+
+`haproxy.cfg` is the live state. There is no template renderer; edits happen by hand. The dated `.bak.<timestamp>.<reason>` convention is the substitute for revision control — every operator does `cp haproxy.cfg haproxy.cfg.bak.$(date -u +%Y%m%d-%H%M%S).<short-reason>` before opening the editor, and `systemctl reload haproxy` after.
+
+## What HAProxy does (the diagram)
+
+<Whiteboard client:load data={{ nodes: haNodes, edges: haEdges }} height={780} />
+
+Reading the diagram top to bottom:
+
+1. **A client** (browser, `curl`, `docker pull`) opens a TLS connection to `<service>.apps.sub.comptech-lab.com:443`. PowerDNS resolves the name to the HAProxy edge address; the TCP handshake reaches one of HAProxy's `:443` binds.
+2. **The top-level frontend** (`public-apps-https`, with binds on both the public edge address and the lab-private edge address) sees the SNI hostname in the TLS ClientHello. If SNI matches `*.apps.sub.comptech-lab.com`, the frontend hands the still-encrypted byte stream off to the internal `vm-tls` frontend over a PROXY-protocol connection on `127.0.0.1:8443`.
+3. **The `vm-tls` frontend** terminates TLS using the wildcard certificate at `certs/wildcard-apps.pem` (or `certs/wildcard-mon.pem` for `*.mon` names — SNI-based cert selection on the same bind). Now HAProxy has plaintext HTTP bytes and the `Host:` header.
+4. **Host-header routing** matches the `Host:` against an ACL list (each platform service has one entry) and picks a backend (`gitlab-vm-be`, `minio-console-vm-be`, etc.).
+5. **The backend** opens a TCP connection to the VM at port `:443` (TLS re-encrypted) or `:8080` (plaintext, then TLS back to the wildcard cert when the VM speaks TLS). The original SNI is restored end-to-end so backend VMs can do their own certificate selection.
+
+The two important shapes are:
+
+- **Outside HAProxy:** TLS in, TLS out. End-to-end the wire is encrypted.
+- **Inside HAProxy:** A short hop on `127.0.0.1:8443` over PROXY protocol where the wildcard cert actually does the decryption.
+
+## Why this shape (not "decrypt at the edge directly")
+
+A simpler design would be: bind `:443` on the public edge, terminate TLS right there with the wildcard cert, route by Host header. That is what most HAProxy tutorials show.
+
+The lab uses SNI-passthrough + loopback re-decrypt instead. Reasons:
+
+1. **Some backends do TLS passthrough end-to-end** (e.g., the RKE2 API on `:6443`, Kafka SNI hosts on `bootstrap.kafka.apps.sub.comptech-lab.com`, the WSO2 hostnames). The `public-apps-https` frontend can't decrypt those because they don't speak HTTP; the wildcard cert may not even cover their SNI. The SNI-aware top frontend can route them to a passthrough backend without ever seeing the plaintext.
+2. **Mixing decrypted and non-decrypted backends on one frontend is hard.** The lab needs both. The split between the SNI-aware outer frontend and the TLS-decrypting inner frontend gives one clean dispatch point.
+3. **Single decryption location.** Only `127.0.0.1:8443` knows about the wildcard cert. If the LE cert rotates, only one bind needs to reload it. Certificates aren't sprinkled across every frontend.
+4. **Multiple wildcard certs share the same bind.** `wildcard-apps.pem` and `wildcard-mon.pem` both load into the same `127.0.0.1:8443` bind; SNI selects which one to use. Adding a new wildcard is a one-line `crt` directive, not a new frontend.
+
+## What HAProxy does NOT do
+
+- **It does not front OpenShift Routes.** Per ADR 0005 and `feedback_haproxy_scope.md`: OpenShift cluster ingress (`*.apps.<cluster>.sub.comptech-lab.com`) is handled by the in-cluster OpenShift router. HAProxy is for the supporting VM fleet only. Pushing OpenShift traffic through HAProxy would mean two TLS terminators racing on the same hostname pattern, two certificate-rotation paths, and a perpetual confusion tax. Don't.
+- **It does not front OpenShift API endpoints.** `api.<cluster>.ocp.comptech-lab.com:6443` goes direct to the API VIP. HAProxy has no involvement.
+- **It does not do health-aware load balancing.** Where there are multiple backends (vault, kafka, redis) the lab uses DNS round-robin or in-app sentinels. HAProxy's role is to route by name, not to balance load.
+
+## Three categories of backend
+
+The ~40 backend blocks fall into three categories:
+
+| Category | Examples | Pattern |
+| --- | --- | --- |
+| **VM-side TLS** | `gitlab-vm-be`, `minio-api-vm-be`, `minio-console-vm-be`, `defectdojo-vm-be`, `wso2-is-vm-be`, `wso2-apim-mgmt-vm-be` | SNI on `:443` from the client; HAProxy decrypts at loopback; backend re-encrypts to VM `:443` (or routes to VM `:8080` for Jenkins-style HTTP+TLS-at-edge) |
+| **Legacy RKE2-hosted** | `vault-rke2-be`, `keycloak-rke2-be`, `awx-rke2-be`, `kafka-rke2-be` | Same shape as VM-side but pointed at the old RKE2 ingress IP. Several are partially decommissioned and remain in the config for archeology |
+| **Self / utility** | `haproxy-self-be` (HAProxy stats), `public-apps-{http,https}-be` (fallback) | Internal-only |
+
+The mass of backends is in category 1 (VM-side). Category 2 was retained during the v6 rebuild for any host still on RKE2 — the rebuild ADR (0018) replaced RKE2 with OpenShift v6 clusters, but several integration points stayed pointed at the old `vault-rke2` etc. until each was explicitly cut over to the new VM path.
+
+## How to apply changes
+
+The lab convention, drilled in by reading the 47 `haproxy.cfg.bak.*` files:
+
+1. **`cp haproxy.cfg haproxy.cfg.bak.$(date -u +%Y%m%d-%H%M%S).<reason>`** before opening the editor.
+2. **Edit `haproxy.cfg`.** Add an ACL entry, a `use_backend` rule, and a backend block. Stay symmetric with existing entries.
+3. **`haproxy -c -f /etc/haproxy/haproxy.cfg`** to validate syntax.
+4. **`systemctl reload haproxy`** — never `restart`. Reload preserves long-lived connections.
+5. **Smoke-test** the new hostname with `curl -ksSI https://<new>.apps.sub.comptech-lab.com/` and `dig @<lab-recursor> <new>.apps.sub.comptech-lab.com A +short`.
+
+If the change involves the certificates (`crt-list` or `crt` directives), `systemctl reload haproxy` re-reads them. If the cert files themselves are renewed (e.g., `acme.sh` post-renewal hook), the same reload picks them up; no service downtime.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` (HAProxy backend identities, public hostnames)
+- ADR 0005 (rebuild network/ingress/PKI)
+- Memory: `reference_haproxy_vm.md`, `feedback_haproxy_scope.md`, `reference_lab_infrastructure.md`
+- HAProxy 2.8 docs: <https://docs.haproxy.org/2.8/configuration.html>

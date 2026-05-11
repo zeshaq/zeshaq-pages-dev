@@ -1,8 +1,150 @@
 ---
-title: "Overview"
-description: "Section 02-lab-infrastructure: Overview (placeholder)."
+title: "Lab Infrastructure: the VM fleet outside OpenShift"
+description: "The supporting VM platform that sits outside OpenShift — edge ingress, DNS, object storage, secret store, image mirror, CI, and observability — and why each piece lives on a VM rather than inside a cluster."
 sidebar_label: "Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const edgeBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const platBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const ciBox   = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const ocpBox  = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dashedEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const fleetNodes = [
+  { id: "client",   position: { x: 360, y: 0   }, data: { label: "Public clients\n(office, home, edge)" }, style: edgeBox },
+  { id: "haproxy",  position: { x: 360, y: 120 }, data: { label: "HAProxy edge VM\nSNI passthrough +\nloopback re-decrypt" }, style: edgeBox },
+  { id: "pdns",     position: { x: 0,   y: 270 }, data: { label: "PowerDNS VM\nauth + recursor" }, style: platBox },
+  { id: "vault",    position: { x: 200, y: 270 }, data: { label: "Vault VM cluster\n(3 raft + transit seal)" }, style: platBox },
+  { id: "minio",    position: { x: 400, y: 270 }, data: { label: "MinIO VM\nobject store" }, style: dataBox },
+  { id: "nexus",    position: { x: 600, y: 270 }, data: { label: "Nexus VM\nimage mirror" }, style: platBox },
+  { id: "jenkins",  position: { x: 0,   y: 420 }, data: { label: "Jenkins VM\nbuilds" }, style: ciBox },
+  { id: "gitlab",   position: { x: 200, y: 420 }, data: { label: "GitLab VM\nsource of truth" }, style: ciBox },
+  { id: "signoz",   position: { x: 400, y: 420 }, data: { label: "SigNoz VM\nproduct obs" }, style: dataBox },
+  { id: "mon",      position: { x: 600, y: 420 }, data: { label: "monitoring-0 VM\nLGTM learning" }, style: dataBox },
+  { id: "dr",       position: { x: 300, y: 560 }, data: { label: "docker-runtime VM\napp runtime host" }, style: ciBox },
+  { id: "ocp",      position: { x: 700, y: 560 }, data: { label: "OpenShift hub +\nspoke clusters\n(via in-cluster ingress)" }, style: ocpBox },
+];
+
+export const fleetEdges = [
+  { id: "c-h",  source: "client",  target: "haproxy", label: "TLS on :443", ...reqEdge },
+  { id: "h-pd", source: "haproxy", target: "pdns",    label: "DNS lookups", ...muted },
+  { id: "h-v",  source: "haproxy", target: "vault",   ...muted },
+  { id: "h-m",  source: "haproxy", target: "minio",   ...muted },
+  { id: "h-n",  source: "haproxy", target: "nexus",   ...muted },
+  { id: "h-j",  source: "haproxy", target: "jenkins", ...muted },
+  { id: "h-g",  source: "haproxy", target: "gitlab",  ...muted },
+  { id: "h-s",  source: "haproxy", target: "signoz",  ...muted },
+  { id: "h-mn", source: "haproxy", target: "mon",     ...muted },
+  { id: "g-j",  source: "gitlab",  target: "jenkins", label: "webhooks", ...dashedEdge },
+  { id: "j-n",  source: "jenkins", target: "nexus",   label: "push app images", ...dashedEdge },
+  { id: "j-m",  source: "jenkins", target: "minio",   label: "evidence", ...dashedEdge },
+  { id: "n-dr", source: "nexus",   target: "dr",      label: "pull app-registry", ...dashedEdge },
+  { id: "n-o",  source: "nexus",   target: "ocp",     label: "release + operator + app", ...dashedEdge },
+  { id: "v-o",  source: "vault",   target: "ocp",     label: "ESO syncs", ...dashedEdge },
+];
+
+A working OpenShift fleet is not just OpenShift. It needs a DNS plane, an ingress edge, an image mirror, a secret store, durable object storage, a build system, and at least one place to look at what is happening. In this lab every one of those sits on a small Linux VM next to the clusters, never inside them. This section documents that VM platform.
+
+This page is the orientation map. Subsections drill into each VM family: the libvirt+cloud-init build pattern, PowerDNS, HAProxy, MinIO, Vault. The image supply chain (Nexus), CI (Jenkins), and observability (SigNoz / monitoring-0) live in adjacent sections under this same top-level — they share the platform conventions described here.
+
+## The fleet, in one picture
+
+<Whiteboard client:load data={{ nodes: fleetNodes, edges: fleetEdges }} height={720} />
+
+HAProxy is the only public-facing component. Everything else is reachable only on the private `30.30.0.0/16` lab bridge, and is exposed selectively through HAProxy's `*.apps.sub.comptech-lab.com` wildcard when a public hostname is needed. OpenShift clusters get their own ingress (the in-cluster OpenShift router) — they do **not** ride this HAProxy. That boundary is set by ADR 0005 and reinforced in the HAProxy subsection.
+
+## What each VM family does
+
+| Family | Hostnames | Role |
+| --- | --- | --- |
+| **HAProxy edge** | `haproxy` (private only) | Public+private TLS edge for the platform VM fleet. ~40 frontend/backend blocks, SNI passthrough to a loopback re-decrypt with the Let's Encrypt wildcard cert. Off-limits for OpenShift Routes. |
+| **PowerDNS** | `pdns.local`; lab resolver on the recursor IP | Authoritative DNS for `sub.comptech-lab.com` (PowerDNS Authoritative 4.8.3 over SQLite) and a recursor (PowerDNS Recursor 4.9.3) that every other lab VM points to. Forwards lab subdomain locally, everything else to public resolvers. |
+| **MinIO** | `minio.sub.comptech-lab.com`, `minio-console.apps.sub.comptech-lab.com` | S3-compatible object store. Hosts Loki/Tempo storage, Quay backing store, OADP backups, CI evidence, Vault Raft snapshots. |
+| **Vault OSS** | `vault.sub.comptech-lab.com` (DNS RR to 3 raft voters), `vault-seal-0` | HashiCorp Vault OSS 1.21.1 on dedicated VMs. Three-node Raft cluster auto-unsealed against a separate single-node transit-seal Vault. Backs ESO in both OpenShift clusters. |
+| **Nexus** | `nexus.apps`, `mirror-registry.apps`, `docker-group.apps`, `app-registry.apps` | Sonatype Nexus on a single VM exposing three independent Docker endpoints: install mirror, dev pull-through, app push target. Detailed under §3 of the docs site. |
+| **Jenkins + agent** | `jenkins.apps`, `jenkins-agent-0` | Single-controller LTS Jenkins on Ubuntu, dedicated build-agent VM with Podman/Buildah/Skopeo/Trivy. Detailed under §4. |
+| **GitLab** | `gitlab.apps.sub.comptech-lab.com` | Self-hosted GitLab CE; canonical source of truth for the platform GitOps repo (`openshift-platform-gitops`). Detailed under §8. |
+| **SigNoz** | `signoz.apps` | SigNoz EE Docker-Compose VM. The intended production OTLP/UI track. |
+| **monitoring-0** | `monitoring.apps`, `grafana.apps`, `*.mon.sub.comptech-lab.com` | Native-systemd LGTM stack (Grafana, Prometheus, Alertmanager, Loki, Tempo, Pyroscope, Alloy). Learning sandbox, not a production destination. |
+| **docker-runtime-vm** | `docker-runtime.sub.comptech-lab.com` | Ubuntu host running Docker Engine 29 / Podman / Buildx as a non-OpenShift app target (paused OpenShift-app delivery track). |
+| **DefectDojo / Trivy / WSO2 / Kafka / Redis** | various `*.apps.sub.comptech-lab.com` | Adjacent platform VMs. Touched in their own sections. |
+
+## Why VM-hosted, not in-cluster
+
+The defining constraint of the lab is **disconnected rebuild safety**: OpenShift must be reinstallable end-to-end without depending on the things it itself delivers secrets, images, and DNS to. That argues for putting the supply chain *outside* the data plane it serves.
+
+Specifically:
+
+1. **Vault** must not live inside OpenShift, because OpenShift secrets (kubeconfigs, registry pull-secrets, htpasswd hashes, OperatorHub credentials, ACM init bundles) need to be reachable before any cluster has finished installing. ADR `vault-oss-vm-plan.md` is explicit: "the new active target is a Vault OSS service running directly on dedicated VMs on the private lab network. Vault must be independent of OpenShift and RKE2 so OpenShift secret delivery does not depend on a cluster that is itself being rebuilt."
+2. **Nexus** is the local image mirror that OpenShift's release payload, OperatorHub catalogs, operator operands, and certified-catalog images all resolve to via IDMS/ITMS. If Nexus were a Quay running inside the cluster, a cluster failure would brick the cluster's own re-install path. ADR 0019 forces it onto its own VM.
+3. **DNS** has to be running before any cluster node boots. PowerDNS on a single dual-homed VM is fine for a lab; the moment it depends on OpenShift it stops being a recovery tool and becomes another thing that has to be recovered.
+4. **HAProxy** terminates TLS for ~40 platform service hostnames using a public Let's Encrypt wildcard. OpenShift's own ingress controller terminates TLS for `*.apps.<cluster>.sub.comptech-lab.com` independently. Putting OpenShift Routes behind HAProxy would mean two TLS terminators fighting over the same wildcard, double-edge logic, and a 4th-tier of certificate distribution — see [the HAProxy subsection](/docs/02-lab-infrastructure/04-edge-ingress-haproxy/01-architecture-overview) for the full rationale.
+5. **Object storage** (MinIO) backs Loki, Tempo, Quay, OADP backups, *and* Vault Raft snapshots. Putting it inside a cluster would mean cluster backups depending on the cluster — bootstrap loop.
+6. **CI** (Jenkins) builds images that flow into Nexus. Putting Jenkins in-cluster on the cluster it builds for would mean every cluster upgrade has to either evict Jenkins or run with no CI for the duration.
+
+The pattern across all six items is "the dependency must not move into the thing that depends on it." VM-hosting is how this lab keeps that property without introducing a second OpenShift cluster just for management. (The hub cluster does management, but for OpenShift-native operations — ACM placement, GitOps wiring — not for the underlying supply chain.)
+
+## What runs in-cluster vs. on a VM
+
+| Function | VM | OpenShift |
+| --- | --- | --- |
+| Public TLS edge (platform VM hostnames) | HAProxy edge VM | — |
+| Public TLS edge (cluster app hostnames) | — | OpenShift Router (per cluster) |
+| Authoritative DNS for lab zone | PowerDNS VM | — |
+| Image mirror & app registry | Nexus VM | — |
+| Secret store | Vault VM cluster | — |
+| Secret delivery into pods | — | ESO (External Secrets Operator) per cluster |
+| Object storage backing services | MinIO VM | — |
+| Backup product (OADP) | — | OADP operator on each cluster |
+| Service mesh | — | OSSM 3 + Kiali |
+| Logging/tracing pipelines | SigNoz, monitoring-0 (collectors) | Loki/Tempo operator (per cluster, ships to MinIO) |
+| CI builds | Jenkins + jenkins-agent VMs | — |
+| Build runtime (non-OCP) | docker-runtime VM | — |
+
+## Network plane (general shape)
+
+- A single Linux bridge per hypervisor — `br30` — carries the lab `/16` allocation. VMs on the bridge get static addresses inside a platform `/24`; the OpenShift node range lives one zone over inside a separate `/24` in the same `/16`. IPv6 is intentionally disabled across the platform per ADR 0005.
+- A single recursor address on the DNS VM is what every other VM and OpenShift node points to as upstream DNS. That recursor forwards the lab subdomain to the authoritative daemon on the same host and recurses public names via `8.8.8.8` and `1.1.1.1`.
+- HAProxy listens on a private edge address (`:443/:80`) and on the public address(es) routed in from outside. Both binds reach the same set of frontends so lab traffic and public traffic produce identical TLS behavior.
+- The `*.apps.sub.comptech-lab.com` Let's Encrypt wildcard certificate is loaded once at HAProxy's loopback bind (`127.0.0.1:8443`). All VM-side TLS for the wildcard re-decrypts there.
+
+> Internal-only specifics (exact host addresses, hardware identifiers, credential locations) are kept in `codex-opp-agent/connection-details/platform-admin-handoff.md`.
+
+## How a request reaches a platform service
+
+1. **Browser** opens `https://signoz.apps.sub.comptech-lab.com/`.
+2. **PowerDNS Recursor** answers from cache or from its own authoritative side: name → HAProxy's public edge IP.
+3. **HAProxy** accepts the TCP connection on `:443`, reads SNI, matches `signoz.apps.sub.comptech-lab.com`, hands the bytes to its internal `vm-tls` frontend at `127.0.0.1:8443` via PROXY protocol.
+4. **HAProxy `vm-tls`** terminates TLS with the wildcard cert, reads the HTTP `Host` header, and routes to `signoz-vm-be` → SigNoz VM port `:8080`.
+5. **SigNoz** answers; bytes flow back unchanged.
+
+That five-step path is the same for every VM-hosted service that uses the wildcard. The subsection on HAProxy describes the SNI-passthrough plus loopback re-decrypt pattern in detail, including why this lab uses it instead of decrypting at the public bind directly.
+
+## Reading order in this section
+
+1. **VM platform (§2.2)** — libvirt + cloud-init + `br30`, deterministic MAC/IP allocation, the base image and how new VMs join the fleet.
+2. **DNS (§2.3)** — the authoritative + recursor split on one dual-homed VM, zone contents, forwarder topology, failure modes.
+3. **Edge ingress / HAProxy (§2.4)** — architecture, frontends, SNI passthrough + loopback re-decrypt, backend conventions, certificates.
+4. **Object storage / MinIO (§2.5)** — deployment, bucket inventory, IAM, evidence lifecycle.
+5. **Vault VM (§2.6)** — deployment + storage, TLS, auth methods, secret engines, app namespacing, rotation/DR, monitoring/audit.
+
+§2.7 onward (Nexus, CI VMs, observability VMs, other platform VMs, GitLab) are documented in their own sections under this same top-level `02-lab-infrastructure`.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- `codex-opp-agent/connection-details/minio.md`
+- `codex-opp-agent/connection-details/vault-app-secrets.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md`
+- ADRs 0005 (rebuild network/ingress/PKI), 0009 (Jenkins VM), 0010 (SigNoz VM), 0012 (monitoring VM), 0013 (DefectDojo VM), 0019 (Nexus-only image supply chain)
+- Memory: `reference_lab_infrastructure.md`, `reference_haproxy_vm.md`, `reference_pdns_vm.md`, `feedback_haproxy_scope.md`, `project_nexus_endpoint_split.md`

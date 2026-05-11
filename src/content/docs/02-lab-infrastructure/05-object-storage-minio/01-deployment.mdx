@@ -1,8 +1,191 @@
 ---
-title: "Deployment"
-description: "Section 02-lab-infrastructure/05-object-storage-minio: Deployment (placeholder)."
+title: "MinIO deployment"
+description: "The single-VM MinIO server that backs Loki, Tempo, Quay, OADP, CI evidence, and Vault Raft snapshots. Why VM-hosted, the bucket inventory, and how clients reach it through HAProxy."
 sidebar_label: "Deployment"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const clientBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const platBox   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const bucketBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted   = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dashed  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const mNodes = [
+  { id: "loki",    position: { x: 0,   y: 0   }, data: { label: "LokiStack\n(per-cluster logging)" }, style: clientBox },
+  { id: "tempo",   position: { x: 220, y: 0   }, data: { label: "TempoStack\n(per-cluster tracing)" }, style: clientBox },
+  { id: "quay",    position: { x: 440, y: 0   }, data: { label: "Quay registry\n(future)" }, style: clientBox },
+  { id: "oadp",    position: { x: 0,   y: 130 }, data: { label: "OADP\n(cluster backups)" }, style: clientBox },
+  { id: "vault",   position: { x: 220, y: 130 }, data: { label: "Vault VMs\n(Raft snapshots)" }, style: clientBox },
+  { id: "ci",      position: { x: 440, y: 130 }, data: { label: "Jenkins\n(CI evidence)" }, style: clientBox },
+
+  { id: "haproxy", position: { x: 220, y: 270 }, data: { label: "HAProxy edge\n(SNI route to minio*)" }, style: platBox },
+  { id: "minio",   position: { x: 220, y: 400 }, data: { label: "MinIO VM\n(S3 API :9000, Console :9001)" }, style: platBox },
+
+  { id: "b1",      position: { x: 0,   y: 540 }, data: { label: "developer-ci-evidence" }, style: bucketBox },
+  { id: "b2",      position: { x: 230, y: 540 }, data: { label: "loki-* / tempo-*" }, style: bucketBox },
+  { id: "b3",      position: { x: 460, y: 540 }, data: { label: "oadp-* / vault-snapshots" }, style: bucketBox },
+];
+
+export const mEdges = [
+  { id: "loki-ha",  source: "loki",    target: "haproxy", ...muted },
+  { id: "tempo-ha", source: "tempo",   target: "haproxy", ...muted },
+  { id: "quay-ha",  source: "quay",    target: "haproxy", ...muted },
+  { id: "oadp-ha",  source: "oadp",    target: "haproxy", ...muted },
+  { id: "vault-ha", source: "vault",   target: "haproxy", ...muted },
+  { id: "ci-ha",    source: "ci",      target: "haproxy", ...muted },
+  { id: "ha-minio", source: "haproxy", target: "minio",   label: "TLS (wildcard)\n→ minio :9000/:9001", ...reqEdge },
+  { id: "m-b1",     source: "minio",   target: "b1",      ...dashed },
+  { id: "m-b2",     source: "minio",   target: "b2",      ...dashed },
+  { id: "m-b3",     source: "minio",   target: "b3",      ...dashed },
+];
+
+The lab runs **one** MinIO server on **one** VM. It is the lab's only persistent object store. Every service that wants S3 — Loki logs, Tempo traces, OADP backups, Vault Raft snapshots, Jenkins CI evidence, future Quay registry backing — points at this MinIO.
+
+## Why a single VM (not in-cluster)
+
+MinIO is *the* object store the rebuild plan depends on for cluster recovery. Putting it in-cluster would create a bootstrap loop: OADP needs MinIO to restore the cluster, and you can't restore the cluster if MinIO is one of the workloads being restored. Same for Vault — Vault snapshots back into MinIO; if MinIO disappeared with Vault, you'd lose both.
+
+So MinIO lives on its own VM, on the platform `/24`, separate from any OpenShift cluster. The lab accepts a single point of failure here in exchange for keeping the dependency graph acyclic. Future work (more than one MinIO VM, MinIO erasure coding across drives) is tracked under the relevant follow-up issues.
+
+## The host
+
+| Item | Value |
+| --- | --- |
+| VM | `minio` (private FQDN `minio.sub.comptech-lab.com`) |
+| OS | Ubuntu 24.04 (cloud-init) |
+| MinIO binary | upstream MinIO server, pinned to a known-good release |
+| Service | `systemd` unit running as a dedicated `minio` user |
+| S3 API port | `:9000` (HTTP — TLS handled by HAProxy at the edge) |
+| Console port | `:9001` |
+| Data root | dedicated data disk mounted under `/srv/minio` |
+| Bucket layout | flat (no nested federation) |
+
+## The diagram
+
+<Whiteboard client:load data={{ nodes: mNodes, edges: mEdges }} height={680} />
+
+Every S3 client in the lab (LokiStack, TempoStack, OADP, Vault snapshot jobs, Jenkins) points at MinIO through HAProxy using the standard wildcard hostname pattern. HAProxy terminates TLS at the wildcard cert and forwards to the MinIO VM. MinIO itself speaks plain HTTP on `:9000` and `:9001` and trusts the lab `/16` not to be hostile.
+
+## Endpoints
+
+| Endpoint | Purpose | Audience |
+| --- | --- | --- |
+| `minio.sub.comptech-lab.com` (private alias) | Direct VM access | Operators on the lab network |
+| `minio.apps.sub.comptech-lab.com` (HAProxy public) | S3 API through the edge | All clients (OADP, LokiStack, TempoStack, Vault, Jenkins, Quay) |
+| `minio-console.apps.sub.comptech-lab.com` (HAProxy public) | Web console for human admin | Operators |
+
+Both `apps` hostnames pass through the SNI-aware outer HAProxy frontend, get re-decrypted at the wildcard cert, and route via `minio-api-vm-be` / `minio-console-vm-be` to the MinIO VM. Backend conventions are described in [the HAProxy backend page](/docs/02-lab-infrastructure/04-edge-ingress-haproxy/04-backend-conventions).
+
+## Why MinIO and not other choices
+
+The S3 ecosystem inside OpenShift is dense — Loki/Tempo/Quay/OADP all expect S3. Alternatives considered:
+
+- **In-cluster Ceph (ODF MCG/NooBaa) only.** The spoke cluster does run ODF with NooBaa, but coupling cluster recovery to its own NooBaa is the bootstrap loop. NooBaa is used inside the spoke for non-backup workloads; MinIO on a VM is the cross-cluster backbone.
+- **An external commercial S3.** Out of scope for a disconnected lab.
+- **Plain `nfs` or `cifs` for OADP.** Doesn't work for Loki/Tempo (S3-native), and OADP works much better with S3.
+
+MinIO is also fully open source, runs as a single ~50MB binary, and has near-zero config to "go" — it's the smallest viable thing that satisfies every S3 client in the lab.
+
+## Service unit
+
+The MinIO systemd unit is the upstream-shipped one with lab-specific paths:
+
+```ini
+[Unit]
+Description=MinIO Object Storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=minio
+Group=minio
+EnvironmentFile=/etc/default/minio
+ExecStart=/usr/local/bin/minio server $MINIO_VOLUMES --address :9000 --console-address :9001
+Restart=on-failure
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The environment file at `/etc/default/minio` carries lab-specific server-side variables; the root credentials are kept in local-only ignored custody under `secrets/minio/` and never published.
+
+## Data layout
+
+```
+/srv/minio/
+  developer-ci-evidence/
+    builds/
+    releases/
+    sbom/
+    smoke/
+    trivy/
+  loki-spoke-dc-v6/
+  tempo-spoke-dc-v6/
+  loki-hub-dc-v6/
+  tempo-hub-dc-v6/
+  oadp-hub-dc-v6/
+  oadp-spoke-dc-v6/
+  vault-snapshots/
+  ... (more buckets as services come online)
+```
+
+One filesystem path per bucket. No erasure coding across nodes (single-node MinIO). The data disk is a dedicated qcow2 mounted at `/srv/minio` — sized for current capacity plus headroom for at least three months of CI evidence + scheduled OADP backups.
+
+## Capacity expectations (rough)
+
+| Bucket family | Producer | Typical size after retention |
+| --- | --- | --- |
+| `developer-ci-evidence/*` | Jenkins | ~10–30 GB at any time (lifecycle keeps it bounded) |
+| `loki-*` | LokiStack from each cluster | ~50 GB / cluster, mostly logs |
+| `tempo-*` | TempoStack from each cluster | ~30 GB / cluster, mostly traces |
+| `oadp-*` | Velero/OADP scheduled backups | ~10–50 GB / cluster, snapshot-style |
+| `vault-snapshots/` | Vault snapshot job | ~1 GB |
+
+The numbers are lab scale, not production. They inform disk sizing but don't drive a hard alert.
+
+## Why TLS at the edge (not at MinIO)
+
+MinIO supports TLS directly (`--certs-dir`). The lab chose to keep TLS at HAProxy instead:
+
+- One cert (`wildcard-apps.pem`) covers MinIO + Loki + Tempo + Quay + every other `*.apps` hostname. No per-service cert management.
+- MinIO inside the lab is a private-network service. The hop from HAProxy to MinIO is over the lab `/16`; the wire is already protected by network segmentation.
+- A future tightening (TLS HAProxy → MinIO) is a one-line change (`server minio <ip>:9000 ssl verify none check` plus `--certs-dir` on MinIO) if compliance requires it.
+
+## Validation after restart
+
+```bash
+ssh ze@<minio-vm>
+systemctl status minio
+mc alias set local http://127.0.0.1:9000 <ACCESS> <SECRET>
+mc admin info local
+
+# from a lab client
+mc alias set lab https://minio.apps.sub.comptech-lab.com <ACCESS> <SECRET>
+mc ls lab
+mc cp /etc/hostname lab/developer-ci-evidence/smoke/$(hostname)-$(date -u +%Y%m%d-%H%M%S)
+```
+
+The smoke-write into `developer-ci-evidence/smoke/` is the canonical "MinIO is reachable and writable" check. The bucket's lifecycle policy (described on the IAM page) auto-purges `smoke/` objects after 30 days, so leaving probe writes there isn't a long-term cost.
+
+## What MinIO is *not* the answer for
+
+- **Per-pod ephemeral storage.** That's PVCs from OpenShift's storage class (ODF), not S3.
+- **Filesystem-style shared writes.** S3 is object semantics; no `rename`, no atomic append-to-existing-object. Use the right primitive.
+- **HA without operator intervention.** Single-VM MinIO has no failover. Loss of the VM means the data is gone unless restored from offline backup.
+
+## References
+
+- `codex-opp-agent/connection-details/minio.md`
+- `codex-opp-agent/connection-details/platform-admin-handoff.md`
+- Memory: `reference_lab_infrastructure.md`
+- MinIO docs: <https://min.io/docs/minio/linux/index.html>

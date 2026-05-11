@@ -1,8 +1,154 @@
 ---
-title: "Bucket Inventory"
-description: "Section 02-lab-infrastructure/05-object-storage-minio: Bucket Inventory (placeholder)."
-sidebar_label: "Bucket Inventory"
+title: "Bucket inventory"
+description: "Every bucket in lab MinIO — who writes to it, what's stored, the prefix convention, and the lifecycle (retention) rules per prefix."
+sidebar_label: "Bucket inventory"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+MinIO holds buckets for every S3 consumer in the lab. This page enumerates them, who writes to each, and the lifecycle (retention) rules in force. The IAM page covers the user/policy mapping.
+
+## Bucket-by-bucket inventory
+
+| Bucket | Producer | Consumer | Lifecycle |
+| --- | --- | --- | --- |
+| `developer-ci-evidence` | Jenkins build jobs | Operators, future DefectDojo importer | Per-prefix (see below) |
+| `loki-<cluster>` | LokiStack on each OpenShift cluster | LokiStack reads same bucket | Loki-managed retention; OperatorPolicy enforces lab caps |
+| `tempo-<cluster>` | TempoStack on each OpenShift cluster | TempoStack reads same bucket | Tempo-managed retention |
+| `oadp-<cluster>` | OADP/Velero scheduled backups | OADP restore jobs | OADP backup-storage-location retention |
+| `quay-<cluster>` (future) | Quay operator on each cluster | Quay readers | Quay-managed retention |
+| `vault-snapshots` | Vault snapshot cron on Vault VMs | Restore drill / DR | Operator-managed (keep last N) |
+
+Cluster names plug into `<cluster>` — currently `hub-dc-v6` and `spoke-dc-v6`. Each new cluster adds its own per-purpose buckets so blast radius is bounded.
+
+## `developer-ci-evidence` — prefix convention
+
+The CI-evidence bucket is the most-touched. Its prefix layout:
+
+```
+developer-ci-evidence/
+  builds/      # Jenkins build artifacts (logs, intermediate)
+  releases/    # release-ready artifacts (manifests, image digest tags)
+  sbom/        # SPDX / CycloneDX SBOMs per build
+  smoke/       # smoke-test evidence; aggressive lifecycle
+  trivy/       # Trivy vulnerability scan reports per build
+```
+
+Lifecycle rules (per `connection-details/minio.md`):
+
+| Prefix | Expiration |
+| --- | --- |
+| `smoke/` | 30 days |
+| `builds/` | 90 days |
+| `trivy/` | 180 days |
+| `sbom/` | 365 days |
+| `releases/` | 365 days |
+
+The split reflects how each artifact ages out of relevance:
+
+- `smoke/` is operational probe data. Useful for ~a week; kept 30 days for safety.
+- `builds/` is intermediate evidence. Most builds never get looked at again; 90 days is enough to investigate recent failures.
+- `trivy/` and `sbom/` are compliance evidence. 180 / 365 days lets the lab demonstrate "we scanned every build for at least six months" / "we have SBOM coverage for the past year."
+- `releases/` keeps a year of release manifests for rollback support.
+
+Lifecycle is applied via `mc ilm rule add` per prefix:
+
+```bash
+mc ilm rule add lab/developer-ci-evidence --expire-days 30  --prefix smoke/
+mc ilm rule add lab/developer-ci-evidence --expire-days 90  --prefix builds/
+mc ilm rule add lab/developer-ci-evidence --expire-days 180 --prefix trivy/
+mc ilm rule add lab/developer-ci-evidence --expire-days 365 --prefix sbom/
+mc ilm rule add lab/developer-ci-evidence --expire-days 365 --prefix releases/
+```
+
+The CI evidence schema is documented in `codex-opp-agent/connection-details/ci-evidence-schema.md`. Jenkins writes objects in a predictable layout — operators can `mc ls lab/developer-ci-evidence/builds/<job>/<build-number>/` to find evidence for any build.
+
+## `loki-<cluster>` and `tempo-<cluster>`
+
+LokiStack and TempoStack (both Red Hat operator products on the OpenShift clusters) need an S3-compatible backing store. Each cluster gets its own bucket:
+
+- `loki-hub-dc-v6`, `loki-spoke-dc-v6`
+- `tempo-hub-dc-v6`, `tempo-spoke-dc-v6`
+
+The buckets are written by the operator's pods (one ServiceAccount per cluster, with a per-cluster MinIO IAM user — see the IAM page). LokiStack and TempoStack manage their own retention internally: index TTL, log/trace TTL, and compaction are all driven by the operator's CR spec, not by MinIO lifecycle. The MinIO side typically uses no explicit lifecycle rule for these — the operator deletes its own keys.
+
+The credential flow into the cluster runs through Vault → ESO. The platform-side wiring uses the OBC → operand-storage-Secret bridge pattern (documented in `project_obc_to_operand_secret_bridge.md`).
+
+## `oadp-<cluster>` (cluster backups)
+
+OADP (Velero) takes scheduled backups of cluster resources and PVCs and stores them as Restic chunks + Velero metadata in an S3 bucket. The lab convention:
+
+- One bucket per cluster (`oadp-hub-dc-v6`, `oadp-spoke-dc-v6`).
+- Retention controlled via the OADP `BackupStorageLocation` and `Schedule` CRs in cluster, not via MinIO lifecycle.
+- A small ConfigMap on each cluster names the MinIO endpoint; the access key comes from an ESO-synced Secret.
+
+The backups are not yet under formal restore-drill cadence; that's tracked in the OADP-onboarding follow-up issue.
+
+## `quay-<cluster>` (future)
+
+Once the Quay operator is installed (per the platform admin handoff's operator install queue), each cluster's Quay instance will use a per-cluster bucket. Same OBC → operand-Secret bridge pattern as Loki/Tempo. Not yet provisioned.
+
+## `vault-snapshots`
+
+Vault Raft snapshots are produced by a snapshot job running on one of the Vault Raft voter VMs:
+
+```bash
+# rendered as a systemd timer on a Vault VM
+VAULT_TOKEN=<scoped-snapshot-token> \
+  vault operator raft snapshot save /tmp/raft.snap
+mc cp /tmp/raft.snap lab/vault-snapshots/$(date -u +%Y%m%d-%H%M%S).snap
+rm /tmp/raft.snap
+```
+
+The snapshot token is **scoped** (limited policy: only `sys/storage/raft/snapshot`). The CI key for the `lab` `mc` alias is for the dedicated `vault-snapshots-rw` MinIO IAM user. Both are kept in local-only ignored custody on the Vault VMs.
+
+Retention is operator-managed: typically `keep last 14 daily snapshots + last 12 monthly`. No MinIO lifecycle rule.
+
+Restore drill is required before Vault is treated as production-trusted (per the Vault production-readiness gates in `vault-oss-vm-plan.md`). The current state: restore drill not yet performed at v6 generation; tracked.
+
+## Smoke-test evidence
+
+The `smoke/` prefix under `developer-ci-evidence` doubles as an operator-friendly probe target:
+
+- Jenkins probe builds drop small objects there with predictable names (`<job>-<build>.txt`).
+- Operators can `mc cp <local> lab/developer-ci-evidence/smoke/<hostname>-<date>` to validate write access.
+- The 30-day lifecycle keeps the prefix from accumulating junk.
+
+This is what `connection-details/minio.md` references as "the scoped CI service account wrote, statted, and deleted a probe object under `s3://developer-ci-evidence/smoke/`."
+
+## "How big should each bucket be"
+
+The lab does **not** enforce per-bucket quotas. The current sizing is:
+
+- `developer-ci-evidence`: small (~tens of GB; lifecycle keeps it bounded).
+- `loki-*`, `tempo-*`: bounded by Loki/Tempo retention CR — typically 30–60 days of logs/traces per cluster.
+- `oadp-*`: bounded by Schedule.spec.ttl — typically 14 days of backups.
+- `vault-snapshots`: small (~GBs).
+
+The data disk under `/srv/minio` is sized to comfortably hold all of the above plus 50% headroom. Disk alerts fire from the monitoring VM (Blackbox + node_exporter) when `/srv/minio` crosses 80%.
+
+## Bucket naming convention summary
+
+| Pattern | Use |
+| --- | --- |
+| `<service>-<cluster>` | per-cluster operand storage (loki, tempo, oadp, quay) |
+| `<service>-<purpose>` | shared service storage (`developer-ci-evidence`, `vault-snapshots`) |
+| Lower-case, hyphen-separated, no underscores | S3 bucket name rules + lab convention |
+
+When a new operand wants a bucket, the rule is: pick a hyphenated name in lower-case, include the cluster name if the bucket is per-cluster, document the bucket here, create it via `mc mb`, set lifecycle rules if appropriate.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Bucket fills up unexpectedly | Lifecycle rule missing or wrong prefix | `mc ilm rule list lab/<bucket>` to verify; re-add rule with correct prefix | Add the lifecycle rule in the same change that creates the bucket |
+| Loki/Tempo errors with `BucketDoesNotExist` | Operand-Secret points at a bucket that wasn't created | `mc mb lab/<bucket>`, retry operand | Always create the bucket before applying the OBC/Secret bridge |
+| Vault snapshot job fails with `AccessDenied` | The `vault-snapshots-rw` IAM user lost write on the bucket | Re-apply the policy; verify with `mc admin user info lab vault-snapshots-rw` | Treat IAM policies as GitOps when possible (currently operator-managed manually) |
+| Operator reports "stale" content even after lifecycle | MinIO lifecycle runs on a schedule; recent deletes propagate within minutes-to-hours | Wait or trigger `mc ilm`, depending on use case | Don't rely on lifecycle for sub-hour cleanup; use explicit `mc rm` instead |
+
+## References
+
+- `codex-opp-agent/connection-details/minio.md`
+- `codex-opp-agent/connection-details/ci-evidence-schema.md`
+- Memory: `project_obc_to_operand_secret_bridge.md`, `reference_lab_infrastructure.md`
+- MinIO `mc ilm` docs: <https://min.io/docs/minio/linux/reference/minio-mc/mc-ilm.html>
