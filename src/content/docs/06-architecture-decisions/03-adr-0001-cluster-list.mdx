@@ -1,8 +1,70 @@
 ---
-title: "ADR 0001 — Cluster List"
-description: "Section 06-architecture-decisions: ADR 0001 — Cluster List (placeholder)."
-sidebar_label: "ADR 0001 — Cluster List"
+title: "ADR 0001 — Local operator workspace"
+description: "Why this lab keeps a single local operator workspace under /home/ze/codex-opp-agent that ties together live state, desired state, secrets, ADRs, and session memory."
+sidebar_label: "0001 — Operator workspace"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+**Date:** 2026-05-04
+**Status:** Accepted. *Cluster-list portion superseded by [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge); rest of this ADR remains in force.*
+
+## Context
+
+The lab operates a small fleet of OpenShift clusters with distinct roles. At the time this ADR was written, that fleet was four clusters: an active management hub, an active workload cluster, a management standby, and a workload standby. (See [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge) for the current active membership, which is now just `hub-dc-v6` + `spoke-dc-v6` — the DR pair was decommissioned in May 2026.)
+
+Operating that fleet effectively required a single working surface where three otherwise-fragmented things came together:
+
+- **Live state**, scraped from the bootstrap host that holds cluster artifacts (`ze@ocp-bootstrap:/home/ze/ocp-clusters`). This is what the clusters *actually* are.
+- **Desired state**, held in the platform GitOps repository (`gitops/lab-gitops`). This is what the clusters *should* be.
+- **Local-only secrets** needed to access GitLab, to run `oc` against the clusters, to drive `pdnsutil` against PowerDNS, to talk to HAProxy. These cannot live in Git.
+
+Without a single place that holds all three, every session began the same way: re-discover topology, re-pull desired state, re-locate the right kubeconfig, re-find the latest assessment, re-decide what was urgent. That waste compounds across sessions and across operators (or operator-agents — Claude Code reads this workspace at the start of every non-trivial task).
+
+The workspace also needs to hold the **decision history**: ADRs (this section), session logs, dated assessment reports, todos. Otherwise the same decisions get re-litigated every few weeks.
+
+## Decision
+
+Maintain `/home/ze/codex-opp-agent` as the local operator workspace. It is a real directory on the operator's workstation, version-controlled in GitHub (`zeshaq/codex-opp-agent`), with a few well-known sub-directories that must always be present:
+
+| Path | Purpose |
+|---|---|
+| `AGENTS.md` | Operating rules for any agent (human or AI) acting in this workspace. |
+| `CLUSTERS.md` | Fleet inventory — names, roles, status, status references. |
+| `ASSESSMENT.md` | Latest cross-fleet health/state assessment. |
+| `RUNBOOK.md` | Repeatable commands — `oc` snippets, `pdnsutil` snippets, ACM/GitOps queries. |
+| `TODO.md` | Outstanding remediation tasks plus the "done" checklist. |
+| `CURRENT_STATE.md` | Living snapshot of platform posture. Updated at session close. |
+| `SESSION_LOG.md` | Append-only session-by-session log. |
+| `scripts/assess.sh` | Repeatable health reporter. Runs from operator's machine, produces a dated report. |
+| `reports/` | Timestamped generated assessments and session reports. |
+| `lab-gitops-full/` | Full desired-state clone (kept up to date with the GitLab platform repo). |
+| `lab-gitops/` | Bootstrap-only desired state copied from `ocp-bootstrap`. |
+| `ocp-clusters/` | Copied cluster artifacts excluding large ISOs. |
+| `secrets/` | Local-only secret material. **`.gitignore`-d.** Never committed. |
+| `adr/` | The ADR set — this section's source. |
+
+The convention is: everything an operator needs to know to operate the fleet lives under this one tree, and everything **except** `secrets/` is in Git.
+
+## Alternatives considered
+
+**Pure GitOps-only workspace (no separate local workspace).** Treat the GitLab platform repo (`openshift-platform-gitops`) as the workspace. Open it, work in it, commit to it. This was rejected because that repo is OpenShift platform *desired* state — it has no place for session logs, assessments, ADRs, operator scripts, or per-operator local secrets. Polluting it with those things would also pollute its blast radius: the repo is read by Argo CD on hubs and spokes, and irrelevant files in it generate noise during reconciliation reviews.
+
+**Multi-repo with a manifest file pointing at each.** Keep ADRs in one repo, runbooks in another, session reports in a third, scripts in a fourth, secrets in encrypted form in a fifth. This is a common convention in larger orgs. Rejected because the lab is operated by one person across many short sessions; the cognitive cost of "which repo holds this?" outweighs the benefit of separation. The federation that *does* happen at the GitLab platform/app-repo level (see [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)) handles real ownership separation; the operator workspace is just the operator's notebook.
+
+**Cloud-hosted notebook (Notion, Confluence, Obsidian Sync).** Tried briefly before this ADR. Rejected because the live cluster artifacts, kubeconfigs, scripts, and `oc` outputs that operations needs to reference don't belong inside a SaaS surface, and round-tripping content between the SaaS and the filesystem-resident clusters wastes time. Local-first with Git for sync wins.
+
+## Consequences
+
+- **Future assessments start from local context** instead of rediscovering topology each session. The first command of any session is "read `CURRENT_STATE.md`, `SESSION_LOG.md` tail, `TODO.md`."
+- **Reports are reproducible and comparable over time** because `scripts/assess.sh` lands them in `reports/` with a timestamp.
+- **Sensitive local files (`secrets/`) must stay out of Git** and must not be printed in chat, logs, MR descriptions, or session reports. The convention is reinforced by `.gitignore`, by a memory entry in `~/.claude/projects/-home-ze-claude-agent/memory/`, and by checking output before pasting.
+- **`AGENTS.md` and `adr/` provide continuity** for future agent sessions. A new operator-agent (or the same agent after a long gap) reads `AGENTS.md` and the ADR Index issue (`#131`) and is operationally caught up.
+- **The cluster-list portion of this ADR is superseded by [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge).** The original four-cluster fleet (`hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr`) is no longer correct — the DR pair has been decommissioned and the active fleet is now `hub-dc-v6` + `spoke-dc-v6`. Everything else in this ADR — the workspace structure, the secret-handling rule, the `AGENTS.md`/`CLUSTERS.md`/`RUNBOOK.md` convention — remains in force.
+
+## References
+
+- Source: `codex-opp-agent/adr/0001-operator-workspace.md`
+- Cluster-list supersession: [ADR 0022 — v6 fleet membership](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge)
+- Workspace governance rules: [ADR 0016 — Workspace execution governance](/docs/06-architecture-decisions/13-adr-0016-oc-mirror)
+- Platform admin handoff: `codex-opp-agent/connection-details/platform-admin-handoff.md`
