@@ -1,8 +1,150 @@
 ---
-title: "Developer CI Evidence Lifecycle"
-description: "Section 02-lab-infrastructure/05-object-storage-minio: Developer CI Evidence Lifecycle (placeholder)."
-sidebar_label: "Developer CI Evidence Lifecycle"
+title: "developer-ci-evidence: lifecycle and consumers"
+description: "Deep-dive on the developer-ci-evidence bucket — the prefix convention, Jenkins write path, planned DefectDojo import, and the lifecycle rules that keep the bucket from growing without bound."
+sidebar_label: "CI evidence lifecycle"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`developer-ci-evidence` is the lab's CI artifact bucket. Jenkins builds drop logs, Trivy reports, SBOMs, image-digest manifests, and release evidence into it. Operators and (in the future) DefectDojo read from it. This page documents the bucket layout, the lifecycle rules, the producer side (Jenkins), and the consumer side.
+
+## Prefix convention
+
+```
+developer-ci-evidence/
+  builds/        # Jenkins build artifacts (logs, intermediate metadata)
+  releases/      # release-ready artifacts (manifests, image-digest tags)
+  sbom/          # SPDX / CycloneDX SBOMs per build
+  smoke/         # smoke-test evidence; aggressive lifecycle
+  trivy/         # Trivy vulnerability scan reports per build
+```
+
+Inside each prefix, Jenkins writes a `<job>/<build-number>/` path, e.g.:
+
+```
+developer-ci-evidence/
+  trivy/openliberty-readiness-probe-image-build/8/trivy.json
+  sbom/openliberty-readiness-probe-image-build/8/sbom.spdx.json
+  releases/openliberty-readiness-probe-image-build/8/release.json
+  builds/openliberty-readiness-probe-image-build/8/build.log
+```
+
+The reference build `openliberty-readiness-probe-image-build #8` is the canonical example (per `connection-details/minio.md`). Future jobs follow the same shape — the producer is responsible for writing into the right prefix; the schema for each prefix is defined in `codex-opp-agent/connection-details/ci-evidence-schema.md`.
+
+## Lifecycle (retention)
+
+| Prefix    | Expiration |
+| --- | --- |
+| `smoke/`    | 30 days  |
+| `builds/`   | 90 days  |
+| `trivy/`    | 180 days |
+| `sbom/`     | 365 days |
+| `releases/` | 365 days |
+
+The rationale per prefix:
+
+- **`smoke/` — 30 days.** Smoke artifacts are short-lived probes. They prove "the CI path is alive end-to-end." Keep them long enough for someone to chase a flaky build a week or two ago; that's it.
+- **`builds/` — 90 days.** A typical investigation of a CI regression looks back a week or two; 90 days is plenty. Long enough to track a quarterly release retrospective.
+- **`trivy/` — 180 days.** Vulnerability scans are compliance-adjacent evidence. Six months covers most "show me your scan history" requests.
+- **`sbom/` — 365 days.** SBOMs back vulnerability response — if a CVE drops on a library, you want to be able to ask "which builds in the last year shipped that library?"
+- **`releases/` — 365 days.** Release manifests support rollback over the lifetime of a release branch.
+
+These are MinIO lifecycle rules (not Jenkins retention) so they fire even if Jenkins forgot about the artifact:
+
+```bash
+mc ilm rule add lab/developer-ci-evidence --expire-days  30 --prefix smoke/
+mc ilm rule add lab/developer-ci-evidence --expire-days  90 --prefix builds/
+mc ilm rule add lab/developer-ci-evidence --expire-days 180 --prefix trivy/
+mc ilm rule add lab/developer-ci-evidence --expire-days 365 --prefix sbom/
+mc ilm rule add lab/developer-ci-evidence --expire-days 365 --prefix releases/
+```
+
+`mc ilm rule list lab/developer-ci-evidence` shows the active set. Expirations are *days since object creation* — not days since last access.
+
+## Producer side: Jenkins write path
+
+Jenkins jobs use the `minio` client (`mc`) via a Jenkins credential bound to the scoped CI user (`dev-ci-evidence-rw`). Typical Jenkinsfile fragment:
+
+```groovy
+withCredentials([
+  string(credentialsId: 'minio-dev-ci-evidence-access', variable: 'MINIO_ACCESS_KEY'),
+  string(credentialsId: 'minio-dev-ci-evidence-secret', variable: 'MINIO_SECRET_KEY')
+]) {
+  sh '''
+    mc alias set ci https://minio.apps.sub.comptech-lab.com "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+    mc cp trivy.json ci/developer-ci-evidence/trivy/$JOB_NAME/$BUILD_NUMBER/
+    mc cp sbom.spdx.json ci/developer-ci-evidence/sbom/$JOB_NAME/$BUILD_NUMBER/
+    mc cp release.json ci/developer-ci-evidence/releases/$JOB_NAME/$BUILD_NUMBER/
+  '''
+}
+```
+
+The Jenkins credential IDs (`minio-dev-ci-evidence-access`, `minio-dev-ci-evidence-secret`) reference Jenkins-stored credentials sourced from `codex-opp-agent/secrets/minio/dev-ci-evidence.env`. They are never printed or committed.
+
+Future state: these credentials live in Vault, and Jenkins fetches them via a Vault Jenkins plugin or via a Vault sidecar that injects them at job start. Tracked but not yet in place.
+
+## Read-only consumer: `dev-ci-evidence-ro`
+
+A second IAM user (`dev-ci-evidence-ro`) holds `s3:GetObject` + `s3:ListBucket` only on `developer-ci-evidence`. Used for:
+
+- Operator ad-hoc probes — `mc ls`, `mc cat`, `mc cp <from> <local>` for diagnosis.
+- Planned: DefectDojo import job (DefectDojo pulls Trivy reports from `trivy/`, ingests them into its database).
+- Planned: any release-engineering tooling that needs to read release manifests without write permission.
+
+This is a *separate* MinIO user with a *separate* credential, not a token derived from the RW user. The principle: "every distinct role gets a distinct credential."
+
+## Smoke prefix as a write-path probe
+
+Operators use the `smoke/` prefix to test write access without polluting the long-retention prefixes:
+
+```bash
+mc cp /etc/hostname lab/developer-ci-evidence/smoke/$(hostname)-$(date -u +%Y%m%d-%H%M%S)
+```
+
+The object expires in 30 days. If a write succeeds the consumer's IAM is plumbed correctly; if it fails (`AccessDenied`, `NoSuchBucket`, network error) the failure mode is clear. This is the canonical "is CI evidence writable?" probe.
+
+## DefectDojo import (planned)
+
+`connection-details/minio.md` notes: "DefectDojo import is deferred." When implemented, the flow:
+
+1. DefectDojo VM holds the `dev-ci-evidence-ro` MinIO credential in local custody.
+2. A scheduled job on the DefectDojo VM lists new objects under `developer-ci-evidence/trivy/<job>/<build>/`.
+3. For each new build, DefectDojo's API ingests the Trivy JSON report and creates / updates a finding set against the corresponding image.
+4. DefectDojo dashboards then show "what's been scanned, what's vulnerable, by which build."
+
+The deferral is operational: DefectDojo VM is up and serving the UI, but the scheduled import isn't wired yet. The bucket is ready (`trivy/` has reports from the readiness-probe build), and the IAM user is ready (`dev-ci-evidence-ro` exists). The missing piece is the import scheduler. Tracked.
+
+## Object key naming gotchas
+
+S3 (and MinIO) treats `/` as part of the key — there are no directories. Most operations behave as if they were, but two caveats:
+
+- **`mc cp` to a "directory" requires a trailing slash.** `mc cp file.txt ci/bucket/path/` writes `path/file.txt`. Without the trailing slash you overwrite the "directory" entry (which doesn't exist), creating an object whose key is literally `path` and is just `file.txt`'s content.
+- **`mc rm --recursive --force` does what it says.** Always double-check the prefix.
+
+These are not lab-specific; just standard S3 hazards.
+
+## Backup of `developer-ci-evidence`
+
+Currently **not** backed up. The bucket is treated as a derived artifact:
+
+- The Jenkins build that produced an artifact can be re-run to regenerate it (within retention).
+- For lost releases beyond retention, the Git tag + image digest in `app-registry.apps.sub.comptech-lab.com` is the recoverable source of truth.
+
+`connection-details/minio.md` records this as an open item: "Bucket backup/restore is deferred, so this evidence is not audit-grade yet." If audit-grade is needed, the next step is mirror replication (`mc mirror lab/developer-ci-evidence offline/developer-ci-evidence`) on a schedule.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Build artifact missing after 90 days | `builds/` lifecycle expired it; that's working as designed | Reissue from Jenkins (re-run build) if needed | Pull long-retention artifacts into the right prefix at build time (`releases/` for release manifests, etc.) — not after the fact |
+| Jenkins job fails with `AccessDenied` writing to `releases/` | A prefix-scoped policy restricts the user to `builds/` only | Use the parent `dev-ci-evidence-rw` user (full bucket access), or expand the prefix policy | Choose the right user for the job at config time; document the scope |
+| `mc cp` to wrong prefix (e.g., `tivy/` typo for `trivy/`) | Producer hard-coded wrong prefix; created a new pseudo-prefix outside lifecycle | Delete the orphan prefix; fix the producer | Lint Jenkinsfile prefixes against a known list; pair-review CI changes |
+| Lifecycle didn't fire on schedule | MinIO ilm scanner stuck or delayed | Restart MinIO; verify with `mc ilm rule list` | Don't rely on lifecycle for sub-hour cleanup; alert on bucket-size growth |
+
+## References
+
+- `codex-opp-agent/connection-details/minio.md`
+- `codex-opp-agent/connection-details/ci-evidence-schema.md`
+- `codex-opp-agent/connection-details/jenkins.md`
+- Memory: `reference_lab_infrastructure.md`
+- MinIO `mc ilm` docs: <https://min.io/docs/minio/linux/reference/minio-mc/mc-ilm.html>

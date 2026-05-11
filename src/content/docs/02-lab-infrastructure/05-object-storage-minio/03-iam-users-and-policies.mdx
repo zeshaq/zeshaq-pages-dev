@@ -1,8 +1,206 @@
 ---
-title: "IAM Users and Policies"
-description: "Section 02-lab-infrastructure/05-object-storage-minio: IAM Users and Policies (placeholder)."
-sidebar_label: "IAM Users and Policies"
+title: "IAM users and policies"
+description: "MinIO IAM convention — one user per consumer, scoped policy per bucket, no shared admin keys for CI. How users are created, where credentials live, and how clients pick them up."
+sidebar_label: "IAM users and policies"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+MinIO ships with two identity primitives: root credentials (everything) and IAM users + policies (scoped). The lab uses root for *initial setup only* and IAM users for every consumer. This page covers the convention.
+
+## Rules
+
+1. **No shared CI user.** Every distinct producer (Jenkins, OADP on cluster X, Loki on cluster Y, Vault snapshot job, future Quay) gets its own MinIO IAM user with a policy scoped to that producer's bucket(s) and prefixes.
+2. **No reading credentials from MinIO console.** New credentials are produced at user-creation time via `mc admin user add` (or via the OBC bridge for cluster operands) and stored in custody — never re-read.
+3. **No root credentials in CI, GitOps, or service config.** Root is a break-glass identity used only when adding/modifying IAM users.
+4. **Service accounts get a parent user and per-application access keys.** MinIO's "access key" concept (a sub-credential of a parent user) is used for service-specific scoping where helpful (e.g., a Jenkins job that should only write to `builds/`, not to `releases/`).
+
+## User inventory (current)
+
+| User | Parent | Policy | Used by |
+| --- | --- | --- | --- |
+| `dev-ci-evidence-rw` | n/a (top-level) | `developer-ci-evidence-rw` (read+write the bucket) | Jenkins CI builds |
+| `dev-ci-evidence-ro` | n/a | `developer-ci-evidence-ro` (read-only on the bucket) | Future DefectDojo importer; ad-hoc operator probes |
+| `oadp-hub-dc-v6` | n/a | `oadp-hub-dc-v6-rw` (read+write `oadp-hub-dc-v6/*`) | OADP on hub cluster |
+| `oadp-spoke-dc-v6` | n/a | `oadp-spoke-dc-v6-rw` (read+write `oadp-spoke-dc-v6/*`) | OADP on spoke cluster |
+| `loki-hub-dc-v6` | n/a | `loki-hub-dc-v6-rw` | LokiStack on hub |
+| `loki-spoke-dc-v6` | n/a | `loki-spoke-dc-v6-rw` | LokiStack on spoke |
+| `tempo-hub-dc-v6` | n/a | `tempo-hub-dc-v6-rw` | TempoStack on hub |
+| `tempo-spoke-dc-v6` | n/a | `tempo-spoke-dc-v6-rw` | TempoStack on spoke |
+| `vault-snapshots-rw` | n/a | `vault-snapshots-rw` (write-only on `vault-snapshots/*`) | Vault snapshot cron |
+| `quay-*` (planned) | n/a | `quay-*-rw` | Future Quay |
+
+Top-level users (not parent/access-key sub-users) are used in every slot above. Sub-keys are reserved for future fine-grained scoping if a single consumer ever splits into multiple roles.
+
+## Policy template
+
+The IAM policy is a JSON document with one or more statements naming buckets and actions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": [
+        "arn:aws:s3:::developer-ci-evidence/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::developer-ci-evidence"
+      ]
+    }
+  ]
+}
+```
+
+Read-only variant drops the write actions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::developer-ci-evidence/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::developer-ci-evidence"]
+    }
+  ]
+}
+```
+
+Per-bucket-prefix-restricted variant (e.g., a Jenkins job that should only write into `builds/`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": ["arn:aws:s3:::developer-ci-evidence/builds/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::developer-ci-evidence"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["builds/*"]
+        }
+      }
+    }
+  ]
+}
+```
+
+## Onboarding a new IAM user
+
+1. **Pick a name and policy scope.** Convention: `<service>-<cluster>` for per-cluster consumers, `<service>-<role>` for shared services.
+2. **Write the policy JSON** locally (don't paste it into the MinIO console; keep it in `secrets/minio/policies/<policy-name>.json` for repeatability).
+3. **Apply the policy:**
+
+   ```bash
+   mc admin policy create lab <policy-name> /path/to/<policy-name>.json
+   ```
+
+4. **Create the user with a fresh secret:**
+
+   ```bash
+   ACCESS=<random-20>
+   SECRET=<random-40>
+   mc admin user add lab "$ACCESS" "$SECRET"
+   ```
+
+   Generate keys with `openssl rand -base64 30` (and trim) or `pwgen -s 40 1`. **Don't reuse a previous user's credentials.**
+
+5. **Attach the policy:**
+
+   ```bash
+   mc admin policy attach lab <policy-name> --user "$ACCESS"
+   ```
+
+6. **Store credentials.** Local-only ignored custody under `codex-opp-agent/secrets/minio/<service>-<cluster>.env`:
+
+   ```
+   MINIO_ENDPOINT=https://minio.apps.sub.comptech-lab.com
+   MINIO_BUCKET=<bucket>
+   MINIO_ACCESS_KEY=<ACCESS>
+   MINIO_SECRET_KEY=<SECRET>
+   MINIO_PARENT_USER=<ACCESS>
+   ```
+
+7. **Push the credentials into Vault** (and let ESO sync to the consumer namespace). For cluster operands, the OBC → operand-Secret bridge pattern is used instead — the OBC creates the IAM user, MinIO returns the keys, ESO syncs them into the LokiStack/TempoStack/Quay-expected Secret shape. See `project_obc_to_operand_secret_bridge.md`.
+
+8. **Validate**:
+
+   ```bash
+   mc alias set <service>-test https://minio.apps.sub.comptech-lab.com "$ACCESS" "$SECRET"
+   mc ls <service>-test/<bucket>
+   mc cp /etc/hostname <service>-test/<bucket>/smoke/$(hostname)-test-$(date -u +%Y%m%d-%H%M%S)
+   ```
+
+## What goes in credential custody, what doesn't
+
+| Item | Custody |
+| --- | --- |
+| MinIO root credentials | local-only `secrets/minio/root.env` on operator workstation |
+| Per-consumer access/secret pairs | local-only `secrets/minio/<service>-<cluster>.env` |
+| Policy JSON files | OK to commit to the operator workspace under `secrets/minio/policies/*.json` if they don't contain secret values |
+| User listing (`mc admin user list lab`) | OK to record in operator notes (lists usernames, not secrets) |
+| **Never** in the public docs site, the planning repo, GitOps, GitHub, GitLab, chat, command output | |
+
+The published lab docs do **not** include any MinIO credentials. The connection-details file at `codex-opp-agent/connection-details/minio.md` documents the existence and location of custody, never the values.
+
+## OBC → operand-Secret bridge (for cluster operands)
+
+LokiStack and TempoStack don't read MinIO credentials from environment variables — they expect a Kubernetes Secret with operator-specific keys (`endpoint`, `bucketnames`, `access_key_id`, `access_key_secret`). The NooBaa-style ObjectBucketClaim provisioner inside the cluster, paired with ESO, fills this:
+
+1. **OBC** (`ObjectBucketClaim`) in the operand's namespace requests a bucket. The NooBaa provisioner inside the spoke creates the bucket on its MCG/NooBaa, returns a Secret with AWS-style keys (`AWS_ACCESS_KEY_ID`, etc.).
+2. **A bridge `ExternalSecret`** reads the OBC's Secret and templates it into the lowercase keys (`access_key_id`, `access_key_secret`, `endpoint`, `bucketnames`) that LokiStack/TempoStack expect.
+
+That bridge is the lab's standard pattern for any operand whose schema doesn't match the OBC default. The current canonical example lives at `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml`. Loki backport is tracked under issue #233.
+
+For MinIO-direct (not via NooBaa) the same bridge concept applies — the producer is a MinIO IAM user, the destination is a Secret matching the operand's expected key names, ESO templates between them.
+
+## Root credentials
+
+The root credentials are kept in operator-only custody and used only for:
+
+- Initial server bootstrap.
+- Adding/modifying IAM users and policies.
+- Repairing broken IAM state.
+
+They are **not** used by any CI job, GitOps controller, ESO sync, or backup job. If you find root credentials in any Service or Job spec, that's a finding — file an issue and rotate.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Consumer gets `AccessDenied` on a bucket it should access | Policy not attached, or attached to wrong user | `mc admin user info lab <user>`; re-attach with `mc admin policy attach` | Verify policy attachment as part of the onboarding checklist |
+| Operand-side Secret has the wrong key names | The OBC → operand-Secret bridge `ExternalSecret` template not applied | Apply the bridge `ExternalSecret`; restart the operand pod | Always pair an OBC with its bridge `ExternalSecret` in the same MR |
+| Credential rotation requested but consumer still uses old key | Application caches the credential at startup | Restart the consumer pod / job after rotation | Treat credential rotation as a "restart consumer" event, not just an IAM change |
+| Root credentials accidentally used somewhere | Operator copied root keys into a job config | Rotate root keys; create a scoped user; clean up the leak | Audit periodically with `grep -r MINIO_ACCESS_KEY` against the operator workspace |
+
+## References
+
+- `codex-opp-agent/connection-details/minio.md`
+- Memory: `project_obc_to_operand_secret_bridge.md`, `reference_lab_infrastructure.md`
+- MinIO IAM docs: <https://min.io/docs/minio/linux/administration/identity-access-management.html>
