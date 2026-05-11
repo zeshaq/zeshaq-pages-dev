@@ -1,22 +1,12 @@
 ---
-// Site-wide search powered by Pagefind. Pagefind generates its index and UI
-// assets at build time into /pagefind/*; this component renders a trigger
-// button that opens a <dialog> hosting the Pagefind default UI, and wires up
-// the Cmd/Ctrl+K keyboard shortcut.
+// Site-wide search powered by Pagefind. The trigger button lives in
+// SectionNav.astro (id="site-search-trigger"); this component renders only
+// the modal + the Pagefind UI initialization. Pagefind generates its index
+// and UI assets at build time into /pagefind/*.
 //
-// In `astro dev` the /pagefind/* assets don't exist (they're build artifacts),
-// so the script gracefully degrades — the button still appears but clicking
-// shows a placeholder message.
+// In `astro dev` the /pagefind/* assets don't exist, so the script gracefully
+// degrades — clicking the trigger shows a placeholder message.
 ---
-
-<button class="search-trigger" id="site-search-trigger" type="button" aria-label="Search (⌘K)">
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-    <circle cx="11" cy="11" r="8" />
-    <path d="m21 21-4.3-4.3" />
-  </svg>
-  <span class="search-trigger-label">Search…</span>
-  <kbd class="search-kbd">⌘K</kbd>
-</button>
 
 <dialog id="site-search-modal" class="search-modal" aria-label="Site search">
   <div class="search-modal-inner">
@@ -60,7 +50,6 @@
       }
       initUI();
       modal.showModal();
-      // Focus the Pagefind input.
       setTimeout(() => {
         const input = modal.querySelector(".pagefind-ui__search-input");
         if (input instanceof HTMLInputElement) input.focus();
@@ -74,7 +63,6 @@
     trigger?.addEventListener("click", openModal);
     closeBtn?.addEventListener("click", closeModal);
     modal?.addEventListener("click", (e) => {
-      // Click on the backdrop (the dialog itself, not its content) closes.
       if (e.target === modal) closeModal();
     });
 
@@ -84,7 +72,6 @@
         e.preventDefault();
         openModal();
       }
-      // Native <dialog> already closes on Esc; this is just belt + braces.
       if (e.key === "Escape" && modal?.open) {
         e.preventDefault();
         closeModal();
