@@ -1,8 +1,178 @@
 ---
-title: "Monitoring VM"
-description: "Section 02-lab-infrastructure/09-observability-vms: Monitoring VM (placeholder)."
+title: "Monitoring VM (LGTM Sandbox)"
+description: "The monitoring-0 VM — native systemd LGTM stack (Grafana, Prometheus, Alertmanager, Loki, Tempo, Pyroscope, Alloy) deployed as a learning sandbox per ADR 0012, distinct from production SigNoz."
 sidebar_label: "Monitoring VM"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`monitoring-0` is the lab's **observability learning sandbox**: a single VM running the Grafana LGTM-plus stack (Loki, Grafana, Tempo, Mimir/Prometheus, with Alloy as the collector and Pyroscope for profiling) as native systemd services. Per ADR 0012 and the lab infrastructure memory, this VM exists to learn observability primitives directly — components, exporters, dashboards, alert rules, collector topologies — not to host production telemetry. SigNoz holds the production observability role.
+
+This page covers `monitoring-0`, why it exists alongside SigNoz, and the `*.mon.sub.comptech-lab.com` exposure pattern unique to this VM.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| VM | `monitoring-0` |
+| Private FQDN | `monitoring-0.sub.comptech-lab.com` |
+| Private alias | `monitoring.sub.comptech-lab.com` |
+| Public hostnames | `*.mon.sub.comptech-lab.com` (Grafana etc.) |
+| Public edge alias | `monitoring.apps.sub.comptech-lab.com` |
+| OS | Ubuntu 24.04 LTS cloud-init |
+| Packaging | Native systemd services (one unit per component) |
+| Sizing | 8 vCPU, 32 GiB RAM, 100 GB OS disk, 1 TB data disk under `/var/lib/monitoring` |
+| Default admin user | `zahid` (lab convention) |
+| Admin password custody | `secrets/monitoring-vm/admin.env` |
+
+The native-systemd choice is intentional. Rather than the Grafana LGTM Docker bundle, each component runs as a discrete unit with its own config under `/etc/<component>/`. The point is *learning*, and packaging components in containers hides too much.
+
+## Component inventory
+
+| Component | Role | Port (private) |
+| --- | --- | --- |
+| Grafana | Dashboards & exploration UI | `3000` |
+| Prometheus | Metrics scrape, rules, alert evaluation | `9090` |
+| Alertmanager | Alert grouping, routing, silences, notifications | `9093` |
+| Loki | Log store + query | `3100` |
+| Tempo | Trace store + query | `3200` |
+| Pyroscope | Continuous profiling experiments | `4040` |
+| Grafana Alloy | Collector (OTLP receiver, log tail, scrape fan-out) | OTLP `4317`/`4318`, multiple internal |
+| Blackbox Exporter | HTTP/TCP/DNS/TLS probing | `9115` |
+| Node Exporter | Linux host metrics on monitored VMs | `9100` |
+
+Service exporters or native metrics for Vault, Kafka, Redis, Jenkins, HAProxy, PowerDNS, Nexus, MinIO, Trivy, SigNoz, WSO2, and future OpenShift endpoints are progressively added under the M8 work track (per ADR 0012).
+
+## Why a separate VM from SigNoz
+
+The two VMs serve different intents and the lab keeps them strictly separate:
+
+| Concern | `signoz` | `monitoring-0` |
+| --- | --- | --- |
+| Intent | Production telemetry destination | Learning sandbox |
+| Status | Stable, single-product | Evolving, multi-component |
+| Backup posture | Open (roadmap) | Operator-managed; loss is acceptable |
+| OTLP receiver | SigNoz Receiver directly | Alloy fans out to Tempo / Loki / Prometheus |
+| Default audience | Application owners | Platform team learning |
+
+The user directive (`reference_lab_infrastructure.md`): "Don't propose production-grade work against `monitoring-0`; treat as a labbench."
+
+## OTLP on `monitoring-0`
+
+OTLP ingestion on `:4317` (gRPC) and `:4318` (HTTP) is owned by **Grafana Alloy** (v1.16+), not by Tempo directly. Alloy fans out:
+
+- Traces → Tempo
+- Logs → Loki
+- Metrics → Prometheus `remote_write`
+- Plus tails systemd journal to Loki
+
+Alloy's config is a single-file at `/etc/alloy/config.alloy`. The configuration uses the new HCL-ish "Alloy syntax" rather than the older static-config approach.
+
+Apps shipping OTLP to `monitoring-0` use the **same ports** as SigNoz (`:4317`, `:4318`). Apps must therefore **choose deliberately** which target they're shipping to. The two VMs are not interchangeable destinations — they accept the same protocol but store and present the data very differently.
+
+## `*.mon.sub.comptech-lab.com` exposure pattern
+
+Unique to `monitoring-0`: a separate DNS sub-zone and a separate LE wildcard, so that monitoring-0 services that need a public hostname don't have to share the `*.apps.*` namespace with cluster apps.
+
+The pattern (added 2026-05-09 per memory):
+
+- **PowerDNS:** `*.mon.sub.comptech-lab.com` records point at the lab public ingress.
+- **Wildcard cert:** `/etc/haproxy/certs/wildcard-mon.pem` issued via `acme.sh --dns dns_pdns` from the pdns VM. The acme.sh state lives under `/root/.acme.sh/*.mon.sub.comptech-lab.com_ecc/`.
+- **HAProxy bind:** `127.0.0.1:8443` carries both `wildcard-apps.pem` and `wildcard-mon.pem` for SNI-based cert selection.
+- **Per-service route:** each new `<svc>.mon.*` host requires 5 HAProxy spots — an SNI rule, a vm-tls host-header → backend mapping, a public-apps-http redirect ACL, a vm-tls deny-unless ACL, plus the new backend if needed.
+
+Concrete example: `grafana.mon.sub.comptech-lab.com` routes through HAProxy and lands on the monitoring-0 VM's Grafana port `3000`. Adding `prometheus.mon.sub.comptech-lab.com` would follow the same five-step HAProxy edit pattern.
+
+Why a separate sub-zone: the `*.mon.*` plane keeps experimental observability dashboards distinct from the `*.apps.*` plane, which is the application-routable plane. If a `mon` cert renewal fails or a `mon` backend goes hot, it can't take down `apps` services.
+
+## Alloy as the central collector
+
+The collector layer matters more than any individual component in this architecture. Alloy is the seam between emitters and stores:
+
+```text
+App pod / app process
+   ↓ OTLP HTTP :4318 or gRPC :4317
+Alloy (on monitoring-0 or co-located with app)
+   ↓ traces → Tempo (3200)
+   ↓ logs → Loki (3100)
+   ↓ metrics → Prometheus remote_write
+   ↓ journal tail → Loki (3100)
+   ↓ scrape configs → Prometheus
+```
+
+Two-layer model per ADR 0012:
+
+1. **Local agent layer** on app/VM nodes — Alloy or OTel Collector receives app OTLP on `localhost`, tails local logs, adds consistent resource labels, batches, retries, and forwards to monitoring-0.
+2. **Central gateway layer** on monitoring-0 — receives OTLP gRPC/HTTP on `:4317`/`:4318`, applies shared filtering, redaction, sampling, routing, and (future) auth, then sends each signal to its store.
+
+In the current state, most lab VMs do not run a local Alloy agent and send OTLP directly to monitoring-0. The two-layer model is the target; the single-layer model is the starting point.
+
+## What's explicitly excluded
+
+- **Kiali.** ADR 0012 explicitly excludes Kiali from this VM. If OpenShift Service Mesh/Istio is deployed later, Kiali should be installed inside the relevant OpenShift service-mesh environment, not on this independent VM.
+- **Production app telemetry destination.** Send production traces/logs to SigNoz, not here.
+- **OpenShift cluster-internal monitoring.** OpenShift has its own cluster monitoring stack; monitoring-0 doesn't replace it.
+
+## Operational guidance
+
+- **One signal, one accepted path.** For each metric/log/trace pipe, define one accepted destination before onboarding it. Don't duplicate Prometheus scrape and Alloy OTLP for the same metric.
+- **Keep HAProxy exposure UI-focused.** OTLP, Prometheus, Loki, Tempo, Pyroscope, and exporter ports stay private unless an explicit phase approves TLS/auth/source-restricted exposure.
+- **Custody on the VM.** Grafana admin, datasource credentials, Alertmanager notifier secrets stay under `secrets/monitoring-vm/`. Migrate durable secrets into Vault once the Vault consumer contract is ready.
+- **Don't promote `monitoring-0` to production.** The natural temptation when something works in a sandbox is to call it production. Resist. SigNoz holds the production role; promotion of components from monitoring-0 to production observability is a separate decision that goes through ADR.
+
+## Failure modes
+
+### Symptom: traces sent to monitoring-0 don't show up in Grafana
+
+**Root cause.** Alloy didn't route them to Tempo, or the Tempo data source in Grafana isn't configured correctly.
+
+**Fix.** Check Alloy's config (`/etc/alloy/config.alloy`) and journal. Check Tempo's API directly (`curl monitoring-0:3200/api/echo`). Verify Grafana data source.
+
+**Prevention.** Test each signal type end-to-end after Alloy config changes.
+
+### Symptom: Grafana login fails
+
+**Root cause.** Admin credential changed without updating local custody, or the systemd unit is restarting.
+
+**Fix.** Check `/etc/grafana/grafana.ini` for current admin user. Reset password via Grafana CLI if needed. Update custody.
+
+**Prevention.** Track credential rotation under the secret custody runbook.
+
+### Symptom: dashboards / alert rules disappear after VM reboot
+
+**Root cause.** Grafana provisioned dashboards live in `/etc/grafana/provisioning/dashboards/*.yaml`, not in the database. Manually-created UI dashboards live in `/var/lib/grafana/grafana.db` (SQLite). A reboot doesn't delete either, but a `rm -rf /var/lib/grafana` (or volume-mount mishap) does.
+
+**Fix.** Restore from snapshot, or recreate manually from documented intent.
+
+**Prevention.** Snapshot `/var/lib/grafana/grafana.db` periodically. Provision important dashboards via config files in source control.
+
+### Symptom: Prometheus is OOM-killed
+
+**Root cause.** Series cardinality exceeded what the VM can hold in memory.
+
+**Fix.** Identify the high-cardinality metric (often a misconfigured label like `instance=<random-pod-id>`). Drop the metric or relabel-drop the offending label.
+
+**Prevention.** Monitor Prometheus's own `prometheus_tsdb_head_series` metric; alert on growth.
+
+### Symptom: `grafana.mon.sub.comptech-lab.com` returns TLS error
+
+**Root cause.** Wildcard `mon` cert expired or HAProxy isn't loading both certs. ACME automation lives on the pdns VM; renewal might have failed.
+
+**Fix.** Verify cert expiry. Force `acme.sh` renewal on the pdns VM, copy renewed cert to HAProxy, reload HAProxy.
+
+**Prevention.** Monitor `*.mon.*` cert expiry; alert at 14 days before expiry.
+
+## Roadmap
+
+Per ADR 0012, the M1–M7 base stack is deployed. M8 (service integrations and dashboards) and M9 (operational hardening) remain open:
+
+- M8: exporters, probes, dashboards, alert rules for Vault, Kafka, Redis, Jenkins, HAProxy, PowerDNS, Nexus, MinIO, Trivy, SigNoz, WSO2.
+- M9: SLOs, alert routing, retention sizing, backups, restore drills, restart validation, Vault-backed credentials.
+
+These are explicitly **learning-track** work; the goal is to develop intuition for production observability, not to declare production readiness on this VM.
+
+## References
+
+- `codex-opp-agent/adr/0012-monitoring-observability-learning-vm.md` — VM design, component list, phase gates.
+- Memory: `reference_lab_infrastructure.md` — two-VM observability split, `*.mon.*` exposure pattern.
+- [SigNoz Overview](./01-signoz-overview) — the production-side counterpart.

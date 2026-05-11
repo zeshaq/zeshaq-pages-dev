@@ -1,8 +1,160 @@
 ---
 title: "SigNoz ClickHouse Storage"
-description: "Section 02-lab-infrastructure/09-observability-vms: SigNoz ClickHouse Storage (placeholder)."
-sidebar_label: "SigNoz ClickHouse Storage"
+description: "How SigNoz uses ClickHouse for traces, metrics, and logs — schema model, retention, the SQLite split for org/user/dashboard data, and the backup posture."
+sidebar_label: "ClickHouse Storage"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+SigNoz separates its data plane into two backing stores: **ClickHouse** for telemetry (traces, metrics, logs), and **SQLite** for org/user/dashboard config. They have very different operational characteristics, and understanding the split matters for retention sizing, backup planning, and the v0.122 auth-quirk reproduction.
+
+## Why ClickHouse
+
+ClickHouse is a column-oriented OLAP database designed for high-cardinality time-series and event data. SigNoz uses it as the trace/metric/log store because:
+
+- **Compression.** Trace spans and log lines compress aggressively in ClickHouse's columnar storage — the disk footprint for a given retention window is much smaller than row-oriented storage.
+- **Query speed.** Aggregation across millions of spans (typical SigNoz dashboard queries) returns in seconds rather than minutes.
+- **High-cardinality friendly.** Trace IDs, span IDs, user IDs — high-cardinality fields don't blow up the index the way they do in Prometheus / InfluxDB / Elasticsearch in many configurations.
+- **Native time-partitioning.** Traces are partitioned by day; retention is enforced by dropping old partitions, not by row-by-row deletes.
+
+The tradeoff: ClickHouse is harder to operate than a stock relational DB. The SigNoz Docker Compose stack manages most of the ClickHouse complexity; the lab does not need to be a ClickHouse expert to keep SigNoz running, but it does need to keep the data disk sized and back up periodically.
+
+## What's stored where
+
+| Data class | Store | Approximate retention | Recovery posture |
+| --- | --- | --- | --- |
+| Trace spans | ClickHouse | ~15 days (default; tunable) | Re-emitting traces from apps; old traces gone if disk loss |
+| Metrics | ClickHouse | longer than traces (90+ days by default) | Same — re-emit; old metrics gone if disk loss |
+| Logs | ClickHouse | ~7-15 days (configurable) | Same — re-emit; old logs gone if disk loss |
+| Organizations | SQLite | indefinite | Recoverable from SQLite backup |
+| Users | SQLite | indefinite | Recoverable from SQLite backup |
+| Dashboards | SQLite | indefinite | Recoverable from SQLite backup |
+| Alert rules | SQLite | indefinite | Recoverable from SQLite backup |
+| Alert channels | SQLite | indefinite | Recoverable from SQLite backup |
+| Saved views / queries | SQLite | indefinite | Recoverable from SQLite backup |
+
+The split is significant for backups: ClickHouse can be wiped and rebuilt from re-emitted telemetry; SQLite cannot — dashboards, alerts, users, and orgs are the operational state of the SigNoz tenant.
+
+## ClickHouse layout
+
+ClickHouse in the SigNoz Compose stack runs as one (or, in HA installs, more) ClickHouse nodes coordinated through Zookeeper. Tables of interest:
+
+- `signoz_traces.signoz_index_v3` — the trace span store, partitioned by toDate(timestamp).
+- `signoz_traces.distributed_signoz_index_v3` — the distributed table view when clustered.
+- `signoz_metrics.time_series_v4` — the metric series catalog.
+- `signoz_metrics.samples_v4` — the metric samples.
+- `signoz_logs.logs` — the log lines.
+
+Retention is enforced via TTL clauses on the tables. The default TTLs are sensible for a small-to-medium lab; tightening them lets you keep less data in less disk.
+
+The data disk on the SigNoz VM mounts under the standard Docker storage path; the ClickHouse data lives in `/var/lib/docker/volumes/signoz-data` (or equivalent depending on the Compose file's volume layout).
+
+## SQLite layout
+
+SigNoz's SQLite database holds the small set of relational state that doesn't fit ClickHouse's columnar model. The DB file lives at:
+
+```text
+/var/lib/docker/volumes/signoz-sqlite/_data/signoz.db
+/var/lib/docker/volumes/signoz-sqlite/_data/signoz.db-wal
+```
+
+The WAL file is part of live state — a backup that only captures `signoz.db` and not `signoz.db-wal` may be missing recent writes. Pause writes (or take a coherent snapshot) before backing up.
+
+Tables relevant for daily operations:
+
+- `organizations` — orgs and their identifiers (the v0.122 auth API needs the org-id UUID from here).
+- `users` — user accounts.
+- `dashboards` — saved dashboards.
+- `rules` — alert rules.
+- `channels` — alert notification channels.
+
+The connection-details runbook documents how to dump the org-id when the auth API needs it — covered in the [auth quirk page](./03-signoz-auth-quirk).
+
+## Retention sizing
+
+Trace retention dominates disk usage. For each application emitting OTLP spans, you can estimate:
+
+```text
+daily_disk_used ≈ spans_per_day * avg_span_size_compressed
+```
+
+`avg_span_size_compressed` for typical Open Liberty / Java apps lands around 200-800 bytes after ClickHouse compression — call it ~500 bytes for back-of-the-envelope.
+
+For a small lab with two apps emitting ~50k spans/day each, daily disk ≈ 50MB; at the default 15-day retention, that's ~750MB for traces. Realistically you'll allocate a 100GB+ data disk and never worry about it.
+
+For larger footprints (real production workload class), the math runs into hundreds of GB, and retention/sizing becomes a real decision. The lab's current state does not exercise that regime.
+
+Metrics retention is typically longer than traces; logs depend heavily on application verbosity.
+
+## Backup posture
+
+Per ADR 0010 and the SigNoz connection-details runbook, the current state is:
+
+- **ClickHouse backup is unresolved.** ClickHouse has its own backup tooling (`BACKUP` SQL statements, `clickhouse-backup` external tool); the lab has not yet wired a regular backup with a tested restore drill.
+- **SQLite backup is partially-wired.** Periodic snapshots can be taken with a `docker cp` from the container plus a `tar`, but the rotation/retention/encryption policy for those snapshots is open.
+- **Effective recovery today** = re-emit telemetry from apps (loses history) + rebuild SQLite from operator notes (loses dashboards/alerts) for ClickHouse, or for SQLite a `tar`/`cp` snapshot taken ad-hoc.
+
+The roadmap items: tested ClickHouse backup with restore drill; periodic SQLite snapshot to MinIO; coordinated backup window so the two stores are consistent.
+
+In the interim:
+
+- Keep dashboards and alert rules in source control by exporting their JSON from the SigNoz UI (or via API) and committing the JSON to a platform-tools-config repo (when that's stood up — see [the GitLab pages](../11-gitlab-self-hosted/02-federated-monorepo-architecture)).
+- Re-emit historical traces is not realistic; treat trace history as best-effort and not a system of record.
+
+## Operational guidance
+
+- **Size the data disk for headroom.** A SigNoz disk-full event hangs ClickHouse and breaks new ingestion. Allocate 2-3x the expected sizing.
+- **Tune TTLs deliberately.** Don't widen retention on a whim — disk grows linearly with retention.
+- **Watch ClickHouse merge pressure.** ClickHouse merges parts in the background. If ingestion rate exceeds merge capacity, the merge queue grows and queries slow down. SigNoz dashboards expose this; alert on backpressure.
+- **Don't hand-modify ClickHouse tables.** Schema changes happen via SigNoz upgrades; manual alters break the next migration.
+- **Snapshot SQLite before SigNoz upgrades.** Even with no automated backup, take an ad-hoc snapshot before each SigNoz upgrade.
+
+## Failure modes
+
+### Symptom: ingestion rate drops, queries get slow
+
+**Root cause.** ClickHouse merge backlog grew faster than merge capacity. Often follows a sudden ingest spike (a new app suddenly emitting 10x its baseline).
+
+**Fix.** Reduce ingest if possible (drop a low-value emitter temporarily). Wait for merges to catch up. If chronic, tune ClickHouse merge settings or grow the VM.
+
+**Prevention.** Capacity planning before onboarding new high-volume apps.
+
+### Symptom: SigNoz UI shows dashboards but no data
+
+**Root cause.** ClickHouse query path is healthy but the ingest path is broken. Or the query time window doesn't include any data.
+
+**Fix.** Verify OTLP ingestion ports are reachable from apps. Verify ClickHouse health. Widen the query time window in the UI.
+
+**Prevention.** Monitor OTLP-receive rate independently from UI dashboards.
+
+### Symptom: SQLite write fails
+
+**Root cause.** Disk full, or DB locked by an aborted transaction, or volume corruption.
+
+**Fix.** Free disk; restart the SigNoz container to release locks; restore from snapshot if corrupted.
+
+**Prevention.** Disk monitoring; periodic snapshots.
+
+### Symptom: ClickHouse parts grow but disk doesn't drop after TTL expiry
+
+**Root cause.** TTL-based partition drops are async; the merge thread eventually drops dropped parts but disk-on-disk space recovery can lag.
+
+**Fix.** Wait for ClickHouse housekeeping. If chronic, `OPTIMIZE TABLE` on the affected table forces it (carefully, in low-traffic window).
+
+**Prevention.** Monitor part count and disk usage independently.
+
+### Symptom: cannot back up SQLite cleanly
+
+**Root cause.** WAL mode means `signoz.db` alone is incomplete; need `signoz.db-wal` too. A naive `cp signoz.db` skips uncommitted writes.
+
+**Fix.** Use SigNoz's recommended backup approach (`docker exec sqlite3 .backup`), or copy both files together while the container is paused.
+
+**Prevention.** Use proper backup tooling, not naive file copy.
+
+## References
+
+- `codex-opp-agent/connection-details/signoz.md` — sections "Current Service", "Known Gotchas" (covers SQLite/orgID).
+- `codex-opp-agent/adr/0010-signoz-standalone-vm-observability.md` — VM design, retention guardrails.
+- ClickHouse documentation — schema/TTL/backup primitives.
+- [SigNoz Overview](./01-signoz-overview)
+- [Auth Quirk (v0.122)](./03-signoz-auth-quirk)
