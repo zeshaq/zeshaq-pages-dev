@@ -1,8 +1,177 @@
 ---
-title: "Failed Installs and cloud-init"
-description: "Section 08-history-and-replay: Failed Installs and cloud-init (placeholder)."
-sidebar_label: "Failed Installs and cloud-init"
+title: "Failed Installs and the cloud-init Scrap Folder"
+description: "Why /home/ze/cloud-init is read-only historical scrap, the class of failures that left it behind, and what replaced it in the v6 rebuild."
+sidebar_label: "Failed Installs & cloud-init"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const scrapBox = { background: "#fee2e2", border: "1.5px dashed #b91c1c", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" };
+export const goodBox  = { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const ruleBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" };
+
+export const replEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const ruleEdge = { style: { stroke: "#b45309", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b45309" }, labelStyle: { fill: "#b45309", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const scrapNodes = [
+  { id: "ci", position: { x: 0,   y: 120 }, data: { label: "/home/ze/cloud-init/\n(read-only scrap)" }, style: scrapBox },
+  { id: "rule",  position: { x: 280, y: 0   }, data: { label: "Boundary rule:\nnever write, only read" }, style: ruleBox },
+  { id: "audit", position: { x: 280, y: 240 }, data: { label: "Treat values as\nhistorical, not authoritative" }, style: ruleBox },
+
+  { id: "vault", position: { x: 600, y: 0   }, data: { label: "Vault VM\n(centralized custody)" }, style: goodBox },
+  { id: "nexus", position: { x: 600, y: 120 }, data: { label: "Nexus VM + oc-mirror\n(single image supply)" }, style: goodBox },
+  { id: "git",   position: { x: 600, y: 240 }, data: { label: "GitLab + codex-opp-agent\n(declarative state)" }, style: goodBox },
+];
+
+export const scrapEdges = [
+  { id: "r1", source: "ci", target: "rule",  ...ruleEdge, label: "governed by" },
+  { id: "r2", source: "ci", target: "audit", ...ruleEdge, label: "governed by" },
+  { id: "v1", source: "ci", target: "vault", ...replEdge, label: "credentials replaced by" },
+  { id: "n1", source: "ci", target: "nexus", ...replEdge, label: "image refs replaced by" },
+  { id: "g1", source: "ci", target: "git",   ...replEdge, label: "state replaced by" },
+];
+
+`/home/ze/cloud-init/` is a folder of ~117 files left over from earlier failed rebuild attempts at this lab. This page documents why it is **scrap** (not current state), the **boundary rule** that forbids writing to it, and the **patterns that replaced it** so future rebuilds don't recreate the same sprawl.
+
+## What's in there
+
+The directory contains plain text and YAML files, each typically named after the system it represents. A representative slice:
+
+```
+/home/ze/cloud-init/
+├── AGENTS.md
+├── INFRASTRUCTURE.md
+├── adr/
+├── acs-central-admin-password
+├── acs-init-bundle-fleet.yaml
+├── argocd-admin-password
+├── argocd-gitlab-webhook-secret
+├── arif-rke2-1 / arif-rke2-2 / arif-rke2-3 / arif-rke2-token
+├── awx-admin-password
+├── cluster-logs-writer-password
+├── cloudflare-token / cloudflare-token.txt
+├── defectdojo-admin-password / defectdojo-api-token / defectdojo-secrets.env
+├── demo-orders-dc-secret / demo-orders-oidc-client.json
+├── github-pat
+├── gitlab / gitlab-md-pat / gitlab-oidc-client.json / gitlab-root-password / gitlab-root-pat
+├── ...
+```
+
+Reading the file names alone is enough to see the failure class.
+
+## The four failure classes that created the scrap
+
+### 1. Credential sprawl
+
+Every system that needed a credential dropped a file here. There is no convention for naming, location, encryption, or rotation. The same credential appears in multiple formats (`gitlab-root-pat` and `gitlab-md-pat` and `gitlab-root-password`). When two attempts at a system left two different password files, nothing told the operator which was current. **Each new rebuild created new credentials and the old ones became indistinguishable noise.**
+
+### 2. No declarative state
+
+Files in `cloud-init/` are point-in-time captures, not declarative state. There is no commit graph, no diff history, no `terraform apply` to converge to a desired state, no `kubectl apply -f`. If the lab broke, the only way to discover the last working values was to grep the folder and hope.
+
+### 3. Mixed-tier secrets
+
+`acs-init-bundle-fleet.yaml` (a Kubernetes-level secret) sits next to `gitlab-root-password` (a VM-level service credential) sits next to `cloudflare-token.txt` (an external-API token). There is no tier separation, so any one secret leaked exposes all of them with no security boundary.
+
+### 4. Unrecoverable installs
+
+Some of the files (`arif-rke2-*` tokens, `awx-rke2-admin-password`) reference RKE2-based clusters that never reached a working OpenShift state. The cloud-init folder is the only durable trace of those attempts — every other artifact (VMs, libvirt definitions, kubeconfigs) was discarded.
+
+## The boundary rule
+
+The workspace boundary rule is recorded in the agent memory entry `feedback_workspace_boundary.md` (the canonical operating constraint for filesystem access). The relevant clause:
+
+> **`/home/ze/cloud-init` is read-only.** Reading (`ls`, `cat`, `grep`, etc.) is allowed when needed. **Never write** to anything under that path. It is leftover historical data from a previous failed installation. Treat values found there as **not authoritative** — they are evidence of past state, not current truth. If the user asks about something in cloud-init, you may inspect it; do not modify it.
+
+This rule has three operational implications:
+
+1. **No automation writes to `cloud-init/`.** No script, no Ansible playbook, no GitOps reconcile loop. The folder is frozen.
+2. **No new secrets land in `cloud-init/`.** New credentials are written to `/home/ze/secrets/` or to the workspace `/home/ze/codex-opp-agent/secrets/` — both of which are git-ignored. Vault is the durable backing store.
+3. **Values found in `cloud-init/` are flagged historical when reported.** When the user asks "what's the GitLab root password?" the answer is **not** `cat /home/ze/cloud-init/gitlab-root-password`; the answer is "Vault path `secret/infra/gitlab/admin/root`" — and if that's empty, the cloud-init value is offered as historical evidence only, with the recommendation to rotate immediately.
+
+REP-6 (issue [#150](https://github.com/zeshaq/codex-opp-agent/issues/150)) explicitly distinguished this kind of operational rule from project-knowledge memory:
+
+- **Behavioral feedback** (like the cloud-init boundary) stays in memory because it governs how the agent operates.
+- **Operational knowledge** (the actual replacement patterns — Vault paths, Nexus URLs, GitOps repos) was migrated into runbooks and connection-details documents that any operator can find.
+
+## What replaced what
+
+<Whiteboard client:load data={{ nodes: scrapNodes, edges: scrapEdges }} height={420} />
+
+| cloud-init artifact | Replacement | Where it lives now |
+| --- | --- | --- |
+| `gitlab-root-password`, `gitlab-root-pat`, `gitlab-md-pat` | Vault KV v2 + admin custody convention | Vault `secret/infra/gitlab/admin/*`; admin steady-state credentials in `/home/ze/secrets/gitlab/` |
+| `argocd-admin-password` | OpenShift-managed Secret | `secret/openshift-gitops-cluster` in the `openshift-gitops` namespace (Argo CD generates and rotates this; never read or copy the value out) |
+| `argocd-gitlab-webhook-secret` | Sealed via Vault + ESO bridge | `secret/apps/<tenant>/ci/webhook` → ESO ExternalSecret materializes `Secret` in the target namespace |
+| `acs-central-admin-password`, `acs-init-bundle-fleet.yaml` | RHACS init-bundle via Central API (no `roxctl` needed) | `POST /v1/cluster-init/init-bundles`; admin creds from `central-htpasswd` Secret; bundle pushed to Vault for ESO delivery (memory `reference_rhacs_init_bundle_via_api.md`) |
+| `defectdojo-admin-password`, `defectdojo-api-token`, `defectdojo-secrets.env` | Per-service Vault path | `secret/infra/defectdojo/admin/*` with ESO bridge to the DefectDojo VM via cloud-init (the *current* cloud-init phase, not the scrap folder) |
+| `cluster-logs-writer-password` | Vault → MinIO STS path | `secret/infra/minio/loki-writer/*` |
+| `cloudflare-token` | Vault | `secret/infra/cloudflare/api-token` |
+| `github-pat` | `/home/ze/secrets/github/` (git-ignored, never committed) | Local custody; PAT scope minimized |
+| `arif-rke2-*` | **N/A — RKE2 clusters out of scope.** Memory `project_workspace_scope.md`: workspace is OpenShift-only. | Not replaced; deprecated wholesale |
+| `awx-*` | **N/A — AWX out of scope.** | Not replaced |
+| `demo-orders-*`, `demo-orders-oidc-client.json` | Per-tenant Vault path | `secret/apps/<division>/demo-orders/*` |
+
+The pattern: **one credential, one location, one tier.** Vault is the durable store; ESO bridges to OpenShift; HashiCorp transit auto-unseals; cloud-init (lowercase, the actual cloud-init phase of new VMs) consumes Vault rather than embedding plaintext.
+
+## The three architectural decisions that closed the loop
+
+The cloud-init scrap folder was the negative example that motivated:
+
+1. **ADR 0001 — operator workspace.** A single tracked workspace at `/home/ze/codex-opp-agent` for assessment, plans, scripts, ADRs, reports, and (git-ignored) secrets. Replaces the "everything lives in `cloud-init/`" pattern with "everything lives in a versioned workspace, with secrets staged separately."
+2. **ADR 0019 — Nexus-only image supply chain.** Single image-supply path. Replaces "every system's image refs are in its cloud-init file" with "every system pulls from `nexus-mirror.apps.sub.comptech-lab.com`."
+3. **ADR 0024 — OpenShift-only platform-gitops boundary.** Platform state for the v6 fleet is declarative under `platform-gitops` on GitLab; VM-tier state is captured in `codex-opp-agent/connection-details/` and `scripts/rebuild/`. Replaces "scattered point-in-time captures" with "declarative state, versioned, MR-reviewed."
+
+## Why we still read it sometimes
+
+Even though `cloud-init/` is scrap, it is not deleted. Three reasons to keep it:
+
+1. **Forensic evidence.** When investigating "did a previous attempt set this OIDC client?", the cloud-init folder is the only place the historical OAuth client_id might be recorded. Reading it is fine; just flag the value as historical.
+2. **Migration audit.** REP-6 used cloud-init as one of the inputs when deciding which memory entries to migrate to runbooks. The folder is a checklist of "things that were credentialed in the old world but should be re-credentialed in the new world."
+3. **Negative example for new operators.** When a new operator (human or agent) sees `cloud-init/` they immediately understand what the workspace-and-Vault discipline is preventing. Showing the bad state is faster than describing it.
+
+## The do-not-touch contract
+
+The cloud-init boundary is the most-violated-on-instinct rule, because filesystem write access is the default mental model. The hard line is:
+
+| Action | Allowed? |
+| --- | --- |
+| `ls /home/ze/cloud-init/` | Yes |
+| `cat /home/ze/cloud-init/<file>` | Yes (for forensic reading; never paste contents into chat) |
+| `grep -r <pattern> /home/ze/cloud-init/` | Yes |
+| `find /home/ze/cloud-init/ -type f` | Yes |
+| `mv`, `cp`, `rm`, `chmod`, `chown`, `>`, `>>`, `mkdir` under that path | **No** — even non-destructive moves are forbidden |
+| Editing any file under `cloud-init/` | **No** |
+| Adding new files under `cloud-init/` | **No** |
+| Symlinking from `cloud-init/` elsewhere | Discouraged; the new convention is one-way (cloud-init never reaches forward into current state) |
+
+If a value is needed **and is not in Vault or the workspace**, the procedure is:
+
+1. Read it from `cloud-init/` for context.
+2. Rotate the credential at the source system (GitLab admin UI, RHACS Central API, etc.).
+3. Store the new value in Vault under the correct convention path.
+4. Wire ESO (or the consuming script) to read from Vault.
+5. Update the relevant runbook in `codex-opp-agent/runbooks/` so the next operator finds the live path, not the cloud-init path.
+
+## What "failed install" specifically means here
+
+The cloud-init folder is the residue of installs that **failed** in two specific senses:
+
+- **Functionally failed.** RKE2 clusters that never bound to the lab edge; AWX deployments that never produced a working tower; OIDC integrations that broke between WSO2 IS and the apps that depended on them. The artifacts exist; the working system never did.
+- **Operationally failed.** Even attempts that produced a running system failed *operationally* because they left no recoverable state. When the cluster broke, the only durable record was a handful of plaintext credential files. There was no `git log`, no MR history, no ADR, no runbook. The v6 rebuild's discipline (issue → MR → ADR → runbook → session report) is the direct response to that operational failure mode.
+
+The v6 fleet inherited zero runtime state from cloud-init. It inherited the lesson.
+
+## References
+
+- Memory `feedback_workspace_boundary.md` — the exact text of the boundary rule
+- Memory `project_workspace_scope.md` — OpenShift-only scope; RKE2/AWX out of scope
+- ADR 0001 — operator workspace
+- ADR 0019 — Nexus-only image supply chain
+- ADR 0024 — OpenShift-only platform-gitops boundary
+- REP-6 issue [#150](https://github.com/zeshaq/codex-opp-agent/issues/150) — migration of memory entries to runbooks
+- `codex-opp-agent/runbooks/secrets-custody-drift-check.md` — the REP-6 output that codifies "one credential, one location"
+- `codex-opp-agent/connection-details/vault-app-secrets.md` — current credential model
+- Memory `reference_rhacs_init_bundle_via_api.md` — replacement for cloud-init's `acs-*` files

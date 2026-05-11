@@ -1,8 +1,249 @@
 ---
 title: "Day-Wrap Archive"
-description: "Section 08-history-and-replay: Day-Wrap Archive (placeholder)."
+description: "Chronological index of session-closeout records — the auditable handoff trail that lets the next session resume without reading chat history."
 sidebar_label: "Day-Wrap Archive"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page is the chronological index of **session-closeout** records — the auditable handoff trail that lets the next operator (human or agent) resume work without reading chat history. The cadence has two layers:
+
+1. **Per-session reports** under `codex-opp-agent/reports/sessions/<timestamp>-<slug>.md`. Every non-trivial session produces one. The `scripts/close-session.sh <slug>` helper creates a timestamped stub; the operator fills it before final handoff.
+2. **Day-wrap issues** on GitHub when the day's work warrants a roll-up summary (multiple operators installed, multiple ADRs accepted, large number of MRs merged). These reference the underlying per-session reports.
+
+The day-wrap convention itself was set during the 2026-05-05 → 2026-05-09 window (session-routines + session-closeout patterns appeared on 2026-05-05 and 2026-05-08). The most explicit roll-up — `Session 2026-05-10: day wrap` — is [issue #159](https://github.com/zeshaq/codex-opp-agent/issues/159).
+
+This page is the **index**, not the content. Each entry links to the underlying record. Per the workspace boundary rule, the linked records may discuss internal IPs and credentials in their full form; the published index avoids restating those.
+
+## How to read this index
+
+| Column | What |
+| --- | --- |
+| **Date** | The UTC date the session closed. Sessions that span midnight UTC use the close date. |
+| **Scope** | One-line headline — what the session was about. |
+| **Key decisions** | The 1–3 architectural or operational decisions that came out of the session, often tied to an ADR or runbook. |
+| **Follow-ups created** | Issues, MRs, or sub-tasks opened during closeout that carried forward. |
+
+## 2026-05-11
+
+| Date | Scope | Key decisions | Follow-ups created |
+| --- | --- | --- | --- |
+| 2026-05-11 | **PCI-DSS chain close** | PCI-0..PCI-5 + PCI-1.13 closed end-to-end on `spoke-dc-v6`; auditor evidence pack published; MR `!53` merged (TailoredProfile + hardening); MR `!54` (spoke `argocd-platform-extensions` ClusterRole unblock); MR `!55` (TailoredProfile exclusion for CSO + ingress-ciphers). Final PCI-DSS FAIL counts: 8 / 3 / 0. | Sub-issues #246–#252 (ClusterLogForwarder, FileIntegrity, cert-manager Ingress, allowedRegistries, SPO namespace, Identity Provider, master-node auditd) |
+| 2026-05-11 | **RHOAI direct mirror progress check** | Direct retry `rhoai-direct-retry-20260510-233119` still running in tmux on the mirror VM; 572 successes / 1 failure (`rhaiis/vllm-cuda-rhel9`); previously-problematic RHOAI images now succeeding via direct Nexus path | none (status check only); session report `reports/sessions/20260511-004259-rhoai-direct-mirror-progress.md` |
+
+## 2026-05-10 — the big day-wrap
+
+[**Issue #159 — Session 2026-05-10: day wrap — 7 operators, 16 MRs, 15 issues closed, 2 ADRs**](https://github.com/zeshaq/codex-opp-agent/issues/159)
+
+Headline numbers:
+
+| Metric | Count |
+| --- | --- |
+| Operators installed end-to-end | 7 (Compliance, OADP, cert-manager × 2 clusters, FIO, SPO, CSO) |
+| MRs merged to `platform-gitops` `main` | 16 |
+| MRs merged to `codex-opp-agent` `main` | 2 (ADR 0020, ADR 0022 + pre-v6 purge) |
+| Issues closed | 15 |
+| ADRs accepted | 0020 (PCI-DSS baseline), 0022 (v6 fleet membership) |
+| Project board [#10](https://github.com/users/zeshaq/projects/10) cards moved to Validated | 6 of 22 |
+| Cluster-breaking incidents (reverted) | 2 (both IPv6 forms vs OVN-K) |
+
+Issues closed on 2026-05-10: #109 PCI-1 day-zero · #110 PCI-2 Compliance Operator + GitOps · #125 IMG-SUPPLY2 ODF dep coverage · #129 SPOKE-GUARD1 · #130 PCI-HANDBOOK · #132 ADR-0020 review · #133 PCI-1.10 etcd encryption · #134 PCI-1.12 OAuth tokenConfig · #136 IMG-REVIEW1 · #138 IMG-CLEAN1 · #139 IMG-CNV1 OpenShift Virtualization mirror · #152 BACKUP-1 OADP Phase A · #156 OPS-V6-FLEET-1 pre-v6 purge · #157 CERT-MGR-1 cert-manager (both clusters) · #158 PCI-3.A operator-presence batch.
+
+Key learnings captured:
+
+1. **XCCDF rule mismatch is a recurring pattern.** Compliance Operator PCI-DSS rules have hardcoded namespace / operand expectations. Hit twice on this day (PCI-3.1 audit/OAuth/TLS variables; PCI-3.A operator namespaces + FileIntegrity operand). Resolution path captured under #111 / #158.
+2. **IPv6 cannot be host-disabled on OVN-K.** Both `ipv6.disable=1` kernel arg AND `net.ipv6.conf.all.disable_ipv6=1` sysctl break OVN-K (geneve uses IPv6 link-local even on IPv4-only clusters). ADR 0005 amendment authored under #135 → became ADR 0026.
+3. **MCO recovery for stuck nodes:** `oc annotate node <stuck> machineconfiguration.openshift.io/desiredConfig=<good> --overwrite`. Documented in `runbooks/mco-stuck-node-recovery.md` (REP-6 output).
+4. **ACM gitops-addon installs a rogue Routes CRD** that collides with the aggregated Route APIService and breaks `/openapi/v2`. Fix: `oc delete crd routes.route.openshift.io`. Tracked under #153.
+5. **REPRO-HUB-1** (#155, MR !12) closes the "hub operators silently outside GitOps" gap by adopting 15 hub catalog/IDMS/ITMS resources into platform-gitops. Future hub-dr-v6 reproducibility now derives from the same source.
+
+Follow-ups carried forward: #158 (FileIntegrity operand + TailoredProfile for SPO/CSO namespaces) · #154 BACKUP-2 (admin: MinIO `oadp-backups` bucket + cloud-credentials Secret) · #135 ADR 0005 amendment (became ADR 0026) · #111 PCI-3 continued (11+ remaining FAILs at the time) · REP-1 through REP-7 (#144 - #151) site-replication framework.
+
+### Other 2026-05-10 session records
+
+| Time (UTC) | Slug | Notes |
+| --- | --- | --- |
+| 06:19 | active-cluster-health-check | Read-only fleet health check |
+| 07:05 | odf-dependency-catalog-gap-fixed | ODF dep Subscriptions `ResolutionFailed=ConstraintsNotSatisfiable` resolved by refreshed mirror catalog |
+| 07:19 | platform-admin-handoff | Canonical operator-admin handoff doc written |
+| 07:39 | gitlab-operator-guide | GitLab operator handoff doc written |
+| 08:06 | spoke-storage-guardrails | Default storage + bootstrap guardrails on spoke-dc-v6 |
+| 08:38 | compliance-implementor-handbook | PCI-DSS-aligned phase-chain handbook authored |
+| 10:14 | oc-mirror-operator-review | Full review of oc-mirror coverage for upcoming operators |
+| 10:20 | retired-mirror-references-purged | Stale mirror references purged from active planning docs |
+| 11:01 | openshift-virtualization-mirror | CNV `4.20.11` mirrored (193/193 release, 481/481 operator) |
+| 16:22 | rhoai-mirror-status | First RHOAI mirror status check |
+| 16:55 | platform-gitops-refresh | platform-gitops refresh on workspace clone |
+| 19:33 | latest-shipped-issues-refresh | Shipped-issues board refresh |
+| 19:37 | rhoai-mirror-retry-started | RHOAI mirror retry kicked off in tmux |
+| 20:23 | blog-cloudflare-pages-audit | Audit of zeshaq.pages.dev surface |
+| 20:30 | blog-full-platform-section | Blog full-platform section design |
+| 20:36 | blog-full-platform-overview | Blog full-platform overview started |
+| 20:41 | blog-wiki-handoff | Wiki → blog handoff |
+| 20:57 | blog-full-platform-removal | Old single-page full-platform removed in favor of /docs/ tree |
+| 23:09 | rhoai-mirror-retry-status | RHOAI retry mid-run status |
+| 23:32 | rhoai-direct-nexus-recovery | Direct Nexus recovery path for stuck RHOAI images |
+
+## 2026-05-09 — v6 fleet install day
+
+This day did not get an explicit "day wrap" issue but is the most significant operationally — `hub-dc-v6` and `spoke-dc-v6` were both installed. The implicit day-wrap is **session-closeout report `reports/sessions/20260509-112323-session-closeout.md`** (closed at 11:23 UTC, mid-day) plus the chain of per-session reports that followed.
+
+| Closeout: 11:23 UTC | Scope: developer readiness + Docker runtime handoff; federated GitOps ADR/milestones/gates + GitLab FG-1 execution; workspace submodule cleanup; spoke-dc-v6 install preflight |
+| --- | --- |
+| **Key decisions** | ADR 0014 developer-readiness contract; ADR 0015 federated GitOps repo architecture; Gate H1 added; FG-1 GitLab group skeleton |
+| **Follow-ups created** | #83 FG-1 (open until CODEOWNERS, CE-compatible merge controls, validation pipelines, runner posture, negative access tests complete); #67 developer-readiness gate (open until sample app/template, Trivy/MinIO evidence, secret custody, OpenShift namespace onboarding, end-to-end smoke evidence complete) |
+| **Closing instruction** | Resume with the spoke-dc-v6 install-input package; do not boot anything until inputs reviewed and the user explicitly approves |
+
+### Selected 2026-05-09 per-session records
+
+| Time (UTC) | Slug | Notes |
+| --- | --- | --- |
+| 06:37 | oc-mirror-partial-complete | Partial completion of oc-mirror recorded |
+| 06:45 | hub-dc-v6-install-preflight | Preflight checks before boot |
+| 06:53 | hub-dc-v6-install-workdir-prep | Install workdir staged on `ocp-bootstrap` |
+| 07:11 | hub-dc-v6-iso-vm-definitions | Agent ISO + libvirt VM XMLs generated |
+| 08:00 | hub-dc-v6-boot-install-complete | **hub-dc-v6 install complete (OCP 4.20.18)** |
+| 08:15 | hub-dc-v6-local-connection-cleanup | Local connection cleanup |
+| 08:23 | hub-dc-v6-day1-checkpoint-baseline | Day-1 baseline recorded |
+| 08:43 | hub-dc-v6-disconnected-catalog-baseline | IDMS/ITMS, mirrored catalogs, default sources disabled |
+| 08:55 | developer-readiness-track | ADR 0014, milestone #23, issue #67 |
+| 08:57 | hub-dc-v6-openshift-gitops-install | OpenShift GitOps operator `v1.20.3` installed |
+| 09:01 | developer-handbook-scaffold | mdBook-compatible handbook scaffolded |
+| 09:12 | hub-dc-v6-minimal-gitlab-gitops-bootstrap | First Argo Application `hub-dc-v6-bootstrap` Synced/Healthy |
+| 09:14 | developer-handbook-runtime-scope | Handbook expanded to include Docker runtime path |
+| 09:28 | hub-dc-v6-gitops-appproject-hardening | AppProject hardening |
+| 09:34 | docker-runtime-vm | docker-runtime-vm deployed |
+| 09:39 | hub-dc-v6-bootstrap-namespace-baseline | bootstrap namespace baseline |
+| 10:08 | federated-gitops-adr-and-milestones | ADR 0015 + milestones |
+| 11:17 | spoke-dc-v6-install-preflight | spoke preflight |
+| 11:31 | spoke-dc-v6-install-inputs | spoke inputs |
+| 11:54 | spoke-dc-v6-install-workdir-prep | spoke workdir |
+| 13:02 | spoke-dc-v6-iso-vm-definitions | spoke ISO + VM definitions |
+| 13:25 | spoke-dc-v6-physical-worker-gate | Physical worker boot safety gate |
+| 14:14 | parallel-agent-worktree-isolation | Parallel-agent worktree-isolation policy → ADR 0017 |
+| 15:20 | spoke-dc-v6-base-install-complete | **spoke-dc-v6 base install complete** (3 VM + 3 physical) |
+| 15:34 | spoke-dc-v6-odf-preflight-blocked | ODF preflight blocked on disks |
+| 15:52 | spoke-dc-v6-odf-disk-remediation | ODF disk remediation |
+| 16:16 | spoke-dc-v6-odf-lso-gitops-drift-audit | ODF/LSO drift audit |
+| 16:27 | spoke-dc-v6-manual-odf-lso-removal | Manual ODF/LSO removal (reset before clean install) |
+| 16:32 | hub-dc-v6-management-gitops-reset | Hub management GitOps reset |
+| 16:49 | management-gitops-pull-model-baseline | ADR 0018 pull-model baseline |
+| 20:10 | spoke-dc-v6-acm-registration | spoke-dc-v6 ACM-registered to hub |
+| 20:15 | argo-orphan-warning-review | Argo orphan warning review |
+| 20:42 | acm-openshift-gitops-pull-starter | ACM + OpenShift GitOps pull starter |
+| 22:13 | spoke-dc-v6-odf-storage-consumer-cleanup | ODF StorageConsumer cleanup |
+| 22:47 | spoke-dc-v6-odf-csi-mirror-fix | ODF CSI image mirror fix (#120) |
+| 23:27 | nexus-image-supply-baseline | ADR 0019 Nexus-only image supply baseline |
+
+## 2026-05-08 — VM platform rebuild day
+
+**Closeout report:** `reports/sessions/20260508-202806-session-closeout.md` — the explicit Session Closeout Handoff for 2026-05-08.
+
+| Closeout: 20:28 UTC | Scope: post-Trivy/DefectDojo import-contracts milestone close |
+| --- | --- |
+| **Key decisions** | GitHub milestone #22 Trivy/DefectDojo Import Contracts created (tracking-only); resume default = disconnected OpenShift mirror gate |
+| **Follow-ups created** | If switching tracks: issue #61 "Define Jenkins → Trivy → DefectDojo import contract" |
+| **Closing instruction** | Default next: resume disconnected OpenShift mirror gate. Alternative track: GitHub milestone #22. |
+| **Residual risks** | GitHub repo cleanup deleted some repos that may still appear in historical docs; audit before relying on legacy workload automation |
+
+### Selected 2026-05-08 per-session records
+
+| Time (UTC) | Slug | Notes |
+| --- | --- | --- |
+| 07:34 | branch-protection-milestone | GitHub branch protection milestone |
+| 08:22 | simple-test-app-monorepo-repoint-rollback | Simple test app monorepo repoint rollback |
+| 09:05 | descope-dr-clusters | **DR clusters de-scoped from active GitOps placement** |
+| 09:55 | github-source-of-truth-pivot | GitHub-first tracking directive |
+| 10:04 | github-repository-secrets-bootstrap | GitHub repository secrets bootstrap |
+| 10:29 | gitlab-and-minio-fresh-start-reset | GitLab + MinIO fresh-start reset |
+| 10:35 | gitlab-minio-vm-network-scope | GitLab + MinIO VM network scope check |
+| 10:43 | gitlab-zahid-web-login-fix | GitLab zahid web login fix |
+| 10:47 | disconnected-rebuild-gotchas-memory | Disconnected rebuild gotchas captured in memory |
+| 11:01 | rebuild-script-import | `scripts/rebuild/*` imported into workspace |
+| 11:19 | ocp-bootstrap-private-network-golden-image | OCP bootstrap golden image + private network |
+| 11:39 | openshift-rebuild-network-ingress-pki | ADR 0005 ingress/PKI decision |
+| 11:42 | openshift-rebuild-gateway-cidr | Gateway CIDR correction |
+| 11:59 | pdns-readiness-check | PDNS readiness check |
+| 12:06 | roadmap-pdns-dns-gates | Roadmap PDNS + DNS gates |
+| 12:14 | github-planning-pack-tracker | GitHub planning pack + tracker created |
+| 12:25 | repeatable-rebuild-documentation-model | Repeatable rebuild documentation model adopted |
+| 12:34 | cluster-names-and-base-domain | `hub-dc-v6` / `spoke-dc-v6` / `sub.comptech-lab.com` approved |
+| 12:46 | pdns-resolver-and-api-cleanup | PDNS resolver + API cleanup |
+| 12:57 | hub-topology-decision | Compact 3-master decision for hub |
+| 13:05 | nic-source-rule-ilo-mac-check | NIC source rule + iLO MAC check |
+| 13:14 | allocation-accepted-dns-records-applied | Allocation accepted, DNS records applied |
+| 13:28 | disconnected-mirror-baseline | Disconnected mirror baseline (ADR 0019 emerging) |
+| 13:44 | standalone-mirror-vms | Standalone Nexus + oc-mirror VMs decided |
+| 14:09 | mirror-tls-pullsecret-dryrun | Mirror TLS, pull secret, dry-run |
+| 15:10 | pinned-fast-mirror-imageset | Pinned fast mirror image set |
+| 15:44 | expanded-previous-platform-mirror | Expanded mirror dry-run |
+| 15:55 | full-mirror-started | **Full mirror download started** |
+| 16:39 | hub-dc-v6-install-inputs | hub-dc-v6 install inputs prepared |
+| 17:04 | first-run-planning-sequence | First-run planning sequence tightened |
+| 17:11 | vault-memory-reset-vm-plan | Vault memory reset + VM plan |
+| 17:35 | kafka-kraft-tracker | Kafka KRaft tracker created |
+| 17:46 | vault-oss-vm-deploy | **Vault OSS VM deployed** |
+| 18:07 | redis-sentinel-vm-deploy | Redis Sentinel VM |
+| 18:13 | kafka-kraft-vm-deploy | Kafka KRaft VM |
+| 18:17 | redis-hardening-adr | ADR 0006 |
+| 18:24 | kafka-adr-production-readiness | ADR 0007 |
+| 18:40 | jenkins-single-vm-deploy | **Jenkins VM** + ADR 0009 |
+| 18:41 | signoz-adr-vm-observability | ADR 0010 |
+| 18:45 | trivy-adr-vm-scanner | ADR 0011 |
+| 18:55 | wso2-apim-is-vm-deploy | **WSO2 APIM + IS VMs** + ADR 0008 |
+| 18:58 | monitoring-observability-vm-adr | ADR 0012 |
+| 19:18 | signoz-vm-deploy | **SigNoz VM** |
+| 19:24 | trivy-vm-deploy | **Trivy VM** |
+| 19:43 | monitoring-observability-vm-deploy | **Monitoring VM** |
+| 19:45 | redis-kafka-wal-utility-vm-deploy | Redis/Kafka WAL utility VM |
+| 20:09 | defectdojo-vm-deploy | **DefectDojo VM** + ADR 0013 |
+| 20:18 | trivy-defectdojo-import-contracts | Trivy/DefectDojo import contracts milestone |
+| 20:28 | session-closeout | **Day closeout report** |
+
+## 2026-05-05 → 2026-05-07 — pre-rebuild assessment + bridging
+
+These early days set up the workspace conventions and assessed the pre-v6 fleet. Closeout style was still emerging; the explicit "Session begin/close routines" report on 2026-05-05 18:39 UTC formalized the convention.
+
+| Date (UTC) | Closeout / key roll-up | Notes |
+| --- | --- | --- |
+| 2026-05-05 06:54 | Fleet check, spoke-dc GitOps cleanup, hub backup check | First workspace session under ADR 0001 |
+| 2026-05-05 07:20 | Session logging baseline | Cadence formalized |
+| 2026-05-05 09:24 | Session handoff and next order update | First explicit handoff record |
+| 2026-05-05 11:45 | Finish remediation queue | End-of-morning roll-up |
+| 2026-05-05 18:39 | **Session begin/close routines** (`session-routines.md`) | Added `scripts/begin-session.sh` and `scripts/close-session.sh`; the close-session helper auto-creates timestamped report stubs under `reports/sessions/` |
+| 2026-05-06 22:08 | Live focused cluster check | Pre-v6 fleet recheck |
+| 2026-05-06 23:29 | Production readiness milestone and phases | Milestone for production readiness |
+| 2026-05-07 20:25 | GitOps and OpenShift mishap check | Early GitOps drift recovery |
+| 2026-05-07 22:15 | Open Liberty Jenkins Nexus smoke app | First end-to-end developer smoke |
+
+## Reading the underlying records
+
+Every entry above is backed by either an issue, a session report, or both. The general pattern:
+
+- **GitHub issues** (`https://github.com/zeshaq/codex-opp-agent/issues/<N>`) carry the durable decision, the MR refs, the gate criteria, and the closeout comment.
+- **Session reports** (`reports/sessions/<timestamp>-<slug>.md`) carry the live commands, validation output, files-changed lists, residual risks, and next steps. These are the operator-facing detail.
+- **`SESSION_LOG.md`** carries a one-paragraph summary per session and is the chronological flat file.
+- **`CURRENT_STATE.md`** is the "fast resume" snapshot. It is rewritten at the top of each session; older content moves down. The very top is always the latest session's headline.
+- **`TODO.md`** is the next-order-of-business queue with status against each gate.
+
+The day-wrap pattern (a GitHub issue summarizing the day) is reserved for days that produced enough churn to warrant the roll-up. Most days don't need one; the per-session reports + `SESSION_LOG.md` carry the load.
+
+## Why the archive matters
+
+Three operational reasons:
+
+1. **Resume without chat.** The next operator (human or agent) starts a session by reading `CURRENT_STATE.md`, `TODO.md`, the latest few session reports, and any open day-wrap issue. They never need to read chat transcripts to know where work left off.
+2. **Audit trail for the framework.** Site Replication Readiness (REP-7) is the dry-run gate; the day-wrap archive is the contemporaneous record that any "ask Claude" moments during a replay are framework gaps, not historical noise.
+3. **PCI-DSS / compliance evidence.** Closeout records carry "no secrets printed," "live changes vs read-only," "files changed," "follow-ups created" — exactly the audit trail PCI-DSS reviewers expect when reconstructing how a control was put in place.
+
+## References
+
+- [Day-wrap issue #159](https://github.com/zeshaq/codex-opp-agent/issues/159) — Session 2026-05-10
+- `codex-opp-agent/SESSION_LOG.md` — 229 entries from 2026-05-05 to 2026-05-11
+- `codex-opp-agent/reports/sessions/` — 244 timestamped session reports
+- `codex-opp-agent/scripts/begin-session.sh` and `codex-opp-agent/scripts/close-session.sh` — the helper scripts that formalize the cadence (added 2026-05-05 18:39 UTC under `session-routines.md`)
+- `codex-opp-agent/CURRENT_STATE.md` — fast-resume snapshot
+- `codex-opp-agent/TODO.md` — next-order-of-business queue
+- `codex-opp-agent/RUNBOOK.md` — the standing operating procedures including `Session Begin Routine` and `Session Close Routine`
+- Memory `feedback_workspace_protocol.md` — read CURRENT_STATE / SESSION_LOG / TODO before non-trivial work; produce a dated session record at end
+- Memory `feedback_github_first_tracking.md` — open issue first; findings/decisions/recommendations go on issues; chat is ephemeral, GitHub is durable

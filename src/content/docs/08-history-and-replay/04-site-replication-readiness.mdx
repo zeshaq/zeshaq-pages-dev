@@ -1,8 +1,368 @@
 ---
 title: "Site Replication Readiness"
-description: "Section 08-history-and-replay: Site Replication Readiness (placeholder)."
+description: "The REP-* tracker — promoting codex-opp-agent + dc-lab into a replicable site-builder framework: profile schema, GitLab bootstrap, scripts refactor, template generators, and the dry-run gate."
 sidebar_label: "Site Replication Readiness"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const meta   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 700 };
+export const open   = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const closed = { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const gate   = { background: "#fee2e2", border: "1.5px dashed #b91c1c", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+
+export const seqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const blockEdge = { animated: true, style: { stroke: "#b91c1c", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const repNodes = [
+  { id: "rep0", position: { x: 340, y: 0   }, data: { label: "REP-0 #144\nMeta + strategy\n(OPEN, long-running)" }, style: meta },
+
+  { id: "rep1", position: { x: 80,  y: 140 }, data: { label: "REP-1 #145\nProfile schema +\ndc-lab profile.yaml\nCLOSED" }, style: closed },
+  { id: "rep2", position: { x: 280, y: 140 }, data: { label: "REP-2 #146\nHandoff templates\nCLOSED (Phase 1)" }, style: closed },
+  { id: "rep3", position: { x: 480, y: 140 }, data: { label: "REP-3 #147\nGitLab bootstrap TF\nOPEN (Phase 1)" }, style: open },
+  { id: "rep4", position: { x: 680, y: 140 }, data: { label: "REP-4 #148\nscripts/rebuild refactor\nOPEN (Phase 1)" }, style: open },
+  { id: "rep5", position: { x: 880, y: 140 }, data: { label: "REP-5 #149\nmake new-site\ngenerator\nOPEN (Phase 1)" }, style: open },
+
+  { id: "rep6", position: { x: 80,  y: 280 }, data: { label: "REP-6 #150\nMemory → runbooks\nCLOSED" }, style: closed },
+  { id: "rep22", position: { x: 280, y: 280 }, data: { label: "REP-2.2 #243\nUnify profiles\nCLOSED" }, style: closed },
+  { id: "rep21", position: { x: 480, y: 280 }, data: { label: "REP-2.1 #241\nParameterize\nremaining docs\nOPEN" }, style: open },
+  { id: "rep42", position: { x: 680, y: 280 }, data: { label: "REP-4.2 #244\nRefactor ~22 more scripts\nOPEN" }, style: open },
+
+  { id: "rep7", position: { x: 340, y: 420 }, data: { label: "REP-7 #151\nDry-run rebuild\non test infra\nOPEN (BLOCKED — proof gate)" }, style: gate },
+];
+
+export const repEdges = [
+  { id: "p1", source: "rep0", target: "rep1", ...seqEdge },
+  { id: "p2", source: "rep0", target: "rep2", ...seqEdge },
+  { id: "p3", source: "rep0", target: "rep3", ...seqEdge },
+  { id: "p4", source: "rep0", target: "rep4", ...seqEdge },
+  { id: "p5", source: "rep0", target: "rep5", ...seqEdge },
+  { id: "p6", source: "rep0", target: "rep6", ...seqEdge },
+
+  { id: "f1", source: "rep1", target: "rep2", ...seqEdge },
+  { id: "f2", source: "rep2", target: "rep3", ...seqEdge },
+  { id: "f3", source: "rep1", target: "rep4", ...seqEdge },
+  { id: "f4", source: "rep2", target: "rep5", ...seqEdge },
+
+  { id: "b1", source: "rep1", target: "rep7",  ...blockEdge, label: "must close" },
+  { id: "b2", source: "rep2", target: "rep7",  ...blockEdge },
+  { id: "b3", source: "rep3", target: "rep7",  ...blockEdge },
+  { id: "b4", source: "rep4", target: "rep7",  ...blockEdge },
+  { id: "b5", source: "rep5", target: "rep7",  ...blockEdge },
+  { id: "b6", source: "rep21", target: "rep7", ...blockEdge },
+  { id: "b7", source: "rep42", target: "rep7", ...blockEdge },
+];
+
+Site Replication Readiness (milestone [#31](https://github.com/zeshaq/codex-opp-agent/milestone/31)) is the long-running effort to promote the `codex-opp-agent` workspace + the dc-lab instance into a **replicable site-builder framework**: another team takes the package, runs it against their site profile, ends up with the same platform shape. This page documents what the framework is, where it stands today, the REP-* tracker, and the gap between "framework exists" and "framework proven."
+
+The PCI-DSS baseline that closed on 2026-05-11 is the *first* repeatable end-to-end exercise on the v6 fleet. REP-* is what makes the *next* site repeat it without reaching for chat history or undocumented memory.
+
+## The seven layers a new site must cross
+
+REP-0 (the meta issue) defines the layers any new lab build has to traverse, with each layer's current state:
+
+| Layer | What | Current state |
+| --- | --- | --- |
+| **L0** Site prereqs | Network, DNS resolver, IP/MAC plan, hardware BOM | Partial template under `plans/disconnected-rebuild/environments/dc-lab/` |
+| **L1** VM platform tools | HAProxy, PDNS, MinIO, Nexus, Jenkins, Trivy, Vault, SigNoz, DefectDojo, docker-runtime, GitLab | Per-VM ADRs (0008–0014); `scripts/rebuild/*` per service — partial scripts, mostly dc-lab-specific until REP-4 refactor lands |
+| **L2** GitLab content bootstrap | Groups, role groups, projects, runners, CODEOWNERS, branch protection | `gitlab-operator-guide.md` describes target; REP-3 Phase-1 has `terraform/gitlab-bootstrap/` design |
+| **L3** OpenShift install | oc-mirror, install-config, hub + spoke deploy | `RUNBOOK.md` + `connection-details/` — partial, manual; agent-install path |
+| **L4** Day-2 OpenShift platform | ACM, GitOps, mirrors, catalogs, ODF | `platform-gitops` repo on GitLab — fully GitOps, replicable |
+| **L5** Operator queue | 22-operator install track | Project board [#10](https://github.com/users/zeshaq/projects/10) — replicable as template |
+| **L6** Compliance | PCI-0 → PCI-5 chain | Compliance handbook + 6 phase issues + ADR 0020 — methodology solid, parameterization missing |
+| **L7** App delivery | GitLab → Jenkins → Trivy → Nexus → runtime → MinIO evidence | ADR 0014 contract; demo-smoke / liberty-smoke / openliberty-readiness-probe exist — partial reference apps |
+
+The point is: every layer has an ADR (or set of ADRs), a checked-in plan or template, and (eventually) a profile-driven script. The framework is *coherent*; it just isn't *complete* yet.
+
+## REP-* tracker
+
+<Whiteboard client:load data={{ nodes: repNodes, edges: repEdges }} height={620} />
+
+REP-0 at the top is the parent meta. Solid arrows are sequence dependencies; dashed red arrows are "must close before" relationships that gate REP-7 (the proof gate at the bottom).
+
+| Issue | State | Artifact (today) |
+| --- | --- | --- |
+| [REP-0 #144](https://github.com/zeshaq/codex-opp-agent/issues/144) | OPEN (long-running parent) | n/a |
+| [REP-1 #145](https://github.com/zeshaq/codex-opp-agent/issues/145) — profile schema + dc-lab extraction | **CLOSED** | `plans/disconnected-rebuild/site-profile-schema.md` + `plans/disconnected-rebuild/environments/dc-lab/profile.yaml` + `scripts/validate-profile.py` (295/295 PASS) |
+| [REP-2 #146](https://github.com/zeshaq/codex-opp-agent/issues/146) — parameterize handoffs | **CLOSED (Phase 1)** | `scripts/render-handoffs.py` + 3 handoffs as `.j2` templates; dc-lab byte-clean render |
+| [REP-2.1 #241](https://github.com/zeshaq/codex-opp-agent/issues/241) — parameterize remaining docs | OPEN | RUNBOOK.md + remaining `connection-details/` |
+| [REP-2.2 #243](https://github.com/zeshaq/codex-opp-agent/issues/243) — unify the two profile.yaml files | **CLOSED** | Single canonical profile at `environments/<site>/profile.yaml`; schema doc updated |
+| [REP-3 #147](https://github.com/zeshaq/codex-opp-agent/issues/147) — GitLab content bootstrap | OPEN (Phase 1) | `plans/disconnected-rebuild/gitlab-bootstrap-design.md` + `terraform/gitlab-bootstrap/` + `scripts/gitlab/render-codeowners.py` |
+| [REP-3.2/3.3/3.4 #235/#236/#237](https://github.com/zeshaq/codex-opp-agent/issues/235) | OPEN | Role groups + shares + branch protection / runner registration / full repo seeding |
+| [REP-4 #148](https://github.com/zeshaq/codex-opp-agent/issues/148) — `scripts/rebuild/` profile-aware refactor | OPEN (Phase 1) | `scripts/rebuild/REFACTOR-PATTERN.md` + `lib/profile.sh` + 3 reference refactors; 11/11 smoke PASS |
+| [REP-4.2 #244](https://github.com/zeshaq/codex-opp-agent/issues/244) — refactor remaining ~22 scripts | OPEN | n/a (large mechanical pass) |
+| [REP-5 #149](https://github.com/zeshaq/codex-opp-agent/issues/149) — `make new-site` generator | OPEN (Phase 1) | `Makefile` + `scripts/new-site.py` + `templates/issues/r-chain/` R0-R6 |
+| [REP-5.2/3/4/5 #238/#239/#240/#242](https://github.com/zeshaq/codex-opp-agent/issues/238) | OPEN | L0-L7 / PCI / FG+DH chains + GitHub Projects v2 GraphQL |
+| [REP-6 #150](https://github.com/zeshaq/codex-opp-agent/issues/150) — memory → runbooks | **CLOSED** | 5 memory entries migrated to `runbooks/*` + `connection-details/signoz.md` |
+| [REP-7 #151](https://github.com/zeshaq/codex-opp-agent/issues/151) — dry-run rebuild | OPEN (BLOCKED — proof gate) | Comment listing preconditions |
+
+## REP-1 — site profile schema (closed)
+
+The first deliverable: define a single, authoritative **site profile schema** capturing every parameter that varies per site. Extract today's dc-lab values out of scattered files into a single `environments/dc-lab/profile.yaml` instance of the schema.
+
+A representative skeleton (excerpted from REP-1's design):
+
+```yaml
+site:
+  name: dc-lab
+  domain: sub.comptech-lab.com
+  bootstrap_admin: zahid
+  trust_domain: comptech-lab
+
+network:
+  machine_subnet: 30.30.0.0/16      # lab /24 allocation pattern
+  reserved_node_subnet: 30.30.75.0/24
+  dns_resolver: <DNS VM in lab /24>
+  haproxy_edge: <HAProxy edge in lab /24>
+  ipv6_disabled: true               # superseded by ADR 0026
+
+clusters:
+  hub:
+    name: hub-dc-v6
+    api_vip: <hub api vip>
+    ingress_vip: <hub ingress vip>
+    masters:
+      - { name: master-0, ip: <…> }
+      - { name: master-1, ip: <…> }
+      - { name: master-2, ip: <…> }
+    workers: []                     # compact
+  spoke:
+    name: spoke-dc-v6
+    api_vip: <spoke api vip>
+    ingress_vip: <spoke ingress vip>
+    masters: [...]
+    workers:
+      - { name: worker-0, cpu: 128, mem_gib: 503 }
+      - { name: worker-1, cpu: 128, mem_gib: 503 }
+      - { name: worker-2, cpu: 128, mem_gib: 503 }    # GPU worker
+
+vm_platform:
+  haproxy:    { role: edge }
+  pdns:       { role: auth+recursor }
+  minio:      { role: object-storage }
+  nexus:      { role: image-supply, endpoints: [mirror-registry, docker-group, app-registry] }
+  vault:      { role: credential-custody, nodes: 3 }
+  jenkins:    { role: ci }
+  signoz:     { role: vm-observability }
+  trivy:      { role: scanner }
+  defectdojo: { role: security-dashboard }
+  docker-runtime: { role: developer-runtime }
+
+gitops:
+  hub_repo: openshift-platform-gitops
+  governance_repo: openshift-governance
+  webhook_secret_path: secret/apps/<tenant>/ci/webhook
+
+governance:
+  pci_phases: [PCI-0, PCI-1, PCI-1.13, PCI-2, PCI-3, PCI-4, PCI-5]
+  fg_phases:  [FG-0, FG-1, FG-2, FG-3, FG-4, FG-5, FG-6]
+  dh_phases:  [DH-1, DH-2, DH-3, DH-4, DH-5, DH-6, DH-7, DH-8, DH-9]
+```
+
+> Specific IPs and node addresses are intentionally placeholdered for the public version — the live profile carries those concrete values. The schema shape is the public artifact.
+
+A `scripts/validate-profile.py` exists and passed 295/295 checks against the dc-lab profile when REP-1 closed. The validator enforces schema shape, value types, cross-references (a cluster's `api_vip` must be inside its subnet, etc.), and the no-overlap rule between cluster ranges.
+
+## REP-2 — parameterize handoff docs (closed Phase 1)
+
+The three operator handoff docs (`platform-admin-handoff.md`, `gitlab-operator-guide.md`, `compliance-implementor-handbook.md`) were converted into Jinja-style `.j2` templates with `{{ profile.* }}` references. A `scripts/render-handoffs.py` reads the profile and renders site-specific markdown into `environments/<site>/rendered/`.
+
+Phase-1 acceptance: render the templates against `dc-lab/profile.yaml` and diff against today's checked-in handoff docs. The diff must be empty (or only cosmetic whitespace). This was achieved. Remaining work in REP-2.1: `RUNBOOK.md` + the per-service connection-details docs (`nexus.md`, `jenkins.md`, `minio.md`, `vault-app-secrets.md`, etc.) still need conversion.
+
+## REP-2.2 — profile unification (closed)
+
+REP-1 and REP-2 each landed *a different* `profile.yaml` for dc-lab:
+
+- REP-1 canonical at `plans/disconnected-rebuild/environments/dc-lab/profile.yaml` — 432 lines, flat `operators` list, `top_level_groups` / `subgroups` split, validated by `scripts/validate-profile.py`.
+- REP-2 handoff at `environments/dc-lab/profile.yaml` — 223 lines, superset shape with `gitops`, `governance`, `image_supply_reports` sections.
+
+Two YAMLs for the same site = drift trap. REP-2.2 unified them at `environments/<site>/profile.yaml` as the canonical path, extending the REP-1 schema to absorb REP-2's extra sections. The old path was retired with a deprecation note.
+
+## REP-3 — GitLab content bootstrap (open, Phase 1)
+
+The GitLab operator guide describes the target federated structure (groups, role groups, repos, runners, branch protection, CODEOWNERS). Without automation, new sites would have to click through GitLab UI for hours and likely diverge.
+
+Phase-1 delivered:
+
+- `plans/disconnected-rebuild/gitlab-bootstrap-design.md` — the design.
+- `terraform/gitlab-bootstrap/` — Terraform module skeleton using the `gitlabhq/gitlab` provider.
+- `scripts/gitlab/render-codeowners.py` — Python helper that renders CODEOWNERS files per repo from the profile's `repo_role_map`.
+
+Open sub-issues:
+
+- [REP-3.2 #235](https://github.com/zeshaq/codex-opp-agent/issues/235) — role groups + project shares + branch protection via Terraform.
+- [REP-3.3 #236](https://github.com/zeshaq/codex-opp-agent/issues/236) — runner registration token generation + Vault storage.
+- [REP-3.4 #237](https://github.com/zeshaq/codex-opp-agent/issues/237) — full repo seeding (infra-ops, platform-services, tenant-registry, divisions).
+
+## REP-4 — scripts/rebuild profile-aware refactor (open, Phase 1)
+
+Each script under `scripts/rebuild/*` (Nexus, Jenkins, Vault, SigNoz, DefectDojo, Monitoring, docker-runtime, WSO2, Trivy, edge-DNS, MinIO, vm-provisioning, developer-smoke) currently takes site-specifics via `pwd`-local files or hardcoded constants. REP-4 introduces a shared `lib/profile.sh` with `profile_init`, `profile_get`, `profile_get_list`, `profile_require`, and `dry_run_or_run` helpers, plus a 6-step refactor pattern.
+
+Phase-1 reference refactors:
+
+- `scripts/rebuild/signoz/bootstrap-signoz.sh` — converted.
+- `scripts/rebuild/minio/configure-ci-evidence-bucket.sh` — converted.
+- `scripts/rebuild/edge-dns/setup-haproxy-rke2.sh` — converted.
+
+Smoke test `scripts/rebuild/lib/test-profile-lib.sh` passes 11/11. The remaining ~22 scripts are tracked under [REP-4.2 #244](https://github.com/zeshaq/codex-opp-agent/issues/244) as a mechanical pass.
+
+## REP-5 — make new-site generator (open, Phase 1)
+
+A new site rollout needs the same GitHub structure dc-lab has: a milestone, a project board with a custom Status, and a long chain of phase issues (R0–R6, PCI-0–PCI-5, FG-0–FG-6, DH-1–DH-9, REP, OPS). Manually clicking them into existence is error-prone and inconsistent.
+
+`make new-site SITE=<name>` reads the site profile and creates the full GitHub scaffold: milestone + project board + all phase issues + cross-references, with bodies templated from the existing dc-lab issues.
+
+Phase-1 delivered:
+
+- `Makefile` with the `new-site` target.
+- `scripts/new-site.py` — the generator.
+- `templates/issues/r-chain/` — R0–R6 issue bodies as templates.
+
+Open sub-issues:
+
+- [REP-5.2 #238](https://github.com/zeshaq/codex-opp-agent/issues/238) — L0-L7 chain templates.
+- [REP-5.3 #239](https://github.com/zeshaq/codex-opp-agent/issues/239) — PCI-0..PCI-5 chain templates.
+- [REP-5.4 #240](https://github.com/zeshaq/codex-opp-agent/issues/240) — FG-0..FG-6 + DH chain templates.
+- [REP-5.5 #242](https://github.com/zeshaq/codex-opp-agent/issues/242) — GitHub Projects v2 GraphQL integration.
+
+## REP-6 — memory → runbooks (closed)
+
+Claude's per-session memory under `claude-agent/memory/project_*` is invisible to another operator. For replicability, the lessons had to migrate into tracked codex-opp-agent docs.
+
+Closed at commit `c27dd5f`. Migrated artifacts:
+
+| Memory entry | Migrated to |
+| --- | --- |
+| `project_jenkins_pollscm_bootstrap.md` | `runbooks/jenkins-gitlab-webhook-pollscm.md` |
+| `project_lab_cred_drift.md` | `runbooks/secrets-custody-drift-check.md` (+ tracking issues per stale credential) |
+| `project_signoz_v0122_auth.md` | `connection-details/signoz.md` (Known gotchas) |
+| `project_wso2_jms_url_encoding.md` | `runbooks/wso2-apim-jms-url-encoding-trap.md` |
+| IPv6/OVN-K incident memory | `runbooks/openshift-ipv6-disable-correct-approach.md` |
+| MCO stuck-node memory | `runbooks/mco-stuck-node-recovery.md` |
+
+REP-6 codified the distinction maintained going forward: **behavioral feedback** (how the agent operates) stays in memory; **operational knowledge** (what any operator needs) goes to runbooks/ADRs/connection-details.
+
+## REP-7 — the dry-run gate (open, BLOCKED)
+
+This is the **proof gate** for the entire framework. The framework is only "replication-ready" when it actually replicates. REP-7 plans a full end-to-end rebuild against parallel test infrastructure using only the artifacts produced by REP-1..REP-6. If anything requires reaching for chat history or undocumented memory, that's a gap → close it before declaring REP-0 done.
+
+Plan:
+
+1. **Provision parallel test infra.** Separate VM hypervisor / network segment / hardware corner. Minimum: 3 VMs for the management VM stack + 6 VMs for OCP hub+spoke. Less than production footprint; just enough to exercise every layer.
+2. **Build a `test-replication` profile** at `environments/test-replication/profile.yaml` with new domain, new IPs (different /24), new hostnames. Reuse the REP-1 schema unchanged.
+3. **Execute layer-by-layer using only the framework artifacts:**
+   - L0: Site prereqs from rendered handoff (REP-2).
+   - L1: VM platform via refactored `scripts/rebuild/*` (REP-4).
+   - L2: GitLab content via REP-3 bootstrap automation.
+   - L3: OpenShift install via rendered `RUNBOOK` + scripts.
+   - L4: Day-2 platform via `platform-gitops` template + Argo bootstrap pattern.
+   - L5: Operator queue via project board template (REP-5) + 22-operator install MRs.
+   - L6: Compliance via PCI-0..PCI-5 phase issues (REP-5) + ADR 0020 baseline.
+   - L7: App delivery via developer-smoke reference apps + ADR 0014 contract.
+4. **Track gaps as REPLAY-N issues** — anything requiring undocumented action gets a parallel sub-issue marked "blocking REP-7 closure."
+5. **Record full elapsed time** — wall-clock from "fresh hardware" to "first PCI scan ran" is the framework-quality metric.
+
+Success criteria:
+
+- Test-site OpenShift cluster running, all 22+1 (compliance) operators installed.
+- `oc get nodes` shows test-site nodes.
+- `platform-gitops` fork on test-site GitLab reconciles cleanly.
+- PCI-DSS scan ran and produced results (PASS/FAIL irrelevant; the scan happening is the proof).
+- Developer pipeline did one round-trip: GitLab → Jenkins → Trivy → Nexus → docker-runtime → MinIO evidence.
+- **Zero "ask Claude" moments** during execution; every step traceable to a checked-in artifact.
+
+REP-7 is **blocked on:** REP-2.1 (remaining handoffs), REP-3.2/3.3/3.4 (full GitLab bootstrap), REP-4.2 (remaining scripts), REP-5.2/3/4/5 (remaining chain templates), AND test infrastructure availability.
+
+## Hub + spoke site-replication strategy
+
+Site replication isn't only about the framework artifacts; it's about what shape a replicated site takes. The strategy: every replicated site is **one hub + one spoke** (the dc-lab pattern), with the same role split:
+
+- **Hub:** compact 3-master, all-in-one (control plane + worker roles), no ODF, no application workload, runs ACM + OpenShift GitOps + per-cluster Argo CD. The hub is the management plane, deliberately storage-light.
+- **Spoke:** 3 VM masters + N physical workers, runs ODF (or equivalent), all application workloads, ACM-registered to the hub, runs its own Argo CD that reconciles its cluster directory in `platform-gitops`.
+
+Future v6-era DR adds two more clusters (`hub-dr-v6`, `spoke-dr-v6`), each mirroring the role of its non-DR counterpart. ADR 0022 reserves the names; no manifests target them today. When DR is reintroduced, the work goes through a new tracked issue + ADR amendment.
+
+## MinIO replication patterns (forward-looking)
+
+MinIO at each site backs three workloads:
+
+- **OADP backup target** — `oadp-backups` bucket; cloud-credentials Secret on the spoke.
+- **LokiStack object storage** — `loki-chunks` bucket via NooBaa OBC; ESO bridges OBC's AWS_*_KEY_* keys + ConfigMap into the lowercase LokiStack storage-Secret keys (memory `project_obc_to_operand_secret_bridge.md`).
+- **TempoStack object storage** — `tempo-chunks` bucket; ExternalSecret at `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml`.
+
+For multi-site replication, the canonical pattern is **MinIO site replication** — bi-directional async replication of object data between two MinIO deployments at separate sites. The framework doesn't ship a MinIO replication config today; that's part of the forward-looking DR design that comes with reintroducing `hub-dr-v6` / `spoke-dr-v6`.
+
+Current status: **not configured.** The dc-lab has one MinIO; the test-replication target will have its own. Cross-site replication is out of scope until DR is.
+
+## Vault DR pairing (forward-looking)
+
+The lab's Vault is a 3-node Raft cluster with HashiCorp transit auto-unseal on a fourth node. The Raft pattern supports performance replicas and DR replicas via Vault Enterprise; the lab runs Vault OSS so DR is a hot-standby pattern at the Raft level, not the Vault Enterprise DR-replication path.
+
+For a replicated site:
+
+- Each site stands up its own Vault Raft cluster (3 nodes + transit seal).
+- Each site's Vault is the source-of-truth for its site's credentials; cross-site secret sync (if needed) is a separate concern (ESO with cross-site SecretStores, or a dedicated sync controller).
+- Vault transit auto-unseal nodes can be kept independent per site — no cross-site dependency.
+
+Current status: **per-site Vault, no cross-site pairing.** When DR is reintroduced, the choice is "per-DR-site independent Vault" vs "single Vault serving both sites with Vault Enterprise DR replication." Today's design assumes the former.
+
+## RHACS Central replication considerations
+
+RHACS Central is hub-side and serves the entire fleet. For multi-site:
+
+- Central can run on the hub of each site (independent Centrals per site) — clusters at each site report to their local Central. Useful when sites are operationally independent.
+- Central can run on one hub and be the single Central for both sites — every cluster reports to that one Central. Useful when fleet-wide policy and view is required.
+
+The init-bundle generation pattern (memory `reference_rhacs_init_bundle_via_api.md`) is site-independent: `POST /v1/cluster-init/init-bundles` with admin creds; bundle pushed to Vault for ESO delivery in the `stackrox` namespace. Each site that runs its own Central uses its own init bundle.
+
+Current status: **single Central on hub-dc-v6 covering the v6 fleet.** Replicated-site decision is per-site Central by default, with an explicit ADR if a site wants to consume an existing Central from another site.
+
+## Ready vs pending
+
+| Capability | Ready | Pending |
+| --- | --- | --- |
+| Profile schema (REP-1) | Yes | Schema covers all observed sections (REP-2.2 unified); no known gaps |
+| Profile validation (`validate-profile.py`) | Yes | 295/295 PASS on dc-lab |
+| Handoff rendering (REP-2 Phase 1) | Yes for 3 handoffs | REP-2.1: RUNBOOK.md + per-service connection-details |
+| GitLab bootstrap automation | Design + module skeleton | Full TF modules (REP-3.2/3.3/3.4) |
+| `scripts/rebuild/` profile-aware | Pattern + 3 refactors | Remaining ~22 scripts (REP-4.2) |
+| `make new-site` | Skeleton + R-chain templates | L/PCI/FG+DH chains; GitHub Projects v2 (REP-5.2-5.5) |
+| Memory → runbooks migration | Yes | none |
+| End-to-end proof | no | REP-7 dry-run rebuild on test infra |
+| MinIO replication | n/a | Forward-looking; requires DR |
+| Vault DR pairing | n/a | Forward-looking; requires DR |
+| RHACS multi-site | n/a | Forward-looking; requires DR |
+
+## Where the work continues
+
+Next visible chunks (per REP-0 status, post-Wave 3):
+
+1. **REP-2.1** — close out remaining handoff/connection-details parameterization. Mostly mechanical.
+2. **REP-3.2 → 3.3 → 3.4** — complete the GitLab bootstrap Terraform; this is the second-largest remaining body of work.
+3. **REP-4.2** — mechanical refactor of the remaining `scripts/rebuild/*` to consume the profile. The pattern + helpers exist; this is "apply the pattern to each script."
+4. **REP-5.2 / 5.3 / 5.4 / 5.5** — fill out the chain templates and wire the Projects v2 GraphQL integration so `make new-site` produces a fully-populated project board.
+5. **Test infra** — REP-7 needs hardware. Could be budget-friendly Proxmox or cloud VMs.
+
+REP-0 itself remains open as the long-running parent issue.
+
+## References
+
+- REP-0 [#144](https://github.com/zeshaq/codex-opp-agent/issues/144) — meta + strategy
+- REP-1 [#145](https://github.com/zeshaq/codex-opp-agent/issues/145) — profile schema (CLOSED)
+- REP-2 [#146](https://github.com/zeshaq/codex-opp-agent/issues/146) — handoff templates (CLOSED Phase 1)
+- REP-2.1 [#241](https://github.com/zeshaq/codex-opp-agent/issues/241) — remaining handoff parameterization
+- REP-2.2 [#243](https://github.com/zeshaq/codex-opp-agent/issues/243) — profile unification (CLOSED)
+- REP-3 [#147](https://github.com/zeshaq/codex-opp-agent/issues/147) — GitLab bootstrap (OPEN Phase 1)
+- REP-3.2/3.3/3.4 [#235/#236/#237](https://github.com/zeshaq/codex-opp-agent/issues/235)
+- REP-4 [#148](https://github.com/zeshaq/codex-opp-agent/issues/148) — scripts refactor (OPEN Phase 1)
+- REP-4.2 [#244](https://github.com/zeshaq/codex-opp-agent/issues/244) — remaining scripts
+- REP-5 [#149](https://github.com/zeshaq/codex-opp-agent/issues/149) — `make new-site` (OPEN Phase 1)
+- REP-5.2/3/4/5 [#238/#239/#240/#242](https://github.com/zeshaq/codex-opp-agent/issues/238)
+- REP-6 [#150](https://github.com/zeshaq/codex-opp-agent/issues/150) — memory → runbooks (CLOSED)
+- REP-7 [#151](https://github.com/zeshaq/codex-opp-agent/issues/151) — dry-run rebuild (BLOCKED)
+- Milestone [Site Replication Readiness #31](https://github.com/zeshaq/codex-opp-agent/milestone/31)
+- ADR 0001, 0015, 0018, 0019, 0022, 0023, 0024 — the foundational decisions the framework relies on
+- Memory `project_obc_to_operand_secret_bridge.md` — OBC → operand storage-Secret bridge
+- Memory `reference_rhacs_init_bundle_via_api.md` — RHACS init-bundle pattern
