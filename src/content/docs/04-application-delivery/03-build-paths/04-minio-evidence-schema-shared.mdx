@@ -1,8 +1,193 @@
 ---
 title: "Shared MinIO Evidence Schema"
-description: "Section 04-application-delivery/03-build-paths: Shared MinIO Evidence Schema (placeholder)."
-sidebar_label: "Shared MinIO Evidence Schema"
+description: "The MinIO bucket, prefix shape, required vs optional keys, and validation script that both build paths must honour so that downstream consumers (DefectDojo, audit, operators) do not need to know which path produced a build."
+sidebar_label: "MinIO Evidence Schema"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page is the public-doc version of the evidence schema contract codified in `connection-details/ci-evidence-schema.md` (DEV-OCP-3.7 / #195). Both build paths (Path A Jenkins on a VM, Path B Tekton in-cluster) emit evidence to the same MinIO bucket with the same prefix shape and the same required keys. The intent: a downstream consumer (DefectDojo for vuln triage, an auditor walking a release, an operator reproducing a build) does not need to know which path produced a given build.
+
+## The bucket and prefix shape
+
+| Item | Value |
+|---|---|
+| MinIO endpoint | LAN endpoint on the MinIO VM (private) |
+| Bucket | `developer-ci-evidence` |
+| Object-prefix shape | `<team>/<app>/<git-sha>/` |
+| Path A writer credential | Jenkins credential `minio-developer-ci-evidence` |
+| Path B writer credential | Tekton workspace-mounted Secret bound to the same MinIO user |
+| Read-only consumer credential | `minio-developer-ci-evidence-reader` |
+
+`<team>` and `<app>` are DNS-1123 labels matching the app-repo contract (`[a-z0-9-]`, start/end alphanumeric, max 40 chars).
+
+`<git-sha>` is the **full 40-character commit SHA** of the build — not a short SHA, not the branch name. The full SHA guarantees uniqueness across rebuilds of the same commit (a rebuild overwrites in place, the intended idempotent behaviour).
+
+## Required keys per build
+
+Every successful build must produce all required keys before its path is allowed to write the GitOps overlay patch MR. A build that emits the patch without the evidence set is non-conforming and the MR must be rejected at review.
+
+| Key | Required | Producer | Content |
+|---|---|---|---|
+| `<team>/<app>/<git-sha>/build.log` | yes | Jenkins console log (A) or `tkn pipelinerun logs` (B) | Plain-text build log, full stdout + stderr |
+| `<team>/<app>/<git-sha>/sbom.spdx.json` | yes | `syft` (A) or `tkn task syft` (B) | SPDX 2.3 JSON SBOM of the final image |
+| `<team>/<app>/<git-sha>/trivy-scan.json` | yes | `trivy image --format json` | Full Trivy scan in JSON, all severities |
+| `<team>/<app>/<git-sha>/image-digest.txt` | yes | `skopeo inspect` (A) or Tekton `image-digest` result (B) | Single line: `sha256:<64hex>\n` |
+| `<team>/<app>/<git-sha>/promotion.log` | optional | overlay-patch step | Plain-text log of the overlay-patch MR creation |
+
+Required = the build must produce it. Optional = the build may produce it if the step ran; consumers must not fail open when it is absent.
+
+### Filename and shape rules
+
+- Filenames are lowercase, hyphen or dot separated, no spaces.
+- JSON files must be valid JSON. The validator only checks presence + parseability, not schema.
+- `image-digest.txt` must be exactly one line, ending with `\n`, of the form `sha256:` followed by 64 lowercase hex characters.
+- `build.log` is plain text. UTF-8 only, no terminal control codes (CI shells strip them).
+- `sbom.spdx.json` must be SPDX 2.3 JSON; downstream consumers reject SPDX 2.2 or CycloneDX silently.
+- `trivy-scan.json` must be the full Trivy JSON output, all severities. Filtering to "CRITICAL only" in the JSON breaks downstream triage.
+
+## Validation
+
+`scripts/evidence-validator.py` (in `codex-opp-agent` or sibling tooling repos) accepts a single build's evidence prefix:
+
+```bash
+scripts/evidence-validator.py s3://developer-ci-evidence/<team>/<app>/<git-sha>/
+```
+
+Exit codes:
+
+- `0` — all required keys present, all JSON files parseable.
+- `1` — one or more required keys missing; stderr lists them.
+
+The validator does **not** validate content shape (that is a downstream consumer concern). What it does check:
+
+1. All five required keys exist at the prefix (counting `image-digest.txt` as required).
+2. `image-digest.txt` matches the regex `^sha256:[a-f0-9]{64}\n?$`.
+3. `trivy-scan.json` and `sbom.spdx.json` parse as JSON.
+
+The validator runs:
+
+- in Jenkins as the last step of every Path A pipeline (before the overlay-patch step).
+- in Tekton as the last Task of every Path B Pipeline (before the overlay-patch Task).
+- on demand by an operator against any historical prefix.
+
+A non-zero exit code must block the overlay-patch step on both paths. (Today the Jenkins pipeline halts the build; the Tekton Pipeline `runAfter` chain ensures the next Task does not start.)
+
+## Worked examples
+
+The `codex-opp-agent` repo ships reference example evidence sets:
+
+- `examples/ci-evidence-jenkins/` — Path A shape.
+- `examples/ci-evidence-tekton/` — Path B shape.
+
+Both directories contain the same filenames with placeholder content; they exist specifically to demonstrate the cross-path parity guarantee.
+
+A real evidence prefix on a freshly-built image looks like:
+
+```text
+developer-ci-evidence/
+  team-platform/
+    sample/
+      3f4781f23a8b4c0e9d8e7b6c5a4b3a2c1d0e9f8a/
+        build.log          (185 KiB)
+        sbom.spdx.json     (1.2 MiB)
+        trivy-scan.json    (340 KiB)
+        image-digest.txt   (76 B)
+        promotion.log      (4 KiB; only present after overlay patch)
+```
+
+`image-digest.txt` content:
+
+```text
+sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890
+```
+
+## Bucket policy
+
+The MinIO bucket has two scoped users:
+
+| User | Policy | Permissions |
+|---|---|---|
+| `minio-developer-ci-evidence` (writer) | `developer-ci-evidence-writer` | `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` on `developer-ci-evidence/*` |
+| `minio-developer-ci-evidence-reader` | `developer-ci-evidence-reader` | `s3:GetObject`, `s3:ListBucket` on `developer-ci-evidence/*` |
+
+Path A and Path B both use the writer credential (delivered via Jenkins credential store and ESO respectively). DefectDojo and operator-side validators use the reader credential.
+
+The bucket has **versioning enabled** and a retention lifecycle:
+
+- Objects are retained for 90 days after last modification.
+- Versions are retained for 30 days.
+- A daily lifecycle rule expires older versions.
+
+Rebuilds of the same `<git-sha>` overwrite the previous evidence in place. The previous version is retained for 30 days for forensics.
+
+## Cross-path parity guarantees
+
+Regardless of path, the following must hold (codified in `build-path-matrix.md` and validated by `evidence-validator.py`):
+
+| Guarantee | What it means |
+|---|---|
+| Same prefix shape | `<team>/<app>/<git-sha>/` everywhere; no path-specific suffix. |
+| Same required blob set | Five keys above; no more, no less. |
+| Same Trivy severity policy | Fail on CRITICAL, warn on HIGH (see [Trivy Policy](./03-trivy-policy-shared)). |
+| Same digest-pinned overlay patch | Same overlay file, same `digest:` field, same `<sha256:...>` value as `image-digest.txt`. |
+| Same MR-into-main flow | Same branch shape (`ci/dev/<short-sha>`), same commit message shape (`bump: <team>/<app> <env> @<sha256-short>`). |
+
+A path that cannot meet all five is not a supported path and must not be onboarded.
+
+## DefectDojo ingestion (future)
+
+DefectDojo (when present) pulls scan reports from MinIO using the read-only evidence credential, normalises Trivy JSON into the standard DefectDojo-trivy parser, and tags findings with `<team>/<app>/<git-sha>`.
+
+If `connection-details/defectdojo-vm.md` exists, it documents the live endpoint and credential custody. As of 2026-05-11 that file does not exist; DefectDojo ingestion is downstream of this schema and not yet wired. The contract above is sufficient for the ingestion to be built later without changing the evidence side.
+
+## Failure modes and gotchas
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Validator says `missing key: sbom.spdx.json` | `syft` step ran but `mc cp` failed silently | Operator: check MinIO permissions; re-upload from the Jenkins archive or Tekton workspace. |
+| Validator says `image-digest.txt: invalid format` | Trailing CR (\r) on Windows-built agent | Strip CRLF in the build step; `image-digest.txt` is exactly `sha256:` + 64 hex + `\n`. |
+| `<git-sha>` in evidence doesn't match the overlay digest | Build pushed to registry without recapturing the digest | Always capture digest from the registry response (skopeo or Tekton result), not from the local `podman push` output. |
+| Evidence missing for a successful Argo sync | Argo's `Application` was synced manually before the overlay was patched | Argo sync without an overlay patch is a drift signal; investigate. |
+| MinIO 403 on writer | `developer-ci-evidence-writer` policy not attached to user | Operator: MinIO console; attach policy. |
+| MinIO connection timeout from agent / cluster | Network path blocked | Operator: from agent, `nc -zv <minio-ip> 9000`; check br30 routing. |
+
+## Operator runbook
+
+Daily check (any LAN client with the reader credential):
+
+```bash
+mc ls evidence/developer-ci-evidence/ \
+  --recursive \
+  --summarize \
+  | tail -5
+# Sanity: total object count + size; trend should be growing
+```
+
+Validate one historical build:
+
+```bash
+scripts/evidence-validator.py \
+  s3://developer-ci-evidence/team-platform/sample/3f4781f23a8b4c0e9d8e7b6c5a4b3a2c1d0e9f8a/
+# Exit 0 = ok; exit 1 with stderr = missing keys
+```
+
+Run the validator across all builds for one app (audit pattern):
+
+```bash
+mc ls evidence/developer-ci-evidence/team-platform/sample/ \
+  | awk '{print $NF}' \
+  | while read sha; do
+      scripts/evidence-validator.py \
+        s3://developer-ci-evidence/team-platform/sample/$sha/ \
+        || echo "FAIL: $sha"
+    done
+```
+
+## References
+
+- `connection-details/ci-evidence-schema.md` (#195) — full schema
+- `connection-details/minio.md` — MinIO endpoint and credentials
+- `connection-details/build-path-matrix.md` (#194) — parity contract
+- `examples/ci-evidence-jenkins/` and `examples/ci-evidence-tekton/` — reference shapes
+- DEV-OCP issue #195 (cross-path parity)

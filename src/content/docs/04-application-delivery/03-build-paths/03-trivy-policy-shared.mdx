@@ -1,8 +1,216 @@
 ---
 title: "Shared Trivy Policy"
-description: "Section 04-application-delivery/03-build-paths: Shared Trivy Policy (placeholder)."
+description: "The single Trivy severity policy both Path A and Path B enforce: fail on CRITICAL, warn on HIGH, capture everything. Plus the shared Trivy VM endpoint, DB freshness rules, and the post-fail image cleanup that prevents vulnerable images from staying addressable."
 sidebar_label: "Shared Trivy Policy"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page documents the Trivy policy that both build paths enforce. The policy is identical across paths by contract — different severity gates per path would mean an image accepted by Path A could be rejected by Path B, breaking the migration symmetry.
+
+The full source-of-truth is `connection-details/ci-evidence-schema.md` (DEV-OCP-3.7 / #195). This page is the shared-policy explainer plus operator runbook.
+
+## The single severity policy
+
+| Severity | Action | Rationale |
+|---|---|---|
+| CRITICAL | **Fail build.** No overlay patch MR is opened. Evidence still uploaded for triage. | A CRITICAL CVE on a deployed image is an incident. Catching it pre-merge is cheaper than catching it in prod. |
+| HIGH | **Warn.** Build succeeds; `trivy-scan.json` captures the finding; downstream (DefectDojo) flags for triage. | HIGH includes many false positives; failing on HIGH would block routine builds. |
+| MEDIUM / LOW / UNKNOWN | Captured in JSON; no gate. | Information for downstream triage. |
+
+The threshold is set in the Trivy invocation:
+
+- `--severity CRITICAL` for the gate (exit non-zero on any CRITICAL).
+- `--severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL` for the full report (preserves everything for downstream consumers).
+
+Both Path A and Path B run **both** invocations: the gate scan is what fails the build; the full scan is what populates the evidence blob.
+
+## Why "fail on CRITICAL, warn on HIGH"
+
+Three reasons the policy lands here, not at "fail on HIGH" or "fail on any vulnerability":
+
+1. **HIGH false-positive rate is enough to block routine builds.** Trivy's HIGH bucket includes CVEs without exploitable code paths in a given context. Fail-on-HIGH means every team carries a Trivy ignore list, and ignore lists drift.
+2. **CRITICAL is a real signal.** The Trivy CRITICAL bucket is "remote code execution / privilege escalation / known-exploited", and catching one of those before merge is the entire point of having a scan gate.
+3. **Downstream triage handles HIGH.** When DefectDojo lands in the lab (currently pending), HIGH findings will be ingested as DefectDojo issues with a SLA, not as build blockers. The CI gate stays narrow; the SDLC triage handles the rest.
+
+A team that wants stricter gating for its own apps can add a project-level `.trivyignore` or a stricter scan in their own CI lane. The platform policy is the **minimum** floor.
+
+## The Trivy server
+
+| Item | Value |
+|---|---|
+| Trivy version | 0.70.0 (both VM and agents) |
+| Public endpoint | `https://trivy.apps.sub.comptech-lab.com` |
+| Mode | server (clients post images, server returns scan results) |
+| Auth | Bearer token in `Authorization` header |
+| Token custody | Vault `secret/platform/trivy/server-token`; Jenkins `trivy-server-token`; Tekton ESO-materialised Secret |
+| TLS | HAProxy edge, wildcard cert `*.apps.sub.comptech-lab.com` |
+| Health | `GET /healthz` returns 200 when DB is fresh |
+
+Trivy runs in **server mode** rather than per-client local-scan mode. The reasons:
+
+- **One DB to refresh.** Trivy's vulnerability DB is several hundred MB; refreshing on every client every build is wasteful. The server caches the DB and clients send a thin image reference.
+- **One policy to enforce.** Severity thresholds, ignore lists, and platform-wide allowlists live on the server side.
+- **One audit log.** Scan history is queryable from one place.
+
+## Trivy DB freshness
+
+Trivy's CVE database is updated continuously upstream. Stale DB → missed CVEs → false negatives. The platform guarantees freshness with:
+
+- A **nightly cron** on the Trivy VM that runs `trivy image --download-db-only`. This refreshes the bundled DB from the upstream mirror.
+- A **pre-scan init step** on both Path A and Path B that verifies the server reports a `db-updated-at` within the last 24 hours; if not, the step blocks until the server refreshes.
+
+Both paths must refresh at least once per 24 hours. Operator-side validation:
+
+```bash
+curl -fsS https://trivy.apps.sub.comptech-lab.com/version \
+  | jq '.NextUpdate, .UpdatedAt'
+```
+
+A `NextUpdate` more than 24h in the future or an `UpdatedAt` more than 48h in the past is a drift signal; refresh manually:
+
+```bash
+ssh ze@<trivy-vm> 'trivy image --download-db-only'
+```
+
+## Post-fail cleanup
+
+A CRITICAL finding must not leave a vulnerable manifest addressable. Both paths run a cleanup step in their failure path.
+
+### Path A (Jenkins)
+
+The `post { unsuccessful { ... } }` block in the Jenkinsfile runs a `skopeo delete` against the pushed manifest in Nexus app-registry. After cleanup:
+
+- The image tag the build pushed is unaddressable (`docker pull` → manifest not found).
+- The Trivy `trivy-scan.json` is still in MinIO under the build's evidence prefix.
+- The Jenkins build is marked red; the digest patch step never ran.
+
+### Path B (Tekton)
+
+`finally` tasks on the Pipeline run a delete Task that uses the same per-tenant Quay robot token to delete the pushed tag from the Quay org. Same post-condition:
+
+- The image is unaddressable.
+- Evidence persists.
+- The PipelineRun is `Failed`; `update-overlay-digest` Task never ran.
+
+The cleanup is best-effort. If it fails (network blip, registry down), the team must manually delete the image from the registry UI. Operator runbook: a periodic job (weekly) sweeps Nexus and Quay for tags that have no corresponding successful build record in MinIO and deletes them.
+
+## What the evidence blob looks like
+
+`trivy-scan.json` is the full Trivy JSON report, all severities, all targets within the image. Schema is Trivy's standard JSON output. Example shape (truncated):
+
+```json
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "app-registry.apps.sub.comptech-lab.com/team-platform/sample",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "Size": 198765432,
+    "OS": { "Family": "ubi", "Name": "9" },
+    "ImageConfig": { "...": "..." }
+  },
+  "Results": [
+    {
+      "Target": "Java",
+      "Class": "lang-pkgs",
+      "Type": "jar",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2024-...",
+          "PkgName": "org.example:lib",
+          "InstalledVersion": "1.2.3",
+          "FixedVersion": "1.2.4",
+          "Severity": "HIGH",
+          "Title": "...",
+          "Description": "...",
+          "References": ["..."],
+          "PublishedDate": "2024-...",
+          "LastModifiedDate": "2024-..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+The evidence validator (`scripts/evidence-validator.py`) checks presence and parseability only. Downstream consumers (DefectDojo, audit dashboards) consume the full JSON.
+
+## SBOM
+
+The SBOM is produced separately from the Trivy scan, by `syft` (Path A) or a `syft` Tekton Task (Path B). The format is SPDX 2.3 JSON. The SBOM file is `sbom.spdx.json` under the same evidence prefix.
+
+SBOM is required for every build (both paths). The reasons:
+
+- **Supply-chain traceability.** What's in the image, by version, by license, by source.
+- **Compliance.** PCI-DSS-style audit needs an answer to "what package versions were running on date X".
+- **Vulnerability re-evaluation.** When a new CVE drops, the SBOM is what's queried — not the scan-time Trivy JSON, which only knew about CVEs that existed at scan time.
+
+## Cross-path parity
+
+The five things the parity contract requires (`build-path-matrix.md`):
+
+1. Same MinIO evidence prefix shape: `developer-ci-evidence/<team>/<app>/<git-sha>/`.
+2. Same required evidence blob set: `build.log`, `sbom.spdx.json`, `trivy-scan.json`, `image-digest.txt`.
+3. Same Trivy severity policy: fail on CRITICAL, warn on HIGH.
+4. Same digest-pinned overlay patch convention.
+5. Same MR-into-`main` flow against the app repo.
+
+A path that cannot meet all five is not a supported path and must not be onboarded as a tenant CI route.
+
+The parity is verifiable by running `scripts/evidence-validator.py` against any historical prefix:
+
+```bash
+scripts/evidence-validator.py \
+  s3://developer-ci-evidence/team-platform/sample/<git-sha>/
+```
+
+Exit 0 = all required keys present; exit 1 with stderr listing missing keys.
+
+## Failure modes and gotchas
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Build red on a CVE that "shouldn't be CRITICAL" | Trivy's database upgraded a CVE severity overnight | Verify with upstream NVD; if disagreement is genuine, file a Trivy upstream issue and add a project-local `.trivyignore` with documented justification + expiry. |
+| Scan succeeds on Path A, fails on Path B (or vice versa) | DB on one side is stale | Re-run after Trivy DB refresh; if the divergence persists, the policy threshold drifted — restore to `CRITICAL` on both sides. |
+| Image deleted but evidence shows it as live | Cleanup ran after evidence upload; race window | Resolved automatically: evidence prefix is keyed by `<git-sha>`, not by image existence. Downstream consumer flags the build as red because no `update-overlay-digest` log appears. |
+| Trivy hangs > 10 min | DB pull stalled on cold start | Operator: pre-warm DB on Trivy VM with `trivy image --download-db-only`. |
+| `connection refused` to Trivy | Trivy VM down or HAProxy backend stale | Operator: `curl -fsS https://trivy.apps.sub.comptech-lab.com/healthz`; if 502, check HAProxy `trivy-vm-be` backend. |
+| Trivy returns 401 | Token rotation didn't propagate | Operator: rotate token in Vault; re-materialise via ESO; restart EventListener if necessary. |
+
+## Operator runbook
+
+Daily check (any LAN client):
+
+```bash
+curl -fsS https://trivy.apps.sub.comptech-lab.com/healthz
+# Expected: 200, body "ok"
+
+curl -fsS https://trivy.apps.sub.comptech-lab.com/version \
+  | jq '{Version, NextUpdate, UpdatedAt, DownloadedAt}'
+# Expected: UpdatedAt within ~48h
+```
+
+Rotating the Trivy server token:
+
+```bash
+# 1. Generate new token (Trivy server config)
+ssh ze@<trivy-vm> 'sudo trivy server --token=<new-token-redacted> ...'
+
+# 2. Write to Vault
+vault kv put secret/platform/trivy/server-token token=<new-token-redacted>
+
+# 3. Refresh Jenkins credential
+# UI: https://jenkins.apps.sub.comptech-lab.com/credentials/store/system/domain/_/credential/trivy-server-token/
+
+# 4. Force ESO re-sync for Tekton consumers
+oc -n openshift-pipelines annotate externalsecret trivy-server-token \
+  force-sync="$(date +%s)" --overwrite
+```
+
+## References
+
+- `connection-details/ci-evidence-schema.md` (#195) — full schema and parity contract
+- `connection-details/build-path-matrix.md` (#194) — parity guarantees list
+- `connection-details/jenkins-ocp-path.md` — Path A scan stage
+- `adr/0019-nexus-only-image-supply-chain.md`
+- DEV-OCP issues: #191 (Tekton Trivy Task), #195 (cross-path parity)
