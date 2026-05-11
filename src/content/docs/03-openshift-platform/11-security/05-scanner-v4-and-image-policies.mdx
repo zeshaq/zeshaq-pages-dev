@@ -1,0 +1,179 @@
+---
+title: "Scanner V4 and Image-Registry Policies"
+description: "Scanner V4 architecture (matcher + indexer), the disconnected CVE feed model, image-registry allowlist as a RHACS policy (IMG-SUPPLY-3), and the dual-layer enforcement against the Kubernetes-native VAP."
+sidebar_label: "Scanner V4 & image policies"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Scanner V4 is RHACS's CVE engine; the image-registry allowlist is the most operationally important policy it enforces. This page covers both — the scan pipeline that produces vulnerability data, and the `IMG-SUPPLY-3` deploy-time policy that uses it (alongside the Kubernetes-native VAP from [08-validating-admission-policies-vap](./08-validating-admission-policies-vap)).
+
+## Scanner V4 architecture
+
+Scanner V4 replaced the older `Scanner` + `Scanner-DB` in RHACS 4.4 / 4.5. It runs as two Deployments + one Postgres DB in `stackrox`:
+
+| Component | Role |
+| --- | --- |
+| `scanner-v4-indexer` | Pulls image layers; extracts package metadata; writes to the V4 DB. |
+| `scanner-v4-matcher` | Matches indexed package metadata against the CVE feed; returns vulnerability lists. |
+| `scanner-v4-db` | Postgres holding the V4 image index and the CVE feed copy. |
+
+Compared to V2 (legacy):
+
+- V4 has separate indexing and matching steps; layers can be cached across image pulls.
+- The CVE feed is shipped *in the operator image* in disconnected mode — no Red Hat phone-home.
+- Scanner V4 understands more package types (rpm, dpkg, OS distros, language ecosystems) than V2.
+
+## When images get scanned
+
+| Trigger | Pipeline |
+| --- | --- |
+| Build-side push to Nexus | Trivy scans on push (separate; ADR 0011/0013) |
+| RHACS Sensor sees a new Pod | If `admissionControl.contactImageScanners: ScanIfMissing`, the Admission webhook asks Scanner V4 to scan synchronously before admitting |
+| Central rescans on policy update | `/v1/images/scan` API call |
+| Operator-driven periodic rescan | Central re-evaluates all known images on policy change |
+
+Scanner V4 talks to registries using the secured cluster's pull credentials. In disconnected mode, the registries are local:
+
+- `mirror-registry.apps.sub.comptech-lab.com` (install + operator content)
+- `app-registry.apps.sub.comptech-lab.com` (tenant app pushes)
+- `quay.apps.sub.comptech-lab.com` (Path B Tekton pushes)
+- `image-registry.openshift-image-registry.svc:5000` (in-cluster registry)
+
+If an image is referenced from an external registry that's not in the allowlist, the VAP will block it anyway — but Scanner V4 also won't be able to scan it because it has no pull credentials for `gcr.io` or similar.
+
+## The CVE feed in disconnected mode
+
+| Source | Path |
+| --- | --- |
+| Red Hat OVAL / VEX feeds | bundled in operator image |
+| OS distros (RHEL, UBI, RHCOS) | bundled |
+| Language ecosystems (Maven, npm, PyPI, Go) | bundled |
+
+The feed is refreshed only when the `rhacs-operator` is upgraded. The lab pins to `4.10.2` — practical implication: the CVE knowledge "freezes" at the operator's release date until the next upgrade. New CVEs disclosed after that aren't seen until the upgrade lands.
+
+This is a known disconnected-mode trade-off. The Trivy build-side scanner (on a different upgrade cadence) catches things RHACS would miss in a stale snapshot.
+
+## IMG-SUPPLY-3: the RHACS image-registry policy
+
+The fleet's primary registry allowlist is the **VAP** (Kubernetes-native, page 08). The companion **RHACS** policy is `IMG-SUPPLY-3 disallowed image registries` — it surfaces the same violation as an RHACS alert (for Central UI traceability) and gates `DEPLOY` lifecycle.
+
+Policy shape (one section, one group):
+
+| Field | Value |
+| --- | --- |
+| Policy name | `IMG-SUPPLY-3 disallowed image registries` |
+| Lifecycle stages | `DEPLOY` |
+| Enforcement | `SCALE_TO_ZERO_ENFORCEMENT` |
+| Policy section | "Disallowed registries" |
+| Policy group | field `Image Registry`, `negate: true`, values = allow-list |
+| Scope | cluster-wide (no namespace filter) |
+
+The value list mirrors the VAP's `allowedPrefixes`, with one caveat:
+
+> RHACS `Image Registry` matches on registry **host** only (no path). VAP matches on path prefix. So `ghcr.io/cloudnative-pg/` in the VAP narrows to one repo; `ghcr.io` in RHACS allows everything under `ghcr.io`. This is documented granularity mismatch — the VAP is the precise layer; RHACS is the broader alert layer.
+
+### Current allowlist values
+
+| Registry host | Purpose |
+| --- | --- |
+| `mirror-registry.apps.sub.comptech-lab.com` | OpenShift install + operator catalog |
+| `registry.redhat.io` | transient; IDMS rewrites locally |
+| `quay.io/openshift-release-dev` | OCP release payload references |
+| `image-registry.openshift-image-registry.svc:5000` | in-cluster registry |
+| `app-registry.apps.sub.comptech-lab.com` | Nexus app-registry (Path A push) |
+| `quay.apps.sub.comptech-lab.com` | Path B Tekton push target |
+| `ghcr.io` | cnpg-operator (broader than VAP, by design) |
+| `icr.io` | open-liberty-operator (broader than VAP) |
+
+The combined precision is: VAP enforces path prefix exactly; RHACS allows host and emits the alert.
+
+## Updating the allowlist
+
+The two layers are managed differently:
+
+| Layer | Source of truth | Update path |
+| --- | --- | --- |
+| VAP | `platform-gitops/clusters/<cluster>/platform/admission-policies/allowed-image-registries.yaml` | git MR + push |
+| RHACS | Central DB (no GitOps) | `scripts/rhacs-update-img-allowlist.sh` (Central API PUT) |
+
+**Both must be updated.** The combined checklist (from `image-registry-allowlist.md`):
+
+1. Edit both VAP files (hub + spoke) in `platform-gitops`.
+2. Open MR / commit + push to `main`.
+3. Wait for Argo sync, run a live VAP allow + deny test.
+4. Edit `DESIRED_REGISTRIES` in `scripts/rhacs-update-img-allowlist.sh`.
+5. Run the script; confirm the verify block.
+6. Update the "Current allowlist" table in `connection-details/image-registry-allowlist.md`.
+
+The script is idempotent — re-running with no array change exits 0 with `already in sync`. The Central API PUT preserves the policy's existing `exclusions` (per-namespace tenant exemptions; see [07-app-team-policy-set](./07-app-team-policy-set)).
+
+## Live test against the VAP
+
+```bash
+KCFG=<spoke-kubeconfig>
+
+# Should be allowed:
+KUBECONFIG=$KCFG oc run vap-test-ok \
+  --image=app-registry.apps.sub.comptech-lab.com/smoke/test:latest \
+  --dry-run=server --image-pull-policy=Never \
+  -n external-secrets-operator -o name
+
+# Should be denied (returns ValidatingAdmissionPolicy ... denied request):
+KUBECONFIG=$KCFG oc run vap-test-deny \
+  --image=evil.example.com/test/foo:latest \
+  --dry-run=server --image-pull-policy=Never \
+  -n external-secrets-operator -o name
+```
+
+The `--dry-run=server` runs the request through the kube-apiserver admission chain (so VAP fires) without actually creating the Pod. Use a non-tenant namespace like `external-secrets-operator` so per-tenant RHACS evaluation doesn't get involved.
+
+## Where RHACS adds value vs VAP
+
+| Capability | VAP | RHACS |
+| --- | --- | --- |
+| Admission-time deny | ✓ | ✓ (via Admission controller webhook) |
+| Audit alert in central UI | ✗ | ✓ |
+| Image content (CVEs, components) drives policy | ✗ | ✓ |
+| Per-namespace exclusion | very limited (matchConditions) | rich (Sensor scope) |
+| Cross-cluster fan-out | per-cluster manifest | one Central policy applies everywhere |
+| Auditor-readable history of violations | ✗ | ✓ |
+
+RHACS shines for "what happened, when, on which clusters" historical analysis. VAP shines for "fail closed at apiserver, no agent in the loop." The fleet runs both because failure modes don't overlap.
+
+## Per-tenant exceptions (IMG-SUPPLY-3)
+
+RHACS supports per-namespace `exclusions` on the policy. Same shape as the deploy-time policies covered in [07-app-team-policy-set](./07-app-team-policy-set): tenant opens a GitLab MR documenting justification + compensating control, platform admin merges and adds an exclusion in Central.
+
+The catch: RHACS exclusion only suppresses the RHACS alert. The VAP is independent and still denies admission. So **a tenant exclusion alone doesn't unblock a denied Pod** while the VAP is in `Deny` mode (which it always is on this fleet). The only paths that actually unblock are Path A (mirror to `app-registry`) or Path B (extend the cluster-wide VAP). See [08-validating-admission-policies-vap](./08-validating-admission-policies-vap) for the full governance discussion.
+
+## Other image policies in scope for RHACS
+
+| Policy | Lifecycle | What it gates |
+| --- | --- | --- |
+| `Fixable Severity at least Important` | BUILD | (not enforced; informational at deploy. Trivy is the build-side gate.) |
+| `90-Day Image Age` | DEPLOY | alerts if image > 90 days unscanned. Useful for stale-base-image hygiene. |
+| `Image Scan Age` | DEPLOY | alerts if image has never been scanned by Scanner V4. |
+| `Required Image Label` | DEPLOY | enforced; in the app-team set ([07-app-team-policy-set](./07-app-team-policy-set)). |
+| `Latest tag` | DEPLOY | enforced; in the app-team set. |
+| `IMG-SUPPLY-3 disallowed image registries` | DEPLOY | enforced; the focus of this page. |
+
+The fleet enables image-vulnerability gating at *build* time (Trivy) rather than deploy time (RHACS). Reason: pushing vulnerability decisions to the build pipeline gives developers fast feedback and one place to wave exceptions; deploy-time gating creates double-blocking and makes incident triage slower. RHACS still *alerts* on the vulnerability policy so Central reflects current image risk, but it does not deny admission.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Scanner V4 indexer crashloops on a new image | image format Scanner doesn't recognize | `oc -n stackrox logs deploy/scanner-v4-indexer` — usually a manifest format mismatch; rebuild image with standard `docker buildx`/`buildah` |
+| `IMG-SUPPLY-3` shows "no violation" but Pod is denied | VAP denied; RHACS sees the Deployment never reached the spec | check VAP audit logs |
+| `allowlist updated but Pod still denied` | only updated one layer (VAP vs RHACS) | follow the combined checklist; both layers must be updated |
+| Scanner V4 returns stale CVE data | feed bundled in operator; operator hasn't been upgraded | check `rhacs-operator` ClusterServiceVersion timestamp |
+| Scanner V4 can't pull image | missing pull credential in `stackrox` | verify Scanner has access to `image-registry.openshift-image-registry.svc:5000` and the registry pull secrets |
+
+## References
+
+- `connection-details/image-registry-allowlist.md` (IMG-SUPPLY-3).
+- `connection-details/vap-tenant-exclusions.md` (DEV-OCP-4.4).
+- `scripts/rhacs-update-img-allowlist.sh` (claude-agent/scripts).
+- ADRs: 0011 (Trivy), 0013 (DefectDojo), 0019 (image supply), 0020 (PCI baseline).
+- RHACS 4.10 docs: Scanner V4 architecture, policy API.

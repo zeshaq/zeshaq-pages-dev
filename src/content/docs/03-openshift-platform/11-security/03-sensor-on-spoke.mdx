@@ -1,0 +1,169 @@
+---
+title: "RHACS Sensor on the Spoke (and Hub Self-Secure)"
+description: "Deploying the SecuredCluster CR on spoke-dc-v6 (and the hub's own self-secure): Sensor, Admission controller, Collector, the Central endpoint, init-bundle Secret consumption."
+sidebar_label: "Sensor on spoke"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+A SecuredCluster is the *managed-cluster* half of RHACS. It runs on every cluster you want Central to see — including the hub itself. This page documents the `SecuredCluster` CR, its three workloads, and the init-bundle Secrets it consumes.
+
+## What a SecuredCluster deploys
+
+| Workload | Kind | Replicas | Purpose |
+| --- | --- | --- | --- |
+| `sensor` | Deployment | 1 | long-lived mTLS connection to Central, watches Kubernetes resources, evaluates policies locally, ships events |
+| `admission-control` | Deployment | 3 | webhook for `ValidatingWebhookConfiguration`; gates deploy-time policy decisions at the apiserver |
+| `collector` | DaemonSet | 1/node | host-level runtime probe (eBPF or kernel module) for process/network/file events |
+
+All three live in `stackrox` on the secured cluster. The Sensor is the "brain" — it talks to Central; Admission and Collector talk to Sensor.
+
+## The SecuredCluster CR
+
+`platform-gitops/clusters/spoke-dc-v6/security/rhacs/securedcluster.yaml`:
+
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: SecuredCluster
+metadata:
+  name: stackrox-secured-cluster-services
+  namespace: stackrox
+spec:
+  clusterName: spoke-dc-v6
+  centralEndpoint: central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com:443
+  admissionControl:
+    listenOnCreates: true
+    listenOnEvents: true
+    listenOnUpdates: true
+    contactImageScanners: ScanIfMissing
+    timeoutSeconds: 10
+    bypass: BreakGlassAnnotation
+  perNode:
+    collector:
+      collection: CORE_BPF        # eBPF probe (preferred over kernel-module on RHCOS)
+      imageFlavor: Regular
+    taintToleration: TolerateTaints
+  scanner:
+    analyzer:
+      scaling:
+        autoScaling: Disabled
+      resources:
+        requests: { cpu: "200m", memory: "256Mi" }
+        limits:   { cpu: "1",    memory: "1Gi"   }
+  monitoring:
+    openshift:
+      enabled: true
+```
+
+Key fields:
+
+- **`clusterName: spoke-dc-v6`** — appears in Central UI / API as the cluster identifier. Pick a stable name; renaming requires re-issuing the init-bundle.
+- **`centralEndpoint`** — the Central Route on `hub-dc-v6`. Port `443` because the Route is `Edge`-terminated. For the hub's own self-secure, this is `central.stackrox.svc:443` (in-cluster service).
+- **`admissionControl.listenOnCreates / Updates / Events`** — three booleans that decide which admission requests RHACS evaluates. Production: all three `true`.
+- **`admissionControl.contactImageScanners: ScanIfMissing`** — when admitting a Pod, RHACS checks if Scanner V4 has already scanned the image; if not, triggers a scan inline. `Never` skips the scan; `ScanIfMissing` is the production default.
+- **`admissionControl.bypass: BreakGlassAnnotation`** — allows operators to bypass admission for a specific Pod by adding `admission.stackrox.io/break-glass: "<reason>"`. This is logged. Use only during incident response.
+- **`perNode.collector.collection: CORE_BPF`** — eBPF probe. On RHCOS 9.x this is the supported and preferred mode; `KERNEL_MODULE` is the older path.
+- **`perNode.taintToleration: TolerateTaints`** — the Collector DaemonSet will run on tainted nodes too (master nodes, infra nodes). Required so the Collector sees *every* node's events.
+
+## The hub self-secure
+
+The hub *also* gets a `SecuredCluster` so Central can see its own workloads — RHACM components, GitOps controllers, Central itself. The hub SecuredCluster CR is identical to the spoke's except:
+
+```yaml
+spec:
+  clusterName: hub-dc-v6
+  centralEndpoint: central.stackrox.svc:443    # in-cluster, no Route
+```
+
+Same operator, same operand namespace. The Sensor connects to Central over the local Service rather than the Route.
+
+## Init-bundle Secrets — what the SecuredCluster consumes
+
+Before a Sensor can establish mTLS to Central, it needs three TLS Secrets in `stackrox`:
+
+| Secret | Used by | Contents |
+| --- | --- | --- |
+| `collector-tls` | Collector DaemonSet | TLS leaf + key + CA used by Collector to call Sensor |
+| `sensor-tls` | Sensor Deployment | TLS leaf + key + CA used by Sensor to call Central (and to serve Admission/Collector) |
+| `admission-control-tls` | Admission controller | TLS leaf + key + CA used to serve the validating webhook |
+
+These three Secrets come from Central. The generation flow and the delivery via Vault + ESO are documented in detail on [04-init-bundle-via-eso](./04-init-bundle-via-eso). At a high level:
+
+1. Platform admin POSTs to Central's `/v1/cluster-init/init-bundles` to create a bundle.
+2. The bundle output is parsed and pushed to Vault at `secret/ocp/platform/rhacs-init-bundle` (fields per Secret/per-property).
+3. Per-cluster `ExternalSecret`s in `stackrox` re-materialize the three Secrets in the right shape.
+
+The SecuredCluster CR's reconciler waits until the three Secrets exist before scheduling Sensor/Admission/Collector. If a Secret is missing, the workloads stay `Pending` with a clear "missing secret" message.
+
+## Bundle name and reuse
+
+The init-bundle has a `name` (we use `platform-cluster`). The bundle is **not** cluster-specific in any technical sense — it provides the trust material for `clusterName: <anything>` to register against Central. Two reuse patterns:
+
+- **One bundle per cluster** — minimal blast radius if a bundle is leaked. The fleet has historically used this.
+- **One bundle shared across many** — simpler operationally; one rotation cycle for everyone.
+
+The fleet currently runs one shared bundle (`platform-cluster`), with all three Secrets delivered to both `hub-dc-v6` and `spoke-dc-v6`. The cluster names that distinguish them in Central are the `clusterName` field of each SecuredCluster CR, not the bundle.
+
+## Admission webhook semantics
+
+When `admissionControl.listenOnCreates: true`, the Admission controller registers a `ValidatingWebhookConfiguration` with the local kube-apiserver. On every Pod CREATE, the apiserver invokes the webhook synchronously:
+
+1. Webhook serializes the request and asks the Sensor "does this Pod violate any policy with `lifecycle: DEPLOY` and `enforcementAction: ...`?"
+2. Sensor evaluates the current policy snapshot.
+3. If a `SCALE_TO_ZERO_ENFORCEMENT` policy is violated, the Deployment's replicas are scaled to 0 *after* admission. The Pod is admitted, then immediately killed. (This is how RHACS's "block" works at the Deployment level — the kube-apiserver only validates Pods, but RHACS owns the upstream Deployment because Sensor watches them.)
+4. If a `DEPLOYMENT_TIME_FAIL_BUILD` policy is violated, the webhook returns Deny — admission is refused.
+
+The asymmetry between "deny" and "scale to zero" is RHACS-specific and important: the *Pod* admission is hard-coded to allow unless the policy is configured for strict deny; the *Deployment* enforcement is what actually stops the workload from running.
+
+## Collector — what it sees
+
+The Collector DaemonSet runs as `privileged: true` (one of the few legitimate privileged workloads on the cluster). It uses eBPF programs to capture:
+
+- `execve()` syscalls (process starts, command-line args)
+- TCP socket accept/connect (network flows)
+- File open events (limited; not full FIM — that's File Integrity Operator territory in §12)
+- Container image pulls (used to correlate runtime events back to image)
+
+The Collector ships events to the Sensor over an in-cluster Service. Sensor batches and forwards aggregated runtime alerts to Central.
+
+The CPU/memory footprint of the Collector is the loudest pod on each node — typically 200m CPU, 400Mi memory at idle, more under load. Worker nodes need headroom.
+
+## Health and readiness
+
+```bash
+# Sensor connection to Central
+oc -n stackrox get deploy sensor -o jsonpath='{.status.readyReplicas}{"\n"}'
+
+# Admission controller webhook registered
+oc get validatingwebhookconfiguration stackrox
+
+# Collector DaemonSet on every node
+oc -n stackrox get ds collector -o jsonpath='{.status.numberReady}/{.status.desiredNumberScheduled}{"\n"}'
+```
+
+Central-side, the cluster's connection status:
+
+```bash
+ROX_PW=$(oc -n stackrox --kubeconfig=<hub-kubeconfig> get secret central-htpasswd -o jsonpath='{.data.password}' | base64 -d)
+curl -fsSk -u "admin:${ROX_PW}" \
+  https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/clusters \
+  | jq '.clusters[] | {name, status: .healthStatus.overallHealthStatus, lastContact: .healthStatus.lastContact}'
+```
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Sensor `CrashLoopBackOff` "no central endpoint reachable" | Route DNS unresolvable from spoke | confirm `pdns.local` resolves `central-stackrox.apps.hub-dc-v6...` |
+| Sensor `Pending` "missing secret sensor-tls" | init-bundle not delivered yet | check ESO ExternalSecrets in `stackrox`; see [04-init-bundle-via-eso](./04-init-bundle-via-eso) |
+| Admission controller webhook not registered | controller pods `Pending` | RBAC: SA `admission-control` needs `validatingwebhookconfigurations.admissionregistration.k8s.io/...` |
+| Collector OOMKilled | eBPF program load failure under memory pressure | bump Collector `memory: limits`, or switch to `KERNEL_MODULE` if eBPF unsupported on the kernel |
+| Cluster shows in Central as "unhealthy" | Sensor pod restarts > 3 in 5min | inspect Sensor logs for the `central connection` block |
+| Admission webhook denies *everything* | Sensor unreachable, webhook fails closed | check `admissionControl.timeoutSeconds`; if Sensor is down, set webhook `failurePolicy: Ignore` temporarily as break-glass |
+
+## References
+
+- `connection-details/platform-admin-handoff.md`.
+- `reference_rhacs_init_bundle_via_api.md` (memory).
+- ADRs: 0019 (image supply), 0020 (PCI baseline).
+- RHACS 4.10 docs: `SecuredCluster` API reference.

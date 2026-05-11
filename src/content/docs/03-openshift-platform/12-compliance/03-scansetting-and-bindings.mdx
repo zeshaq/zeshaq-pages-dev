@@ -1,0 +1,251 @@
+---
+title: "ScanSetting and ScanSettingBinding"
+description: "Defining the workers-storage ScanSetting (worker-scheduled result server, RBD-backed rotation=3) and the pci-dss ScanSettingBinding that wires the PCI-DSS profiles to that setting, kicking off the ComplianceSuite."
+sidebar_label: "ScanSetting & bindings"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+A `ScanSetting` defines *how* compliance scans run: where the result-server pod is scheduled, where raw results are stored, rotation, role coverage. A `ScanSettingBinding` ties one or more `Profile`s to a `ScanSetting` and triggers a `ComplianceSuite`. This page documents the `workers-storage` setting and the `pci-dss` binding.
+
+## Why a custom ScanSetting
+
+The default `ScanSetting`-`default` (and its older `master-storage` and `node-storage` peers) place the result-server pod on **master nodes**. Old `spoke-dc` proved this is a problem:
+
+1. The result-server pod uses an RBD-backed PVC.
+2. Master nodes have a `NoSchedule` taint plus the `master` toleration.
+3. RBD volumes don't reliably attach to master nodes in OCP 4.20 — the operator's default tolerations vs Ceph's node affinity policies disagree.
+4. Result-server crash-loops with "volume not yet attached"; ComplianceSuite hangs in `AGGREGATING`.
+
+The fix is a custom `workers-storage` ScanSetting that pins the result-server to worker nodes (where RBD attach is reliable) while still **scanning** both master and worker nodes. The scan's *target* roles is independent of the *result-server placement*.
+
+## The ScanSetting manifest
+
+`platform-gitops/clusters/spoke-dc-v6/compliance/scansetting-workers-storage.yaml`:
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSetting
+metadata:
+  name: workers-storage
+  namespace: openshift-compliance
+nodeSelector:
+  node-role.kubernetes.io/worker: ""    # result-server pod lands on workers
+roles:
+  - master                              # scan target: master nodes
+  - worker                              # scan target: worker nodes
+rawResultStorage:
+  size: 1Gi
+  pvAccessModes: [ReadWriteOnce]
+  rotation: 3
+  storageClassName: ocs-storagecluster-ceph-rbd
+schedule: "0 1 * * 0"                   # weekly Sunday 01:00 (after baseline gate)
+showNotApplicable: false
+strictNodeScan: true
+suspend: false
+```
+
+Key fields:
+
+| Field | What it does |
+| --- | --- |
+| `nodeSelector` | scheduling constraint for the **result-server pod**, not the scan pods |
+| `roles` | which node roles get scanned. Both `master` and `worker` for full coverage. |
+| `rawResultStorage.size` | per-scan-generation PVC size. 1Gi is sufficient for the PCI-DSS profile set. |
+| `rawResultStorage.rotation` | keep N generations; older results pruned. We use `3` (current + two prior). |
+| `rawResultStorage.storageClassName` | RBD-backed. RWO is the only access mode RBD supports. |
+| `schedule` | cron for periodic auto-runs. Off (`suspend: true`) during PCI-2 / PCI-3 phases; on after the baseline is hardened. |
+| `strictNodeScan: true` | scan fails if any node-role target lacks at least one ready node |
+| `showNotApplicable: false` | hides NOT-APPLICABLE results from the default views (still visible in raw output) |
+
+`scanTolerations` (not shown) defaults to tolerating the master taint so scan pods can run on masters; result-server scheduling is independent.
+
+## Why `rotation: 3`
+
+Three keeps the current scan + two prior generations. Useful for:
+
+- **Trend analysis** — did this scan add or close failures vs the prior two?
+- **Evidence comparison** — auditor wants to see the prior scan ran clean.
+- **Storage cap** — 3 × 1Gi = 3Gi maximum PVC usage. Beyond that you'd want a higher rotation only if doing weekly automated runs and you need a month of history; we export sanitized evidence to MinIO for long-term retention instead.
+
+If you need long history without growing the PVC, the export-to-MinIO pattern (see [06-evidence-collection-and-storage](./06-evidence-collection-and-storage)) is the answer.
+
+## The ScanSettingBinding
+
+A binding ties Profiles to a ScanSetting and starts a ComplianceSuite. Per ADR 0020 we use **two** profiles: the platform profile and the node profile.
+
+`platform-gitops/clusters/spoke-dc-v6/compliance/scansettingbinding-pci-dss.yaml`:
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSettingBinding
+metadata:
+  name: pci-dss
+  namespace: openshift-compliance
+profiles:
+  - apiGroup: compliance.openshift.io/v1alpha1
+    kind: Profile
+    name: ocp4-pci-dss-4-0
+  - apiGroup: compliance.openshift.io/v1alpha1
+    kind: Profile
+    name: ocp4-pci-dss-node-4-0
+settingsRef:
+  apiGroup: compliance.openshift.io/v1alpha1
+  kind: ScanSetting
+  name: workers-storage
+```
+
+This single CR:
+
+1. Creates a `ComplianceSuite/pci-dss` in `openshift-compliance`.
+2. The suite creates two `ComplianceScan` objects:
+   - `pci-dss-ocp4-pci-dss-4-0` — platform scan (the apiserver, OAuth, etcd, etc.).
+   - `pci-dss-ocp4-pci-dss-node-4-0` — node scan (sshd config, sysctls, kernel parameters).
+3. Each scan provisions:
+   - A scan pod per target node (`master` and `worker`) for the node-profile scan; one platform scanner pod for the platform-profile scan.
+   - The result-server pod, scheduled by the ScanSetting `nodeSelector`.
+   - The RBD PVC for raw results.
+
+## The suite lifecycle
+
+```text
+Pending → Launching → Running → Aggregating → Done
+```
+
+- **Pending** — Suite created, controllers haven't acted yet.
+- **Launching** — Scan pods being scheduled; PVCs being provisioned.
+- **Running** — Scan pods executing across nodes.
+- **Aggregating** — Result-server pod collects raw outputs and writes `ComplianceCheckResult` CRs.
+- **Done** — All scans completed; the Suite's `status.result` reports `COMPLIANT` / `NON-COMPLIANT` / `INCONSISTENT`.
+
+A `Done` suite with `result: NON-COMPLIANT` is normal on the first run; remediation closes failures. See [05-remediation-workflow](./05-remediation-workflow).
+
+## Inspecting the suite
+
+```bash
+# Suite-level
+oc -n openshift-compliance get compliancesuite
+# NAME      PHASE   RESULT
+# pci-dss   DONE    NON-COMPLIANT
+
+# Per-scan status
+oc -n openshift-compliance get compliancescan
+# NAME                              PHASE   RESULT
+# pci-dss-ocp4-pci-dss-4-0          DONE    NON-COMPLIANT
+# pci-dss-ocp4-pci-dss-node-4-0     DONE    NON-COMPLIANT
+
+# Check-level results (one row per rule per scan)
+oc -n openshift-compliance get compliancecheckresult
+# (large list; filter with -l compliance.openshift.io/scan-name=pci-dss-ocp4-pci-dss-4-0)
+
+# Summary counts
+oc -n openshift-compliance get compliancecheckresult -o json | \
+  jq '[.items[] | .status] | group_by(.) | map({status: .[0], count: length})'
+# [
+#   {"status":"PASS","count":XX},
+#   {"status":"FAIL","count":XX},
+#   {"status":"MANUAL","count":XX},
+#   {"status":"NOT-APPLICABLE","count":XX},
+#   {"status":"INCONSISTENT","count":XX}
+# ]
+```
+
+## Status interpretations
+
+| Status | Meaning | Action |
+| --- | --- | --- |
+| `PASS` | rule passed on every target node | none |
+| `FAIL` | rule failed on at least one target | inspect the `ComplianceRemediation` if one exists; otherwise manual fix |
+| `MANUAL` | rule requires manual verification | record evidence outside scan output (e.g., a screenshot, a procedure ack) |
+| `NOT-APPLICABLE` | rule doesn't apply (e.g., a feature not enabled) | usually no action |
+| `INCONSISTENT` | rule passed on some nodes, failed on others | inspect per-node breakdown |
+| `INFO` | informational only | no enforcement; record if relevant to audit |
+
+## Suspending and resuming
+
+While iterating in PCI-3 (hardening), it's common to:
+
+1. Apply hardening (etcd encryption, OAuth, …).
+2. Re-run the suite to verify.
+3. Compare to prior generation.
+
+Re-running is a delete + recreate of the ScanSettingBinding (or a manual `oc patch compliancesuite ... rescan=true`). To pause periodic runs while iterating, set `spec.suspend: true` on the ScanSetting.
+
+## Multiple bindings — running PCI-3.2 in parallel
+
+Per ADR 0020 we use 3.2 as **context only**, not a gate. If you want a 3.2 reference suite alongside, add a second binding:
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSettingBinding
+metadata:
+  name: pci-dss-3-2
+  namespace: openshift-compliance
+profiles:
+  - kind: Profile
+    apiGroup: compliance.openshift.io/v1alpha1
+    name: ocp4-pci-dss-3-2
+  - kind: Profile
+    apiGroup: compliance.openshift.io/v1alpha1
+    name: ocp4-pci-dss-node-3-2
+settingsRef:
+  kind: ScanSetting
+  apiGroup: compliance.openshift.io/v1alpha1
+  name: workers-storage
+```
+
+This creates a separate `ComplianceSuite/pci-dss-3-2`. The two suites share the same ScanSetting (and thus the same result-server placement + storage class), but they have independent PVCs (one per scan), so they don't collide.
+
+## TailoredProfile — narrow tailoring
+
+When a baseline rule needs a per-cluster tweak (e.g., ODF reconciles one of its routes back to `Allow` while production S3 uses the secure route), we tailor that rule via a `TailoredProfile`. The tailored profile *extends* the base profile and modifies / removes specific rules.
+
+Skeleton:
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: TailoredProfile
+metadata:
+  name: ocp4-pci-dss-4-0-tailored
+  namespace: openshift-compliance
+spec:
+  extends: ocp4-pci-dss-4-0
+  title: PCI-DSS v4.0 — spoke-dc-v6 tailoring
+  description: |
+    Narrow tailoring for ODF object-store route TLS rule —
+    ODF reconciles one route to Allow while prod uses the secure route.
+  disableRules:
+    - name: ocp4-routes-protected-by-tls   # example only; exact rule name from rule catalog
+      rationale: |
+        ODF route reconciles back to Allow; production S3 access uses the secured route only.
+        Recorded as residual risk in PCI-3 evidence (issue #111).
+```
+
+Then the binding references the tailored profile instead of the base:
+
+```yaml
+profiles:
+  - kind: TailoredProfile
+    apiGroup: compliance.openshift.io/v1alpha1
+    name: ocp4-pci-dss-4-0-tailored
+```
+
+Tailoring is governed by [07-exceptions-and-waivers](./07-exceptions-and-waivers) and tracked on the PCI-3 issue (#111).
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Suite stuck `Pending` | ScanSetting refers to a nonexistent storageClass | confirm `oc get storageclass ocs-storagecluster-ceph-rbd` |
+| Suite stuck `Launching` | PVC `Pending` (Ceph capacity?) | check ODF health; bump storage if needed |
+| Suite stuck `Aggregating` | result-server pod can't attach RBD on master node | confirm ScanSetting `nodeSelector` is set to workers (this is what `workers-storage` fixes) |
+| Most rules return `INCONSISTENT` | node-role coverage uneven; some nodes inaccessible | check `oc get nodes`; address pre-scan |
+| Rules returning `ERROR` | scan content not parsed (`ProfileBundle PARSING`) | see [02-compliance-operator](./02-compliance-operator) failure-modes table |
+| Result PVC fills up | rotation set too high, or too many scan generations retained | lower `rotation`; export evidence to MinIO and prune |
+
+## References
+
+- ADRs: 0020 (PCI baseline), 0025 (GitOps-only operations).
+- `connection-details/compliance-implementor-handbook.md`.
+- Compliance Operator API reference (Red Hat OpenShift 4.20).
+- Issue #110 (PCI-2), #111 (PCI-3).

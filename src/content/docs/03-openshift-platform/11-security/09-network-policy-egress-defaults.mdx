@@ -1,0 +1,275 @@
+---
+title: "Per-Tenant NetworkPolicy Defaults"
+description: "The default-deny + named-allow NetworkPolicy set every tenant namespace ships with: ingress from OpenShift router, egress to DNS, cluster monitoring scrape, ESO consumer egress to Vault, and the istio-ambient hook for mesh participation."
+sidebar_label: "NetworkPolicy defaults"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Every tenant namespace on `spoke-dc-v6` ships with a curated set of NetworkPolicies — default-deny plus a handful of named allows. The set comes from DEV-OCP-4.2 (#197) and is part of the tenant template. This page documents each NP and why it's in the default set.
+
+## The doctrine
+
+Two patterns combined:
+
+1. **Default-deny.** A single NetworkPolicy that selects every Pod in the namespace and allows no ingress or egress. Anything that should be allowed must be explicitly added.
+2. **Named allows.** A small set of well-named NPs that allow exactly the egress/ingress needed for the tenant to function as an "Open Liberty-style microservice" on the platform — nothing more.
+
+The opposite (no NP, "all allowed") was rejected because:
+
+- East-west traffic between tenants is invisible to operators.
+- Compromised pods can reach Vault, the apiserver, neighbours' Services.
+- PCI-DSS requires segmentation; default-deny + named allows is the audit-friendly answer.
+
+Apps that need additional egress — e.g., to an external API, an internal database, a partner service — add per-app NetworkPolicy MRs as overlays inside their app repo.
+
+## The five default policies
+
+Each tenant overlay (under `clusters/spoke-dc-v6/tenants/_template/networkpolicies/`) ships these:
+
+| File | Purpose |
+| --- | --- |
+| `default-deny.yaml` | catch-all deny (ingress + egress) |
+| `allow-from-openshift-ingress.yaml` | OpenShift Router → Pod ingress (for Routes to work) |
+| `allow-egress-dns.yaml` | egress to cluster DNS (CoreDNS) |
+| `allow-egress-cluster-monitoring.yaml` | egress to/from cluster monitoring (Prometheus scrape) |
+| `allow-egress-vault.yaml` | egress to the Vault VM (TCP/8200), for ESO ExternalSecret consumers in the tenant ns |
+
+A sixth, `allow-from-istio-ambient.yaml`, lands when Path 1.4 (service mesh participation) is on. Not yet live on the fleet.
+
+## 1) Default deny
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: <tenant-ns>
+spec:
+  podSelector: {}              # every Pod in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # no ingress: [] and no egress: [] = deny everything
+```
+
+This is the foundation. Even though Kubernetes' default with no NPs is "all allowed," once *any* NP applies to a Pod, only the explicit `allow` rules in NPs are permitted. The `default-deny` NP applies to every Pod (empty `podSelector`), so it activates the explicit-allow model.
+
+## 2) Allow from OpenShift Ingress (Router)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-openshift-ingress
+  namespace: <tenant-ns>
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+```
+
+Without this, OpenShift Routes don't work — the Router Pods (in `openshift-ingress`) cannot reach the tenant's Service backends. The `network.openshift.io/policy-group: ingress` label is set automatically on the Router namespace; using the label rather than the namespace name makes this resilient to Router moves.
+
+Tenants who don't expose any Route in their namespace can technically remove this NP. The template leaves it in by default because most tenants have at least one Service-with-Route, and the cost of a stale-allow is small.
+
+## 3) Allow egress to DNS
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: <tenant-ns>
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+Without DNS, basically nothing works — Service discovery fails, external DNS lookups fail. The OpenShift CoreDNS Pods run in `openshift-dns`; the rule targets that namespace using the well-known `kubernetes.io/metadata.name` label (which OpenShift adds to every namespace automatically).
+
+Both port `53` (standard DNS) and `5353` (multicast DNS / OpenShift internal) are allowed because OCP 4.x CoreDNS may listen on either depending on config.
+
+## 4) Allow egress for cluster monitoring (Prometheus scrape)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-cluster-monitoring
+  namespace: <tenant-ns>
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+```
+
+OpenShift Prometheus (in `openshift-monitoring`) scrapes `ServiceMonitor`-configured tenant endpoints. Without this rule, Prometheus targets in the tenant namespace appear `DOWN` even though the workloads are healthy.
+
+A symmetric `Egress` rule for ServiceMonitor's *reverse* path is not needed because Prometheus is the initiator.
+
+## 5) Allow egress to Vault (ESO consumer)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-vault
+  namespace: <tenant-ns>
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: REDACTED/30          # the Vault VMs in the lab /24
+      ports:
+        - protocol: TCP
+          port: 8200
+```
+
+> Internal-only: the actual CIDR is held in `codex-opp-agent/connection-details/`. The shape and intent are public.
+
+This is the **tenant-side mirror** of the egress NP in `external-secrets` (see §10, [02-eso-operator-and-policies](../10-secrets-eso/02-eso-operator-and-policies)). The tenant's `app-eso` SA mints a JWT and the tenant's `vault-apps` SecretStore reads from Vault — that connection originates in the tenant namespace's Pods (specifically the ESO operand's reconciler running *in the operand namespace*, which is already covered; this tenant rule is for direct Vault egress from tenant workloads that may need it).
+
+Edge case: most tenant workloads don't talk to Vault directly — they read the materialized `Secret` that ESO already produced in their namespace. But some tenants (e.g., apps using a Vault PKI / Transit engine at runtime, future cases) need direct Vault egress, so this NP is in the default to avoid surprise.
+
+## 6) Allow from istio-ambient (future)
+
+When Path 1.4 (service mesh participation) lands, ambient-mode Istio injects sidecar-less mesh on a per-namespace label. The NP that allows the ztunnel pods to reach tenant workloads:
+
+```yaml
+# Placeholder pattern — exact selector depends on Istio ambient release
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-istio-ambient
+  namespace: <tenant-ns>
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+```
+
+Not yet active on the fleet; documented here so tenants know the slot exists.
+
+## Per-app additions
+
+Apps that need additional egress (to a partner API, an internal database, an external SMTP gateway) add per-app NPs as part of their app repo overlay. Conventions for tenant-authored NPs:
+
+| Convention | Why |
+| --- | --- |
+| Name the NP `<purpose>-<destination>` e.g., `allow-egress-payment-gateway` | clear in `oc get netpol` listings |
+| Use `podSelector: { matchLabels: { app: <name> } }` rather than `{}` | scope narrowly to the workload that needs it |
+| Document the destination in the NP's `annotations.description` | the NP itself is the audit trail |
+| For external destinations, prefer `ipBlock` over named hosts | NPs don't resolve DNS; you must specify IPs |
+| For internal destinations (other namespaces), use `namespaceSelector` + label rather than namespace name | resilient to moves |
+
+A common app-side NP pattern:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-internal-cnpg
+  namespace: apps-platform-checkout
+  annotations:
+    description: "egress to CNPG (Postgres) cluster in apps-platform-data namespace"
+spec:
+  podSelector:
+    matchLabels:
+      app: checkout-api
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: apps-platform-data
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: orders
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+This egress allows `checkout-api` Pods to reach the `orders` CNPG cluster's Postgres on TCP/5432 — without opening cluster-wide egress.
+
+## What still leaks through
+
+NetworkPolicy in OpenShift 4.x with OVN-Kubernetes:
+
+- enforces L3/L4 (IP + port).
+- does **not** enforce L7 (HTTP path, gRPC method) — for that, ambient/sidecar Istio is needed.
+- does **not** apply to host-network Pods (which bypass the SDN). Operator namespaces with host-network privileged Pods are not gated by NetworkPolicy.
+- has limited support for combining `ipBlock` and `namespaceSelector` in the same rule's `to:` — they're treated as separate rules.
+
+L7 enforcement is a §3.4 (network) and §4 (service mesh) concern, not §11.
+
+## The Pod Security Standards layer (PSS)
+
+Sitting alongside NetworkPolicy is OpenShift's **Pod Security Standards** enforcement, which is the SCC successor for namespace-level security context constraints. Tenant namespaces are labelled:
+
+```yaml
+metadata:
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+```
+
+`restricted` profile blocks:
+
+- `privileged: true`
+- `hostNetwork`, `hostPID`, `hostIPC`
+- privilege escalation
+- host paths
+- unsafe capabilities
+- non-default seccomp profiles unless explicitly set
+
+The combination of NetworkPolicy (L3/L4 segmentation) + PSS (`restricted`) + RHACS app-team policies (deploy-time class gates) covers the majority of pod-level attack surface.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Tenant Pod can't resolve any DNS | `allow-egress-dns` missing or `podSelector` typo | re-apply the template NPs |
+| Route returns 503 to external clients | `allow-from-openshift-ingress` missing | re-apply; ensure Router NS still labelled `network.openshift.io/policy-group: ingress` |
+| Tenant Pod can't reach Vault directly | `allow-egress-vault` missing; CIDR wrong | refresh template, push to GitOps |
+| Prometheus target `DOWN` for a working endpoint | `allow-from-cluster-monitoring` missing | re-apply |
+| Tenant added a new NP that broke working flow | NP intersection — adding an Egress NP that doesn't include the existing-allowed destination makes the unmentioned destinations *implicitly denied* for that selected Pod | every Egress NP is additive; the union of all matching NPs is the allow set. Make sure new NP rules don't accidentally narrow vs the namespace-wide ones |
+| host-network Pod ignores NPs entirely | by design | use SCC + RBAC to restrict host-network workloads |
+
+## References
+
+- DEV-OCP-4.2 (#197) — NetworkPolicy template baseline.
+- ADRs: 0014 (developer readiness), 0020 (PCI baseline), 0026 (IPv6 baseline for OVN-K).
+- `tenants/_template/networkpolicies/` in `platform-gitops`.
+- OVN-Kubernetes NetworkPolicy reference (OpenShift 4.20 docs).

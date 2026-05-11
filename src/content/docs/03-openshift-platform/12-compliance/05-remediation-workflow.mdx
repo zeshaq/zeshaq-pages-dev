@@ -1,0 +1,223 @@
+---
+title: "Remediation Workflow"
+description: "Reading ComplianceCheckResults, applying ComplianceRemediation objects (auto vs manual), the MachineConfig path for node remediations, pause-and-batch patterns, and the PCI-3 hardening loop."
+sidebar_label: "Remediation"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+After a `ComplianceSuite` reaches `Done`, the work is *triaging the results*. This page covers reading `ComplianceCheckResult`s, the `ComplianceRemediation` object, the MachineConfig-vs-cluster-config split for applying fixes, and the pause-and-batch pattern that keeps node reboots manageable.
+
+## After the suite is done
+
+```bash
+oc -n openshift-compliance get compliancesuite pci-dss \
+  -o jsonpath='{.status.phase} {.status.result}{"\n"}'
+# DONE NON-COMPLIANT
+```
+
+`NON-COMPLIANT` on first run is expected. Now look at the breakdown.
+
+```bash
+oc -n openshift-compliance get compliancecheckresult \
+  -l compliance.openshift.io/scan-name=pci-dss-ocp4-pci-dss-4-0 \
+  -o custom-columns=NAME:.metadata.name,STATUS:.status,SEVERITY:.severity \
+  | grep -E "FAIL|MANUAL"
+```
+
+For each FAIL, two questions:
+
+1. Does a `ComplianceRemediation` exist for it?
+2. Is the remediation safe to apply, or does it need a hardening MR first?
+
+## ComplianceRemediation — the auto-fix candidate
+
+When a rule has a deterministic fix, the Compliance Operator generates a `ComplianceRemediation` CR alongside the `ComplianceCheckResult`:
+
+```bash
+oc -n openshift-compliance get complianceremediation \
+  -l compliance.openshift.io/scan-name=pci-dss-ocp4-pci-dss-node-4-0
+# NAME                                                                       STATE
+# pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords                  NotApplied
+# pci-dss-ocp4-pci-dss-node-4-0-sshd-set-keepalive-0                          NotApplied
+# ...
+```
+
+Each `ComplianceRemediation` has a `.spec.current` block — a fragment of YAML the operator would apply. Inspect before approving:
+
+```bash
+oc -n openshift-compliance get complianceremediation \
+  pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords -o yaml
+```
+
+Output typically contains a partial `MachineConfig` (for node-OS rules) or a partial cluster CR patch (for platform rules).
+
+## Applying a remediation
+
+You don't `oc apply` a `ComplianceRemediation` directly. You flip a flag on the suite or the remediation:
+
+```bash
+# Apply one remediation
+oc -n openshift-compliance patch complianceremediation \
+  pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords \
+  --type=merge -p '{"spec":{"apply":true}}'
+```
+
+The operator then **creates the actual resource** the remediation would impose:
+
+- For node-OS rules: a `MachineConfig` object whose name matches the remediation. The MachineConfigOperator (MCO) rolls it out to the MachineConfigPools (`master`, `worker`). Nodes drain and reboot in serial.
+- For platform rules: a patch to the cluster CR (e.g., `apiserver/cluster`, `oauth/cluster`).
+
+Auto-apply at suite level (rarely used; encourages indiscriminate fixes):
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ComplianceSuite
+metadata:
+  name: pci-dss
+spec:
+  autoApplyRemediations: true
+```
+
+**We do NOT set `autoApplyRemediations: true`** on this fleet — too much risk of indiscriminate reboots. Every remediation is reviewed and applied either individually or in tagged batches.
+
+## The MachineConfig path (node remediations)
+
+Node remediations (sshd, sysctl, file-permission) produce a `MachineConfig`:
+
+```yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 75-pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  config:
+    ignition: { version: "3.4.0" }
+    storage:
+      files:
+        - path: /etc/ssh/sshd_config.d/00-disable-empty-passwords.conf
+          mode: 0600
+          contents:
+            source: data:,PermitEmptyPasswords%20no%0A
+```
+
+The MCO then renders the new `MachineConfig` into the pool's combined config, drains each node in turn, and reboots. A `master` pool rolls all masters; a `worker` pool rolls all workers — both can take hours on a 3-node pool.
+
+### Pause-and-batch pattern
+
+Applying 30 node remediations one at a time = 30 reboots per pool. We instead **pause the MCO pool, apply all remediations, unpause** so the MCO rolls once with the combined config:
+
+```bash
+# Pause both pools
+oc patch machineconfigpool master --type=merge -p '{"spec":{"paused":true}}'
+oc patch machineconfigpool worker --type=merge -p '{"spec":{"paused":true}}'
+
+# Apply remediations in batches
+for r in $(oc -n openshift-compliance get complianceremediation \
+           -l compliance.openshift.io/scan-name=pci-dss-ocp4-pci-dss-node-4-0 \
+           -o name); do
+  oc patch $r -n openshift-compliance \
+    --type=merge -p '{"spec":{"apply":true}}'
+done
+
+# Wait for all MachineConfig objects to render (the operator creates them)
+oc get mc | grep pci-dss
+
+# Unpause — MCO will now roll once per pool
+oc patch machineconfigpool worker --type=merge -p '{"spec":{"paused":false}}'
+oc patch machineconfigpool master --type=merge -p '{"spec":{"paused":false}}'
+
+# Monitor the rollout
+oc get mcp -w
+```
+
+This is essential discipline on PCI-3 (hardening) where 20+ node-level remediations land at once.
+
+## Platform-level remediations (cluster CRs)
+
+Platform rules (etcd encryption, OAuth, ingress TLS) produce CR patches, not MachineConfigs. Example: etcd encryption.
+
+The remediation would patch `apiserver/cluster`:
+
+```yaml
+spec:
+  encryption:
+    type: aesgcm
+```
+
+Apply by setting the remediation's `spec.apply: true`. The operator then patches the `apiserver/cluster` CR. The kube-apiserver operator rolls out new control-plane pods; this is a control-plane disruption (usually <5 min) but no node reboot.
+
+**Always test in PCI-3 / non-prod first.** etcd encryption (re-encryption of existing keys) is a cluster-disruptive operation; once on, it can't be cleanly disabled without unwinding through Red Hat support.
+
+## The PCI-3 hardening loop
+
+Phase PCI-3 (issue #111) is iterative:
+
+1. Inspect FAIL CheckResults; categorize by remediation availability.
+2. For each FAIL with `ComplianceRemediation`:
+   - Review the remediation YAML.
+   - Decide if it's appropriate (some auto-remediations are too aggressive — e.g., disabling protocols a workload needs).
+   - Either apply, or write a TailoredProfile entry to disable the rule with rationale.
+3. For each FAIL without `ComplianceRemediation`:
+   - Manual fix via `platform-gitops` MR (etcd encryption, OAuth client config, ingress TLS profile).
+   - Or TailoredProfile entry with rationale.
+4. Re-run the suite (delete + recreate ScanSettingBinding, or `oc patch compliancesuite ... rescan=true`).
+5. Compare to prior generation — fewer FAILs? Did any PASS regress?
+6. Repeat until: FAIL count = 0 OR every remaining FAIL is intentionally tailored with auditor-defensible rationale.
+
+## What goes through GitOps vs operator-driven
+
+| Change | Path | Why |
+| --- | --- | --- |
+| Hardening cluster CR (etcd, OAuth, Ingress) | `platform-gitops` MR | desired state, reviewable, drift-checked |
+| TailoredProfile (rule tailoring) | `platform-gitops` MR | desired state of the scan itself |
+| `ComplianceRemediation` apply flag | `oc patch` (break-glass-ish) | operator-driven; reverting is `apply: false` |
+| `MachineConfig` produced by remediation | operator-managed | implicitly GitOps because it's reproducible from the same remediation |
+
+The remediation flag is the one exception to "everything goes through GitOps" — because the operator creates the resulting `MachineConfig` deterministically from the remediation object, the operator's mutation is the GitOps state. If you ever delete the cluster and rebuild, re-running the suite + re-applying the same remediations reconstructs the same MachineConfigs.
+
+## Reverting
+
+A remediation can be unapplied:
+
+```bash
+oc -n openshift-compliance patch complianceremediation \
+  pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords \
+  --type=merge -p '{"spec":{"apply":false}}'
+```
+
+For node-OS remediations, the operator deletes the `MachineConfig`. MCO renders the new pool config (without that MC) and rolls.
+
+For platform-CR remediations, the operator removes the patch. The kube-apiserver/OAuth operator reverts the field.
+
+**Note on etcd encryption**: once on, removing the patch reverts the spec but the existing data is already encrypted. Reverting in earnest requires Red Hat support; don't experiment.
+
+## Inspecting MachineConfigs created by remediations
+
+```bash
+oc get mc | grep pci-dss
+# 75-master-pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords ...
+# 75-worker-pci-dss-ocp4-pci-dss-node-4-0-sshd-disable-empty-passwords ...
+```
+
+The convention is `75-<pool>-<remediation-name>` (75 is the priority slot — between user MachineConfigs and operator-shipped ones).
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Remediation `apply: true` but no MachineConfig appears | operator backlogged or the remediation has no `current` | check operator logs; inspect the remediation's `.spec.current` for emptiness |
+| MachineConfig created but MCP stuck `Updating` | another MC change in flight; node drain failing on a Pod | inspect `oc get mcp`; `oc -n openshift-machine-config-operator logs ...` |
+| Node drain stuck | a Pod with PDB that can't tolerate eviction | inspect `oc get pdb -A`; relax PDB if appropriate; otherwise force-cordon and reboot |
+| Suite re-run shows same FAILs | remediation applied but MachineConfig hadn't rolled when the new scan ran | wait for `oc get mcp` clean, then rescan |
+| Multiple remediations conflict (same file) | rare; operator merges where possible | inspect both MCs; if they touch same path, last-applied wins. Manual MC author override may be needed |
+
+## References
+
+- ADR 0020 (PCI-DSS profile compliance on spoke-dc-v6).
+- ADR 0025 (GitOps-only operations + break-glass discipline).
+- `connection-details/compliance-implementor-handbook.md`.
+- `runbooks/mco-stuck-node-recovery.md` (MCO recovery runbook).
+- Compliance Operator API reference (Red Hat OpenShift 4.20).

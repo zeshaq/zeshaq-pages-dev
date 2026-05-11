@@ -1,0 +1,277 @@
+---
+title: "Init-Bundle Generation and Delivery via Vault + ESO"
+description: "The pattern: generate a SecuredCluster init-bundle from Central's API, flatten the three TLS Secrets into Vault, then deliver them to every cluster's stackrox namespace via ExternalSecrets. No roxctl required."
+sidebar_label: "Init-bundle via ESO"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+A SecuredCluster needs three TLS Secrets in `stackrox` before any of its workloads start. The classic answer is `roxctl central init-bundle generate ... | oc apply`. The fleet does not use that path — the bundle goes through Vault + ESO so it's reproducible, rotatable, and never leaves a YAML on someone's laptop.
+
+## Why through Vault + ESO
+
+| Alternative | Why we did not pick it |
+| --- | --- |
+| `roxctl ... | oc apply -f -` on each cluster | The Secret YAML containing TLS keys lives transiently on a workstation. Operators forget to delete it. Re-applying requires re-generating the bundle (each bundle is single-use). |
+| One-shot `Secret` committed to GitOps | TLS keys in Git, even encrypted, are a non-starter. |
+| Sealed Secrets | Encrypted blob in Git is still ugly for material this sensitive. |
+| Vault + per-cluster ExternalSecret | Bundle generated once, lives in Vault, re-materialized on every cluster on demand. Rotation is a single `vault kv put`. |
+
+The Vault + ESO path matches the [03-vault-clustersecretstore](../10-secrets-eso/03-vault-clustersecretstore) pattern used elsewhere in this section: read-only consumption from Vault, no Secret material in Git.
+
+## Step 1 — generate the init-bundle from Central's API
+
+You **do not need `roxctl`**. Central's REST API takes a POST request and returns the bundle inline.
+
+```bash
+KCFG=/path/to/hub-dc-v6-kubeconfig
+ADMIN_PW=$(KUBECONFIG=$KCFG oc -n stackrox get secret central-htpasswd \
+  -o jsonpath='{.data.password}' | base64 -d)
+ROUTE=central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com
+
+curl -sk -u "admin:${ADMIN_PW}" -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"name":"platform-cluster"}' \
+  "https://${ROUTE}/v1/cluster-init/init-bundles" > /tmp/init-bundle.json
+```
+
+Response shape (`/tmp/init-bundle.json`):
+
+```json
+{
+  "meta": {
+    "id": "<uuid>",
+    "name": "platform-cluster",
+    "createdAt": "2026-05-11T10:00:00Z",
+    "expiresAt": "2027-05-11T10:00:00Z"
+  },
+  "helmValuesBundle": "<base64 of helm values file>",
+  "kubectlBundle":   "<base64 of a multi-doc K8s YAML>"
+}
+```
+
+The `kubectlBundle` is base64-encoded YAML containing **three Secrets** (`collector-tls`, `sensor-tls`, `admission-control-tls`), each with `stringData` fields for the cert/key/CA. The `helmValuesBundle` is the same material in Helm chart format — useful for the Helm install path, but not used here.
+
+## Step 2 — flatten the kubectlBundle and push to Vault
+
+Decode and parse:
+
+```bash
+base64 -d <<< "$(jq -r '.kubectlBundle' /tmp/init-bundle.json)" > /tmp/init-bundle.yaml
+```
+
+The decoded YAML looks like:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: collector-tls
+  namespace: stackrox
+type: Opaque
+stringData:
+  ca.pem:                 "-----BEGIN CERTIFICATE-----..."
+  collector-cert.pem:     "-----BEGIN CERTIFICATE-----..."
+  collector-key.pem:      "-----BEGIN PRIVATE KEY-----..."
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sensor-tls
+  ...
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admission-control-tls
+  ...
+```
+
+Flatten into 9 properties (3 Secrets × 3 fields):
+
+| Vault property | Source |
+| --- | --- |
+| `collector-tls.ca.pem` | `collector-tls.stringData["ca.pem"]` |
+| `collector-tls.collector-cert.pem` | `collector-tls.stringData["collector-cert.pem"]` |
+| `collector-tls.collector-key.pem` | `collector-tls.stringData["collector-key.pem"]` |
+| `sensor-tls.ca.pem` | `sensor-tls.stringData["ca.pem"]` |
+| `sensor-tls.sensor-cert.pem` | `sensor-tls.stringData["sensor-cert.pem"]` |
+| `sensor-tls.sensor-key.pem` | `sensor-tls.stringData["sensor-key.pem"]` |
+| `admission-control-tls.ca.pem` | `admission-control-tls.stringData["ca.pem"]` |
+| `admission-control-tls.admission-control-cert.pem` | `admission-control-tls.stringData["admission-control-cert.pem"]` |
+| `admission-control-tls.admission-control-key.pem` | `admission-control-tls.stringData["admission-control-key.pem"]` |
+
+Push to Vault (kv-v2 at `secret/ocp/platform/rhacs-init-bundle`):
+
+```bash
+vault kv put secret/ocp/platform/rhacs-init-bundle \
+  collector-tls.ca.pem=@/tmp/collector-ca.pem \
+  collector-tls.collector-cert.pem=@/tmp/collector-cert.pem \
+  collector-tls.collector-key.pem=@/tmp/collector-key.pem \
+  sensor-tls.ca.pem=@/tmp/sensor-ca.pem \
+  sensor-tls.sensor-cert.pem=@/tmp/sensor-cert.pem \
+  sensor-tls.sensor-key.pem=@/tmp/sensor-key.pem \
+  admission-control-tls.ca.pem=@/tmp/adm-ca.pem \
+  admission-control-tls.admission-control-cert.pem=@/tmp/adm-cert.pem \
+  admission-control-tls.admission-control-key.pem=@/tmp/adm-key.pem
+```
+
+A wrapper script (`claude-agent/scripts/rhacs-init-bundle-push.sh`) does the decode + flatten + Vault write in one step.
+
+After this, the original `/tmp/init-bundle.*` files are deleted. The only persistent storage of the material is Vault.
+
+## Step 3 — per-cluster ExternalSecrets
+
+In `clusters/<cluster>/security/rhacs/`:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: collector-tls
+  namespace: stackrox
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: collector-tls
+    template:
+      type: Opaque
+      data:
+        ca.pem:             "{{ .ca }}"
+        collector-cert.pem: "{{ .cert }}"
+        collector-key.pem:  "{{ .key }}"
+  data:
+    - secretKey: ca
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "collector-tls.ca.pem" }
+    - secretKey: cert
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "collector-tls.collector-cert.pem" }
+    - secretKey: key
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "collector-tls.collector-key.pem" }
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: sensor-tls
+  namespace: stackrox
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: sensor-tls
+    template:
+      type: Opaque
+      data:
+        ca.pem:          "{{ .ca }}"
+        sensor-cert.pem: "{{ .cert }}"
+        sensor-key.pem:  "{{ .key }}"
+  data:
+    - secretKey: ca
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "sensor-tls.ca.pem" }
+    - secretKey: cert
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "sensor-tls.sensor-cert.pem" }
+    - secretKey: key
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "sensor-tls.sensor-key.pem" }
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: admission-control-tls
+  namespace: stackrox
+spec:
+  refreshInterval: 24h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: admission-control-tls
+    template:
+      type: Opaque
+      data:
+        ca.pem:                       "{{ .ca }}"
+        admission-control-cert.pem:   "{{ .cert }}"
+        admission-control-key.pem:    "{{ .key }}"
+  data:
+    - secretKey: ca
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "admission-control-tls.ca.pem" }
+    - secretKey: cert
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "admission-control-tls.admission-control-cert.pem" }
+    - secretKey: key
+      remoteRef: { key: ocp/platform/rhacs-init-bundle, property: "admission-control-tls.admission-control-key.pem" }
+```
+
+Three ExternalSecrets, one per Secret. Each templates the Vault flat properties back into the field shapes the SecuredCluster reconciler expects. Same manifest on both clusters — they reference the same Vault path.
+
+> Internal-only: the actual TLS material is in Vault; not in Git, not in issues. The handbook discusses only the shape.
+
+## Step 4 — SecuredCluster reconciles
+
+Once the three Secrets exist (within `refreshInterval=24h`, or immediately on a `force-sync` annotation), the SecuredCluster controller can schedule Sensor/Admission/Collector. They mount the Secrets and complete mTLS handshake to Central.
+
+Validation:
+
+```bash
+oc -n stackrox get externalsecret
+# NAME                    READY   STATUS
+# collector-tls           True    SecretSynced
+# sensor-tls              True    SecretSynced
+# admission-control-tls   True    SecretSynced
+
+oc -n stackrox get secret collector-tls sensor-tls admission-control-tls
+# all three Opaque, ~7-10 KB each
+
+oc -n stackrox get pods -l app=sensor
+# sensor-... Running
+```
+
+## Bundle lifecycle and rotation
+
+The bundle metadata includes `expiresAt` — typically ~1 year from creation. Before expiry:
+
+1. Regenerate from Central (`POST /v1/cluster-init/init-bundles` with a new `name` or the same; same name appears to be allowed and creates a fresh bundle).
+2. Re-run the flatten + Vault push.
+3. ExternalSecrets re-sync within `refreshInterval`, or force-sync each.
+4. SecuredCluster reconcilers pick up the new Secrets; Sensor/Admission re-establish mTLS using the new material.
+
+There is no need to delete the old bundle from Central — Central tracks bundles by ID and the new bundle's TLS material supersedes the old. The previous Sensor connection drops on TLS renegotiation.
+
+## Cross-cluster bundle reuse
+
+The fleet uses **one bundle** (`platform-cluster`) shared by `hub-dc-v6`'s self-secure and `spoke-dc-v6`. The bundle isn't pinned to a cluster name — it provides the trust material; the `SecuredCluster.spec.clusterName` is what distinguishes them in Central.
+
+Trade-offs:
+
+- **Shared bundle (current):** one Vault write rotates everyone. Lower blast-radius isolation.
+- **Per-cluster bundle:** N Vault writes; tighter isolation.
+
+For a 2-cluster fleet, shared is cheap operationally and the blast radius is small.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| ExternalSecret `Ready=False not found` | Vault path empty or wrong property name | `vault kv get -format=json secret/ocp/platform/rhacs-init-bundle | jq '.data.data | keys'` |
+| ExternalSecret synced, but Secret data is empty | template referencing wrong intermediate key name | check `data[].secretKey` matches `{{ .name }}` in template |
+| Sensor pod `CrashLoopBackOff "TLS handshake failure"` | bundle expired in Central | regenerate, re-push to Vault, force-sync ExternalSecrets |
+| Sensor sees Central but Admission pods don't start | `admission-control-tls` ExternalSecret missing/`Ready=False` | the SecuredCluster waits for all three; fix the missing one |
+| Bundle regenerated but Sensor still using old cert | ExternalSecret refresh window not elapsed | `oc -n stackrox annotate externalsecret sensor-tls force-sync=$(date +%s) --overwrite` |
+
+## What never goes into this page (or Git, or issues)
+
+- The actual cert/key PEM bytes.
+- The bundle JSON (it contains base64 of the same).
+- The decoded `/tmp/init-bundle.yaml`.
+- The admin htpasswd password (this page references it by Secret name only).
+
+These are kept in `codex-opp-agent/connection-details/` style notes if at all, and never in this public blog.
+
+## References
+
+- `reference_rhacs_init_bundle_via_api.md` (memory) — the canonical pattern.
+- `connection-details/platform-admin-handoff.md`.
+- `scripts/rhacs-init-bundle-push.sh` (claude-agent/scripts).
+- RHACS 4.10 docs: `/v1/cluster-init/init-bundles` API reference.

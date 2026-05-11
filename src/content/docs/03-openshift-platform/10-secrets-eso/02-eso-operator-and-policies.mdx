@@ -1,0 +1,174 @@
+---
+title: "ESO Operator: Install, Operand Split, and Default-Deny NetworkPolicy"
+description: "Installing the Red Hat External Secrets Operator on each v6 cluster: the operator namespace vs the operand namespace, the default-deny NetworkPolicy that ships with v1.1.0, and the egress allow-list that lets the operand reach Vault."
+sidebar_label: "Operator & policies"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers the install layer: which operator we use, where it lives, and the *NetworkPolicy gotcha* that costs a half-hour the first time it bites you. Read [01-architecture](./01-architecture) first for the wider picture.
+
+## What we install
+
+| Field | Value |
+| --- | --- |
+| Operator (OperatorHub) | `openshift-external-secrets-operator` |
+| Version (rebuild lock) | `1.1.0` |
+| Catalog source | mirrored `cs-redhat-operator-index-v4-20` |
+| Operator namespace | `openshift-external-secrets-operator` |
+| Operand namespace | `external-secrets` (created by the operator) |
+| Channel | `stable-1.1` |
+| InstallPlan approval | `Manual` (per ADR 0019 / 0025 — no unattended upgrades) |
+
+The Red Hat distribution is required because the rebuild image-supply chain (ADR 0019) does not include the upstream `external-secrets.io` operator from `ghcr.io`. The catalog source is mirrored to Nexus; the operator is referenced from the `cs-redhat-operator-index-v4-20` index.
+
+## Operator vs operand split
+
+ESO ships as two distinct workloads in two distinct namespaces:
+
+- **Operator** (`openshift-external-secrets-operator`) — the OLM-managed controller for the `OperatorConfig` CRD plus a bootstrap reconciler. It installs the operand and the CRDs.
+- **Operand** (`external-secrets`) — three Deployments:
+  - `external-secrets` — the main reconciler. Reads `ClusterSecretStore`, `SecretStore`, `ExternalSecret`, `ClusterExternalSecret`, talks to Vault.
+  - `external-secrets-cert-controller` — manages the webhook serving cert.
+  - `external-secrets-webhook` — validating + mutating admission webhook for the CR kinds.
+
+When you ask "which pod is talking to Vault?" the answer is always **the operand `external-secrets` Deployment, in the `external-secrets` namespace**. Not the operator controller pod in `openshift-external-secrets-operator`. This matters for the NetworkPolicy fix below.
+
+## OperatorConfig: the quirk
+
+ESO v1.1.0 installs the operator, but the operand is only created when an `OperatorConfig` CR is applied. The desired-state shape is small:
+
+```yaml
+apiVersion: operator.external-secrets.io/v1alpha1
+kind: OperatorConfig
+metadata:
+  name: cluster
+  namespace: openshift-external-secrets-operator
+spec:
+  applicationLevelLabels: {}
+  controllerClass: ""
+```
+
+The `name: cluster` is enforced — any other name is rejected by the validating webhook. The CR has minimal surface; you almost never need to touch it after install.
+
+`OperatorConfig` is consumed by the operator pod, which then materializes the operand `external-secrets` namespace, the three Deployments, the ServiceAccounts, the RBAC, and a set of default NetworkPolicies (see next section). This is the source of the install-time gotcha — the operand only appears after `OperatorConfig` reconciles, not when the OLM Subscription becomes `Succeeded`.
+
+## The default-deny NetworkPolicy gotcha
+
+When the operator materializes `external-secrets`, it also drops in these NetworkPolicies:
+
+| Policy | Affects | What it permits |
+| --- | --- | --- |
+| `deny-all-traffic` | every pod in `external-secrets` | nothing (catch-all default-deny) |
+| `allow-api-server-egress-for-main-controller` | main reconciler | TCP/6443 to cluster apiserver |
+| `allow-api-server-egress-for-cert-controller` | cert controller | TCP/6443 to cluster apiserver |
+| `allow-api-server-egress-for-webhook` | webhook | TCP/6443 to cluster apiserver |
+| `allow-to-dns` | every pod | UDP/53 + TCP/53 to cluster DNS |
+
+The default set is intentionally minimal — anything else is blocked, including egress to the lab Vault VM on TCP/8200. The first time you apply a `ClusterSecretStore`, the operand quietly fails to authenticate, and `oc get clustersecretstore` reports:
+
+```text
+NAME             AGE   STATUS   READY
+vault-platform   2m    Error    False
+```
+
+With message:
+
+```text
+unable to log in to auth method: unable to log in with Kubernetes auth:
+context deadline exceeded
+```
+
+The diagnosis trap is that **the ESO controller-manager pod (in `openshift-external-secrets-operator`) can reach Vault**. The reconciler that fails is the *operand* `external-secrets` Deployment in the operand namespace; its NetworkPolicy is the one applying the default-deny.
+
+### The fix
+
+Add a NetworkPolicy in `external-secrets` that allows egress to the Vault VM on TCP/8200. The platform-gitops file is `clusters/<cluster>/secrets/eso/networkpolicy-vault-egress.yaml`, with sync-wave `20` so it lands after the operator install.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-vault
+  namespace: external-secrets
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: external-secrets
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            # /30 covering the Vault VM(s), redacted (lab /24).
+            cidr: REDACTED/30
+      ports:
+        - protocol: TCP
+          port: 8200
+```
+
+> Internal-only specifics (exact CIDR) are kept in `codex-opp-agent/connection-details/`.
+
+After applying, the operand controller is restarted because **the controller does not re-trigger reconcile on NetworkPolicy changes** — connections are TCP-cached and the previous reconcile lost its window:
+
+```bash
+oc -n external-secrets rollout restart deployment external-secrets
+oc -n external-secrets rollout status deployment external-secrets --timeout=2m
+```
+
+Within ~30s, the `ClusterSecretStore` flips to `Ready=True`:
+
+```bash
+oc get clustersecretstore vault-platform -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# True
+```
+
+## Detect the symptom without trial-and-error
+
+Three signals indicate the egress NetworkPolicy is the issue:
+
+1. Operand log line:
+   ```text
+   unable to log in to auth method: unable to log in with Kubernetes auth:
+   context deadline exceeded
+   ```
+2. CSS condition:
+   ```text
+   Ready=False, reason=InvalidProviderConfig,
+   message="unable to create client"
+   ```
+3. TCP probe from inside the operand pod:
+   ```bash
+   oc -n external-secrets exec deploy/external-secrets -- \
+     curl -skf https://vault.sub.comptech-lab.com:8200/v1/sys/health
+   # exit 124 (timeout)
+   ```
+
+Probe (3) is the smoking gun. From the *operator* pod the same command succeeds because the operator namespace has no default-deny.
+
+## Inventory
+
+| Resource | Where it lives |
+| --- | --- |
+| `Subscription/openshift-external-secrets-operator` | `clusters/<cluster>/operators/eso/subscription.yaml` |
+| `OperatorConfig/cluster` | `clusters/<cluster>/secrets/eso/operatorconfig.yaml` |
+| `NetworkPolicy/allow-egress-to-vault` | `clusters/<cluster>/secrets/eso/networkpolicy-vault-egress.yaml` |
+| `ClusterSecretStore/vault-platform` | `clusters/<cluster>/secrets/eso/clustersecretstore-vault.yaml` |
+| Operand image | mirrored at `mirror-registry.apps.sub.comptech-lab.com/eso/...` |
+
+All four files belong to the same Argo Application (`<cluster>-cluster-config`) and reconcile in sync-wave order so the operator becomes ready before the operand-scope NP and the CSS.
+
+## Future-proofing
+
+- **Adding a second Vault endpoint** — widen the CIDR in `allow-egress-to-vault`, or add a second NP. The Vault label remains `app.kubernetes.io/name=external-secrets`.
+- **Adding a non-Vault backend (e.g., AWS Secrets Manager)** — would need a new NP allowing egress to that endpoint plus a `ClusterSecretStore` of `aws` provider type. Out of scope on the disconnected lab today.
+- **Upgrading ESO** — manual InstallPlan approval; verify the operand NP still permits Vault egress (the default-deny set can drift between versions, in which case the wave-20 NP still applies because it's GitOps-managed).
+
+## References
+
+- `connection-details/platform-admin-handoff.md` — operator inventory table.
+- ADRs: 0019 (Nexus-only image supply), 0025 (GitOps-only operations), 0014 (developer readiness).
+- Memory: `project_eso_egress_to_vault.md`.
+- Issue: #126 (DEV-OCP-2.5 baseline), wave-20 NP backfill under issue trail in `platform-gitops/clusters/spoke-dc-v6/secrets/eso/`.

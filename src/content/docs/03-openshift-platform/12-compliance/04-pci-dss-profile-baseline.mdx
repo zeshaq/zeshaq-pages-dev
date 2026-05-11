@@ -1,0 +1,148 @@
+---
+title: "PCI-DSS Profile Baseline (v4.0)"
+description: "What ocp4-pci-dss-4-0 and ocp4-pci-dss-node-4-0 cover: the rule taxonomy (platform vs node), the v3.2 vs v4.0 difference, the carry-forward lessons from old spoke-dc, and what counts as evidence vs commentary."
+sidebar_label: "PCI-DSS profile"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers the contents of the PCI-DSS profile pair (`ocp4-pci-dss-4-0` + `ocp4-pci-dss-node-4-0`) — what the rules check, the platform vs node split, the relationship to PCI DSS v4.0.1, and the cluster invariants you must have right before scans are meaningful.
+
+## Two profiles, one suite
+
+The Red Hat Compliance Operator ships PCI-DSS as a **pair**:
+
+| Profile | Targets | Examples of checks |
+| --- | --- | --- |
+| `ocp4-pci-dss-4-0` | cluster-level objects (the apiserver, OAuth, etcd, controllers, ingress, RBAC, image-policy) | etcd encryption at rest; OAuth inactivity timeout; ingress TLS profile; ImagePolicy enforcement; cluster log retention; audit log shipping |
+| `ocp4-pci-dss-node-4-0` | node-level OS / RHCOS configs | FIPS-mode kernel; sshd config (e.g., disable root login, MaxSessions, KeepAlive); sysctls (`net.ipv4.ip_forward`, `kernel.randomize_va_space`); file permissions on `/etc/kubernetes/*`; kernel-module restrictions |
+
+The platform profile fires once per scan; the node profile fires once per target node. A 3-master + 3-worker cluster = 6 node-scan pods.
+
+You always run both. A platform-only scan misses node-level controls; a node-only scan misses the cluster control plane. The PCI auditor's expectation is "the whole cluster" — both profiles together.
+
+## v4.0 vs v3.2
+
+PCI SSC published PCI DSS v4.0.1 as a *limited revision* to v4.0; no new or deleted requirements. After 2024-12-31, **v4.0.1 is the only active version supported by PCI SSC**. Red Hat ships the profile content as `ocp4-pci-dss-4-0` (mapping to v4.0/v4.0.1 requirements).
+
+`ocp4-pci-dss-3-2` is retained for context. Differences worth knowing:
+
+- v4 introduces explicit MFA-everywhere requirements for cardholder data environments (encoded in profile rules as OAuth/IdP checks).
+- v4 strengthens encryption-at-rest expectations (mapping to `etcd encryption` + ODF cluster-wide encryption rules).
+- v4 has more granular audit-log retention rules.
+
+ADR 0020 makes v4.0 the production gate and 3.2 a comparison-only secondary; the implementation matches.
+
+## The rule taxonomy
+
+A typical Compliance Operator profile contains 100–200 rules. The major buckets:
+
+| Bucket | Examples | Where they pass/fail |
+| --- | --- | --- |
+| **Authentication / IdP** | OAuth identity providers configured; HTPasswd not used in prod; OAuthClient `accessTokenInactivityTimeoutSeconds` set | `oauth/cluster`, `oauthclient` objects |
+| **API server / etcd** | etcd encryption-at-rest enabled; auditPolicy set to `WriteRequestBodies` or stricter; default kube-apiserver TLS profile | `apiserver/cluster` |
+| **Pod-level controls** | PSS restricted; allowed-image-registry policy; SCC posture | namespace labels; admission policies |
+| **Ingress / TLS** | Ingress TLS profile is `Intermediate` or `Modern`; cipher suites approved; redirect HTTP→HTTPS | `ingresscontroller`, Route objects |
+| **Storage / encryption** | ODF cluster-wide encryption on; storage class encryption posture | `storagecluster` |
+| **Logging / audit** | cluster logging operator deployed; audit forwarder configured; retention ≥ 1 year | LokiStack + cluster logging CRs |
+| **Node OS (RHCOS)** | FIPS enabled; sshd hardening; sysctls; file permissions | per-node via openscap |
+
+Each rule has:
+
+- a stable **ID** (`ocp4-...`), used in `ComplianceCheckResult` names.
+- a **severity** (`high`, `medium`, `low`, `informational`).
+- an associated **remediation** if auto-fixable.
+
+## The carry-forward lessons (from old spoke-dc)
+
+Old `spoke-dc` reached profile compliance after hardening. The lessons (per ADR 0020):
+
+| Lesson | Why it matters on v6 |
+| --- | --- |
+| FIPS from install (`fips: true` in install-config + butane) | not a casual day-2 toggle; many rules check the FIPS-mode kernel |
+| Install with **`ssh-rsa`** keys, not `ssh-ed25519` | ed25519 is FIPS-incompatible; install fails or scans fail |
+| VM masters need vTPM | required for LUKS unlock and TPM2-bound clevis on encrypted boot |
+| Physical workers need TPM2-backed LUKS on root disk | with recovery passphrase escrowed outside Git |
+| ODF encryption cluster-wide (`storagecluster.spec.encryption.clusterWide=true`) | from cluster init; can't be enabled day-2 |
+| etcd encryption at rest with `aesgcm` (OCP 4.20 preferred) | aescbc is the older default; v4.20 prefers `aesgcm` |
+| `kubeadmin` removed (or rotated) after real IdP wired | scans fail relevant kubeadmin rule otherwise |
+| OAuth inactivity timeout at both levels | `oauth.config.spec.tokenConfig.accessTokenInactivityTimeout` and per-`OAuthClient.accessTokenInactivityTimeoutSeconds` |
+| Default ScanSetting placed result-server on masters → RBD attach failures | `workers-storage` ScanSetting fixes it ([03-scansetting-and-bindings](./03-scansetting-and-bindings)) |
+| ODF reconciles one route back to `Allow` while production S3 uses the secure route | rule tailored via `TailoredProfile`, narrow scope ([07-exceptions-and-waivers](./07-exceptions-and-waivers)) |
+
+If any prereq is missing on `spoke-dc-v6`, scans will fail rules that have no in-cluster remediation. Phase PCI-1 (issue #109) is the prereq validation gate.
+
+## IPv6 / OVN-K and PCI scans
+
+ADR 0026 (IPv6 baseline) clarifies: "IPv6 not used for cluster traffic" per *4 verifiable invariants*, NOT host-kernel-disable. Old guidance to disable IPv6 at the kernel via boot args or sysctl drop-in **breaks OVN-Kubernetes**. The #135 incident on 2026-05-10 proved this; further attempts are forbidden.
+
+The four invariants ADR 0026 mandates (and the Compliance Operator rules check via cluster config):
+
+1. `Network.config.openshift.io cluster` `serviceNetwork` is IPv4-only.
+2. `clusterNetwork` is IPv4-only.
+3. Cluster Routes accept IPv4 connections only (configured at HAProxy edge).
+4. Cluster DNS resolves IPv4 A records preferentially.
+
+The kernel sysctl `net.ipv6.conf.*.disable_ipv6 = 1` is **explicitly forbidden** because OVN-K's geneve tunnel + VXLAN encap requires the IPv6 stack to be loadable. The corresponding Compliance Operator rule (if it exists) is tailored away in the `TailoredProfile` with the rationale linked to ADR 0026 and #135.
+
+## What counts as evidence vs commentary
+
+The Compliance Operator output is the **evidence**:
+
+- ComplianceCheckResult PASS/FAIL/MANUAL counts.
+- The actual rule names that PASS or FAIL.
+- The Git SHA of `platform-gitops` under which the scan ran.
+- The Suite's status timestamps.
+- The ScanSetting + ScanSettingBinding used.
+
+The blog / handbook / GitHub issue comments are **commentary** — they explain *why* something is configured a certain way, but they don't constitute scan evidence. Auditors should be able to ignore commentary and look directly at the ComplianceCheckResult output to make their assessment.
+
+## What's NOT in the profile
+
+| Out of scope for `ocp4-pci-dss-*` | Why |
+| --- | --- |
+| Application-level PCI controls | the cluster is platform; apps are the tenant's responsibility |
+| Network segmentation outside the cluster (firewalls, ACLs at HAProxy) | not visible to scans; manual evidence required (PCI-5) |
+| Cardholder data environment (CDE) scoping | a control / policy question, not a cluster check |
+| Physical security | obviously not |
+| Personnel / training controls | obviously not |
+| Quarterly external scans of public-facing systems | external scanner output, not Compliance Operator |
+
+These are part of a real PCI assessment but not part of platform evidence.
+
+## Inspecting profile rules
+
+```bash
+# List all rules used by the platform profile
+oc -n openshift-compliance get profile ocp4-pci-dss-4-0 -o json \
+  | jq '.rules[] | .name'
+
+# Look at a specific rule's definition
+oc -n openshift-compliance get rule ocp4-api-server-encryption-provider-cipher -o yaml
+
+# Cross-reference: which CheckResults reference this rule?
+oc -n openshift-compliance get compliancecheckresult \
+  -l compliance.openshift.io/check-name=ocp4-api-server-encryption-provider-cipher \
+  -o yaml
+```
+
+A rule's `instructions` field tells you what would make it PASS; the `severity` indicates how critical it is.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Profile shows 0 rules in `oc get profile` | ProfileBundle still `PARSING` | wait for bundle to be `VALID`; otherwise debug content image |
+| All node-scan rules `INCONSISTENT` | one node tainted in a way scan pods can't tolerate | adjust ScanSetting `scanTolerations` |
+| FIPS rule `FAIL` on every node | FIPS not enabled at install | this is a rebuild, not a fix; track as residual risk and plan reinstall |
+| etcd encryption rule `FAIL` | `apiserver/cluster` doesn't have `spec.encryption.type` set | apply hardening — see [05-remediation-workflow](./05-remediation-workflow) |
+| ODF route TLS rule `FAIL` even after hardening | ODF reconciles one route back to `Allow` (documented) | TailoredProfile entry, narrow scope, link to evidence under PCI-3 issue |
+| `kubeadmin` rule `FAIL` | `kubeadmin` user still exists | remove only after real IdP confirmed working |
+
+## References
+
+- ADR 0020 (PCI-DSS profile compliance on spoke-dc-v6).
+- ADR 0026 (IPv6 baseline — verifiable invariants for OVN-K).
+- `connection-details/compliance-implementor-handbook.md`.
+- PCI SSC v4.0.1 documentation.
+- Red Hat OpenShift 4.20 Compliance Operator profiles (`ocp4-pci-dss-4-0`, `ocp4-pci-dss-node-4-0`).

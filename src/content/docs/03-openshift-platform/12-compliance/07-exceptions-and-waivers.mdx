@@ -1,0 +1,182 @@
+---
+title: "Exceptions and Waivers (TailoredProfile)"
+description: "When and how to use TailoredProfile to disable or tune a rule: the narrow-tailoring rule, the rationale requirement, the linked-issue audit trail, and the worked example for the ODF route TLS rule that does not converge."
+sidebar_label: "Exceptions & waivers"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Some scan failures cannot be remediated in-cluster — the rule and the platform's actual posture are unavoidably mismatched. The mechanism is `TailoredProfile`: a CR that extends a base profile and disables specific rules with rationale. This page covers when tailoring is legitimate, how it's authored, and the audit trail that keeps it defensible.
+
+## The tailoring rule
+
+> Tailor only specific checks with specific rationale. Link each tailoring to a GitHub issue. Keep tailoring narrow. **Do not tailor away a failure just because remediation is inconvenient.**
+
+That's from the compliance-implementor handbook (§ PCI-3) and ADR 0020 § Carried-Forward Lessons. The doctrine has three concrete consequences:
+
+1. **One rule per `disableRule` entry.** Never `regex-match` a group of rules.
+2. **A rationale paragraph per entry.** "Operational difficulty" is not a rationale.
+3. **A linked GitHub issue.** The issue holds the longer story; the TailoredProfile holds the pointer.
+
+If a tailoring would suppress a `high` or `medium` severity rule, the rationale must include a compensating control.
+
+## The TailoredProfile manifest
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: TailoredProfile
+metadata:
+  name: ocp4-pci-dss-4-0-tailored
+  namespace: openshift-compliance
+spec:
+  extends: ocp4-pci-dss-4-0
+  title: PCI-DSS v4.0 — spoke-dc-v6 narrow tailoring
+  description: |
+    Narrow tailoring for spoke-dc-v6 covering rules whose passing state
+    is unreachable due to documented platform realities. Each entry below
+    has a rationale and a linked issue.
+  disableRules:
+    - name: ocp4-routes-protected-by-tls
+      rationale: |
+        ODF reconciles one of its object-store routes back to `Allow` while
+        production S3 access uses the secure route only. This is an
+        upstream ODF behavior on OCP 4.20; production traffic does not
+        traverse the unsecured route. Compensating control: HAProxy edge
+        TLS termination + per-route allow-list. Linked issue: #111 (PCI-3).
+```
+
+`extends: ocp4-pci-dss-4-0` means "everything in the base profile applies unless disabled here." The tailored profile inherits PASS/FAIL status for every rule the base evaluates; disabled rules become NOT-APPLICABLE in scans.
+
+The companion `ScanSettingBinding` references the tailored profile instead of the base:
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSettingBinding
+metadata:
+  name: pci-dss
+  namespace: openshift-compliance
+profiles:
+  - kind: TailoredProfile
+    apiGroup: compliance.openshift.io/v1alpha1
+    name: ocp4-pci-dss-4-0-tailored
+  - kind: TailoredProfile
+    apiGroup: compliance.openshift.io/v1alpha1
+    name: ocp4-pci-dss-node-4-0-tailored
+settingsRef:
+  kind: ScanSetting
+  apiGroup: compliance.openshift.io/v1alpha1
+  name: workers-storage
+```
+
+The shape of `ocp4-pci-dss-node-4-0-tailored` is identical to the platform tailored profile — one per profile bundle.
+
+## Beyond `disableRules` — `setValues`
+
+`TailoredProfile` also supports overriding rule variables:
+
+```yaml
+spec:
+  setValues:
+    - name: ocp4-var-sshd-set-keepalive
+      rationale: |
+        Default 300s aligns with the cluster's OAuth inactivity timeout
+        of 300s; consistent inactivity behavior. Linked issue: #111.
+      value: "300"
+```
+
+This tunes a rule without disabling it. The rule still fires; it just compares against the new variable.
+
+`setValues` is preferred to `disableRules` whenever the rule's intent is sound but its default threshold is wrong for our environment. Same rationale-and-issue discipline applies.
+
+## The IPv6 / OVN-K case
+
+Per ADR 0026 (IPv6 baseline for OVN-K), the cluster runs with IPv6 *not used for cluster traffic* but the kernel's IPv6 stack is *not disabled* (disabling breaks OVN-K geneve/VXLAN encap). The relevant Compliance Operator rule (if present in the v4.0 profile) checks for IPv6 disabled at the host kernel — which the cluster cannot satisfy.
+
+The tailoring entry:
+
+```yaml
+- name: <rule name for "IPv6 disabled at host kernel">
+  rationale: |
+    ADR 0026 establishes 4 verifiable invariants for "IPv6 not used for
+    cluster traffic" without disabling the host kernel stack. The
+    #135 incident on 2026-05-10 proved that kernel-arg and sysctl
+    drop-in mechanisms break OVN-K; this rule's passing state is
+    therefore not achievable on an OVN-K cluster. Compensating
+    controls: (1) serviceNetwork IPv4-only, (2) clusterNetwork
+    IPv4-only, (3) Routes accept IPv4 connections only at HAProxy,
+    (4) DNS resolves IPv4 A records preferentially. Linked: ADR 0026,
+    issue #135, issue #111 (PCI-3).
+```
+
+The exact rule name depends on the profile bundle version; check `oc -n openshift-compliance get rule | grep -i ipv6`. The rationale is the link to the ADR; without ADR 0026 this tailoring would look like operational laziness rather than a documented invariant.
+
+## The ODF object-store route case
+
+ODF (OpenShift Data Foundation) reconciles its NooBaa S3 routes; on OCP 4.20 one of the two routes (the legacy non-mTLS S3) is reset back to `Allow` after every restart, while production S3 access uses the secure route. This means a "all routes are TLS-protected" check fails — even though no traffic flows over the unsecured route.
+
+The tailoring is narrow: disable that specific rule with rationale explaining ODF's reconciliation behavior and the compensating control (HAProxy edge terminates TLS; an allow-list at HAProxy ensures only the secured-route VIP is exposed externally).
+
+## What does NOT belong in a TailoredProfile
+
+| Bad reason | What to do instead |
+| --- | --- |
+| "This is just hard to fix" | actually fix it; raise blocker on PCI-3 issue if blocked |
+| "Our app depends on this loose setting" | tighten the platform; apps adapt |
+| "The auditor said it's fine to skip" | get it in writing on a linked issue; otherwise treat as MANUAL evidence |
+| "All masters fail; rolling them is disruptive" | apply via pause-and-batch ([05-remediation-workflow](./05-remediation-workflow)) |
+| "Three rules I don't understand" | research each. Don't blanket-tailor what you don't grasp. |
+
+## TailoredProfile workflow (GitOps)
+
+1. Identify a rule that should be tailored.
+2. Open or update the PCI-3 issue (#111) with: rule name, why it can't pass, compensating control, severity.
+3. Open MR against `platform-gitops` adding/updating the TailoredProfile manifest under `clusters/spoke-dc-v6/compliance/`.
+4. Update the ScanSettingBinding manifest to reference the TailoredProfile (instead of the base profile) if it doesn't already.
+5. Wait for Argo sync.
+6. Re-run the suite (delete + recreate the binding, or `rescan` annotation).
+7. Confirm the tailored rule now shows `NOT-APPLICABLE` and no other rule regresses.
+8. Update the evidence pack (under PCI-4 / PCI-5) to document the tailoring as a residual risk.
+
+## Auditing tailoring entries
+
+Per the compliance-implementor handbook, auditors review:
+
+- Each TailoredProfile manifest in `platform-gitops`.
+- Each `disableRules[].rationale` block.
+- The linked issue for each entry.
+- Whether the compensating control is real (sometimes verifiable, sometimes a procedural commitment).
+
+A `TailoredProfile` with three blanket entries and no linked issues is an immediate red flag. A `TailoredProfile` with 12 narrow entries each linked to an ADR / GitHub issue / runbook is defensible.
+
+## Per-tenant exceptions vs platform tailoring
+
+There is no equivalent of the RHACS per-tenant exclusion in Compliance Operator. The PCI-DSS profile scopes the *cluster*, not tenant namespaces; tenant-level deviations are handled by other layers (PSS labels, RHACS app-team set, NetworkPolicies). The Compliance Operator's tailoring is always cluster-scope.
+
+## Residual risk register
+
+Each tailored rule contributes to a **residual risk register** held in the evidence pack (per [06-evidence-collection-and-storage](./06-evidence-collection-and-storage)). The register has the same fields as the TailoredProfile rationale plus:
+
+- Risk severity (high / medium / low).
+- Likelihood (likely / possible / unlikely).
+- Impact statement.
+- Compensating control status (in place / in progress / proposed).
+- Review date (re-evaluate every PCI cycle).
+
+Auditors can request the register independently of the scan output; it's the human-readable companion to the machine-readable TailoredProfile.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| TailoredProfile created but rules still FAIL in scan | Binding still references base profile, not the tailored one | update Binding `profiles[].name` and re-bind |
+| `disableRules[].name` doesn't match a real rule | typo or rule name changed in operator upgrade | confirm with `oc get rule <name>` |
+| Tailoring works locally but not after operator upgrade | rule was renamed in new content image | re-audit the TailoredProfile against new bundle |
+| Tailoring blanket-disables a class of rules | regex / wildcards used (which the API doesn't really support but operators sometimes try) | rewrite as explicit per-rule entries |
+
+## References
+
+- ADR 0020 (PCI-DSS profile compliance on spoke-dc-v6).
+- ADR 0026 (IPv6 baseline — verifiable invariants).
+- `connection-details/compliance-implementor-handbook.md` § PCI-3 Hardening and Tailoring.
+- Compliance Operator `TailoredProfile` API reference.
+- Issues #111 (PCI-3), #135 (IPv6 incident).

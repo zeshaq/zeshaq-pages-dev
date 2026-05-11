@@ -1,0 +1,181 @@
+---
+title: "RHACS Central on hub-dc-v6"
+description: "Installing and running RHACS Central + Postgres + Scanner V4 on hub-dc-v6: namespace, operator, Central CR shape, storage, Route, htpasswd admin, the Central API surface."
+sidebar_label: "Central on hub"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers the hub-side install: where Central lives, the Central CR shape, the Route, the admin password, and the API surface that the rest of §11 uses for init-bundle generation and policy patches.
+
+## Where it lives
+
+| Field | Value |
+| --- | --- |
+| Cluster | `hub-dc-v6` |
+| Namespace | `stackrox` (created by the operator) |
+| Operator | `rhacs-operator` v `4.10.2` (mirrored catalog `cs-redhat-operator-index-v4-20`) |
+| Operator namespace | `rhacs-operator` |
+| Route | `central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com` |
+| Admin user | `admin` (htpasswd-backed; password in Secret `central-htpasswd`) |
+| Postgres mode | embedded (Central-managed Postgres pod) |
+
+`stackrox` is the operand namespace; `rhacs-operator` is the operator namespace. This split matches every other Red Hat operator on the fleet (ESO, Compliance, etc.) — operator install in one namespace, operand workload in another.
+
+## Why hub-dc-v6 and not spoke
+
+ADR 0004 (management-only hubs) and ADR 0020 (PCI baseline) both push centralized security/compliance tooling to the hub:
+
+- The hub already runs ACM, OpenShift GitOps, the central observability layer (Thanos). Co-locating RHACS Central keeps "fleet operator" tools in one place.
+- PCI-target workloads are on the spoke; running Central there would mix the inspector with the inspected — bad for evidence integrity.
+- One Central manages every cluster's Sensors, so there is one source of truth for policies, alerts, and image scans across the fleet.
+
+## The Central CR
+
+`platform-gitops/clusters/hub-dc-v6/security/rhacs/central.yaml`:
+
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: Central
+metadata:
+  name: stackrox-central-services
+  namespace: stackrox
+spec:
+  egress:
+    connectivityPolicy: Offline      # disconnected — no Red Hat call-home
+  central:
+    exposure:
+      route:
+        enabled: true               # creates the Route
+    persistence:
+      persistentVolumeClaim:
+        claimName: central-db
+        size: 50Gi
+        storageClassName: ocs-storagecluster-ceph-rbd
+    resources:
+      requests: { cpu: "1",  memory: "4Gi" }
+      limits:   { cpu: "4",  memory: "16Gi" }
+    db:
+      isEnabled: Default            # embedded Postgres
+      persistence:
+        persistentVolumeClaim:
+          claimName: central-db-data
+          size: 100Gi
+          storageClassName: ocs-storagecluster-ceph-rbd
+  scannerV4:
+    indexer:
+      replicas: 1
+    matcher:
+      replicas: 1
+    db:
+      persistence:
+        persistentVolumeClaim:
+          claimName: scanner-v4-db
+          size: 50Gi
+          storageClassName: ocs-storagecluster-ceph-rbd
+  monitoring:
+    openshift:
+      enabled: true                 # ServiceMonitor for OpenShift monitoring
+```
+
+Three fields deserve attention:
+
+1. **`egress.connectivityPolicy: Offline`** — disconnected lab. RHACS will not phone home for the CVE feed; instead it uses the bundled offline feed in the operator image, refreshed when the operator is upgraded. The image registry for image scans is the local Nexus mirror (see §6 image supply).
+2. **`central.exposure.route.enabled: true`** — creates an OpenShift Route at `central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com`. TLS is the OpenShift router's default (cluster wildcard cert).
+3. **`db.isEnabled: Default`** — embedded Postgres. The fleet doesn't run an external Postgres for RHACS today; the embedded pattern is simpler at small scale. If you ever externalize Postgres, this field becomes `External` and a Secret reference is added.
+
+## Storage layout
+
+| PVC | Size | Storage class | Purpose |
+| --- | --- | --- | --- |
+| `central-db` | 50Gi | `ocs-storagecluster-ceph-rbd` | Central's own DB metadata (smaller) |
+| `central-db-data` | 100Gi | `ocs-storagecluster-ceph-rbd` | embedded Postgres data |
+| `scanner-v4-db` | 50Gi | `ocs-storagecluster-ceph-rbd` | Scanner V4 vulnerability cache |
+
+All three are RWO. Ceph RBD is the default RWO class on ODF (`ocs-storagecluster-ceph-rbd`). Backups for these PVCs are out of scope on this page; see §13 (`backup-oadp`).
+
+## The Route
+
+```text
+https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com
+```
+
+- TLS termination: `Edge` (router terminates TLS with the cluster wildcard cert; backend is HTTP).
+- Authentication: htpasswd (default) + optional OIDC if a real IdP is wired (the fleet has not wired RHACS to OIDC yet; the htpasswd Secret is the only login path).
+- The Route is platform-owned; tenant teams do not get cluster-admin access to Central. Read-only roles for tenant-relevant policies are out of scope today.
+
+## Admin password — `central-htpasswd`
+
+On first install, the operator generates a random admin password and stores it in `Secret/central-htpasswd` in `stackrox`. The Secret has two fields:
+
+| Field | Contains |
+| --- | --- |
+| `htpasswd` | the bcrypt htpasswd line (used by Central's auth) |
+| `password` | the plaintext password (base64-encoded by Kubernetes Secret encoding) |
+
+To retrieve it during break-glass / API calls:
+
+```bash
+oc -n stackrox get secret central-htpasswd \
+  -o jsonpath='{.data.password}' | base64 -d
+```
+
+The plaintext is never copied into Git, issues, or chat. The Secret is created by Central on first reconcile and rotated only by manual operator action (`oc -n stackrox rsh deploy/central` then `roxctl central admin-password regenerate` from inside the pod — actually rare).
+
+## The Central API surface (what the rest of §11 uses)
+
+Once Central is up, the API at `https://${ROUTE}/v1/...` is the canonical control plane. Useful endpoints:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/v1/cluster-init/init-bundles` | POST | generate a new init-bundle (see [04-init-bundle-via-eso](./04-init-bundle-via-eso)) |
+| `/v1/policies` | GET / PUT | list / update policies (see [07-app-team-policy-set](./07-app-team-policy-set)) |
+| `/v1/policies/{id}` | GET / PUT | individual policy CRUD |
+| `/v1/images/scan` | POST | force-scan an image |
+| `/v1/alerts` | GET | list alerts (paginated) |
+| `/v1/clusters` | GET | list managed clusters |
+
+Authentication is Basic auth with the admin htpasswd password. In production we'd swap that for an API token; the lab uses htpasswd for simplicity. Helper scripts wrap the API call:
+
+```bash
+ROX_PW=$(oc -n stackrox get secret central-htpasswd -o jsonpath='{.data.password}' | base64 -d)
+ROUTE=central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com
+
+curl -fsSk -u "admin:${ROX_PW}" "https://${ROUTE}/v1/clusters" | jq '.clusters[].name'
+```
+
+The `-k` is required because the cluster wildcard cert is signed by an internal CA that the host running `curl` may not trust.
+
+## Scanner V4
+
+Scanner V4 (introduced in RHACS 4.4, GA in 4.5) replaces the older `Scanner` + `Scanner-DB`. Two new pods:
+
+- `scanner-v4-indexer` — pulls images and writes layer indexes to the V4 DB. Stateless beyond the cache PVC.
+- `scanner-v4-matcher` — matches indexed layers against the CVE feed.
+
+The V4 DB is a separate Postgres instance from Central's. It holds the indexed image layers and the CVE feed.
+
+In a disconnected install, Scanner V4 fetches images from the local registries (Nexus app-registry, mirror-registry) using the cluster's pull credentials. The CVE feed is shipped *in the operator image*; updates land when the operator is upgraded. The lab does **not** stream the CVE feed from Red Hat.
+
+## Observability hooks
+
+- `monitoring.openshift.enabled: true` materializes a `ServiceMonitor` so the OpenShift built-in Prometheus scrapes Central metrics. Useful queries: `central_total_policies`, `central_active_alerts`, `central_image_scan_duration_seconds`.
+- Central also exposes a `/v1/metrics` endpoint scraped by the OpenShift monitoring stack if the cluster is wired into Thanos (it is on `hub-dc-v6`).
+- Logs go to the cluster logging stack (LokiStack on the hub via the OBC bridge — see §10).
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Central pod `CrashLoopBackOff` | PVC pending — Ceph capacity | check `oc -n openshift-storage get cephcluster -o yaml` |
+| Sensor cannot connect to Central | Route TLS / cluster cert chain | confirm `central-stackrox` Route accepts the Sensor's cert (init-bundle) |
+| Login fails | htpasswd password rotation needed | regenerate via `roxctl central admin-password regenerate` |
+| Scanner V4 reports "no CVE data" | feed not bundled in operator | confirm `rhacs-operator` version; upgrade if older |
+| `Central CR` never reaches `Ready` | image pull from disconnected catalog failing | check `oc -n stackrox describe pod central-...` for ImagePullBackOff |
+
+## References
+
+- `connection-details/platform-admin-handoff.md` — operator install + version lock.
+- `connection-details/rhacs-app-policy.md` — Central-side policy management.
+- `reference_rhacs_init_bundle_via_api.md` (memory) — Central API patterns.
+- ADRs: 0004 (management-only hubs), 0019 (image supply), 0020 (PCI baseline).

@@ -1,0 +1,183 @@
+---
+title: "Evidence Collection and Storage"
+description: "What constitutes scan evidence, what the raw result PVC contains, how sanitized evidence is exported to MinIO developer-ci-evidence/pci-dss/, retention, and what NEVER goes into the evidence pack."
+sidebar_label: "Evidence & storage"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers the evidence chain: what scan output actually contains, what we publish to MinIO, what we retain, and the firm boundary on what never leaves the cluster.
+
+## Two storage tiers
+
+| Tier | Where | Lifetime | Sanitization |
+| --- | --- | --- | --- |
+| Raw scan results | `rawResultStorage` PVC in `openshift-compliance` (Ceph RBD) | rotation `3` (current + 2 prior) | none — full raw output |
+| Sanitized evidence | MinIO bucket `developer-ci-evidence/pci-dss/` | bucket retention policy | sanitization applied before upload |
+
+The raw PVC is operator-internal — for the result-server pod to aggregate. The MinIO export is the auditor-facing trail.
+
+## What raw results contain
+
+The raw PVC contains the full openscap output: ARF (Asset Reporting Format) XML, raw stdout from each rule's check, and the SCAP datastream referenced. Pieces include:
+
+- Per-node scan ARF bundles (one per target node).
+- Platform scan ARF bundle (one per `Profile`).
+- The `ComplianceCheckResult` summaries (also stored as CRs in etcd).
+- For each rule with INFO/MANUAL status, sometimes the raw command output ("the kubectl get returned X").
+
+Some of this raw output may contain:
+
+- IP addresses of cluster nodes.
+- Service account tokens (rarely — should not, but openscap sometimes captures truncated output that includes Bearer fragments).
+- Internal hostnames and FQDNs.
+- File paths revealing cluster topology.
+
+That's why the raw PVC stays on the cluster. We don't `tar` it out and email it to anyone.
+
+## What the sanitized evidence pack contains
+
+The auditor-facing pack (per ADR 0020 § Validation) is a structured artifact uploaded to MinIO. Per scan cycle:
+
+| Field | Source |
+| --- | --- |
+| `cluster_name` | `spoke-dc-v6` |
+| `openshift_version` | `oc get clusterversion -o jsonpath='{.items[0].status.desired.version}'` |
+| `compliance_operator_version` | from the CSV |
+| `profiles` | `[ocp4-pci-dss-4-0, ocp4-pci-dss-node-4-0]` (or tailored equivalents) |
+| `scansetting_name` | `workers-storage` |
+| `scansettingbinding_name` | `pci-dss` |
+| `compliancesuite_name` | `pci-dss` |
+| `compliancesuite_phase` | `Done` |
+| `compliancesuite_result` | `COMPLIANT` / `NON-COMPLIANT` |
+| `started_at` / `completed_at` | from suite status |
+| `platform_gitops_sha` | the Git SHA under which the scan ran |
+| `check_counts` | `{PASS: N, FAIL: N, MANUAL: N, NOT-APPLICABLE: N, INCONSISTENT: N}` |
+| `failing_rules` | list of FAIL rule names + severities; **rule output redacted to a single status line** |
+| `manual_rules` | list of MANUAL rule names; for each, a reference to where manual evidence lives |
+| `tailoring` | list of TailoredProfile entries with rationale and linked ADR/issue |
+| `residual_risks` | enumerated risks for FAILs that won't be fixed and MANUALs without coverage |
+| `image_supply_check` | `scripts/openshift-image-supply-check.sh` output for `spoke-dc-v6`: 0 uncovered references is the gate |
+
+The full per-rule output is **not** included. Auditors who need it must request break-glass access to the cluster.
+
+## The export tool
+
+A `scripts/pci-dss-export-evidence.sh` (placeholder name; planned for PCI-5) does:
+
+1. Reads `ComplianceSuite` status, all `ComplianceCheckResult`s, all `ComplianceRemediation`s.
+2. Reads cluster invariants:
+   - FIPS state (per node).
+   - etcd encryption state (`apiserver/cluster`).
+   - OAuth config (`oauth/cluster`).
+   - ODF encryption state (`storagecluster.spec.encryption.clusterWide`).
+   - Ingress TLS profile.
+3. Compiles the sanitized JSON above.
+4. Tars into a single artifact named `pci-dss-evidence-<cluster>-<UTC>.tar.gz`.
+5. Uploads to MinIO `developer-ci-evidence/pci-dss/<UTC>/`.
+
+The artifact + a top-level `manifest.json` are what an auditor downloads. The manifest indexes the contents.
+
+Until the export script is fully implemented, the manual path is `oc get` + `jq` shaping into the same structure.
+
+## What never goes in the pack
+
+| Forbidden | Why |
+| --- | --- |
+| Full Secret manifests | tokens / keys, even sanitized, are not safe at this distance |
+| Tokens, passwords, kubeconfigs | obvious |
+| Private keys | obvious |
+| Recovery passphrases (LUKS, etcd-encryption keys) | catastrophic if leaked |
+| Raw scan logs that include sensitive values | the redaction layer is the export script's job |
+| Internal IP addresses, MAC addresses, hardware serials | redact to descriptive labels ("master-1", "worker-3") |
+| Customer / cardholder data | obviously |
+
+The compliance-implementor handbook reiterates this. If an evidence request needs material that would expose any of the above, the request goes through a break-glass procedure — not the routine evidence channel.
+
+## MinIO bucket layout
+
+```text
+developer-ci-evidence/
+  pci-dss/
+    2026-05-15T01-00-00Z/             # per-scan-cycle UTC timestamp
+      manifest.json                    # the index
+      summary.json                     # check_counts, failing_rules, etc.
+      cluster-state.json               # FIPS / etcd / OAuth / ODF / Ingress snapshots
+      tailoring/
+        tailoredprofile-pci-dss-4-0-tailored.yaml
+        rationale-<rule>.md           # human-readable rationale per tailored rule
+      sources/
+        scansetting-workers-storage.yaml
+        scansettingbinding-pci-dss.yaml
+      gitops/
+        platform-gitops-sha.txt        # SHA + repo URL
+```
+
+All files are JSON or YAML where machine-readable; rationale and README files are Markdown.
+
+## Retention
+
+The bucket has a lifecycle rule:
+
+| Object age | Lifecycle |
+| --- | --- |
+| `< 1 year` | Standard tier |
+| `1–7 years` | (no DR backups beyond the cluster; we don't currently archive off-cluster) |
+| `> 7 years` | manual review |
+
+7 years is the typical PCI retention window. The lab does not yet have an off-cluster backup of the `developer-ci-evidence` bucket; that's a known gap and lives on the residual-risk register.
+
+## Manual evidence
+
+Some rules return `MANUAL` because no automated check can prove the control. Examples (paraphrased — exact names depend on the v4.0 ruleset):
+
+- "An incident response plan exists." → not testable by scan; record the plan name and link in the manifest.
+- "Personnel undergo security awareness training annually." → not testable by scan; record the training program reference.
+- "Quarterly internal network vulnerability scans." → external scanner output; reference its location.
+
+For each `MANUAL` rule, the evidence pack includes a pointer to where the manual evidence lives (a GitHub issue, a controlled-doc reference, a runbook). The pointer can be specific (`See manifest entry pci-dss-manual-12-3-irp.md`) without containing the actual document.
+
+## Sanitization rules — concrete
+
+For each rule's status line in `failing_rules` / `manual_rules`:
+
+| Input form | Sanitized form |
+| --- | --- |
+| `FAIL: nodes [master-0, master-1] failed with output: ... 192.168.x.y:6443 ...` | `FAIL: 2 master nodes failed; internal endpoints redacted` |
+| `FAIL: kubelet config /etc/kubernetes/kubelet.conf contains: certificateAuthority: <full PEM>` | `FAIL: kubelet.conf has unexpected certificateAuthority configuration` |
+| `MANUAL: token in /var/run/secrets/...: <JWT>` | `MANUAL: token presence check; raw token redacted` |
+
+The redactor is a regex + a deny-list (`\\d+\\.\\d+\\.\\d+\\.\\d+`, `(eyJ[A-Za-z0-9_\\-]+\\.){2}[A-Za-z0-9_\\-]+`, `BEGIN .*KEY`, MAC patterns).
+
+The redactor is overzealous on purpose. Anything that *might* be sensitive becomes "redacted". Auditors who need specifics file a break-glass request.
+
+## What's published vs internal
+
+| Artifact | Public-ish (this blog, GitHub issues) | Internal (codex-opp-agent connection-details, MinIO) |
+| --- | --- | --- |
+| Profile names | ✓ | ✓ |
+| Suite status summary | ✓ | ✓ |
+| Rule names | ✓ | ✓ |
+| Per-rule output | ✗ | ✓ (sanitized) |
+| Per-node hostnames | ✗ | ✓ (with internal context) |
+| IP addresses | ✗ | ✗ (always redact) |
+| Cluster invariants snapshot | ✗ | ✓ |
+| Manual evidence pointers | ✗ | ✓ |
+
+This split is what makes the blog publishable. The codex-opp-agent repo is the internal SoT.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Evidence export script can't reach MinIO | NetworkPolicy egress or MinIO credentials | confirm `openshift-compliance` ns allows egress to MinIO (`s3.openshift-storage.svc` is in-cluster; external MinIO at `30.30.30.x` requires a per-namespace NP) |
+| Manifest missing fields | export script run before suite reached `Done` | rerun after `oc get compliancesuite ... result=...` |
+| Redactor over-redacted a hostname required for evidence | regex too aggressive | tune the deny-list; re-export |
+| MinIO bucket lifecycle deleted evidence before audit | retention misconfigured | check `s3api get-bucket-lifecycle-configuration`; restore via prior backup if exists |
+
+## References
+
+- ADR 0020 (PCI-DSS profile compliance on spoke-dc-v6) § Validation.
+- `connection-details/compliance-implementor-handbook.md` § Evidence and PCI-5.
+- `connection-details/ci-evidence-schema.md` (developer-ci-evidence schema).
+- Issues #112 (PCI-4), #113 (PCI-5).

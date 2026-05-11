@@ -1,0 +1,242 @@
+---
+title: "App-Team Policy Set and the Exception Process"
+description: "The five RHACS built-in policies scoped to apps-.* namespaces with SCALE_TO_ZERO_ENFORCEMENT, why these five, the exception process via GitLab MR + Central exclusion, and the idempotent enable script."
+sidebar_label: "App-team policy set"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This is the operationalized half of [06-admission-controller-policies](./06-admission-controller-policies). DEV-OCP-4.3 (#198) defines a minimum policy set that must be enforced on tenant namespaces (`apps-.*`), the lightweight exception process for legitimate violations, and the audit trail. The implementation is `scripts/rhacs-enable-app-policies.sh`.
+
+## The five built-in policies
+
+All five are **RHACS built-in** policies (shipped with RHACS 4.10.2). We deliberately do not author custom policies for this issue — built-ins survive RHACS upgrades; custom policies need migration on every operator bump.
+
+| # | Policy name | Why it's in the app-team set |
+| --- | --- | --- |
+| 1 | `Latest tag` | Blocks Pods that reference `:latest`. The build-once / promote-by-digest model (ADR 0014, `promotion-model.md`) is only meaningful if tenants can't float HEAD into prod. |
+| 2 | `No CPU request or memory limit specified` | Blocks containers missing CPU request or memory limit. The `apps-*` `LimitRange` defaults these, but if the LimitRange is deleted or the manifest overrides defaults, RHACS catches it. |
+| 3 | `Privileged Container` | Blocks `securityContext.privileged: true`. Tenant workloads have zero legitimate reason to run privileged; this closes the most common container-escape vector. The `apps-.*` scope means platform operator namespaces (which legitimately need privileged Collectors, MachineConfig daemons, etc.) are unaffected. |
+| 4 | `CAP_SYS_ADMIN capability added` | Blocks containers that add `CAP_SYS_ADMIN`. Equivalent to root on the host — app-team workloads should never need it. |
+| 5 | `Required Image Label` | Requires `app.kubernetes.io/version` (or equivalent) on every image. Forces tenant builds through the GitLab CI / Jenkins pipelines that emit standard OCI labels — what makes SBOM + Trivy + DefectDojo trace-back meaningful. |
+
+## What's not in the set, and why
+
+| Built-in | Why excluded |
+| --- | --- |
+| `Required Annotation: Email/owner` | Ownership is already enforced by per-namespace Vault + ESO tenancy and by GitLab CODEOWNERS. Duplicating in RHACS adds friction without coverage. |
+| `Fixable Severity at least Important` | Image-vuln gating is at the build path (Trivy + DefectDojo). Adding a deploy-time vuln gate creates double-blocking and slows incident triage. RHACS still *alerts* on this policy. |
+| `Apache Struts CVE-2017-5638` (and similar CVE-specific built-ins) | Image-vuln class; same reasoning as above. |
+| `kubectl/oc as a container entrypoint` | Real cluster-admin tooling images run privileged anyway; this is mostly a posture nudge and we cover it via the privileged-container policy. |
+
+After a quarter of operation, if a sixth or seventh built-in is warranted, extend the list in `rhacs-enable-app-policies.sh` and re-run.
+
+## Scope: `apps-.*` only
+
+Each policy is scoped with a per-policy `scope.namespace` regex of `apps-.*` (and `cluster` of `hub-dc-v6` + `spoke-dc-v6`). This means:
+
+- Platform / system / operator namespaces (`openshift-*`, `stackrox`, `external-secrets-operator`, `openshift-gitops`, …) are **not affected**. The privileged Collector pod, for example, will continue to deploy because `stackrox` isn't `apps-*`.
+- ACM-managed namespaces on the hub (`open-cluster-management-*`) are similarly excluded.
+- Any tenant namespace following the `apps-<division>-<app>` convention from §10 falls under the policy.
+
+The convention enforced by the platform is: every tenant namespace starts with `apps-`. This single naming rule is what makes the `apps-.*` scope an effective tenant filter.
+
+## Enforcement
+
+All five policies are configured with:
+
+| Setting | Value |
+| --- | --- |
+| `lifecycleStages` | `["DEPLOY"]` |
+| `enforcementActions` | `["SCALE_TO_ZERO_ENFORCEMENT"]` |
+| `disabled` | `false` |
+
+`SCALE_TO_ZERO_ENFORCEMENT` is intentional (see [06-admission-controller-policies](./06-admission-controller-policies)) — the Deployment stays visible, the tenant can see the alert, and rollback is `oc rollout undo`.
+
+## The exception process
+
+A tenant may request a time-bounded exception. The process is light: a single Markdown file in the tenant's app repo, a platform-admin merge, a Central exclusion. No DSL, no policy YAML, no special tooling.
+
+### 1) Tenant files the exception
+
+The tenant opens an MR against their app-repo at:
+
+```text
+apps/_exceptions/<team>-<app>-<policy-shortname>.md
+```
+
+Example file path: `apps/_exceptions/platform-eso-smoke-latest-tag.md`.
+
+Required content sections:
+
+```markdown
+# RHACS Policy Exception: Latest tag
+
+- Policy name: Latest tag
+- Policy ID: <UUID from Central>
+- Tenant / division: platform
+- App: eso-smoke
+- Namespace(s): apps-platform-eso-smoke-dev
+- Requested by: <gitlab handle>
+- Requested on: 2026-05-10
+
+## Justification
+
+3-5 sentences. Why does this app legitimately need to violate the policy?
+Generic answers ("it works on my machine") are rejected in review.
+
+## Compensating Control
+
+3-5 sentences. What other mechanism prevents the risk this policy was guarding
+against? Examples:
+
+- Image is pinned to a tag that points to a digest that is itself Trivy-scanned
+  in CI; the registry has an immutability rule preventing retag, so `:latest`
+  is functionally a digest in this repo.
+- Container needs `CAP_SYS_ADMIN` for FUSE mounts; the container also runs as
+  non-root and has a strict seccomp profile, so the blast radius is bounded.
+
+## Approval
+
+- Platform owner: <name>
+- Approved on: <date>
+- Expiry: <date, default = approved-on + 90 days>
+
+## Renewal
+
+When expiry approaches, the tenant re-files the same Markdown with a new
+`Requested on` date.
+```
+
+### 2) Platform owner reviews
+
+The MR is reviewed and merged by the platform owner (`platform-admin` group on GitLab). Approval criteria:
+
+- Both **Justification** and **Compensating Control** are substantively filled in (not "needs to work").
+- Expiry is set (default 90 days, max 1 year).
+- Namespace scope is specific (single namespace, not `apps-.*`).
+
+The merged MR is the audit trail — nothing else needs to be filed.
+
+### 3) Platform owner adds the Central exclusion
+
+Once merged, the platform owner adds an entry to the matching policy's `exclusions` field in Central. The shape:
+
+```json
+{
+  "name": "platform/eso-smoke (exception: platform-eso-smoke-latest-tag)",
+  "deployment": {
+    "name": "eso-smoke",
+    "scope": {
+      "namespace": "apps-platform-eso-smoke-dev"
+    }
+  },
+  "expiration": "2026-08-08T00:00:00Z"
+}
+```
+
+The `name` field **must** embed the exception file name so the Central exclusion is traceable to its GitLab MR. The `expiration` field **must** be set so the exclusion auto-disables.
+
+API path (PUT the modified policy back):
+
+```bash
+ROX_PW=$(oc -n stackrox get secret central-htpasswd -o jsonpath='{.data.password}' | base64 -d)
+
+# Get current policy, jq in the new exclusion, PUT back.
+curl -fsSk -u "admin:${ROX_PW}" \
+  "https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies/<POLICY_ID>" \
+  > /tmp/policy.json
+
+jq '.exclusions += [{
+  "name": "platform/eso-smoke (exception: platform-eso-smoke-latest-tag)",
+  "deployment": {
+    "name": "eso-smoke",
+    "scope": {"namespace": "apps-platform-eso-smoke-dev"}
+  },
+  "expiration": "2026-08-08T00:00:00Z"
+}]' /tmp/policy.json > /tmp/policy-new.json
+
+curl -fsSk -u "admin:${ROX_PW}" \
+  -H 'Content-Type: application/json' \
+  -X PUT \
+  -d @/tmp/policy-new.json \
+  "https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies/<POLICY_ID>"
+```
+
+The Central UI exposes the same operation under Policy Management → policy → Exclusions tab; UI is simpler for one-off entries, API is preferred for batch.
+
+### 4) Audit
+
+`rhacs-enable-app-policies.sh` does **not** delete existing exclusions when it reconciles policies. The policy GET dumped by the script (`--dry-run`) is the source of truth for which exceptions are currently live; diff that against `apps/_exceptions/*` in tenant repos to catch drift.
+
+## The enable script
+
+`/home/ze/claude-agent/scripts/rhacs-enable-app-policies.sh` is idempotent:
+
+1. Authenticates with htpasswd (reads from `central-htpasswd` Secret).
+2. Looks up each of the five built-ins by name.
+3. For each policy, GETs the current object.
+4. Builds the desired object:
+   - adds `apps-.*` namespace scope if missing;
+   - sets `DEPLOY` → `SCALE_TO_ZERO_ENFORCEMENT` in `enforcementActions`;
+   - sets `disabled: false`;
+   - preserves existing `exclusions`.
+5. PUTs the policy only if current ≠ desired.
+
+A clean re-run after policies are already enabled prints `already in sync` and exits 0.
+
+```bash
+scripts/rhacs-enable-app-policies.sh --dry-run    # preview
+scripts/rhacs-enable-app-policies.sh              # apply
+```
+
+The script is the right tool when adding new clusters to the fleet, on rebuild from scratch, or when verifying RHACS state after a Central upgrade.
+
+## Looking up policy IDs
+
+Built-in policy IDs are stable per Central install — they're generated at first boot, not at upgrade. But they differ across Central installs, so to find the IDs on `hub-dc-v6`:
+
+```bash
+ROX_PW=$(oc -n stackrox get secret central-htpasswd -o jsonpath='{.data.password}' | base64 -d)
+curl -fsSk -u "admin:${ROX_PW}" \
+  "https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies" \
+  | jq '.policies[] | select(.name | IN(
+        "Latest tag",
+        "No CPU request or memory limit specified",
+        "Privileged Container",
+        "CAP_SYS_ADMIN capability added",
+        "Required Image Label"
+      )) | {id, name}'
+```
+
+The enable script does this lookup internally and patches by name, so operators rarely need raw IDs in routine work.
+
+## Defense-in-depth — where these policies sit
+
+The app-team set is one of several layers:
+
+| Layer | Mechanism | What's gated |
+| --- | --- | --- |
+| Build | Trivy + DefectDojo | CVEs at image push |
+| Admission (Kubernetes-native) | VAP `allowed-image-registries` | registry prefix |
+| Admission (RHACS) | the five policies above | latest tag, limits, privileged, capabilities, labels |
+| Tenant template | LimitRange + ResourceQuota | per-namespace request/limit + total resource caps |
+| Runtime | RHACS Collector | unexpected process / network activity |
+
+Even if RHACS goes degraded, the VAP and the LimitRange continue to enforce subsets. Even if a tenant bypasses the LimitRange override, RHACS denies the Pod. The PCI-DSS posture (ADR 0020) depends on this layered story being intact.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Policy violation not gated | policy `disabled: true` or wrong enforcement action | re-run `rhacs-enable-app-policies.sh` |
+| Tenant deployed `:latest` and admission still allowed it | the namespace doesn't match `apps-.*` (e.g., legacy name) | rename namespace to `apps-<division>-<app>` |
+| Exception expired but policy still suppressed | RHACS Central doesn't currently auto-cleanup expired exclusions | manual cleanup via Central UI / API; future work: `--reconcile-exceptions` flag in the script |
+| Tenant claims false-positive | misreading the violation; usually a missing `resources.limits` or a `securityContext.privileged: true` they didn't know was inherited | check the actual Pod spec with `oc get pod <pod> -o yaml` |
+
+## References
+
+- `connection-details/rhacs-app-policy.md` (DEV-OCP-4.3 / #198).
+- `scripts/rhacs-enable-app-policies.sh` (claude-agent/scripts).
+- ADRs: 0019 (image supply), 0020 (PCI baseline), 0014 (developer readiness).
+- RHACS 4.10 docs: built-in policy catalog.
