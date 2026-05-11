@@ -1,0 +1,186 @@
+---
+title: "StorageClass defaults"
+description: "Which StorageClass is the cluster default on hub-dc-v6 and spoke-dc-v6, how it's enforced, and what to do when a workload needs something different."
+sidebar_label: "StorageClass defaults"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+A "default StorageClass" is the one Kubernetes uses when a `PersistentVolumeClaim` omits `spec.storageClassName`. Most workload manifests in the dc-lab fleet do omit it, on purpose, and rely on the cluster's default class. This page documents what each cluster's default is, how it's set, why it's set that way, and the rules for overriding it.
+
+## Per-cluster defaults
+
+| Cluster | Default StorageClass | Why |
+| --- | --- | --- |
+| `hub-dc-v6` | `lvms-vg1` | The only StorageClass on the hub. LVMS-provisioned LVs on each control-plane VM. |
+| `spoke-dc-v6` | `ocs-storagecluster-ceph-rbd` | RBD covers the most common pattern (block, RWO); operands that need RWX or S3 ask explicitly. |
+
+## How "default" is signalled
+
+A StorageClass is marked default via an annotation on the StorageClass itself:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ocs-storagecluster-ceph-rbd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: openshift-storage.rbd.csi.ceph.com
+parameters: { ... }
+```
+
+Removing this annotation (or setting it to `false`) makes the class non-default. A cluster MAY have multiple default StorageClasses, but that's an antipattern — Kubernetes picks one and the choice is non-deterministic.
+
+In dc-lab, **exactly one** StorageClass per cluster has the annotation set to `"true"`. Every other StorageClass has the annotation absent or `"false"`.
+
+## How it gets applied in GitOps
+
+The annotation is part of the StorageClass YAML committed in `platform-gitops`. ODF / LVMS create their StorageClass objects, and a GitOps patch sets the default annotation:
+
+```yaml
+# clusters/spoke-dc-v6/platform/storage/storageclass-default-rbd.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ocs-storagecluster-ceph-rbd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+allowVolumeExpansion: true
+provisioner: openshift-storage.rbd.csi.ceph.com
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  clusterID: openshift-storage
+  pool: ocs-storagecluster-cephblockpool
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: openshift-storage
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: openshift-storage
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: openshift-storage
+  csi.storage.k8s.io/fstype: ext4
+```
+
+Argo CD applies this as an idempotent patch. If ODF's CSV recreates the StorageClass without the annotation, Argo's `selfHeal` puts it back within ~3 minutes.
+
+## Why RBD is the spoke default (not CephFS)
+
+| Property | RBD | CephFS |
+| --- | --- | --- |
+| Access mode | RWO (RWOnePod on CSI) | RWX, RWO |
+| IO pattern | block, low-latency | shared filesystem, slightly higher latency |
+| Use cases | Postgres, Quay state, single-pod workloads | OADP backup repos, multi-pod-shared caches |
+| Frequency in fleet | ~90% of PVCs | ~10% of PVCs |
+
+The default is "what most workloads need without thinking." RBD wins on that metric. Workloads that *do* need RWX state `storageClassName: ocs-storagecluster-cephfs` explicitly.
+
+## Why `lvms-vg1` is the hub default
+
+It's the only option. LVMS is the only storage provisioner on the hub. Any PVC on the hub goes to LVMS-on-the-local-VM, and the hub doesn't host workloads that need anything else.
+
+## How to override
+
+When a PVC needs a non-default class, it says so:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-backup
+  namespace: openshift-adp
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: ocs-storagecluster-cephfs            # explicit override
+```
+
+Helm charts and operators that *generate* PVCs typically expose a `storageClass:` field; setting it on the parent CR (StorageCluster, MinIO Tenant, MariaDB, etc.) overrides per-PVC.
+
+## When NOT to omit the StorageClass
+
+The convention in dc-lab is: **prefer explicit `storageClassName` for production workloads.** The reason is auditability: a manifest that says `ocs-storagecluster-ceph-rbd` declares its intent; one that says nothing relies on the cluster's default being set correctly forever.
+
+For prototypes / smoke apps, defaulting is fine. For long-lived tenant workloads, explicit is better.
+
+## Validation
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+# Default class set
+oc --kubeconfig "$K" get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}'
+# expected: exactly one name
+
+# No competing defaults
+oc --kubeconfig "$K" get storageclass --no-headers | wc -l
+# inspect manually; only one should carry the (default) marker
+oc --kubeconfig "$K" get storageclass
+
+# Default-PVC smoke test
+cat <<EOF | oc --kubeconfig "$K" apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: default-class-smoke
+  namespace: openshift-storage
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+oc --kubeconfig "$K" -n openshift-storage get pvc default-class-smoke
+# expected: Bound within seconds, StorageClass = ocs-storagecluster-ceph-rbd (spoke) or lvms-vg1 (hub)
+```
+
+## Volume expansion
+
+Both `ocs-storagecluster-ceph-rbd` and `ocs-storagecluster-cephfs` are configured with `allowVolumeExpansion: true`. To grow a PVC:
+
+```bash
+oc -n <ns> patch pvc <name> --type=merge -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'
+```
+
+ODF / Ceph resizes the underlying RBD image; the pod sees the new size on next remount. The exact mechanism differs per filesystem:
+
+- ext4 (RBD default): online resize.
+- xfs: also online.
+- CephFS: pseudo-instantaneous (no underlying block to resize).
+
+LVMS supports expansion on the same volume group; shrink is not supported.
+
+## Reclaim policy
+
+| Class | reclaimPolicy | Behavior |
+| --- | --- | --- |
+| `ocs-storagecluster-ceph-rbd` | `Delete` | PV is destroyed when PVC is deleted; data is gone |
+| `ocs-storagecluster-cephfs` | `Delete` | same |
+| `lvms-vg1` | `Delete` | same |
+| `localblock` (LSO source for ODF OSDs) | `Delete` | reclaim doesn't run for static-provisioned PVs in practice |
+| `openshift-storage.noobaa.io` | `Delete` (for OBC) | bucket and credentials deleted when OBC is deleted |
+
+For PVCs that hold genuinely valuable state (Postgres data, Quay registry blobs), the lab convention is to **back them up** before deleting them, not to rely on a `Retain` reclaim policy. Backup is OADP-managed; see Section 11.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| PVC `Pending` with event `no default storage class` | annotation not applied | apply the StorageClass patch via GitOps |
+| PVC binds to unexpected class | two StorageClasses both marked default | remove the annotation from all but one |
+| PVC expansion stuck | underlying class doesn't have `allowVolumeExpansion: true` | update the StorageClass (cluster-scoped change; GitOps MR) |
+| LVMS PVC on hub doesn't bind | the requested size exceeds available LV space on every master | scale down the request or expand the VG (requires VM disk attachment) |
+| Workload uses RBD when it should use CephFS | wrong default for an RWX workload | declare `storageClassName: ocs-storagecluster-cephfs` explicitly |
+| Operator-managed PVC has no `storageClassName` and no class is default | rare regression where the StorageClass annotation was lost | check ODF reconcile; restore the GitOps default patch |
+
+## References
+
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — spoke topology.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — LVMS, ODF versions.
+- Kubernetes docs: *Storage Classes — Default*.
+- [03-odf-on-spoke](/docs/openshift-platform/storage/odf-on-spoke).
+- [02-lso-and-local-volumes](/docs/openshift-platform/storage/lso-and-local-volumes).

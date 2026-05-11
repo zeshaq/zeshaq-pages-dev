@@ -1,8 +1,196 @@
 ---
-title: "Overview"
-description: "Section 03-openshift-platform/08-storage: Overview (placeholder)."
+title: "Storage overview — LVMS hub, ODF spoke, storage clients"
+description: "How the dc-lab v6 fleet provisions persistent storage: LVMS on the compact hub, ODF on the spoke, and the workload clients (Quay, OADP, Loki, Tempo, CNPG) that consume it."
 sidebar_label: "Overview"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center" };
+export const extBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const hubBox = { background: "#fce7f3", border: "1px solid #be185d", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const spokeBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const storageNodes = [
+  { id: "hub",      position: { x: 40,  y: 0   }, data: { label: "hub-dc-v6\n(compact: 3 VM masters)" }, style: hubBox },
+  { id: "lvms",     position: { x: 80,  y: 130 }, data: { label: "LVMS operator\nlocal LVM storage" }, style: ctrlBox },
+  { id: "hub-sc",   position: { x: 80,  y: 260 }, data: { label: "StorageClass\nlvms-vg1 (default)" }, style: dataBox },
+  { id: "spoke",    position: { x: 440, y: 0   }, data: { label: "spoke-dc-v6\n(3 VM masters + 3 physical workers)" }, style: spokeBox },
+  { id: "lso",      position: { x: 440, y: 130 }, data: { label: "Local Storage Operator\nlocalvolumeset → PVs" }, style: ctrlBox },
+  { id: "odf",      position: { x: 660, y: 130 }, data: { label: "ODF / Ceph operator\nstoragecluster" }, style: ctrlBox },
+  { id: "noobaa",   position: { x: 880, y: 130 }, data: { label: "NooBaa MCG\nS3 endpoint" }, style: ctrlBox },
+  { id: "rbd",      position: { x: 480, y: 290 }, data: { label: "ocs-storagecluster-ceph-rbd\n(block, default)" }, style: dataBox },
+  { id: "cephfs",   position: { x: 680, y: 290 }, data: { label: "ocs-storagecluster-cephfs\n(shared filesystem)" }, style: dataBox },
+  { id: "s3",       position: { x: 880, y: 290 }, data: { label: "OBC / s3.openshift-storage\n(object)" }, style: dataBox },
+  { id: "quay",     position: { x: 480, y: 440 }, data: { label: "Quay (app images)" }, style: agentBox },
+  { id: "oadp",     position: { x: 660, y: 440 }, data: { label: "OADP / Velero\n(backup)" }, style: agentBox },
+  { id: "loki",     position: { x: 840, y: 440 }, data: { label: "LokiStack" }, style: agentBox },
+  { id: "tempo",    position: { x: 1020, y: 440 }, data: { label: "TempoStack" }, style: agentBox },
+  { id: "cnpg",     position: { x: 320, y: 440 }, data: { label: "CloudNativePG" }, style: agentBox },
+];
+
+export const storageEdges = [
+  { id: "h1", source: "hub", target: "lvms", label: "owns", ...muted },
+  { id: "h2", source: "lvms", target: "hub-sc", label: "provides", ...muted },
+  { id: "s1", source: "spoke", target: "lso", label: "discovers disks", ...muted },
+  { id: "s2", source: "lso", target: "odf", label: "feeds PVs", ...muted },
+  { id: "s3", source: "odf", target: "rbd", label: "provisions", ...muted },
+  { id: "s4", source: "odf", target: "cephfs", label: "provisions", ...muted },
+  { id: "s5", source: "odf", target: "noobaa", label: "deploys", ...muted },
+  { id: "s6", source: "noobaa", target: "s3", label: "exposes", ...muted },
+  { id: "c1", source: "rbd", target: "cnpg", label: "PVC (RWO)", ...pullEdge },
+  { id: "c2", source: "rbd", target: "quay", label: "PVC", ...pullEdge },
+  { id: "c3", source: "cephfs", target: "oadp", label: "PVC (RWX)", ...pullEdge },
+  { id: "c4", source: "s3", target: "loki", label: "OBC + ESO bridge", ...pullEdge },
+  { id: "c5", source: "s3", target: "tempo", label: "OBC + ESO bridge", ...pullEdge },
+  { id: "c6", source: "s3", target: "quay", label: "OBC (registry blobs)", ...pullEdge },
+];
+
+The fleet runs two distinct storage stories — one on each cluster — and a third "object" plane that bridges both. This page is the map.
+
+## The two clusters, two storage models
+
+| Cluster | Role | Storage system | Why |
+| --- | --- | --- | --- |
+| `hub-dc-v6` | management plane (ACM, OpenShift GitOps, Compliance Operator) | **LVMS** (Logical Volume Manager Storage) | Compact 3-master VM topology with no physical disk pool; LVMS turns each master's local volume group into a `StorageClass` |
+| `spoke-dc-v6` | workload cluster (apps, logging, tracing, registry, backup) | **ODF** (OpenShift Data Foundation; Ceph RBD + CephFS + NooBaa MCG) | Physical workers with dedicated data disks; full Ceph stack provides RBD block, CephFS shared filesystem, and S3 object |
+
+This split is intentional and recorded in ADR 0004 (management-only hubs) and the post-install GitOps plan. The hub stays **storage-light**: it has just enough PVCs to hold ACM observability, GitOps repo cache, and operator state. The spoke does the heavy storage lifting.
+
+## Reading the architecture
+
+<Whiteboard client:load data={{ nodes: storageNodes, edges: storageEdges }} height={620} />
+
+- **Hub side (left):** LVMS reads a local volume group on each control-plane VM and exposes it as a `lvms-vg1` StorageClass. PVCs on the hub bind to LVs sliced out of that VG. Cluster-local, no replication across nodes — adequate for hub workloads (kafka-less GitOps, no application data).
+- **Spoke side (centre + right):** Local Storage Operator (LSO) discovers raw data disks on the physical worker nodes and creates `PersistentVolume` objects of type `localvolumeset`. ODF's `StorageCluster` consumes those PVs and stands up a Ceph cluster: OSDs on each worker's disks, MONs for quorum, MGRs for management. ODF then exposes three storage flavours through CSI:
+  - **`ocs-storagecluster-ceph-rbd`** — block, `ReadWriteOnce`, the default StorageClass for general workloads.
+  - **`ocs-storagecluster-cephfs`** — shared filesystem, `ReadWriteMany`, used where multiple pods need write access to the same volume (OADP backup repositories, some shared-cache patterns).
+  - **NooBaa MCG / `s3.openshift-storage.svc`** — S3-compatible object endpoint, accessed by `ObjectBucketClaim` (OBC), used by Loki, Tempo, and Quay for blob storage.
+- **Bottom row (clients):** the actual workloads that consume the storage. CNPG (CloudNativePG) takes RBD `ReadWriteOnce` for its Postgres data directories. Quay takes RBD for its operand state and an OBC for image-layer blobs. OADP takes a CephFS PVC plus a NooBaa OBC for backup state. Loki and Tempo take only OBC — no PVCs, S3-only.
+
+## Why ODF on the spoke
+
+The choice is constrained by the v6 design:
+
+1. **Disconnected operation** — ODF ships as an OLM operator that we mirror via `oc mirror`; the same disconnected story already documented in [Section 6](/docs/openshift-platform/disconnected-image-supply/architecture) applies.
+2. **Hyperconverged density** — the three physical workers each carry data disks; ODF turns them into a unified storage layer without requiring a separate storage array.
+3. **Three storage shapes in one operator** — RBD + CephFS + S3 from a single CSI install instead of three independent storage products. The single integration surface is operationally simpler.
+4. **Compliance** — ADR 0020 requires cluster-wide ODF encryption from initialization (`storagecluster.spec.encryption.clusterWide: true`). Ceph's encrypted block-store gives this directly.
+5. **Backup target** — ODF NooBaa is in-cluster S3, which OADP uses as its primary backup target during disconnected operation when external S3 isn't reachable.
+
+The alternative, **Local Storage Operator alone** (no Ceph), was rejected for the spoke because:
+
+- Local volumes are single-node; pod rescheduling away from the node carrying the data drops storage.
+- No `ReadWriteMany` mode.
+- No S3.
+
+LSO is still in the picture, but as the **disk-discovery layer feeding ODF**, not as the storage layer itself.
+
+## Why LVMS on the hub
+
+LVMS is the right answer for compact OpenShift on VMs because:
+
+- It doesn't require dedicated data disks per node — it reads a Linux volume group on each control-plane VM.
+- The hub doesn't carry workload data; PVCs are small (Argo repo cache, GitOps state, observability ConfigMaps).
+- It's a single CSI driver with no separate operator-state complexity.
+- Each VM master gets its own LVMS LV — no inter-node replication, no quorum, no Ceph.
+
+The trade-off: hub PVCs are local to one VM. If that VM is lost, the LV goes with it. For hub workloads this is acceptable; the hub's stateful workloads (ACM observability) are regenerated from GitOps state, and durable hub data lives off-cluster (the platform-gitops GitLab repo).
+
+## The storage-client matrix
+
+| Workload | Cluster | Storage type | StorageClass / OBC | Access mode | Notes |
+| --- | --- | --- | --- | --- | --- |
+| ACM observability | hub | block | `lvms-vg1` | RWO | small PVC per metric backend |
+| OpenShift GitOps repo cache | hub | block | `lvms-vg1` | RWO | volatile |
+| Argo CD redis cache | hub | block | `lvms-vg1` | RWO | volatile |
+| Pipelines / Tekton workspaces | spoke | block | `ocs-storagecluster-ceph-rbd` | RWO | per-PipelineRun PVC |
+| CloudNativePG (Postgres) | spoke | block | `ocs-storagecluster-ceph-rbd` | RWO | one PV per pod replica |
+| Open Liberty apps | spoke | block | `ocs-storagecluster-ceph-rbd` | RWO | per-pod state where required |
+| OADP / Velero | spoke | shared FS + S3 | `ocs-storagecluster-cephfs` + NooBaa OBC | RWX + S3 | backup state + restic blobs |
+| Loki (logs) | spoke | object | OBC `loki-storage` | n/a (S3) | bridged via ESO; see page 04 |
+| Tempo (traces) | spoke | object | OBC `tempo-traces` | n/a (S3) | bridged via ESO; see page 04 |
+| Quay (image registry) | spoke | block + object | RBD PVC + OBC | RWO + S3 | image-layer blobs in S3 |
+| Compliance Operator scan results | spoke | block | `ocs-storagecluster-ceph-rbd` | RWO | workers-storage ScanSetting (ADR 0020) |
+
+## Default StorageClass posture
+
+| Cluster | Default StorageClass | Rationale |
+| --- | --- | --- |
+| `hub-dc-v6` | `lvms-vg1` | the only StorageClass on the hub |
+| `spoke-dc-v6` | `ocs-storagecluster-ceph-rbd` | block is the most common shape; if a workload needs CephFS it asks explicitly |
+
+The default is set via the `storageclass.kubernetes.io/is-default-class: "true"` annotation. See [06-storage-class-defaults](/docs/openshift-platform/storage/storage-class-defaults).
+
+## Encryption baseline
+
+ADR 0020 §Decision 8 + Carried-Forward Lessons makes two storage-encryption rules non-negotiable on `spoke-dc-v6`:
+
+- **ODF cluster-wide encryption at cluster initialization** (`storagecluster.spec.encryption.clusterWide: true`).
+- **TPM2-backed LUKS on physical worker root disks** with recovery passphrase custody outside Git.
+
+The hub has its own requirements (vTPM on VM masters, FIPS at install time) but doesn't run ODF.
+
+## Capacity baselines (illustrative)
+
+The exact disk sizes are recorded in `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/odf-storage-inventory.md`. Per-cluster general ranges:
+
+| Cluster | Storage | Approximate raw capacity |
+| --- | --- | --- |
+| `hub-dc-v6` | LVMS (sum across 3 masters) | 100s of GiB |
+| `spoke-dc-v6` | ODF (sum across 3 workers, Ceph replication factor 3) | multiple TiB raw → ~1/3 usable |
+
+Net usable depends on Ceph replication settings; ODF defaults to 3-way replication, so usable ≈ raw / 3.
+
+## Boundaries and explicit non-goals
+
+| Boundary | Why |
+| --- | --- |
+| No ODF on the hub | ADR 0004 — hub is management-only, storage-light |
+| No LVMS on the spoke | LVMS doesn't give ReadWriteMany or S3; ODF already covers block |
+| No external NFS server | adds an external dependency; ADR 0019 image rule extends to dependency surface — keep storage in-cluster |
+| No public S3 (AWS / Wasabi / etc.) | disconnected operation — external S3 not assumed reachable; NooBaa is the S3 |
+| No multi-cluster storage federation | each cluster owns its storage; cross-cluster data movement is via OADP backup-restore, not real-time replication |
+
+## Storage-related ADRs and memory
+
+- **ADR 0004** — management-only hubs.
+- **ADR 0019** — Nexus-only image supply chain (covers ODF operand image references).
+- **ADR 0020** — PCI baseline — ODF cluster-wide encryption, workers-storage ScanSetting.
+- Memory: *project_obc_to_operand_secret_bridge.md* — OBC → operand Secret shape transformation via ESO.
+- Memory: *project_eso_egress_to_vault.md* — ESO 1.1.0 in `external-secrets` namespace needs NetworkPolicy egress to Vault (relevant to the OBC bridge).
+
+## Where each topic is documented
+
+- **LSO and local volumes (the disk-discovery layer on the spoke):** [02-lso-and-local-volumes](/docs/openshift-platform/storage/lso-and-local-volumes).
+- **ODF on the spoke:** [03-odf-on-spoke](/docs/openshift-platform/storage/odf-on-spoke).
+- **NooBaa MCG and ObjectBucketClaims:** [04-noobaa-and-object-bucket-claims](/docs/openshift-platform/storage/noobaa-and-object-bucket-claims).
+- **CloudNativePG and Postgres patterns:** [05-cnpg-postgres-pattern](/docs/openshift-platform/storage/cnpg-postgres-pattern).
+- **Default StorageClass conventions:** [06-storage-class-defaults](/docs/openshift-platform/storage/storage-class-defaults).
+
+## Failure modes (cross-page summary)
+
+| Symptom | Root cause | See |
+| --- | --- | --- |
+| PVC `Pending` with no default class warning | StorageClass not annotated as default | page 06 |
+| CSI driver pod `CrashLoopBackOff` | image-pull failure for an ODF operand digest | Section 6 — disconnected image supply |
+| LokiStack `Warning Degraded` after fresh deploy | OBC Secret has wrong key shape | page 04 (OBC bridge) |
+| Backup PVC `ReadWriteMany` requested but only RBD class available | wrong StorageClass | use CephFS for RWX workloads |
+| Hub PVC won't reschedule to another VM | LVMS is node-local by design | accept the constraint or use a different cluster |
+
+## References
+
+- ADR 0004 — Management-only hubs.
+- ADR 0020 — PCI baseline.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/odf-storage-inventory.md` — disk inventory.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — LVMS, LSO, ODF versions.
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — node + worker topology.
+- Memory: *project_obc_to_operand_secret_bridge.md*.
