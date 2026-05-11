@@ -1,6 +1,5 @@
 ---
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import DocsTocNode from "../../components/DocsTocNode.astro";
 import { getCollection } from "astro:content";
 import { buildDocsTree, type NavNode } from "../../utils/navTree";
 
@@ -11,6 +10,71 @@ function countLeaves(n: NavNode): number {
   if (n.href) return 1;
   return (n.children ?? []).reduce((acc, c) => acc + countLeaves(c), 0);
 }
+
+function firstLeafHref(n: NavNode): string | undefined {
+  if (n.href) return n.href;
+  for (const c of n.children ?? []) {
+    const h = firstLeafHref(c);
+    if (h) return h;
+  }
+  return undefined;
+}
+
+// Hand-written taglines per section (keyed by the directory name *without* its
+// numeric prefix — e.g., "01-foundations" → "foundations"). New sections fall
+// back to a generic blurb.
+const SECTION_TAGLINES: Record<string, string> = {
+  "foundations":
+    "The platform's vocabulary: naming, domains, network map, credentials, glossary.",
+  "lab-infrastructure":
+    "The off-cluster substrate — DNS, edge HAProxy, object storage, Vault, Nexus, CI, observability VMs.",
+  "openshift-platform":
+    "The OpenShift fleet: install, topology, ACM, GitOps, disconnected supply, operators, networking, security, backup.",
+  "application-delivery":
+    "Build and ship: pipelines, image promotion, app patterns, environment topology.",
+  "operations":
+    "Day-2: oncall, runbooks, upgrade choreography, incident response, capacity, cost.",
+  "architecture-decisions":
+    "ADRs — the load-bearing decisions, why they were made, and what they replace.",
+  "references":
+    "Cheatsheets, command catalogs, external links, and quick lookups.",
+  "history-and-replay":
+    "Past incidents, retros, and replays — the institutional memory.",
+  "brac-poc":
+    "Proof-of-concept work for the Brac engagement: scope, environments, milestones, and decisions.",
+};
+
+// Friendlier display titles (override the auto-prettified directory name).
+const SECTION_TITLES: Record<string, string> = {
+  "foundations": "Foundations",
+  "lab-infrastructure": "Lab Infrastructure",
+  "openshift-platform": "OpenShift Platform",
+  "application-delivery": "Application Delivery",
+  "operations": "Operations",
+  "architecture-decisions": "Architecture Decisions",
+  "references": "References",
+  "history-and-replay": "History & Replay",
+  "brac-poc": "Brac POC",
+};
+
+const sectionKeyFromLabel = (label: string) =>
+  label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+const sectionCards = tree
+  .filter((n) => !n.href)
+  .map((n) => {
+    const key = sectionKeyFromLabel(n.label);
+    return {
+      title: SECTION_TITLES[key] ?? n.label,
+      tagline: SECTION_TAGLINES[key] ?? "",
+      pageCount: countLeaves(n),
+      url: firstLeafHref(n) ?? "/docs",
+    };
+  });
+
+// Top-level standalone pages (e.g., 00-welcome.mdx) surfaced as a small intro
+// list at the top of the page.
+const topPages = tree.filter((n) => n.href);
 
 const totalLeaves = tree.reduce((acc, n) => acc + countLeaves(n), 0);
 ---
@@ -24,17 +88,31 @@ const totalLeaves = tree.reduce((acc, n) => acc + countLeaves(n), 0);
       OADP backup, compliance, and admin handoff.
     </p>
     <p class="text-[var(--color-muted)] text-sm">
-      <strong>{totalLeaves}</strong> pages across <strong>{tree.length}</strong> sections.
-      Authoring is tracked under
-      <a class="underline" href="https://github.com/zeshaq/codex-opp-agent/milestone/33">Public Blog Documentation</a>.
+      <strong>{totalLeaves}</strong> pages across <strong>{sectionCards.length}</strong> sections.
     </p>
   </section>
 
-  <section class="toc">
-    {tree.map((node) => (
-      <div class="toc-section">
-        <DocsTocNode node={node} depth={0} />
-      </div>
+  {topPages.length > 0 && (
+    <section class="mb-8">
+      <ul class="docs-top-pages">
+        {topPages.map((p) => (
+          <li>
+            <a href={p.href}>{p.label}</a>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )}
+
+  <section class="track-cards">
+    {sectionCards.map((s) => (
+      <a href={s.url} class="track-card">
+        <h2 class="track-card-title">{s.title}</h2>
+        {s.tagline && <p class="track-card-tagline">{s.tagline}</p>}
+        <p class="track-card-meta">
+          {s.pageCount} {s.pageCount === 1 ? "page" : "pages"}
+        </p>
+      </a>
     ))}
   </section>
 </DocsLayout>
