@@ -1,8 +1,407 @@
 ---
 title: "Naming Conventions"
-description: "Section 01-foundations: Naming Conventions (placeholder)."
+description: "The naming patterns used across the CompTech v6 fleet — clusters, Vault paths, MinIO buckets, ESO bindings, Argo CD Applications, GitLab repos, Quay robot tokens, and platform-gitops branches."
 sidebar_label: "Naming Conventions"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Naming is the cheapest form of design. The patterns on this page exist so that an operator who has never seen a particular cluster, division, or tenant can read a single resource name and know what it is, where it belongs, and what it is allowed to talk to. The patterns are not aesthetic; they encode the ownership boundaries from ADR 0015 (federated GitOps) and ADR 0024 (OpenShift-only repo boundary), and the multi-tenant secret model from issue #174 (per-division Vault tenancy).
+
+If you are introducing a new resource, a new tenant, or a new cluster, follow these patterns. If a pattern does not exist for what you are doing, that is a signal to write an ADR before naming things — not to invent a new convention quietly.
+
+## Cluster names
+
+Active fleet:
+
+| Cluster | Role | Naming components |
+| --- | --- | --- |
+| `hub-dc-v6` | active management hub | `<role>-<datacenter>-<generation>` |
+| `spoke-dc-v6` | active workload cluster | `<role>-<datacenter>-<generation>` |
+
+Reserved (not yet built; ADR 0022):
+
+| Cluster | Role | Status |
+| --- | --- | --- |
+| `hub-dr-v6` | future v6 management DR | reserved name, no manifests |
+| `spoke-dr-v6` | future v6 workload DR | reserved name, no manifests |
+
+**Generation suffix.** The `-v6` suffix is the rebuild generation. Pre-v6 names (`hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr`) refer to the decommissioned cluster set; they may appear in historical reports but **must not appear in new manifests, plans, scripts, runbooks, or session reports** (ADR 0022).
+
+**Role prefixes.** `hub-*` is a management cluster — runs RHACM, MCE, OpenShift GitOps, gitops-addon, ACS Central. Storage-light by ADR 0004; LVMS only, no ODF. `spoke-*` is a workload cluster — runs ODF, ESO, tenant workloads, LokiStack, TempoStack, OADP, the ACS Sensor.
+
+**Datacenter token.** `dc` is the primary datacenter; `dr` is the disaster-recovery datacenter. Today the lab has one DC and reserves `dr` names; the pre-v6 DR was decommissioned and v6 DR is not built.
+
+**Cluster ingress hostnames** follow the cluster name: `*.apps.<cluster>.sub.comptech-lab.com`. So spoke ingress is `*.apps.spoke-dc-v6.sub.comptech-lab.com` and the spoke console is `console-openshift-console.apps.spoke-dc-v6.sub.comptech-lab.com`. The cluster API is `api.<cluster>.sub.comptech-lab.com:6443`.
+
+## Host names and IP allocation
+
+The lab uses a private RFC1918 `/16` divided into role-bands. **Specific addresses are kept in the private `connection-details/` runbooks**; this page documents only the allocation *pattern*, never an individual address.
+
+Allocation pattern (general):
+
+| Band | Used by | Notes |
+| --- | --- | --- |
+| `.x` (low) | Edge and infrastructure VMs | DNS, HAProxy edge, GitLab, MinIO, Nexus, Vault, Jenkins, SigNoz |
+| `.y` (mid) | OpenShift node networks | Per-cluster API and ingress VIPs |
+| `.z` (high) | Workers, dynamic hosts | Physical workers `gold-1`, `gold-2`, `gpu-01` |
+
+The hostname convention for platform VMs is `<service>.sub.comptech-lab.com` for the LAN-internal authoritative name (e.g., `pdns.local`, `nexus-mirror.sub.comptech-lab.com`, `gitlab.apps.sub.comptech-lab.com`). Edge-exposed HTTPS hostnames live under `*.apps.sub.comptech-lab.com` even though they are platform VMs and not OpenShift routes — HAProxy fronts them with the LE wildcard for that domain.
+
+The monitoring track adds a parallel `*.mon.sub.comptech-lab.com` domain for the LGTM testing VM (`grafana.mon.sub.comptech-lab.com`, etc.). This split keeps the testing observability stack out of the `*.apps.*` namespace.
+
+## Vault paths
+
+Per-division application tenancy under KV-v2 mount `secret/`:
+
+```text
+secret/apps/
+  <division>/                  # e.g. platform, payments, retail
+    <app>/                     # e.g. open-liberty-readiness-probe
+      <env>/                   # dev, stage, prod
+        <key>                  # individual secret entries
+```
+
+Examples (illustrative, not live values):
+
+```text
+secret/apps/platform/eso-smoke/dev/hello
+secret/apps/payments/checkout-api/prod/db.password
+secret/apps/retail/storefront-api/stage/api.token
+```
+
+KV-v2 access paths:
+
+| Operation | Path |
+| --- | --- |
+| Read | `secret/data/apps/<division>/<app>/<env>/<key>` |
+| List metadata | `secret/metadata/apps/<division>/<app>/<env>/` |
+| Update | `secret/data/apps/<division>/<app>/<env>/<key>` |
+
+Platform-scoped Vault paths (cluster operators, not tenant apps) live under a separate subtree (`ocp/platform/*`, `ocp/<cluster>/*`) and are bound to the platform ESO `ClusterSecretStore`, not the per-tenant `SecretStore`.
+
+**Why this shape:** one path subtree per division means a leaked role only ever exposes one division's secrets; the Vault role's namespace glob refuses to issue a token to any namespace outside that division's prefix. See [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules) for the full bridge from path → role → policy → tenant `SecretStore`.
+
+## Vault role and policy names
+
+Per-cluster, per-division roles under the cluster's Kubernetes auth mount:
+
+```text
+auth/kubernetes-<cluster>/role/apps-<cluster>-<division>
+```
+
+Examples:
+
+```text
+auth/kubernetes-spoke-dc-v6/role/apps-spoke-dc-v6-platform
+auth/kubernetes-spoke-dc-v6/role/apps-spoke-dc-v6-payments
+```
+
+ACL policy per division (cluster-agnostic):
+
+```text
+apps-<division>-read
+```
+
+The role binds a single policy to a service-account / namespace selector:
+
+```json
+{
+  "bound_service_account_names":      ["app-eso"],
+  "bound_service_account_namespaces": ["apps-<division>-*"],
+  "token_policies":                   ["apps-<division>-read"],
+  "token_ttl":                        "1h",
+  "token_max_ttl":                    "4h",
+  "audience":                         "vault"
+}
+```
+
+`app-eso` is the per-tenant ServiceAccount, created in each `apps-<division>-<app>` namespace by the tenant template — not to be confused with the platform-scoped `external-secrets-operator-controller-manager` SA used by the cluster `ClusterSecretStore`.
+
+## Tenant namespace names
+
+Tenant application namespaces use the prefix `apps-<division>-<app>`:
+
+```text
+apps-platform-eso-smoke
+apps-platform-readiness-probe
+apps-payments-checkout-api
+apps-retail-storefront-api
+```
+
+Why the prefix: the Vault role's `bound_service_account_namespaces` glob is `apps-<division>-*`, so any namespace that doesn't start with `apps-<division>-` is structurally locked out of that division's Vault role. The naming *is* the access boundary.
+
+Platform-owned (non-tenant) namespaces are prefixed by purpose:
+
+| Prefix | Purpose | Examples |
+| --- | --- | --- |
+| `openshift-*` | OCP system + Red Hat operators | `openshift-gitops`, `openshift-storage`, `openshift-pipelines` |
+| `open-cluster-management*` | RHACM hub-side resources | `open-cluster-management`, `open-cluster-management-agent` |
+| `stackrox` | ACS Sensor namespace on spokes | `stackrox` |
+| `external-secrets` | ESO operator | `external-secrets` |
+| `cert-manager` | cert-manager operator | `cert-manager` |
+| (cluster-name)-managed-cluster | Hub-side namespace per spoke | `spoke-dc-v6-managed-cluster` |
+
+## MinIO bucket and prefix names
+
+The active developer-evidence bucket is `developer-ci-evidence` with prefixes per evidence kind:
+
+```text
+developer-ci-evidence/
+  builds/      # build artifacts (90-day retention)
+  trivy/       # scan reports (180-day retention)
+  sbom/        # SBOM JSON (365-day retention)
+  releases/    # release evidence (365-day retention)
+  smoke/       # smoke-test probe data (30-day retention)
+```
+
+Lifecycle policies are attached at the prefix level so that retention is by evidence type rather than by application — the same bucket is shared across CI jobs and divisions.
+
+For platform backup/restore, per-cluster buckets:
+
+```text
+oadp-backups-<cluster>           # OADP / Velero
+acm-backups-<cluster>            # ACM DataProtectionApplication
+vault-snapshots                  # Vault raft snapshots
+loki-storage-<cluster>           # LokiStack chunks/index
+tempo-storage-<cluster>          # TempoStack traces
+```
+
+Bucket access is per-bucket least-privilege MinIO users — there is no shared "operator" account used across multiple buckets.
+
+## OBC (ObjectBucketClaim) names and the bridge to operand secrets
+
+NooBaa-backed OBCs on the spoke create an Object Bucket and a `Secret` containing `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` plus a ConfigMap with the endpoint. The LokiStack and TempoStack operators expect a **different** secret shape (`endpoint`/`bucketnames`/`access_key_id`/`access_key_secret`). The bridge is an ESO `ExternalSecret` using the `kubernetes` provider that reads the OBC Secret + ConfigMap and templates the operand Secret.
+
+OBC names follow purpose:
+
+```text
+loki-obc           -> loki-storage      (operand-shaped Secret)
+tempo-obc          -> tempo-storage     (operand-shaped Secret)
+quay-obc           -> quay-storage      (operand-shaped Secret)
+```
+
+See the memory entry `project_obc_to_operand_secret_bridge.md` for the canonical example.
+
+## ESO Secret-store and ExternalSecret names
+
+The platform-scoped `ClusterSecretStore` (used by cluster operators):
+
+```text
+vault-cluster        # ClusterSecretStore at clusters/<cluster>/secrets/eso/clustersecretstore-vault.yaml
+```
+
+The per-tenant `SecretStore` (used by tenant apps):
+
+```text
+vault-apps           # SecretStore inside each apps-<division>-<app> namespace
+```
+
+`ExternalSecret` resources reference their store by kind + name:
+
+```yaml
+spec:
+  secretStoreRef:
+    kind: SecretStore        # or ClusterSecretStore for platform-scoped
+    name: vault-apps
+```
+
+`ExternalSecret` names usually match the target K8s `Secret` name they materialize:
+
+```text
+ExternalSecret: pull-secret-app-registry  ->  Secret: pull-secret-app-registry
+ExternalSecret: db-credentials            ->  Secret: db-credentials
+```
+
+## Argo CD Application names
+
+Top-level Applications follow `<cluster>-<purpose>`:
+
+```text
+hub-dc-v6-bootstrap           # hub Argo's first Application; bootstraps the rest
+spoke-dc-v6-cluster-config    # spoke Argo's bootstrap; reconciles the spoke overlay
+```
+
+ApplicationSets generated by ACM placement use `<applicationset>-<cluster>` where the cluster is the placement decision:
+
+```text
+platform-operators-spoke-dc-v6
+platform-storage-spoke-dc-v6
+platform-observability-spoke-dc-v6
+```
+
+Tenant-scoped Applications inside `<division>-gitops` use `<division>-<app>-<env>`:
+
+```text
+platform-eso-smoke-dev
+payments-checkout-api-prod
+retail-storefront-api-stage
+```
+
+AppProject names are usually `<scope>` (`platform`, `tenant-<division>`, `system`) and bound to allowed source repos + destination namespaces.
+
+## Platform-gitops branch names
+
+Branches in `comptech-platform/openshift-ops/openshift-platform-gitops` use a phase-or-issue prefix:
+
+```text
+main                                 # protected, MR-only
+<phase-tag>                          # e.g. dev-ocp-0.4
+<phase>-<purpose>                    # e.g. pci-3-hardening-tailored-profile
+<issue-number>-<purpose>             # e.g. 153-routes-crd-cleanup
+```
+
+Phase tags come from the milestone/phase chain (PCI-0, PCI-1, PCI-1.13, PCI-2, ..., DEV-OCP-0.4, OBS-1, etc.). The branch name is set when the phase issue is opened and stays consistent through the MR. Once the MR merges, the branch is deleted on the GitLab side; the merge commit on `main` carries the phase tag in its message.
+
+The MR title convention echoes the branch:
+
+```text
+<phase-or-issue>: <one-line summary>           # MR title
+```
+
+Example titles from the recent rebuild:
+
+```text
+PCI-3: tailored profile + hardening manifests
+DEV-OCP-0.4: per-division Vault tenancy (apps-* namespaces)
+OBS-1: LokiStack + TempoStack OBC bridges via ESO kubernetes provider
+153: remove stale routes.route.openshift.io CRD on hub
+```
+
+## GitLab repo names
+
+Group layout (ADR 0015):
+
+```text
+comptech-platform/
+  openshift-ops/
+    openshift-platform-gitops          # the OpenShift platform repo
+    openshift-cluster-build            # cluster install inputs (planned)
+
+  infra-ops/
+    vm-platform-ops                    # HAProxy, PDNS, GitLab, Jenkins, Nexus, Vault, ... (planned)
+
+  platform-services/
+    platform-tools-iac                 # shared infra modules (planned)
+    platform-tools-config              # tool config via APIs / JCasC / Ansible (planned)
+
+  tenant-registry/
+    openshift-tenants                  # approved tenant metadata (optional split)
+
+divisions/
+  <division>/
+    <division>-apps-monorepo           # application source per division
+    <division>-gitops                  # deployment intent per division
+```
+
+## GitLab role-group names
+
+Role groups follow `ct-<scope>-<role>`:
+
+```text
+ct-gitlab-admins
+ct-openshift-platform-maintainers
+ct-openshift-platform-reviewers
+ct-infra-platform-maintainers
+ct-infra-platform-reviewers
+ct-cicd-platform-maintainers
+ct-security-reviewers
+ct-auditors
+ct-<division>-app-maintainers
+ct-<division>-developers
+ct-<division>-release-approvers
+```
+
+The `ct-` prefix is "CompTech." `<scope>` is the operational domain. `<role>` is the role within that scope. Adding a user directly to a project rather than to a role group is treated as drift.
+
+## Quay robot token names (per-tenant Tekton push)
+
+For tenants pushing application images through Tekton on the spoke, the convention is per-tenant Quay robot tokens delivered as dockerconfigjson Secrets in `openshift-pipelines`:
+
+```text
+Vault path:     secret/apps/<division>/<app>/ci/quay-robot
+Vault role:     apps-<cluster>-<division>             # the existing per-division role
+SecretStore:    vault-apps (in openshift-pipelines, scoped via tenant overlay)
+Secret name:    quay-robot-team-<team>                # the materialized dockerconfigjson
+```
+
+The shared `push-image-quay` Tekton Task accepts the Secret name as a parameter, so each tenant overlay supplies its own robot token without per-task duplication. See the memory entry `reference_quay_robot_token_convention.md` for the canonical pattern.
+
+## Nexus user / role names
+
+Service accounts on Nexus are scoped, not shared:
+
+| Account | Role | Permissions |
+| --- | --- | --- |
+| `admin` | full admin | break-glass only |
+| `jenkinsbot` | `nexus-jenkins-ci` | read on `docker-group`; browse+read+add+edit+delete on `docker-dev-hosted`; no access to `ocp-mirror` |
+| (per-division CI accounts, when created) | per-division role | scoped to that division's repository path |
+
+The deletion right on `docker-dev-hosted` is intentional and bounded — Jenkins removes tags it created when a downstream pipeline stage fails. It is not permission to mutate OpenShift platform mirror content.
+
+## Catalog source names
+
+Mirrored OperatorHub catalog sources on the spoke:
+
+```text
+cs-redhat-operator-index-v4-20          # Red Hat operator catalog (OCP 4.20)
+cs-certified-operator-index-v4-20       # certified operator catalog (OCP 4.20)
+clustercatalog-redhat-operator-index-v4-20      # OLM v1 ClusterCatalog
+clustercatalog-certified-operator-index-v4-20   # OLM v1 ClusterCatalog
+```
+
+The `-v4-20` suffix is the OpenShift minor version. When the cluster moves to OCP 4.21, the catalog name changes to `-v4-21` and the GitOps overlay refreshes the digest along with the name.
+
+## Image registry hostnames
+
+Three Nexus Docker endpoints, three purposes:
+
+| Hostname | Purpose | Backed by |
+| --- | --- | --- |
+| `mirror-registry.apps.sub.comptech-lab.com` | OpenShift platform mirror (`oc mirror --v2` target) | Nexus hosted repo `ocp-mirror` |
+| `docker-group.apps.sub.comptech-lab.com` | Developer / Jenkins base-image pulls | Nexus group repo `docker-group` |
+| `app-registry.apps.sub.comptech-lab.com` | CI-produced application image pushes | Nexus hosted repo `docker-dev-hosted` |
+
+**Hard rule:** apps never push to `mirror-registry`; never pull base images from `app-registry`; never push to `docker-group`. Three endpoints, three change windows, three ACL surfaces.
+
+## Image tag conventions
+
+Application images use immutable tags:
+
+```text
+<repo>:<env>-<git-sha>           # preferred
+<repo>:build-YYYYMMDD-HHMMSS     # build-id fallback
+<repo>:<jenkins-build-number>    # short fallback
+<repo>@sha256:<digest>           # canonical reference for promotion
+```
+
+`latest` is forbidden in any OpenShift manifest or Compose file. Promotion is by digest, not by re-tagging; build once, promote across `dev` → `uat` → `staging` → `prod` by referring to the same `@sha256:...` digest in each environment overlay.
+
+## Summary
+
+The naming patterns are deliberately repetitive so an operator can read a single name and triangulate every other name. A namespace called `apps-payments-checkout-api` implies:
+
+- division `payments`;
+- application `checkout-api`;
+- Vault path `secret/apps/payments/checkout-api/<env>/...`;
+- Vault role `apps-<cluster>-payments`;
+- ACL policy `apps-payments-read`;
+- ESO `SecretStore` named `vault-apps` inside the namespace;
+- GitLab repo `divisions/payments/payments-gitops` (deployment intent);
+- Argo Application `payments-checkout-api-<env>`;
+- Quay robot token Secret at `secret/apps/payments/checkout-api/ci/quay-robot`.
+
+When something doesn't follow the pattern, that is the signal to investigate before adopting the exception.
+
+## References
+
+- `connection-details/vault-app-secrets.md` — per-division Vault tenancy convention
+- `connection-details/platform-admin-handoff.md` — cluster names, operator inventory
+- `connection-details/gitlab-operator-guide.md` — GitLab group + role-group layout
+- `connection-details/nexus.md` — Nexus endpoint naming
+- `connection-details/minio.md` — bucket/prefix layout
+- `adr/0015-federated-gitops-repo-architecture.md`
+- `adr/0019-nexus-only-image-supply-chain.md`
+- `adr/0022-v6-fleet-membership.md`
+- `adr/0024-openshift-only-platform-gitops-boundary.md`
+- Memory: `reference_quay_robot_token_convention.md`, `project_obc_to_operand_secret_bridge.md`, `project_nexus_endpoint_split.md`
