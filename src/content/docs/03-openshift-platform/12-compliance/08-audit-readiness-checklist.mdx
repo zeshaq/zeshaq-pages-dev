@@ -1,0 +1,183 @@
+---
+title: "Audit Readiness Checklist"
+description: "What to hand the auditor: the evidence pack contents, the GitOps audit trail, the linked ADRs and phase issues, the residual-risk register, and the path for break-glass deeper inspection."
+sidebar_label: "Audit readiness"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This is the final §12 page: a checklist that turns "we ran the suite" into "we're ready for an auditor walkthrough." It maps the PCI-5 (issue #113) acceptance criteria from ADR 0020 onto a concrete list. Use this both for self-checks and as the contents page when packaging evidence.
+
+## The auditor's review path
+
+Per the compliance-implementor handbook, auditors review in this order:
+
+1. **The handbook itself** — `connection-details/compliance-implementor-handbook.md`. It's the working guide.
+2. **ADRs** — 0016 (workspace governance), 0018 (ACM + GitOps pull), 0019 (Nexus-only image supply), 0020 (PCI baseline), 0026 (IPv6 baseline). These are the framing decisions.
+3. **Milestone #30 issue list** — `spoke-dc-v6 PCI-DSS Compliance Baseline`. Each phase has its own issue with comments.
+4. **Phase issue comments** — PCI-0 through PCI-5 (issues #108–#113). Acceptance evidence + residual risks.
+5. **Platform GitOps commits** — every PCI-relevant resource is in GitLab `platform-gitops`. The Git SHA at each scan cycle is recorded.
+6. **Sanitized evidence pack** — MinIO `developer-ci-evidence/pci-dss/<UTC>/`. The artifact the auditor downloads.
+7. **Residual-risk register** — accompanies the evidence pack.
+
+Auditors should not need:
+
+- The `kubeadmin` password (and it should be removed entirely from the cluster).
+- GitLab write access (read-only sufficient).
+- Direct cluster-admin rights for routine review.
+- Raw scan artifacts containing sensitive values.
+
+If direct inspection is required, use time-bound, named, audited access and record the access in the relevant issue.
+
+## What's in the evidence pack
+
+A complete pack contains:
+
+```text
+pci-dss-evidence-spoke-dc-v6-<UTC>.tar.gz
+├── manifest.json
+├── summary.json                     # PASS/FAIL/MANUAL counts
+├── cluster-state.json               # FIPS / etcd / OAuth / ODF / Ingress snapshots
+├── compliance/
+│   ├── scansetting-workers-storage.yaml
+│   ├── scansettingbinding-pci-dss.yaml
+│   ├── tailoredprofile-ocp4-pci-dss-4-0-tailored.yaml
+│   ├── tailoredprofile-ocp4-pci-dss-node-4-0-tailored.yaml
+│   └── tailoring-rationale/
+│       └── <rule-name>.md           # one per tailored rule
+├── checks/
+│   ├── failing-rules.json
+│   ├── manual-rules.json
+│   ├── not-applicable-rules.json
+│   └── pass-rules-count.txt         # just the count, not the per-rule list
+├── gitops/
+│   ├── platform-gitops-sha.txt
+│   └── repo-url.txt
+├── adr/
+│   ├── 0020-pci-dss-profile-compliance-spoke-dc-v6.md
+│   ├── 0026-ipv6-baseline-for-ovn-kubernetes.md
+│   └── (referenced ADRs only — not the full set)
+├── residual-risks.md
+└── README.md                        # how to read this pack
+```
+
+The pack is self-contained: handed to an auditor with no access to the cluster, they can review the entire compliance posture from the artifacts.
+
+## Cluster-state snapshot — what's in `cluster-state.json`
+
+The cluster-state snapshot captures the invariants the auditor cares about, in sanitized form:
+
+| Invariant | Source | Sanitization |
+| --- | --- | --- |
+| OpenShift version | `clusterversion/version` | none (public version string) |
+| Compliance Operator version | CSV in `openshift-compliance` | none |
+| FIPS state per node-role | node labels + sample kernel version | "all nodes FIPS-enabled" (no per-node hostnames) |
+| etcd encryption type | `apiserver/cluster.spec.encryption.type` | none (`aesgcm`) |
+| ODF encryption clusterWide | `storagecluster.spec.encryption.clusterWide` | `true` / `false` |
+| OAuth `accessTokenInactivityTimeout` | `oauth/cluster.spec.tokenConfig` | none |
+| OAuthClient inactivity timeouts | per-client | "all OAuthClients have inactivity timeout set" or list with values |
+| Ingress TLS profile | `ingresscontroller/default.spec.tlsSecurityProfile` | none |
+| `kubeadmin` user existence | `secret/kubeadmin -n kube-system` | `removed` / `present` |
+| Image-supply check result | `scripts/openshift-image-supply-check.sh` | `0 uncovered references` |
+| Allowed-image-registries VAP | `validatingadmissionpolicy/allowed-image-registries` allowedPrefixes | the list |
+| RHACS connected | central API GET `/v1/clusters` (just status) | `healthy` / `degraded` |
+| Node count, roles | `oc get nodes -L node-role.kubernetes.io/...` | counts only ("3 master, 3 worker") |
+
+This snapshot is what closes the loop between "scan output" and "auditor's interpretation."
+
+## The residual-risk register
+
+`residual-risks.md` is the human-readable trail of every FAIL or MANUAL that won't be remediated in the current cycle. Per entry:
+
+```markdown
+## RR-NN: <short title>
+
+- Linked rule: <rule name from profile>
+- Severity: high | medium | low
+- Status: residual (tailored) | open (planned remediation)
+- Tailoring entry: yes / no — TailoredProfile name + rule name
+- Linked issue: #XXX
+- Description: <2-3 sentences>
+- Compensating control: <if any>
+- Likelihood: likely | possible | unlikely
+- Impact: <statement>
+- Review date: <next-review-date>
+```
+
+A complete register has zero "TBD" fields. Anything truly to-be-decided is a phase issue, not a residual risk.
+
+## The PCI-5 checklist
+
+Per ADR 0020 § Validation and the implementor handbook § PCI-5, before declaring a cycle complete:
+
+| Item | How to verify |
+| --- | --- |
+| ScanSetting + ScanSettingBinding manifests are in GitOps with the recorded Git SHA | `git -C platform-gitops log -1 -- clusters/spoke-dc-v6/compliance/` |
+| ComplianceSuite reached `Done` | `oc get compliancesuite pci-dss -o jsonpath='{.status.phase}'` |
+| ComplianceSuite result is `COMPLIANT`, OR every FAIL has a tailoring or remediation issue | manual review of `checks/failing-rules.json` |
+| Raw result PVC has the run's data with rotation intact | `oc get pvc -n openshift-compliance | grep rotation` |
+| Sanitized evidence pack uploaded to MinIO | `aws s3 ls s3://developer-ci-evidence/pci-dss/<UTC>/` (with the developer-ci-evidence credentials) |
+| Image-supply check reports 0 uncovered references | `scripts/openshift-image-supply-check.sh` output |
+| Residual-risk register entries all linked to GitHub issues | grep `residual-risks.md` for `#XXX` patterns |
+| All tailoring entries linked to a rationale doc + issue | inspect TailoredProfile YAMLs |
+| Phase issue updated with the cycle's evidence summary | comment on #112 / #113 |
+| `CURRENT_STATE.md` / `SESSION_LOG.md` updated | git log of codex-opp-agent |
+
+## Break-glass deeper inspection
+
+When an auditor needs to see something not in the sanitized pack:
+
+1. Auditor opens a request issue against `codex-opp-agent` describing what's needed and why.
+2. Platform admin reviews:
+   - Can the question be answered from the pack with a different cut?
+   - Does it require live cluster access?
+3. If live access is required:
+   - Grant time-bound `view` on `openshift-compliance` (no cluster-admin).
+   - Record the access window in the audit issue.
+4. After review, revoke access and close the issue with a summary comment.
+
+This break-glass path is the same shape as the standard `break-glass-procedure.md` runbook applied to audit access.
+
+## What the auditor takes away
+
+A complete review produces:
+
+- A signed (or otherwise attested) "I have reviewed the PCI-DSS compliance evidence for spoke-dc-v6 dated <date>" record on the PCI-5 issue.
+- A list of follow-up questions or recommendations from the auditor — these become new issues.
+- An updated residual-risk register if the auditor's review identifies new risks.
+
+The platform admin closes the PCI-5 issue for the cycle when all items above are landed.
+
+## Sustaining compliance — what happens between audits
+
+Per the compliance-implementor handbook § Sustaining Compliance:
+
+| Cadence | Action |
+| --- | --- |
+| Weekly (or monthly, configurable) | Compliance Operator scheduled re-run via ScanSetting cron |
+| After OpenShift minor upgrade | manual re-run + diff against last cycle |
+| After operator upgrade (Compliance Operator, ESO, RHACS, ODF) | manual re-run + check no regressions |
+| After any `platform-gitops` change to compliance/admission-policies/secrets | manual re-run |
+| Quarterly | audit the residual-risk register for stale entries |
+| Per major event (new tenant onboarded, new app pattern, etc.) | review whether the change introduced new residual risk |
+| Annually | full audit cycle, fresh evidence pack |
+
+Compliance is not a one-time scan. The evidence pack is dated; an auditor seeing a 6-month-old pack will ask why a fresh one hasn't been produced.
+
+## What this section does NOT replace
+
+- **A formal PCI assessment.** A QSA's Report on Compliance is a separate deliverable produced by the assessor, not by the platform team.
+- **An Attestation of Compliance.** Out of scope.
+- **Application-level PCI controls.** Tenant teams must produce their own evidence for app-side controls.
+- **Cardholder Data Environment scoping.** The cluster is one piece; CDE scoping is broader.
+
+ADR 0020 § Out Of Scope makes this explicit. The platform produces evidence; the assessment turns that evidence (plus other inputs) into a finding.
+
+## References
+
+- ADR 0020 (PCI-DSS profile compliance on spoke-dc-v6) — primary authority for this section.
+- ADR 0026 (IPv6 baseline) — invariant relied on by tailored rule entries.
+- `connection-details/compliance-implementor-handbook.md` § PCI-5, § Auditor Review Path.
+- `reference_compliance_implementor_handbook.md` (memory).
+- Issues #108–#113 (PCI-0 through PCI-5).
+- GitHub milestone #30.

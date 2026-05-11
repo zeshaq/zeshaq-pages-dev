@@ -1,0 +1,229 @@
+---
+title: "Compliance Operator Install"
+description: "Installing the OpenShift Compliance Operator on spoke-dc-v6: namespace, OperatorGroup, Subscription from the mirrored catalog, ProfileBundles (ocp4 + rhcos4), and the manual InstallPlan approval pattern."
+sidebar_label: "Compliance Operator"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page covers the install layer: where the Compliance Operator lives, the OperatorGroup / Subscription pattern, and what ProfileBundles materialize. PCI-2 Phase A (issue #110) implements this; the operator was installed on `spoke-dc-v6` 2026-05-10.
+
+## What we install
+
+| Field | Value |
+| --- | --- |
+| Operator | `compliance-operator` |
+| Version (rebuild lock) | `1.9.0` |
+| Catalog source | `cs-redhat-operator-index-v4-20` (mirrored Nexus) |
+| Namespace | `openshift-compliance` (created via GitOps) |
+| OperatorGroup mode | OwnNamespace |
+| Subscription channel | `release-0.1` |
+| InstallPlan approval | `Manual` |
+
+The operator is installed via GitOps under `clusters/spoke-dc-v6/compliance/`. The three core manifests are namespace, OperatorGroup, Subscription. Phase A (the install) was the first step in PCI-2 #110.
+
+## Why `openshift-compliance` (not a custom namespace)
+
+The Red Hat Compliance Operator is hard-coded in places to install into `openshift-compliance`. Custom namespaces are not supported and may break ProfileBundle materialization. We follow the Red Hat convention.
+
+The namespace is created with the OpenShift PSS labels for `restricted` to keep it consistent with the rest of the cluster, even though the operator itself uses cluster-wide privileged scopes for some pods.
+
+## The three manifests
+
+### Namespace
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-compliance
+  labels:
+    openshift.io/cluster-monitoring: "true"
+    pod-security.kubernetes.io/enforce: privileged   # the result-server needs RBD volume access
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+```
+
+The operator's result-server pod attaches RBD volumes and reads scan content from privileged paths, so the namespace is `privileged` PSS. Tenant workloads don't run here; only the operator and its operands do.
+
+`openshift.io/cluster-monitoring: "true"` opts the namespace into OpenShift Prometheus scraping so the operator's metrics are observable.
+
+### OperatorGroup
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: compliance-operator
+  namespace: openshift-compliance
+spec:
+  targetNamespaces:
+    - openshift-compliance
+```
+
+`OwnNamespace` mode (targetNamespaces = the operator's own namespace) is the documented pattern for the Compliance Operator. The CRs we'll create later (`ScanSetting`, `ScanSettingBinding`) live in `openshift-compliance` even though the *scans they cause* affect the whole cluster.
+
+### Subscription
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: compliance-operator
+  namespace: openshift-compliance
+spec:
+  name: compliance-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  channel: release-0.1
+  installPlanApproval: Manual
+  startingCSV: compliance-operator.v1.9.0
+```
+
+| Field | Why |
+| --- | --- |
+| `source` | the **mirrored** catalog, not the default `redhat-operators`. Per ADR 0019 (Nexus-only image supply), the default OperatorHub sources are disabled. |
+| `installPlanApproval: Manual` | per ADR 0025 (GitOps-only operations + break-glass discipline). Auto-upgrades are not allowed; the platform admin reviews each InstallPlan. |
+| `startingCSV` | pins the initial install to 1.9.0; the rebuild lock matches. |
+
+Manual approval means after merging the Subscription you must approve the InstallPlan:
+
+```bash
+oc -n openshift-compliance get installplan
+# NAME            CSV                          APPROVAL   APPROVED
+# install-abc12   compliance-operator.v1.9.0   Manual     false
+
+oc -n openshift-compliance patch installplan install-abc12 \
+  --type=merge -p '{"spec":{"approved":true}}'
+```
+
+Argo doesn't (and shouldn't) auto-approve InstallPlans — the approval is platform-admin scope.
+
+## What materializes
+
+After the Subscription is `AtLatestKnown` and the InstallPlan is approved, the operator CSV reaches `Succeeded`. Three things appear:
+
+1. **Operator pod** — `compliance-operator-...` Deployment.
+2. **CRDs** — `ScanSetting`, `ScanSettingBinding`, `ComplianceSuite`, `ComplianceScan`, `ComplianceCheckResult`, `ComplianceRemediation`, `ProfileBundle`, `Profile`, `Rule`, `Variable`, `TailoredProfile`.
+3. **ProfileBundles** — two of them, `ocp4` and `rhcos4`, created automatically by the operator.
+
+## ProfileBundles `ocp4` and `rhcos4`
+
+```bash
+oc -n openshift-compliance get profilebundle
+# NAME     CONTENTIMAGE                                                STATUS
+# ocp4     registry.redhat.io/compliance/openshift-compliance-content-rhel9:latest   VALID
+# rhcos4   registry.redhat.io/compliance/openshift-compliance-content-rhel9:latest   VALID
+```
+
+The `contentImage` for both is the same image — the bundle ships SCAP content for OCP-level rules (apiserver, OAuth, ingress, etcd) and RHCOS-level rules (sshd config, sysctls, file permissions on every node). The `status` should reach `VALID`; if it stays `PARSING`, the content image isn't reachable (mirror issue) or the operator can't parse it.
+
+The two bundles then materialize a set of `Profile` CRs:
+
+```bash
+oc -n openshift-compliance get profile
+# NAME                              AGE
+# ocp4-cis                          ...
+# ocp4-cis-node                     ...
+# ocp4-e8                           ...
+# ocp4-e8-node                      ...
+# ocp4-essentials-criteria          ...
+# ocp4-high                         ...
+# ocp4-high-node                    ...
+# ocp4-moderate                     ...
+# ocp4-moderate-node                ...
+# ocp4-nerc-cip                     ...
+# ocp4-nerc-cip-node                ...
+# ocp4-pci-dss                      ...   # legacy alias / current redirector
+# ocp4-pci-dss-3-2                  ...
+# ocp4-pci-dss-4-0                  ...   # **primary target**
+# ocp4-pci-dss-node-3-2             ...
+# ocp4-pci-dss-node-4-0             ...   # **primary target**
+# rhcos4-e8                         ...
+# rhcos4-high                       ...
+# rhcos4-moderate                   ...
+# rhcos4-nerc-cip                   ...
+```
+
+Our scope (per ADR 0020):
+
+- **Primary**: `ocp4-pci-dss-4-0` and `ocp4-pci-dss-node-4-0` — production gates.
+- **Secondary**: `ocp4-pci-dss-3-2` and `ocp4-pci-dss-node-3-2` — context only, not gates. Useful when comparing legacy posture against the v4.0 ruleset.
+
+Other profiles (CIS, e8, NERC-CIP, high, moderate) exist but aren't in scope for the §12 baseline.
+
+## The Profile vs ProfileBundle vs Rule vs Variable model
+
+- **ProfileBundle** — the operator's wrapper over a Red Hat content image. Two of them on this cluster.
+- **Profile** — a named selection of rules (e.g., "PCI-DSS v4 platform").
+- **Rule** — an atomic check (e.g., `ocp4-kubelet-enable-protect-kernel-defaults`).
+- **Variable** — a tunable (e.g., `ocp4-var-sshd-set-keepalive`, default `300`).
+
+Most operators won't ever look at individual `Rule` or `Variable` CRs — they pick Profiles and tune via `TailoredProfile`. The model is open for inspection when a specific rule misbehaves:
+
+```bash
+oc -n openshift-compliance get rule ocp4-kubelet-enable-protect-kernel-defaults -o yaml
+```
+
+## Disconnected-mode notes
+
+Per ADR 0019, the operator and its content image are mirrored:
+
+| Image | Mirror |
+| --- | --- |
+| `compliance-operator` | `mirror-registry.apps.sub.comptech-lab.com/compliance/compliance-operator:v1.9.0` |
+| `openshift-compliance-content-rhel9` | `mirror-registry.apps.sub.comptech-lab.com/compliance/openshift-compliance-content-rhel9` |
+
+The `contentImage` reference in each ProfileBundle is the *original* upstream path (`registry.redhat.io/...`); OpenShift's IDMS (ImageDigestMirrorSet) rewrites the pull at runtime to the local mirror. The ProfileBundle status will report the upstream path even though the actual pull went to mirror-registry.
+
+## Verification
+
+```bash
+# Subscription state
+oc -n openshift-compliance get subscription compliance-operator \
+  -o jsonpath='{.status.state}{"\n"}'
+# AtLatestKnown
+
+# CSV
+oc -n openshift-compliance get csv compliance-operator.v1.9.0 \
+  -o jsonpath='{.status.phase}{"\n"}'
+# Succeeded
+
+# ProfileBundles
+oc -n openshift-compliance get profilebundle
+# both VALID
+
+# Profile materialization
+oc -n openshift-compliance get profile | grep pci-dss
+# ocp4-pci-dss-3-2
+# ocp4-pci-dss-4-0
+# ocp4-pci-dss-node-3-2
+# ocp4-pci-dss-node-4-0
+# ocp4-pci-dss
+```
+
+PCI-2 Phase A's acceptance was "all of the above show clean" on 2026-05-10. The next phase moves on to ScanSetting + Binding.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Operator pod `ImagePullBackOff` | mirrored catalog source not synced | re-run `oc-mirror` for the operator index; verify CatalogSource pod healthy |
+| CSV stuck `Pending` | InstallPlan not approved | approve via `oc patch installplan ... approved=true` |
+| ProfileBundle `PARSING` indefinitely | content image not reachable, or IDMS misconfigured | inspect operator logs; check `oc get imagedigestmirrorset` |
+| `Profile` CRs absent after install | ProfileBundle `PARSING` or `INVALID` | resolve the ProfileBundle first; Profile materialization is downstream |
+| Operator pod restarts on RBAC errors | OperatorGroup target namespaces wrong | confirm `targetNamespaces: [openshift-compliance]` |
+
+## What comes next
+
+- [03-scansetting-and-bindings](./03-scansetting-and-bindings) — `workers-storage` ScanSetting + the PCI-DSS binding that kicks off the suite.
+- [04-pci-dss-profile-baseline](./04-pci-dss-profile-baseline) — what `ocp4-pci-dss-4-0` actually covers.
+- [05-remediation-workflow](./05-remediation-workflow) — `ComplianceCheckResult` / `ComplianceRemediation` triage.
+
+## References
+
+- ADRs: 0019 (image supply), 0020 (PCI baseline), 0025 (GitOps-only operations).
+- `connection-details/compliance-implementor-handbook.md`.
+- `connection-details/platform-admin-handoff.md` (operator version lock).
+- Red Hat OpenShift 4.20 Compliance Operator install docs.
+- Issue #110 (PCI-2).

@@ -1,0 +1,220 @@
+---
+title: "Compliance Overview (PCI-DSS on spoke-dc-v6)"
+description: "The OpenShift Compliance Operator on spoke-dc-v6: ScanSettings, ScanSettingBindings, PCI-DSS profile (v4.0), the phase chain PCI-0..PCI-5, evidence to MinIO, and the documented compliance boundary (platform evidence, not formal PCI assessment)."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 190, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const tenantBox = { background: "#dbeafe", border: "1px solid #2563eb", borderRadius: 8, padding: 8, color: "#1e3a8a", width: 200, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  // operator + content
+  { id: "co",       position: { x: 0,   y: 0   }, data: { label: "Compliance Operator\n(openshift-compliance)" }, style: ctrlBox },
+  { id: "ocp4",     position: { x: 280, y: 0   }, data: { label: "ProfileBundle\nocp4" },                          style: dataBox },
+  { id: "rhcos4",   position: { x: 280, y: 130 }, data: { label: "ProfileBundle\nrhcos4" },                        style: dataBox },
+
+  // profiles
+  { id: "p40",      position: { x: 560, y: 0   }, data: { label: "Profile\nocp4-pci-dss-4-0" },                    style: tenantBox },
+  { id: "p40node",  position: { x: 560, y: 130 }, data: { label: "Profile\nocp4-pci-dss-node-4-0" },               style: tenantBox },
+
+  // scan settings
+  { id: "ss",       position: { x: 0,   y: 200 }, data: { label: "ScanSetting\nworkers-storage" },                 style: dataBox },
+  { id: "ssb",      position: { x: 280, y: 270 }, data: { label: "ScanSettingBinding\npci-dss" },                  style: dataBox },
+
+  // scans + suite
+  { id: "suite",    position: { x: 560, y: 270 }, data: { label: "ComplianceSuite" },                              style: ctrlBox },
+  { id: "scans",    position: { x: 820, y: 270 }, data: { label: "ComplianceScan\n(per profile)" },                style: dataBox },
+  { id: "results",  position: { x: 820, y: 400 }, data: { label: "ComplianceCheckResult\n+ ComplianceRemediation" }, style: dataBox },
+
+  // storage + evidence
+  { id: "rrs",      position: { x: 280, y: 400 }, data: { label: "Raw result PVC\n(worker-scheduled)" },           style: dataBox },
+  { id: "minio",    position: { x: 0,   y: 530 }, data: { label: "MinIO bucket\ndeveloper-ci-evidence/pci-dss/" }, style: extBox },
+
+  // remediation
+  { id: "mco",      position: { x: 560, y: 530 }, data: { label: "MachineConfig\n(applied remediations)" },        style: tenantBox },
+  { id: "kubeapi",  position: { x: 820, y: 530 }, data: { label: "kube-apiserver / OAuth /\nIngress / etcd config" }, style: tenantBox },
+];
+
+export const edges = [
+  { id: "a", source: "co",      target: "ocp4",     label: "manages",         ...muted },
+  { id: "b", source: "co",      target: "rhcos4",   label: "manages",         ...muted },
+  { id: "c", source: "ocp4",    target: "p40",      label: "provides",        ...muted },
+  { id: "d", source: "rhcos4",  target: "p40node",  label: "provides",        ...muted },
+  { id: "e", source: "ssb",     target: "ss",       label: "settingsRef",     ...muted },
+  { id: "f", source: "ssb",     target: "p40",      label: "profilesRef",     ...reqEdge },
+  { id: "g", source: "ssb",     target: "p40node",  label: "profilesRef",     ...reqEdge },
+  { id: "h", source: "co",      target: "suite",    label: "creates",         ...reqEdge },
+  { id: "i", source: "suite",   target: "scans",    label: "drives",          ...reqEdge },
+  { id: "j", source: "scans",   target: "results",  label: "emits",           ...reqEdge },
+  { id: "k", source: "scans",   target: "rrs",      label: "raw results",     ...muted },
+  { id: "l", source: "rrs",     target: "minio",    label: "export (sanitized)", ...pullEdge },
+  { id: "m", source: "results", target: "mco",      label: "applies via",     ...reqEdge },
+  { id: "n", source: "results", target: "kubeapi",  label: "applies via",     ...reqEdge },
+];
+
+This section documents compliance on `spoke-dc-v6` — the workload cluster — using the OpenShift Compliance Operator, the PCI-DSS profile, and the evidence chain that lands in MinIO. The hub (`hub-dc-v6`) doesn't run PCI scans; per ADR 0020 hub provides ACM/GitOps/governance evidence only, and PCI target is the workload cluster.
+
+## What this is — and isn't
+
+The Compliance Operator runs Red Hat-provided compliance profiles against an OpenShift cluster and produces machine-readable PASS/FAIL/MANUAL evidence. The PCI-DSS profile (v4.0) is one of those profiles. We use it to produce **OpenShift platform evidence**, not a formal Report on Compliance.
+
+This is explicit per ADR 0020 (PCI-DSS baseline on spoke-dc-v6) and the compliance-implementor handbook:
+
+| Inside scope | Outside scope |
+| --- | --- |
+| Reproducible OpenShift Compliance Operator profile evidence | A formal PCI DSS Report on Compliance |
+| Documented cluster hardening | An Attestation of Compliance |
+| Documented GitOps guardrails | A QSA sign-off |
+| Sanitized evidence for an auditor / internal reviewer | Proof that applications are PCI compliant |
+| Known residual risks + manual evidence requirements | Proof that the full Cardholder Data Environment is correctly scoped |
+
+The output supports a PCI assessment; it does not substitute for one.
+
+## Versions
+
+| Component | Version | Source |
+| --- | --- | --- |
+| OpenShift | `4.20.18` | hub + spoke |
+| Compliance Operator | `1.9.0` | `cs-redhat-operator-index-v4-20` (mirrored Nexus) |
+| ProfileBundle `ocp4` | shipped with operator | `1.9.0` |
+| ProfileBundle `rhcos4` | shipped with operator | `1.9.0` |
+| Profile `ocp4-pci-dss-4-0` | shipped with operator | `1.9.0` |
+| Profile `ocp4-pci-dss-node-4-0` | shipped with operator | `1.9.0` |
+| PCI DSS version | v4.0.1 (only active version per PCI SSC after 2024-12-31) | external |
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={640} />
+
+Reading the diagram:
+
+1. **Compliance Operator** runs in `openshift-compliance`. It owns two ProfileBundles (`ocp4`, `rhcos4`) shipped with the operator image.
+2. **ProfileBundles** materialize a set of `Profile` CRs. We use `ocp4-pci-dss-4-0` and `ocp4-pci-dss-node-4-0`.
+3. **ScanSetting** `workers-storage` controls *how* scans run — worker-scheduled result server, RBD-backed raw result PVC, rotation policy.
+4. **ScanSettingBinding** ties the profiles to the setting. Creating the binding kicks off a `ComplianceSuite`.
+5. **ComplianceSuite** spawns one `ComplianceScan` per profile; each emits one `ComplianceCheckResult` per rule and one `ComplianceRemediation` per failed-but-fixable rule.
+6. **Raw result PVC** is written by the result server (RWO, RBD, worker-scheduled). Sanitized exports land in MinIO `developer-ci-evidence/pci-dss/`.
+7. **Remediations**, when applied, take effect via `MachineConfig` (node-level fixes like FIPS, SSHd config, sysctls) or direct cluster config (OAuth, Ingress, etcd encryption).
+
+## The phase chain (PCI-0 → PCI-5)
+
+Milestone #30 (`spoke-dc-v6 PCI-DSS Compliance Baseline`) breaks the work into a six-phase chain. Each phase has its own GitHub issue and must close before the next begins.
+
+| Phase | Issue | Goal |
+| --- | --- | --- |
+| `PCI-0` | #108 | Port old `spoke-dc` PCI lessons into the current baseline; finalize ADR coverage (delivered ADR 0020). |
+| `PCI-1` | #109 | Day-zero / day-one prereq validation. FIPS, vTPM, LUKS, ODF encryption, etcd encryption, OAuth, kubeadmin, IPv6 disabled-for-cluster-traffic. |
+| `PCI-2` | #110 | Deploy Compliance Operator + PCI-DSS scan desired state through GitOps. Phase A done 2026-05-10 (operator + ProfileBundles VALID). |
+| `PCI-3` | #111 | Hardening + tailoring (etcd encryption, OAuth inactivity, ODF route TLS tailoring, etc.). |
+| `PCI-4` | #112 | Run suite, remediate failures, record final state. |
+| `PCI-5` | #113 | Sanitize evidence, hand off. |
+
+Don't skip phases. If a later phase looks easy, still prove prior gates are satisfied; leave the evidence on the prior issue.
+
+## Subpage map
+
+| Page | Topic |
+| --- | --- |
+| 02 `compliance-operator` | install, OperatorGroup, Subscription, mirrored catalog |
+| 03 `scansetting-and-bindings` | the `workers-storage` ScanSetting; ScanSettingBinding patterns; suite/scan lifecycle |
+| 04 `pci-dss-profile-baseline` | what `ocp4-pci-dss-4-0` covers; rule taxonomy; the v3.2 vs v4.0 split; node vs platform profiles |
+| 05 `remediation-workflow` | reviewing `ComplianceCheckResult`s, applying remediations (auto vs manual), MachineConfig pause windows |
+| 06 `evidence-collection-and-storage` | raw result PVC, sanitized export to MinIO, evidence retention |
+| 07 `exceptions-and-waivers` | TailoredProfile narrow tailoring (e.g., ODF route TLS), exception governance |
+| 08 `audit-readiness-checklist` | what to hand the auditor; the bundle structure; what's evidence vs commentary |
+
+## Why we ship this through GitOps
+
+Per ADR 0025 (GitOps-only operations) and the compliance-implementor handbook, **every** PCI-relevant CR lives in `platform-gitops`:
+
+| Resource | Location |
+| --- | --- |
+| `Namespace/openshift-compliance` | `clusters/spoke-dc-v6/compliance/namespace.yaml` |
+| `OperatorGroup` | `clusters/spoke-dc-v6/compliance/operatorgroup.yaml` |
+| `Subscription/compliance-operator` | `clusters/spoke-dc-v6/compliance/subscription.yaml` |
+| `ScanSetting/workers-storage` | `clusters/spoke-dc-v6/compliance/scansetting-workers-storage.yaml` |
+| `ScanSettingBinding/pci-dss` | `clusters/spoke-dc-v6/compliance/scansettingbinding-pci-dss.yaml` |
+| `TailoredProfile/*` (if any) | `clusters/spoke-dc-v6/compliance/tailored-*.yaml` |
+
+Direct `oc apply` is break-glass only. The Argo Application `spoke-dc-v6-cluster-config` owns the layer and reconciles within ~3 minutes.
+
+## The non-negotiable prerequisites
+
+Carried forward from old `spoke-dc` to ADR 0020:
+
+| Prerequisite | What it means | Verification |
+| --- | --- | --- |
+| FIPS enabled from install | `fips: true` in install-config + butane `openshift.fips: true` | `oc get nodes -o jsonpath='{.items[*].status.nodeInfo.kernelVersion}'` includes `+fips` (or check `/proc/sys/crypto/fips_enabled`) |
+| vTPM on VM masters | required for LUKS unlock and TPM2-bound clevis | hypervisor config |
+| TPM2-backed LUKS on physical worker root | not a casual day-2 toggle | physical inspection / clevis status; recovery passphrase escrowed outside Git |
+| ODF cluster-wide encryption | `storagecluster.spec.encryption.clusterWide=true` from cluster init | `oc -n openshift-storage get storagecluster -o yaml \| grep encryption -A3` |
+| etcd at-rest encryption | `apiserver.spec.encryption.type: aesgcm` (OCP 4.20 prefers `aesgcm` over `aescbc`) | `oc get apiserver cluster -o yaml \| grep encryption` |
+| OAuth inactivity timeout | both cluster-OAuth and per-OAuthClient | `oc get oauth cluster -o yaml`; `oc get oauthclient` |
+| `kubeadmin` removed | after a real IdP wired | `oc get secret kubeadmin -n kube-system` returns `NotFound` |
+| `ssh-rsa` only | NOT `ssh-ed25519` (FIPS-incompatible) | install-config inspection |
+| IPv6 not used for cluster traffic | per ADR 0026 (4 verifiable invariants); host-kernel-disable forbidden (breaks OVN-K) | `oc get networks.config.openshift.io cluster -o yaml` |
+
+If any of these is missing on `spoke-dc-v6`, scans will fail rules that have no in-cluster remediation. Phase PCI-1 (issue #109) is the prereq validation pass.
+
+## Where the raw results go
+
+Per ADR 0020 / the carried-forward `workers-storage` pattern:
+
+```yaml
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
+  roles:
+    - master
+    - worker
+  rawResultStorage:
+    size: 1Gi
+    pvAccessModes: [ReadWriteOnce]
+    rotation: 3
+    storageClassName: ocs-storagecluster-ceph-rbd
+```
+
+The result-server pod is `nodeSelector`-pinned to worker nodes. The default (master placement) caused RBD attach failures on old `spoke-dc` because RBD volumes can't attach to nodes with the master taint; the worker-scheduled variant fixes it. `rotation: 3` keeps three scan generations in the PVC.
+
+## Sanitized evidence to MinIO
+
+Exports land in MinIO `developer-ci-evidence/pci-dss/` per ADR 0020. Each scan cycle produces:
+
+- ComplianceSuite name, status, timestamp
+- per-scan PASS/FAIL/MANUAL/NOT-APPLICABLE counts
+- the platform-gitops Git SHA under which the scan ran
+- the residual-risk list for FAIL and MANUAL findings
+- (sanitized) raw rule output — secrets and identifying details redacted
+
+The retention follows the `developer-ci-evidence` bucket lifecycle: see §9 (MinIO).
+
+## Failure modes (high-level — subpages cover detail)
+
+| Symptom | Cause | Subpage |
+| --- | --- | --- |
+| ProfileBundle stays `PARSING` | mirrored content image not available | 02 |
+| ComplianceSuite stuck `AGGREGATING` | result-server pod can't attach RBD | 03 |
+| Many FAILs on first run | hardening (PCI-3) not applied | 05 |
+| ODF route check flapping | one of two ODF routes reconciles to `Allow` | 07 |
+| Auditor needs evidence not in scan output | manual evidence not captured | 08 |
+
+## References
+
+- ADR 0020 (PCI-DSS profile compliance on spoke-dc-v6).
+- ADR 0026 (IPv6 baseline — verifiable invariants).
+- `connection-details/compliance-implementor-handbook.md` (canonical operator/auditor handbook).
+- `reference_compliance_implementor_handbook.md` (memory).
+- Red Hat OpenShift 4.20 Compliance Operator documentation.
+- PCI SSC v4.0.1 announcement.
+- GitHub milestone #30 (issues #108–#113).
