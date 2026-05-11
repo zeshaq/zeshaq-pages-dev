@@ -1,8 +1,283 @@
 ---
-title: "MultiClusterHub"
-description: "Section 03-openshift-platform/04-acm-multicluster: MultiClusterHub (placeholder)."
+title: "MultiClusterHub — RHACM Components on the Hub"
+description: "What the MultiClusterHub CR turns on, how MCE relates to it, which components are enabled for the v6 fleet (registration, work, placement, app-lifecycle, GRC, console), and what's deliberately disabled."
 sidebar_label: "MultiClusterHub"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const offBox  = { background: "#f3f4f6", border: "1px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#6b7280", width: 180, textAlign: "center" };
+export const subBox  = { background: "#dbeafe", border: "1.5px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1e3a8a", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const mchNodes = [
+  { id: "mch", position: { x: 350, y: 0 }, data: { label: "MultiClusterHub\nopen-cluster-management/\nmulticlusterhub" }, style: ctrlBox },
+  { id: "mce", position: { x: 720, y: 0 }, data: { label: "MultiClusterEngine\nmulticluster-engine/\nmulticluster-engine" }, style: ctrlBox },
+
+  // enabled components
+  { id: "regist", position: { x: 0,   y: 140 }, data: { label: "registration\n(via MCE)\nManagedCluster + klusterlet" }, style: subBox },
+  { id: "work",   position: { x: 200, y: 140 }, data: { label: "work\n(via MCE)\nManifestWork dispatch" }, style: subBox },
+  { id: "place",  position: { x: 400, y: 140 }, data: { label: "placement\n(via MCE)\nPlacement + Decision" }, style: subBox },
+  { id: "applc",  position: { x: 600, y: 140 }, data: { label: "app-lifecycle\nSubscription + Channel\n+ ApplicationSet" }, style: subBox },
+  { id: "grc",    position: { x: 800, y: 140 }, data: { label: "grc\nPolicy + ConfigPolicy\n+ ComplianceHistory" }, style: subBox },
+  { id: "console",position: { x: 350, y: 260 }, data: { label: "console\nACM UI on hub OpenShift console" }, style: subBox },
+  { id: "cperm",  position: { x: 550, y: 260 }, data: { label: "cluster-permission\nClusterPermission CR\n(spoke RBAC dist.)" }, style: subBox },
+  { id: "clife",  position: { x: 750, y: 260 }, data: { label: "cluster-lifecycle\nHive + CAPI provisioning" }, style: subBox },
+
+  // disabled components
+  { id: "bk",  position: { x: 0,   y: 390 }, data: { label: "cluster-backup\nDISABLED" }, style: offBox },
+  { id: "obs", position: { x: 180, y: 390 }, data: { label: "multicluster-observability\nDISABLED" }, style: offBox },
+  { id: "srch",position: { x: 360, y: 390 }, data: { label: "search\nDISABLED" }, style: offBox },
+  { id: "ins", position: { x: 540, y: 390 }, data: { label: "insights\nDISABLED" }, style: offBox },
+  { id: "rbf", position: { x: 720, y: 390 }, data: { label: "fine-grained-rbac\nDISABLED" }, style: offBox },
+  { id: "sub", position: { x: 900, y: 390 }, data: { label: "submariner-addon\nvolsync / siteconfig\nDISABLED" }, style: offBox },
+];
+
+export const mchEdges = [
+  { id: "e-mch-mce", source: "mch", target: "mce", label: "spec.overrides.components", ...muted },
+  { id: "e-mce-reg", source: "mce", target: "regist", ...muted },
+  { id: "e-mce-wrk", source: "mce", target: "work", ...muted },
+  { id: "e-mce-pl",  source: "mce", target: "place", ...muted },
+  { id: "e-mch-app", source: "mch", target: "applc", ...muted },
+  { id: "e-mch-grc", source: "mch", target: "grc", ...muted },
+  { id: "e-mch-cons",source: "mch", target: "console", ...muted },
+  { id: "e-mch-cp",  source: "mch", target: "cperm", ...muted },
+  { id: "e-mce-cl",  source: "mce", target: "clife", ...muted },
+];
+
+`MultiClusterHub` is the top-level CR that turns RHACM on. It is one object — `open-cluster-management/multiclusterhub` — whose `spec.overrides.components` list enables or disables the eight or so RHACM capability bundles. ACM's lower half is the `MultiClusterEngine` (`MCE`) operator, which provides the cluster-registration, work-dispatch, and placement controllers. The v6 hub runs both, with a deliberately small enabled-component set.
+
+## ACM and MCE, in one picture
+
+<Whiteboard client:load data={{ nodes: mchNodes, edges: mchEdges }} height={520} />
+
+Solid blue boxes are components enabled in the v6 hub. Gray dashed boxes are deliberately off. The arrows show ownership — `MultiClusterHub` owns the upper-tier capability bundles; `MultiClusterEngine` owns the core registration/work/placement controllers and feeds the upper tier.
+
+## Why both MCE and ACM
+
+`MultiClusterEngine` (MCE) is the **core**: it ships the controllers for `ManagedCluster`, `klusterlet`, `ManifestWork`, `Placement`, `PlacementDecision`, Hive `ClusterDeployment`, and the Cluster API providers. MCE can run by itself — a hub that only needs cluster registration and ManifestWork dispatch doesn't need ACM.
+
+`MultiClusterHub` (ACM) is MCE **plus** the application, governance, console, and observability pillars. Installing ACM installs MCE as a dependency and configures it via the `MultiClusterHub.spec.overrides`.
+
+The v6 fleet installs ACM (which pulls in MCE) so we get governance policies, the ACM console, and ApplicationSet-driven app delivery on top of the core registration mechanics.
+
+## Subscription + install order
+
+Two `Subscription` resources, two namespaces, one sync-wave ordering. The hub bootstrap applies them like this (paths in `clusters/hub-dc-v6/platform/acm/`):
+
+```yaml
+# namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: open-cluster-management
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+---
+# operatorgroup.yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: open-cluster-management
+  namespace: open-cluster-management
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  targetNamespaces:
+    - open-cluster-management
+---
+# subscription.yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  channel: release-2.16
+  installPlanApproval: Automatic
+  name: advanced-cluster-management
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+```
+
+MCE is created automatically when MCH lands — the ACM operator creates `MultiClusterEngine/multicluster-engine` in the `multicluster-engine` namespace. Installing it explicitly is also fine, but the v6 fleet relies on ACM to manage MCE.
+
+After the Subscription reaches `AtLatestKnown` and the CSV `advanced-cluster-management.v2.16.1` is `Succeeded`, the `MultiClusterHub` CR creation triggers the rest of the install:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: MultiClusterHub
+metadata:
+  name: multiclusterhub
+  namespace: open-cluster-management
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,ServerSideApply=true
+spec:
+  disableHubSelfManagement: false
+  overrides:
+    components:
+      - name: app-lifecycle
+        enabled: true
+      - name: cluster-lifecycle
+        enabled: true
+      - name: cluster-permission
+        enabled: true
+      - name: console
+        enabled: true
+      - name: grc
+        enabled: true
+      - name: multicluster-engine
+        enabled: true
+      - name: cluster-backup
+        enabled: false
+      - name: fine-grained-rbac
+        enabled: false
+      - name: insights
+        enabled: false
+      - name: multicluster-observability
+        enabled: false
+      - name: search
+        enabled: false
+      - name: siteconfig
+        enabled: false
+      - name: submariner-addon
+        enabled: false
+      - name: volsync
+        enabled: false
+```
+
+`disableHubSelfManagement: false` keeps `local-cluster` registered as a `ManagedCluster` — the hub manages itself in addition to managing spokes. This is what lets the hub Argo CD's `GitOpsCluster` resource target `cluster: local-cluster` for hub-side applications.
+
+## Enabled components
+
+### `multicluster-engine`
+
+The core engine. Installs in `multicluster-engine` namespace. Owns:
+
+- `ManagedCluster` API (`cluster.open-cluster-management.io/v1`)
+- `klusterlet` registration agent (deployed to spokes via the registration component)
+- `ManifestWork` API (`work.open-cluster-management.io/v1`)
+- `Placement` and `PlacementDecision` API (`cluster.open-cluster-management.io/v1beta1`)
+- `ManagedClusterSet` and `ManagedClusterSetBinding`
+- Hive (cluster provisioning, classic) and Cluster API providers
+
+### `cluster-lifecycle`
+
+The ACM-level wrapper around MCE's provisioning. Provides:
+
+- `ClusterDeployment`-driven Hive provisioning for AWS, Azure, GCP, vSphere, OpenStack, bare metal.
+- Cluster API (CAPI) provisioning, increasingly the recommended path.
+- Cluster import flows — generate a join command or `auto-import-secret` to attach an existing cluster to the hub.
+
+The v6 fleet uses **import**, not provisioning. `spoke-dc-v6` was installed agent-based outside ACM, then imported by creating a `ManagedCluster` CR (covered in [§4.2 ManagedCluster registration](/docs/03-openshift-platform/04-acm-multicluster/02-managedcluster-registration/)).
+
+### `cluster-permission`
+
+`ClusterPermission` CR for distributing RBAC to managed clusters. The hub creates a `ClusterPermission` naming the target spoke; ACM ships it as ManifestWork; the spoke materializes the corresponding ClusterRole/RoleBinding. Useful for granting break-glass access to a SecuredCluster or for tenant onboarding flows.
+
+### `app-lifecycle`
+
+The application-delivery pipe. Provides:
+
+- `Subscription` + `Channel` + `PlacementRule` (the classic RHACM application model).
+- The ManifestWork dispatch path that ApplicationSet uses for the pull model — ApplicationSet generates Applications labeled `apps.open-cluster-management.io/pull-to-ocm-managed-cluster=true`, and `app-lifecycle` wraps each one as ManifestWork.
+- The `MulticlusterApplicationSetReport` status aggregation across spokes.
+
+### `grc`
+
+Governance, Risk, Compliance — the policy pillar. Provides:
+
+- `Policy` API (`policy.open-cluster-management.io/v1`) and `ConfigurationPolicy`.
+- `PlacementBinding` to bind policies to placements.
+- `PolicySet` to group policies into bundles (CIS Benchmark, PCI-DSS, internal control set).
+- `PolicyController` on each managed cluster that evaluates the policy locally and reports compliance back.
+
+The v6 fleet currently uses GRC sparingly — the heavy lifting is in OpenShift Compliance Operator (PCI-DSS scans) on the spoke. Future use of GRC is for fleet-wide policy distribution (covered in [§4.3 policies and placement](/docs/03-openshift-platform/04-acm-multicluster/03-policies-and-placement/)).
+
+### `console`
+
+The ACM console UI plugin for the hub's OpenShift console. Accessed via the All-clusters dropdown in the top-left of the OpenShift console. Provides:
+
+- Fleet view (which clusters are healthy, which are violating policy, OCP version distribution)
+- Cluster import wizard
+- Application overview
+- Policy compliance dashboards
+
+## Deliberately disabled components
+
+### `cluster-backup`
+
+ACM's backup-and-restore operator. **Disabled** in the current MCH spec; planned re-enable when ACM backup is set up against MinIO (covered in [§4.4 ACM cluster backup](/docs/03-openshift-platform/04-acm-multicluster/04-acm-cluster-backup/)).
+
+### `multicluster-observability`
+
+Thanos-backed federated metrics layer. **Disabled** — the v6 fleet does cluster-level observability on the spoke (LokiStack + TempoStack + OpenTelemetry) and does not need a fleet-wide metrics federation today.
+
+### `search`
+
+ACM's cross-cluster Kubernetes resource search. **Disabled** — useful at scale but operationally heavy and not needed for a two-cluster fleet.
+
+### `insights`
+
+Red Hat Insights integration. **Disabled** — Insights phones home, not appropriate for a disconnected lab.
+
+### `fine-grained-rbac`
+
+The newer ACM fine-grained RBAC subsystem. **Disabled** — the v6 fleet leans on coarse-grained `ClusterRoleBinding` via `cluster-permission` instead.
+
+### `siteconfig`, `submariner-addon`, `volsync`
+
+Edge-fleet provisioning (`siteconfig`), inter-cluster networking (`submariner-addon`), CSI replication (`volsync`). **Disabled** — none in scope for the dc-lab fleet today.
+
+## Validation commands
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+
+# ACM operator
+oc --kubeconfig "$K_HUB" -n open-cluster-management get sub,installplan,csv,pods
+
+# MultiClusterHub status
+oc --kubeconfig "$K_HUB" -n open-cluster-management get multiclusterhub
+oc --kubeconfig "$K_HUB" -n open-cluster-management get multiclusterhub multiclusterhub \
+  -o jsonpath='{.status.phase}{"\n"}'
+
+# MCE status
+oc --kubeconfig "$K_HUB" -n multicluster-engine get multiclusterengine
+oc --kubeconfig "$K_HUB" -n multicluster-engine get pods
+
+# Enabled component pods
+oc --kubeconfig "$K_HUB" -n open-cluster-management get pods | head -30
+```
+
+Expected:
+
+- ACM Subscription `AtLatestKnown`, CSV `advanced-cluster-management.v2.16.1` `Succeeded`.
+- `MultiClusterHub/multiclusterhub` `status.phase: Running`.
+- `MultiClusterEngine/multicluster-engine` `status.phase: Available`.
+- Component pods running: `cluster-manager`, `multicluster-operators-application`, `multicluster-operators-channel`, `multicluster-operators-subscription`, `grc-policy-propagator`, `acm-console-*`, plus the registration and work controllers under `multicluster-engine` namespace.
+
+## Failure modes seen
+
+- **Hub OpenAPI/v2 broken by ACM's `routes.route.openshift.io` CRD.** ACM's gitops-addon ships a Route CRD intended for non-OpenShift managed clusters. On the actual OpenShift hub it duplicates the aggregated `Route` APIService and breaks `oc get --raw /openapi/v2` with a `duplicated path` error. Argo CD uses v2 and stalls silently with `ComparisonError`. Quick fix: `oc delete crd routes.route.openshift.io`. Memory: `project_acm_gitops_addon_routes_crd.md`. Tracked under issue #153.
+
+- **Hub `MultiClusterHub` stuck `Installing`.** Most common cause: a `MultiClusterEngine` dependency hasn't reached `Available`. Check `oc -n multicluster-engine get pods` and `oc -n multicluster-engine describe multiclusterengine`.
+
+- **`ManagedCluster/local-cluster` missing.** Caused by `spec.disableHubSelfManagement: true`. We keep it `false` so the hub manages itself and the local `GitOpsCluster` can target `local-cluster` as the Argo destination.
+
+## References
+
+- platform-gitops `clusters/hub-dc-v6/platform/acm/{namespace,operatorgroup,subscription,multiclusterhub}.yaml`
+- `connection-details/platform-admin-handoff.md` — hub installed-operator baseline.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — why ACM is on the hub.
+- Memory: `project_acm_gitops_addon_routes_crd.md`, `feedback_acm_gitops_pull_pattern.md`.
+- Tracker: codex-opp-agent #153 (`routes.route.openshift.io` CRD incident).

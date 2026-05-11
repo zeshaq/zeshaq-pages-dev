@@ -1,8 +1,171 @@
 ---
 title: "Spoke RBAC Extensions"
-description: "Section 03-openshift-platform/05-gitops-operating-model: Spoke RBAC Extensions (placeholder)."
+description: "Why the spoke pull-model Argo CD has a least-privilege ClusterRole, the consolidated argocd-platform-extensions pattern, the full list of API groups covered, and how to extend it for a new operator."
 sidebar_label: "Spoke RBAC Extensions"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The spoke pull-model Argo CD (`acm-openshift-gitops-argocd-application-controller`) runs **least-privilege**, not `cluster-admin`. That's the security distinction between the hub Argo and the spoke Argo. The cost is that every new operator whose API group falls outside the default allowlist needs an RBAC extension. The v6 fleet consolidates these extensions into one `ClusterRole` named `argocd-platform-extensions`. This page is the why, the live contents, and the extension recipe.
+
+## Default least-privilege ClusterRole — what's already covered
+
+The ACM gitops-addon Deployment ships an Argo CD application controller with a default ClusterRole granting:
+
+- **`get`, `list`, `watch`** on everything (cluster-wide read).
+- **`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`** on a fixed allowlist of API groups:
+  - `operators.coreos.com` (Subscription, CSV, InstallPlan, OperatorGroup)
+  - `operator.openshift.io` (subset — see "what's NOT covered" below)
+  - `user.openshift.io` (groups, users, identities)
+  - `config.openshift.io` (cluster configuration objects)
+  - `console.openshift.io` (consoleplugins, etc.)
+  - `rbac.authorization.k8s.io` (ClusterRole, ClusterRoleBinding, Role, RoleBinding)
+  - `storage.k8s.io` (StorageClass, VolumeAttachment, CSIDriver)
+  - `machine.openshift.io` (Machine, MachineSet)
+  - `machineconfiguration.openshift.io` (MachineConfig, MachineConfigPool, KubeletConfig)
+  - `compliance.openshift.io/scansettingbindings` (just that resource)
+- Core `""` — namespaces, persistentvolumes, persistentvolumeclaims, configmaps (but **not** serviceaccounts or secrets by default).
+
+Anything else hits `forbidden: User "system:serviceaccount:openshift-gitops:acm-openshift-gitops-argocd-application-controller" cannot patch resource "..." in API group "..."`. The new MR sits `OutOfSync` until the RBAC extends.
+
+## What's NOT covered, and the single home for additions
+
+`clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml` is the only place to add extensions. It is one ClusterRole called `argocd-platform-extensions` and a sibling ClusterRoleBinding that binds it to the spoke Argo's service account. Adding new groups/resources means appending rules to that ClusterRole — **not** creating per-feature ClusterRoles next to consuming manifests.
+
+The consolidation MR `!31` cleaned up the previous scatter pattern. Subsequent MR `!46` added the core `""` SA + Secret rule cluster-wide. The current full list (as of 2026-05-11):
+
+| API group | Resources | Why |
+| --- | --- | --- |
+| `external-secrets.io` | `clustersecretstores`, `secretstores`, `externalsecrets`, `clusterexternalsecrets` | ESO operands |
+| `operator.openshift.io` | `externalsecretsconfigs`, `externalsecretsmanagers` | ESO operator CRs (subset not covered by default) |
+| `networking.k8s.io` | `networkpolicies` | Default-deny baselines, allow-egress to platform VMs |
+| `platform.stackrox.io` | `centrals`, `securedclusters` | RHACS operator CRs |
+| `admissionregistration.k8s.io` | `validatingadmissionpolicies`, `validatingadmissionpolicybindings` | VAP-based guardrails |
+| `operator.tekton.dev` | `tektonconfigs` | OpenShift Pipelines config |
+| `tekton.dev` | `pipelines`, `tasks` | Pipeline templates + reusable Tasks |
+| `triggers.tekton.dev` | `eventlisteners`, `triggertemplates`, `triggerbindings` | GitLab webhook → Tekton trigger flow |
+| `loki.grafana.com` | `lokistacks` | Cluster Logging Loki backend |
+| `observability.openshift.io` | `clusterlogforwarders`, `uiplugins` | Cluster Logging + COO UI plugin |
+| `tempo.grafana.com` | `tempostacks` | Distributed tracing backend |
+| `opentelemetry.io` | `opentelemetrycollectors` | OTel collection pipeline |
+| `objectbucket.io` | `objectbucketclaims` | NooBaa MCG bucket claims for Loki/Tempo/Quay |
+| `sailoperator.io` | `istios`, `istiocnis`, `ztunnels` | OSSM 3 / Sail-based mesh |
+| `kiali.io` | `kialis` | Service mesh UI |
+| `quay.redhat.com` | `quayregistries` | On-cluster Quay registry |
+| `fileintegrity.openshift.io` | `fileintegrities` | File Integrity Operator config |
+| `""` (core) | `serviceaccounts`, `secrets`, `resourcequotas`, `limitranges` | Cluster-wide — see "the core SA+Secret rule" below |
+
+The full manifest lives at `clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml`; the ClusterRoleBinding is the sibling `clusterrolebinding.yaml`. Both are at sync-wave 0 so they land ahead of any wave-5+ resource that depends on them.
+
+## The core `""` SA + Secret rule is broader than the others
+
+The core `""` rule grants `serviceaccounts` and `secrets` cluster-wide. That's noticeably broader than the rest, which are scoped to specific operator CRs. The reasoning:
+
+Wave 2 (the spoke operator rollout) surfaced that almost every operand CR ships **companion ServiceAccounts and Secrets**: the Tempo ESO bridge SA, Quay component SAs, Tekton task SAs, etc. — each in a different namespace, sometimes multiple per namespace.
+
+The choice was:
+
+- **Scatter per-namespace `Role`/`RoleBinding` everywhere** — accurate but unwieldy, hundreds of tiny files.
+- **Grant SA + Secret cluster-wide on the spoke Argo** — concentrated rule, easy to audit.
+
+The v6 fleet chose cluster-wide. The safety argument: Argo CD only applies what is in the GitOps tree. The spoke Argo will never accidentally touch system SAs or system Secrets because those manifests aren't in `platform-gitops`. The cluster-wide grant is permission Argo *could* exercise, not permission it *will* exercise on its own.
+
+Earlier per-namespace `Role`/`RoleBinding` fixes (vault-auth in `external-secrets`, tenant template SAs, etc.) **stay in place** — they document the original safer pattern and are now redundant but harmless.
+
+## Extending for a new operator — the recipe
+
+When you install a new operator whose API group isn't in the default allowlist:
+
+1. Identify the API group(s) and resource(s) the operator's CRs use:
+
+```bash
+oc explain <kind> --recursive | head -5
+# Look at the apiVersion: e.g., grafana.integreatly.org/v1beta1 → group is "grafana.integreatly.org"
+```
+
+2. Open a feature branch in the platform-gitops clone:
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+git pull --ff-only origin main
+git checkout -b <issue-key>/argocd-extension-for-<operator>
+```
+
+3. Edit `clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml`, append:
+
+```yaml
+  - apiGroups: ["grafana.integreatly.org"]
+    resources:
+      - grafanas
+      - grafanadashboards
+      - grafanadatasources
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+4. Validate locally:
+
+```bash
+kubectl kustomize clusters/spoke-dc-v6 > /tmp/spoke.yaml
+git diff --check
+```
+
+5. Commit, push, open MR via the GitLab API (PAT at `/home/ze/codex-opp-agent/secrets/gitlab-zahid-pat`):
+
+```bash
+git add clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml CHANGELOG.md
+git commit -m "argocd-extensions: grant <verbs> on <kind> in <group>"
+git push -u origin <issue-key>/argocd-extension-for-<operator>
+
+curl --request POST \
+  --header "PRIVATE-TOKEN: <PAT>" \
+  --header "Content-Type: application/json" \
+  --data '{"source_branch":"<branch>","target_branch":"main","title":"<issue-key>: argocd extension for <operator>"}' \
+  http://30.30.30.5/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops/merge_requests
+```
+
+6. Wait for Argo sync. The new rule is sync-wave 0 so it lands ahead of the operator's CR (which is at sync-wave 20 or higher).
+
+## Detection — how to know this is the cause
+
+When a new operator's CR fails to apply on the spoke, the Argo Application status shows:
+
+```text
+OutOfSync (operationState message):
+"... is forbidden: User \"system:serviceaccount:openshift-gitops:
+   acm-openshift-gitops-argocd-application-controller\" cannot patch resource
+   \"<resource>\" in API group \"<group>\""
+```
+
+This message is the diagnostic. The fix is **always** one rule addition to the consolidated ClusterRole — same wave, same file, same binding.
+
+## When sync is stuck after applying a new rule
+
+Argo CD gives up after 5 retries with the same error. After applying a new ClusterRole rule, the spoke Argo's reconciler may still be in the failure-mode cache. To break the cycle:
+
+1. Imperatively `oc apply` the missing manifest **once** to break the cache:
+
+```bash
+oc --kubeconfig "$K_SPOKE" apply -f \
+  /tmp/spoke.yaml --selector <appropriate-label>
+```
+
+2. Hard-refresh the Application in Argo:
+
+```bash
+argocd app get spoke-dc-v6-cluster-config --hard-refresh --grpc-web
+```
+
+Argo will then own the resource going forward. This is a one-time bootstrap, not a recurring break-glass.
+
+## Hub does not have this ClusterRole
+
+`argocd-platform-extensions` exists **only** under `clusters/spoke-dc-v6/`. The hub Argo CD is bound to `cluster-admin` per [ADR 0019](/docs/06-architecture-decisions/) and doesn't need extensions.
+
+If a new operator is hub-only (e.g., a new ACM addon for hub management), it works without RBAC changes. If the same operator is also installed on the spoke (rare but possible), the spoke side needs the extension.
+
+## References
+
+- platform-gitops `clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml`, `clusterrolebinding.yaml` (the live manifests).
+- Memory: `reference_spoke_argo_extension_rbac.md` — the consolidated pattern documented at session level.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`.
+- platform-gitops MRs `!31` (consolidation) and `!46` (core SA+Secret cluster-wide).

@@ -1,8 +1,122 @@
 ---
 title: "ACM Cluster Backup"
-description: "Section 03-openshift-platform/04-acm-multicluster: ACM Cluster Backup (placeholder)."
+description: "What the ACM cluster-backup component does (when enabled), how it differs from OADP, and the planned MinIO-backed backup posture for the v6 fleet."
 sidebar_label: "ACM Cluster Backup"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The ACM `cluster-backup` component is **disabled** on `hub-dc-v6` today — the `MultiClusterHub` `spec.overrides.components` list explicitly sets `cluster-backup: enabled: false`. This page documents what it does when enabled, why it isn't yet, and the planned path to turn it on (tracked under [§13 backup-oadp / 06 acm-cluster-backup](/docs/03-openshift-platform/13-backup-oadp/06-acm-cluster-backup/)).
+
+## What ACM cluster-backup is for
+
+ACM cluster-backup is a wrapper around **OADP** (OpenShift API for Data Protection) that backs up the **hub's ACM state** — `ManagedCluster`, `Policy`, `Placement`, `Channel`, `Subscription`, `Application`, RBAC, secrets, and the various ACM CRs. It is not a backup of spoke clusters' workloads.
+
+When enabled, ACM installs:
+
+- OADP operator (`oadp-operator.v1.5.5`) on the hub.
+- A specific `BackupSchedule` CR that selects the ACM-related objects and ships them to the configured object-store backend.
+- A `Restore` CR for replaying the backup onto a second hub (the classic "hub-restore" disaster recovery posture).
+
+The matching object-store backend for the v6 fleet plan is the **MinIO VM** on the lab `/24` (the same target the workload OADP on the spoke uses), with a per-purpose bucket.
+
+## Why it is disabled today
+
+Three reasons:
+
+1. **No second hub.** ACM cluster-backup is most valuable for hub-recovery — `hub-dr-v6` doesn't exist yet (per [ADR 0022](/docs/06-architecture-decisions/)). Backing up to MinIO with no recovery target is half a solution.
+2. **The pre-v6 hub-dr ODF lesson.** The pre-v6 `hub-dr` cluster's storage recovery left a lasting impression that hub-side storage is operational risk. [ADR 0004](/docs/06-architecture-decisions/) is explicit: management hubs are storage-light. OADP on the hub needs storage for backup-operator state (Velero's `BackupRepository`, restic/kopia caches). LVMS on the hub can supply this, but the team chose to validate workload-side OADP first (on the spoke against MinIO) before adding a hub OADP install.
+3. **Day-1 fleet state is small.** ACM state on `hub-dc-v6` today is the seven fleet-registration manifests plus the MultiClusterHub overrides — all of which live in `platform-gitops` already. The fleet can be rebuilt from Git faster than from an ACM backup. As the fleet grows (more spokes, more policies, more ApplicationSets), the calculus shifts.
+
+## What enabling it looks like
+
+The future MR will:
+
+1. Flip `cluster-backup: enabled: true` in `clusters/hub-dc-v6/platform/acm/multiclusterhub.yaml`.
+2. Add an OADP `DataProtectionApplication` for the hub (separate from the spoke's). Suggested name `acm-dpa` to disambiguate from the workload `lab-dpa`.
+3. Configure the `BackupStorageLocation` to point at MinIO:
+
+```yaml
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataProtectionApplication
+metadata:
+  name: acm-dpa
+  namespace: open-cluster-management-backup
+spec:
+  configuration:
+    velero:
+      defaultPlugins:
+        - openshift
+        - aws
+        - csi
+        - kubevirt
+    nodeAgent:
+      enable: true
+      uploaderType: kopia
+  backupLocations:
+    - velero:
+        provider: aws
+        default: true
+        objectStorage:
+          bucket: acm-backup-hub-dc-v6
+          prefix: acm
+        config:
+          region: minio
+          s3ForcePathStyle: "true"
+          s3Url: http://<minio-vm-endpoint>:9000
+          insecureSkipTLSVerify: "true"
+        credential:
+          name: cloud-credentials                # ESO-materialized from Vault
+          key: cloud
+```
+
+4. Add an `ExternalSecret` to materialize the MinIO `cloud-credentials` Secret from Vault (`secret/platform/minio/acm-backup-credentials`) — same ESO + bridge pattern used for the spoke OADP (`reference_obc_to_operand_secret_bridge.md` for the rough shape).
+5. Add a `Schedule` CR for the recurring backup cadence (e.g., daily at 02:00 UTC, retention 14 days).
+
+## Backup contents (when enabled)
+
+ACM's backup definition selects:
+
+- `ManagedCluster`, `KlusterletAddonConfig`, `ManagedClusterSetBinding` — the spoke registration state.
+- `Placement`, `PlacementBinding`, `PlacementDecision` — placement state.
+- `Policy`, `PolicySet`, `ConfigurationPolicy` — governance state.
+- `Channel`, `Subscription`, `Application` (RHACM) — app-lifecycle state.
+- `ApplicationSet`, Argo CD `AppProject` — GitOps state.
+- ACM-internal resources (MCH, MCE, addons).
+- Cluster-scoped + namespaced resources in `open-cluster-management*` namespaces.
+
+Restic/kopia handles PV data backup for any PVCs in scope (Velero captures `PersistentVolumeClaim` metadata; the node agent captures PV data).
+
+Note that workload-cluster spoke state (ODF PVCs, application data) is not part of ACM cluster-backup. The workload OADP (`lab-dpa` on the spoke) handles that — see [§13.5 backup-restore drill](/docs/03-openshift-platform/13-backup-oadp/05-backup-restore-drill/).
+
+## Restore posture
+
+When the future `hub-dr-v6` exists, the disaster-recovery flow is:
+
+1. Install `hub-dr-v6` to the same OCP version as `hub-dc-v6` via the same agent-based install path.
+2. Install OpenShift GitOps and OADP on `hub-dr-v6` (bootstrap, before ACM).
+3. Configure the same `BackupStorageLocation` pointing at the same MinIO bucket.
+4. Create an ACM `Restore` CR (when ACM is installed) selecting the most recent backup.
+5. Validate `ManagedCluster/spoke-dc-v6` reappears with its labels, the `Placement` and `GitOpsCluster` reappear, and the spoke's klusterlet auto-reconnects to the new hub.
+
+The spoke survives the hub failover because the klusterlet's outbound-connection model can reconnect to a different hub at the same `api.hub-dc-v6.sub.comptech-lab.com` endpoint (DNS reassignment, or eventually the hub VIP is moved). The spoke continues to reconcile from its local platform-gitops Argo CD throughout — the hub is the coordinator, not the executor.
+
+## Reference vs reality
+
+The path described is the **planned** posture. As of 2026-05-11 the current state is:
+
+- `MultiClusterHub.spec.overrides.components[?(@.name=='cluster-backup')].enabled: false`
+- No OADP operator installed on the hub.
+- No MinIO bucket allocated for ACM backup.
+- `hub-dr-v6` not built; restore target does not exist.
+
+The first concrete step toward enabling it is workload OADP validation on the spoke (already installed) — once the spoke backup-and-restore drill is clean, the hub OADP install follows.
+
+## References
+
+- platform-gitops `clusters/hub-dc-v6/platform/acm/multiclusterhub.yaml` — current `cluster-backup: enabled: false`.
+- `connection-details/platform-admin-handoff.md` — "Planned Operator Install Queue" (OADP `1.5.5`).
+- [§13 backup-oadp](/docs/03-openshift-platform/13-backup-oadp/) — workload backup posture (the prerequisite for hub backup enablement).
+- `adr/0004-management-only-hubs.md` — storage-light hub rationale (relevant to why OADP isn't yet on the hub).
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — hub coordinator role, spoke as own reconciler (so spokes survive hub outage).
+- `adr/0022-v6-fleet-membership.md` — `hub-dr-v6` is a reserved name, not a built cluster.

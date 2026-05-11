@@ -1,8 +1,191 @@
 ---
 title: "Policies and Placement"
-description: "Section 03-openshift-platform/04-acm-multicluster: Policies and Placement (placeholder)."
+description: "How ACM Policy + ConfigurationPolicy + PlacementBinding drive governance across the fleet, how Placement selects clusters, and the v6 fleet's current minimal policy footprint."
 sidebar_label: "Policies and Placement"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+ACM's governance pillar (`grc`) is enabled on the v6 hub but used sparingly today — the active heavy lifting for compliance is done by the OpenShift Compliance Operator on the spoke (PCI-DSS profiles, [§12 compliance](/docs/03-openshift-platform/12-compliance/)). ACM Policy is the right tool for **fleet-wide** governance that has to span hub and spoke or future spokes; it is over-engineered for a single-spoke fleet. This page documents the mechanics so future fleet growth doesn't have to relearn them.
+
+## The five-CR governance model
+
+| CR | What it does |
+| --- | --- |
+| `Policy` (policy.open-cluster-management.io/v1) | Top-level governance object. Composes one or more `ConfigurationPolicy` templates. Carries a `remediationAction: inform \| enforce`. |
+| `ConfigurationPolicy` (policy.open-cluster-management.io/v1) | Declares required state for one or more resources (`object-templates`). The policy controller on the spoke evaluates this against local resources. |
+| `Placement` (cluster.open-cluster-management.io/v1beta1) | Same Placement CR used for ApplicationSet / GitOps — selects ManagedClusters by `clusterSets` + label selectors. |
+| `PlacementBinding` (policy.open-cluster-management.io/v1) | Binds a Policy (or PolicySet) to a Placement so the Placement's matched clusters receive the policy. |
+| `PolicySet` (policy.open-cluster-management.io/v1beta1) | Groups Policies into a logical bundle (e.g., "CIS Benchmark v1.7", "PCI-DSS"). Optional but useful at scale. |
+
+## A worked example: "every spoke must disable default OperatorHub sources"
+
+A minimal fleet-wide policy that ensures the Nexus-only image supply rule is enforced (and reported) on every managed cluster:
+
+```yaml
+# policy-disable-default-operatorhub.yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: disable-default-operatorhub
+  namespace: openshift-gitops
+  annotations:
+    policy.open-cluster-management.io/standards: ADR-0019
+    policy.open-cluster-management.io/categories: SC Image Supply Chain
+    policy.open-cluster-management.io/controls: ADR-0019.disable-default-operatorhub
+spec:
+  remediationAction: enforce          # change to "inform" for measure-first
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: disable-default-operatorhub
+        spec:
+          remediationAction: enforce
+          severity: high
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: config.openshift.io/v1
+                kind: OperatorHub
+                metadata:
+                  name: cluster
+                spec:
+                  disableAllDefaultSources: true
+---
+# placementbinding-disable-default-operatorhub.yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: disable-default-operatorhub
+  namespace: openshift-gitops
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: gitops-managed                # reuse the fleet-registration Placement
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: disable-default-operatorhub
+```
+
+When applied (committed to platform-gitops, reconciled by hub Argo), ACM:
+
+1. Resolves the `Placement` → `PlacementDecision` (currently `spoke-dc-v6`).
+2. Wraps the Policy as ManifestWork in the `spoke-dc-v6` namespace.
+3. The spoke's policy controller (installed via `KlusterletAddonConfig`) pulls the ManifestWork, materializes the local `Policy` object in `open-cluster-management-policies` (and a `ConfigurationPolicy` it expands from the template).
+4. The `ConfigurationPolicy` controller evaluates the policy against the local `OperatorHub/cluster`. If it matches (`musthave` + spec matches): compliant. If not, and `remediationAction: enforce`, it patches the local resource to match.
+5. Compliance status propagates back to the hub as updates to the original `Policy.status.status[]` list.
+
+## Where Policy lives in platform-gitops
+
+The v6 hub has a `clusters/hub-dc-v6/platform/policies/` slot reserved but currently empty — the fleet has not yet adopted ACM Policy as the governance vehicle. When it does, the layout is:
+
+```text
+clusters/hub-dc-v6/platform/policies/
+  kustomization.yaml
+  policy-<name>.yaml
+  placementbinding-<name>.yaml
+```
+
+PolicySets are optional:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1beta1
+kind: PolicySet
+metadata:
+  name: pci-dss-fleet
+  namespace: openshift-gitops
+spec:
+  description: PCI-DSS-aligned fleet policies for the v6 OpenShift fleet
+  policies:
+    - disable-default-operatorhub
+    - require-default-deny-ingress-netpol
+    - require-fips-mode
+```
+
+`PlacementBinding` can then bind the PolicySet (instead of each individual Policy) to a Placement, simplifying maintenance as the bundle grows.
+
+## `inform` vs `enforce`
+
+`remediationAction: inform` is **measure-only**: the spoke reports compliance but does not change anything. `enforce` makes ACM actively converge the spoke to match the declared state.
+
+The v6 fleet's preferred order:
+
+1. Author a Policy with `remediationAction: inform`.
+2. Apply, wait one evaluation cycle (default 10s-30s), inspect `Policy.status.status[].compliant`.
+3. Confirm the compliance report matches what the operator expected.
+4. Flip to `remediationAction: enforce` only after the inform report is clean.
+
+This sequence catches policy bugs (typos in CR names, missing fields) before they start mutating cluster state.
+
+## Placement reuse
+
+The `gitops-managed` Placement (in [§4.2 ManagedCluster registration](/docs/03-openshift-platform/04-acm-multicluster/02-managedcluster-registration/)) selects `env=dc, role=spoke, gitops-managed=true`. The same Placement is reused by:
+
+- the `spoke-cluster-config-pull` **ApplicationSet** to fan out per-spoke Argo Applications,
+- any **PlacementBinding** that binds Policy or PolicySet to the same set of clusters.
+
+A different fleet shape (e.g., a future "policy applies to hubs too") would add a new Placement that selects `clusterSets: [default]` with predicate `role in (hub, spoke)`, and bind to that.
+
+## Hub-side vs spoke-side policy
+
+ACM's policy controllers live in two places:
+
+- **Hub:** `governance-policy-framework`, `governance-policy-propagator`, `governance-policy-spec-sync`, `governance-policy-status-sync`. The propagator wraps Policy → ManifestWork; the status-sync reads compliance back.
+- **Spoke:** the `governance-policy-framework` addon (enabled via `KlusterletAddonConfig.spec.policyController.enabled: true`) plus `config-policy-controller` for `ConfigurationPolicy` evaluation, and `cert-policy-controller` for `CertificatePolicy`.
+
+Spoke-side controllers run in `open-cluster-management-agent-addon`. They are installed automatically by ACM when the `ManagedClusterAddon` matching the addon name appears in the spoke's hub-side namespace.
+
+## Failure modes and validation
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+K_SPOKE=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Hub: policy propagator pods
+oc --kubeconfig "$K_HUB" -n open-cluster-management get pods | egrep 'policy|propagator'
+
+# Hub: see all Policy objects + their compliance
+oc --kubeconfig "$K_HUB" get policy -A
+oc --kubeconfig "$K_HUB" get policy <name> -n openshift-gitops -o yaml | yq '.status'
+
+# Spoke: addon pods
+oc --kubeconfig "$K_SPOKE" -n open-cluster-management-agent-addon get pods | egrep 'policy'
+
+# Spoke: see the wrapped/replicated Policy
+oc --kubeconfig "$K_SPOKE" -n spoke-dc-v6 get policy
+oc --kubeconfig "$K_SPOKE" -n open-cluster-management-policies get configurationpolicy
+```
+
+Common issues:
+
+- **Policy never lands on spoke.** Usually a missing `PlacementBinding`, or the Placement returns zero decisions. Check `oc -n openshift-gitops get placementdecision`.
+- **Policy stuck NonCompliant with `enforce`.** The `ConfigurationPolicy.spec.object-templates` references a resource the spoke doesn't have (CRD missing). The policy controller can't enforce what doesn't have an API. Fix by adding the prerequisite manifest (operator install) earlier in sync-wave.
+- **Status not reporting back.** The `governance-policy-status-sync` addon on the spoke needs `policyController.enabled: true` in `KlusterletAddonConfig`. Without it, the spoke runs the controllers but the hub never sees the report.
+
+## Why the v6 fleet doesn't lean on ACM Policy yet
+
+Two reasons:
+
+1. **One spoke.** With a fleet of two clusters (one hub, one spoke), fleet-wide policy distribution is over-engineering. The same desired state is more naturally expressed in GitOps directly — every spoke gets the same `clusters/spoke-dc-v6/` directory, and any drift surfaces immediately as Argo `OutOfSync`.
+2. **Compliance Operator covers the high-value evaluations.** PCI-DSS, CIS Benchmark, and similar profile scans are owned by `compliance-operator` on the spoke, with results aggregated under `clusters/spoke-dc-v6/compliance/`. ACM Policy is a complementary tool, not a replacement.
+
+The threshold for adopting ACM Policy meaningfully is "the fleet has more than three managed clusters with diverging workload profiles" or "we need a single human-readable compliance dashboard across hub and spoke that includes non-Compliance-Operator checks". Neither is the case today.
+
+## When to use it anyway
+
+The good use cases even in a small fleet:
+
+- **Hub vs spoke divergence checks.** "Every cluster must have a default-deny ingress NetworkPolicy in `openshift-operators`" — easy to express as one Policy bound to a `role in (hub, spoke)` Placement, hard to express in two separate GitOps overlays without drift.
+- **Validating something the cluster generates.** ACM Policy can evaluate, say, "`oc get csr` shows no Pending CSRs older than 5 minutes" — a Policy with `complianceType: mustnothave` on a stale CSR. GitOps can't do that; it only knows about the manifests it owns.
+- **Reporting without mutating.** The `inform`-only mode is a fleet-wide audit lens that doesn't require GitOps coverage for everything it inspects.
+
+## References
+
+- `connection-details/platform-admin-handoff.md` — ACM operator baseline.
+- platform-gitops `clusters/hub-dc-v6/platform/acm/multiclusterhub.yaml` (`grc` enabled).
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — Placement re-use rationale.
+- Section 12 (compliance) for the Compliance Operator path that covers the active PCI-DSS work.

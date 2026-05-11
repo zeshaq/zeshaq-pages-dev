@@ -1,8 +1,261 @@
 ---
-title: "hub-dc-v6"
-description: "Section 03-openshift-platform/03-cluster-topology: hub-dc-v6 (placeholder)."
+title: "hub-dc-v6 — Management Cluster Topology"
+description: "Compact 3-master VM-only management cluster: OS, version, control plane, storage choice (LVMS, no ODF), GitOps, ACM/MCE, RHACS Central, and image-supply baseline."
 sidebar_label: "hub-dc-v6"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const hubBox  = { background: "#dbeafe", border: "1.5px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1e3a8a", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" } };
+
+export const hubNodes = [
+  { id: "cluster", position: { x: 320, y: 0 }, data: { label: "hub-dc-v6\nCompact 3-master VM\nOCP 4.20.18 FIPS=on" }, style: hubBox },
+
+  { id: "m0", position: { x: 100, y: 130 }, data: { label: "master-0 (rendezvous)\netcd / api / scheduler" }, style: ctrlBox },
+  { id: "m1", position: { x: 320, y: 130 }, data: { label: "master-1\netcd / api / scheduler" }, style: ctrlBox },
+  { id: "m2", position: { x: 540, y: 130 }, data: { label: "master-2\netcd / api / scheduler" }, style: ctrlBox },
+
+  { id: "gitops", position: { x: 50,  y: 290 }, data: { label: "OpenShift GitOps 1.20.3\n(OLM CSV)\nhub Argo CD" }, style: dataBox },
+  { id: "acm",    position: { x: 250, y: 290 }, data: { label: "ACM 2.16.1\n+ MCE 2.11.1\nMultiClusterHub" }, style: dataBox },
+  { id: "lvms",   position: { x: 450, y: 290 }, data: { label: "LVMS 4.20.0\n(node-local LVM)\nfor RHACS Central PVCs" }, style: dataBox },
+  { id: "rhacs",  position: { x: 650, y: 290 }, data: { label: "RHACS Central 4.10.2\n+ ScannerV4 + DB" }, style: dataBox },
+
+  { id: "eso", position: { x: 50,  y: 420 }, data: { label: "ESO 1.1.0\n(Vault Kubernetes auth)" }, style: dataBox },
+  { id: "cm",  position: { x: 250, y: 420 }, data: { label: "cert-manager 1.19.0\n(internal CA + Let's Encrypt)" }, style: dataBox },
+  { id: "ir",  position: { x: 450, y: 420 }, data: { label: "image-registry: Removed\n(no PV/SC on hub)" }, style: dataBox },
+  { id: "appset", position: { x: 650, y: 420 }, data: { label: "ApplicationSet\nspoke-cluster-config-pull" }, style: dataBox },
+];
+
+export const hubEdges = [
+  { id: "e-c-m0", source: "cluster", target: "m0", ...muted },
+  { id: "e-c-m1", source: "cluster", target: "m1", ...muted },
+  { id: "e-c-m2", source: "cluster", target: "m2", ...muted },
+  { id: "e-c-g", source: "cluster", target: "gitops", label: "reconciles clusters/hub-dc-v6/", ...pullEdge },
+  { id: "e-c-a", source: "cluster", target: "acm", ...muted },
+  { id: "e-c-l", source: "cluster", target: "lvms", ...muted },
+  { id: "e-l-r", source: "lvms", target: "rhacs", label: "PVC backing", ...reqEdge },
+  { id: "e-c-e", source: "cluster", target: "eso", ...muted },
+  { id: "e-c-cm", source: "cluster", target: "cm", ...muted },
+  { id: "e-c-ir", source: "cluster", target: "ir", ...muted },
+  { id: "e-a-aps", source: "acm", target: "appset", label: "drives placement", ...muted },
+];
+
+`hub-dc-v6` is the compact management cluster — three masters and no workers. It runs the fleet's control plane: hub Argo CD, ACM MultiClusterHub, MCE, the ApplicationSet that drives the pull model, RHACS Central (with LVMS-backed storage), External Secrets Operator, and cert-manager. It does **not** run ODF, NooBaa, OpenShift Pipelines, or logging/tracing/observability operators ([ADR 0004](/docs/06-architecture-decisions/)).
+
+## What's on the cluster
+
+<Whiteboard client:load data={{ nodes: hubNodes, edges: hubEdges }} height={580} />
+
+## Cluster shape
+
+| Item | Value |
+| --- | --- |
+| Cluster name | `hub-dc-v6` |
+| Base domain | `sub.comptech-lab.com` |
+| OCP version | `4.20.18` |
+| Topology | Compact 3-node VM-only control plane (no workers) |
+| Install method | Agent-based, disconnected |
+| FIPS | Enabled |
+| etcd encryption | Enabled |
+| Disk encryption | TPM2-backed LUKS via `99-master-tpm2-encryption.bu` |
+| Network | `OVNKubernetes`, `clusterNetwork=10.128.0.0/14`, `serviceNetwork=172.30.0.0/16`, `machineNetwork=30.30.0.0/16` |
+| API VIP | `30.30.75.10` |
+| Ingress VIP | `30.30.75.11` |
+| Masters | `30.30.75.13` / `.14` / `.15` (`master-0` / `-1` / `-2`) |
+| API | `https://api.hub-dc-v6.sub.comptech-lab.com:6443` |
+| Console | `https://console-openshift-console.apps.hub-dc-v6.sub.comptech-lab.com` |
+
+## Why compact 3-master
+
+A compact cluster is OpenShift's pattern for a control-plane-only cluster where the masters are also workers (they have the `node-role.kubernetes.io/master` and `node-role.kubernetes.io/worker` labels both). It is the right shape for a management hub because:
+
+- the management workload (Argo CD, ACM, MCE, RHACS Central, ESO operator pods) is small enough to fit on three nodes.
+- there are no application workloads to isolate from the control plane.
+- doubling the cluster to six nodes (3 masters + 3 dedicated workers) would add hardware cost without adding value.
+
+The trade-off: the cluster cannot tolerate two simultaneous master failures (it loses etcd quorum), and the masters carry both the control plane and the management workload load. Both are accepted in this design.
+
+## Storage posture — LVMS only
+
+[ADR 0004](/docs/06-architecture-decisions/) is "Keep Management Hubs Storage-Light":
+
+- **LVMS is installed** on the hub. It provides node-local LVM-backed PersistentVolumes via the TopoLVM CSI driver. The default StorageClass is `lvms-vg1` and is consumed by RHACS Central, RHACS DB, and RHACS Scanner V4 components.
+- **ODF / NooBaa is not installed** on the hub. The lessons from the pre-v6 `hub-dr` storage recovery were that hub-local ODF added more operational risk (stale finalizers, NooBaa RBD-PVC dependency, LVMS device-set mistakes) than value. ACM backup/restore uses external MinIO instead.
+- **OpenShift Pipelines, logging, tracing, NooBaa, observability stacks are not installed** on the hub. They live on the workload cluster (`spoke-dc-v6`) where ODF backs them.
+- **The internal OpenShift image registry is `Removed`** — `Config.imageregistry/cluster.spec.managementState=Removed`, no PV, no SC. The hub does not need to host an in-cluster image registry; workloads pull from Nexus.
+
+`Config.imageregistry/cluster`:
+
+```yaml
+apiVersion: imageregistry.operator.openshift.io/v1
+kind: Config
+metadata:
+  name: cluster
+spec:
+  managementState: Removed
+```
+
+This is intentional design, not drift. The memory entry `feedback_acm_gitops_pull_pattern.md` calls this out explicitly.
+
+## Installed operators (as of 2026-05-11)
+
+| Operator | CSV |
+| --- | --- |
+| OpenShift GitOps Operator | `openshift-gitops-operator.v1.20.3` |
+| Advanced Cluster Management | `advanced-cluster-management.v2.16.1` |
+| Multicluster Engine | `multicluster-engine.v2.11.1` |
+| LVMS (TopoLVM CSI) | `lvms-operator.v4.20.0` |
+| RHACS Operator | `rhacs-operator.v4.10.2` |
+| External Secrets Operator | `external-secrets-operator.v1.1.0` |
+| OpenShift cert-manager Operator | `cert-manager-operator.v1.19.0` |
+
+The Subscriptions live in `clusters/hub-dc-v6/operators/*` (cert-manager, ESO, LVMS, RHACS) and `clusters/hub-dc-v6/platform/acm/` (ACM). OpenShift GitOps was installed first (via the day-1 bootstrap), so it does not appear under `operators/`; its install lives in the pre-GitOps bootstrap state and is recorded in `connection-details/openshift-gitops-hub-dc-v6.md`.
+
+## ACM MultiClusterHub configuration
+
+The hub runs ACM with a curated set of components enabled:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: MultiClusterHub
+metadata:
+  name: multiclusterhub
+  namespace: open-cluster-management
+spec:
+  disableHubSelfManagement: false
+  overrides:
+    components:
+      - name: app-lifecycle
+        enabled: true
+      - name: cluster-lifecycle
+        enabled: true
+      - name: cluster-permission
+        enabled: true
+      - name: console
+        enabled: true
+      - name: grc
+        enabled: true
+      - name: multicluster-engine
+        enabled: true
+      - name: cluster-backup
+        enabled: false
+      - name: fine-grained-rbac
+        enabled: false
+      - name: insights
+        enabled: false
+      - name: multicluster-observability
+        enabled: false
+      - name: search
+        enabled: false
+      - name: siteconfig
+        enabled: false
+      - name: submariner-addon
+        enabled: false
+      - name: volsync
+        enabled: false
+```
+
+What's enabled:
+
+- `app-lifecycle` — Application/Subscription/Channel and the ManifestWork distribution pipe.
+- `cluster-lifecycle` — `ManagedCluster`, `ManagedClusterSet`, Hive and Cluster API provisioning.
+- `cluster-permission` — `ClusterPermission` CR for spoke RBAC distribution.
+- `console` — ACM UI under the hub's OpenShift console.
+- `grc` — Governance / Policy / Compliance pillar.
+- `multicluster-engine` — registration, work, placement controllers.
+
+What's disabled (will be re-enabled per tracked issue when added):
+
+- `cluster-backup` — ACM backup/restore. Planned re-enable under [§4.4 ACM cluster backup](/docs/03-openshift-platform/04-acm-multicluster/04-acm-cluster-backup/).
+- `multicluster-observability` — Thanos-backed federation. Not in scope; observability lives on the spoke.
+- `search`, `insights`, `siteconfig`, `submariner-addon`, `volsync` — not in scope for this fleet.
+- `fine-grained-rbac` — leveraging coarse-grained `ClusterRoleBinding` via `cluster-permission` instead.
+
+## RHACS Central on the hub
+
+RHACS Central runs on the hub because:
+
+- Central is the policy server and UI for the whole fleet; running it on the management cluster keeps its blast radius low.
+- The hub has LVMS for the Central, Central DB, and Scanner V4 PVCs. Moving Central to the spoke would have meant either making the spoke depend on the hub (wrong direction for the pull model) or using ODF for Central (defeats the storage-light hub posture for no operational gain).
+
+RHACS Central reads pull-secret config from a hub Secret seeded by ESO from Vault (`secret/platform/rhacs/central-htpasswd`), and the init-bundle for the spoke `SecuredCluster` is generated by hitting Central's `/v1/cluster-init/init-bundles` API and pushing the resulting `kubectlBundle` Secrets into Vault for ESO delivery on the spoke (memory: `reference_rhacs_init_bundle_via_api.md`). The bundle is never committed.
+
+## Hub Argo CD configuration
+
+Single Argo CD instance per OpenShift GitOps default: `openshift-gitops/openshift-gitops`. It is bound to `cluster-admin` so it can install operators and write cluster-scoped resources on the hub itself. The hub Argo CD's `cluster-admin` posture is recorded in [ADR 0019](/docs/06-architecture-decisions/) and the memory entry `feedback_acm_gitops_pull_pattern.md`.
+
+Hub Argo serves three roles:
+
+1. Reconciles `clusters/hub-dc-v6/` from internal GitLab via the `hub-dc-v6-bootstrap` Application.
+2. Hosts the `spoke-cluster-config-pull` ApplicationSet that generates per-spoke Applications.
+3. Hosts the AppProject `hub-dc-v6-platform` that restricts hub Argo to the LAN GitLab source.
+
+## Image supply on the hub
+
+The hub uses the same Nexus mirror-registry as the spoke. IDMS / ITMS / CatalogSources for the hub live under:
+
+```text
+clusters/hub-dc-v6/platform/image-mirrors/
+clusters/hub-dc-v6/platform/catalogs/
+clusters/hub-dc-v6/platform/admission-policies/   # OperatorHub disable + future VAP
+```
+
+Default external OperatorHub sources are disabled (`OperatorHub/cluster.spec.disableAllDefaultSources: true`). The `cs-redhat-operator-index-v4-20` CatalogSource is the source for ACM, MCE, GitOps, LVMS, RHACS, ESO, and cert-manager Subscriptions.
+
+> Note: per `feedback_acm_gitops_pull_pattern.md`, the hub's IDMS/ITMS were applied during the day-1 install bootstrap from oc-mirror output, and the durable manifests under `clusters/hub-dc-v6/platform/image-mirrors/` represent the same state. Reproducing the hub from scratch means re-running install bootstrap, then GitOps takes over.
+
+## Health snapshot commands
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+
+# Cluster baseline
+oc --kubeconfig "$K_HUB" get nodes -o wide
+oc --kubeconfig "$K_HUB" get clusterversion version
+oc --kubeconfig "$K_HUB" get co | awk \
+  'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'
+
+# OpenShift GitOps
+oc --kubeconfig "$K_HUB" -n openshift-gitops-operator get sub,installplan,csv,pods
+oc --kubeconfig "$K_HUB" -n openshift-gitops get argocd,pods,route
+
+# ACM / MCE
+oc --kubeconfig "$K_HUB" -n open-cluster-management get sub,installplan,csv
+oc --kubeconfig "$K_HUB" get multiclusterhub -A
+oc --kubeconfig "$K_HUB" get managedcluster
+
+# LVMS + RHACS
+oc --kubeconfig "$K_HUB" -n openshift-storage get pods   # LVMS
+oc --kubeconfig "$K_HUB" -n stackrox get pods            # RHACS Central + ScannerV4 + DB
+
+# Bootstrap Application
+oc --kubeconfig "$K_HUB" -n openshift-gitops get app hub-dc-v6-bootstrap \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+```
+
+Expected steady state:
+
+- All three masters `Ready`.
+- ClusterVersion `4.20.18`, `Available=True`, `Progressing=False`.
+- No degraded ClusterOperators.
+- All operator namespaces healthy.
+- `MultiClusterHub` `Running`; `ManagedCluster/spoke-dc-v6` `Available=True`.
+- `hub-dc-v6-bootstrap` Application `Synced Healthy`.
+
+## References
+
+- `connection-details/openshift-hub-dc-v6.md` — endpoints, credential custody, validation commands.
+- `connection-details/openshift-gitops-hub-dc-v6.md` — Argo CD instance details, repo + AppProject + Application wiring.
+- `connection-details/platform-admin-handoff.md` — installed-operator baseline, validation checklist.
+- `adr/0004-management-only-hubs.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0022-v6-fleet-membership.md`.
+- platform-gitops `clusters/hub-dc-v6/` tree.
+- Memory: `feedback_acm_gitops_pull_pattern.md`, `reference_rhacs_init_bundle_via_api.md`.

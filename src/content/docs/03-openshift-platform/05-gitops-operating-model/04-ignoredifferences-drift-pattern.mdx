@@ -1,8 +1,179 @@
 ---
-title: "ignoreDifferences Drift Pattern"
-description: "Section 03-openshift-platform/05-gitops-operating-model: ignoreDifferences Drift Pattern (placeholder)."
-sidebar_label: "ignoreDifferences Drift Pattern"
+title: "Pull Model vs Hub-Render, and the ignoreDifferences Drift Pattern"
+description: "Why the v6 fleet prefers the pull model over hub-render execution, and how ignoreDifferences keeps Argo CD calm against mutating operator controllers."
+sidebar_label: "Pull vs Hub-Render + ignoreDifferences"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Two GitOps patterns sit next to each other in OpenShift documentation: **pull model** (each cluster reconciles itself from a shared repo) and **hub-render / hub-push** (the hub's Argo CD has cluster secrets for every spoke and applies into them remotely). The v6 fleet picked pull. This page is why, and follows with the `ignoreDifferences` rule that keeps the pattern stable in the face of operators that rewrite their own CRs after creation.
+
+## Pull model vs hub-render — the side-by-side
+
+| Property | Pull model (this fleet) | Hub-render / hub-push |
+| --- | --- | --- |
+| Who applies to the spoke | The spoke's local Argo CD | The hub's Argo CD, via a cluster secret pointing at the spoke API |
+| Spoke needs to reach hub API | Yes (klusterlet outbound to ACM ManifestWork dispatch) | No |
+| Hub needs to reach spoke API | **No** | Yes — hub holds spoke kubeconfig |
+| Survives spoke→hub network partition | Yes — spoke continues to reconcile from local Argo against local API | No — hub Argo cannot reach the spoke |
+| Survives hub failure | Yes — spoke continues with last-known desired state | No — hub down means no apply |
+| Repo credential location | Both clusters (hub and spoke) have repo creds | Only the hub |
+| Argo CD load | Distributed — each cluster reconciles its own state | Concentrated — hub Argo reconciles every spoke |
+| Application status visibility | Aggregated via ACM `MulticlusterApplicationSetReport` | Direct in hub Argo CD UI |
+| Cluster secrets in Argo | Only `local-cluster` | One per spoke (with kubeconfig in Secret) |
+| Argo CD Agent compatible | No — uses ACM's app-lifecycle pillar | n/a (pre-Argo CD Agent pattern) |
+
+## Why pull, in three reasons
+
+### 1. Operational independence
+
+The lab's two clusters share the same hypervisor and the same lab network — but the design is meant to scale to fleets where:
+
+- the spoke is at a remote site behind NAT
+- the spoke's link to the hub is unreliable
+- the spoke needs to keep running when the hub is being upgraded or replaced
+
+Pull model preserves these properties at any fleet size. Hub-render does not — it assumes the hub-to-spoke control plane is always open.
+
+### 2. Avoids the hub-heavy executor anti-pattern
+
+[ADR 0018](/docs/06-architecture-decisions/) frames the v6 design as a step away from the pre-v6 hub-heavy pattern:
+
+> Previous hub-heavy GitOps operation put too much pressure on the management cluster.
+
+A hub running Argo CD reconcilers for every spoke is a single point of contention. With one or two spokes it doesn't bite; with twenty or two hundred, the hub becomes the bottleneck (Argo CD application controller is single-process per Application).
+
+### 3. Spoke owns its own RBAC
+
+In the pull model, the spoke Argo's ClusterRole defines what *it* can do on its own cluster. In hub-render, the hub Argo has spoke `cluster-admin` via a Secret. The blast radius if the hub Argo is compromised is much larger in hub-render — every spoke's API server, simultaneously.
+
+The pull model's compensating constraint is that the spoke Argo's least-privilege ClusterRole has to be maintained as new operators land (see [§5.5 spoke extension RBAC](/docs/03-openshift-platform/05-gitops-operating-model/05-spoke-rbac-extensions/)). That's a real maintenance cost, but it's a cost on the security side of the ledger.
+
+## The trade-offs we accept
+
+Pull isn't free:
+
+- **Two Argo CD instances** — one on hub, one on spoke. Each needs its own repo credential, its own image-supply rules, its own backup considerations.
+- **Spoke needs egress to the hub's ACM controllers.** klusterlet's outbound connection is on the same lab network here, but in a real WAN deployment the spoke has to be able to reach the hub on tcp/6443 (assisted-service / cluster-manager registration endpoints).
+- **ApplicationSet status is one level removed.** The hub Argo's view of the spoke's Application is "ManifestWork shipped". The actual sync/health status comes from `MulticlusterApplicationSetReport` (an aggregation), not from the hub Argo UI directly. Operators get used to checking the spoke Argo for the real picture.
+
+## The `ignoreDifferences` problem
+
+Argo CD's reconcile loop compares the desired state (manifest from Git) to the live state (cluster). If they differ, the Application is `OutOfSync`. With `selfHeal: true`, Argo CD then patches the live state to match desired.
+
+The problem: **many operator controllers mutate their own CRs after creation**. They add defaults, normalize values, fill in computed fields. Argo CD sees the mutated live state, the unmutated desired state, decides it's `OutOfSync`, and patches. The controller mutates again. Sync war.
+
+`ignoreDifferences` is the rule "Argo, pretend this field doesn't exist for comparison purposes". It lets the controller own the field.
+
+## Three patterns for managing this
+
+### Pattern A — ignoreDifferences at the ApplicationSet level
+
+Used in `spoke-cluster-config-pull` for `ExternalSecret`, `DataProtectionApplication`, and `LVMCluster`. The rule is global to every Application the AppSet generates:
+
+```yaml
+ignoreDifferences:
+  - group: external-secrets.io
+    kind: ExternalSecret
+    jsonPointers:
+      - /spec/target/deletionPolicy
+    jqPathExpressions:
+      - .spec.data[].remoteRef.conversionStrategy
+      - .spec.data[].remoteRef.decodingStrategy
+      - .spec.data[].remoteRef.metadataPolicy
+```
+
+This is the right pattern when:
+
+- the mutating fields are the same across all consumers of the CR
+- many manifests use the CR (so per-resource exceptions would be repetitive)
+- the field never carries meaningful intent in our manifests (it's always controller-owned)
+
+### Pattern B — explicitly write the default in the manifest
+
+Sometimes the right move is to write the default value Argo sees from the controller, so there's nothing to diff:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: rhacs-init-bundle
+  namespace: stackrox
+spec:
+  target:
+    name: collector-tls
+    deletionPolicy: Retain          # match controller default
+  data:
+    - secretKey: tls.crt
+      remoteRef:
+        key: platform/rhacs/spoke-dc-v6/init-bundle
+        property: collector-tls.crt
+        conversionStrategy: Default # match controller default
+        decodingStrategy: None      # match controller default
+        metadataPolicy: None        # match controller default
+```
+
+This is more verbose but the manifest accurately represents the intended state. Useful when:
+
+- the field carries intent we want to lock down (we *do* want `deletionPolicy: Retain`)
+- the field's default could change between operator versions
+- we have only one or two consumers of the CR
+
+The v6 fleet uses Pattern A on the AppSet because the operands above are stable and the explicit fields would add noise to every manifest. New operands lean toward Pattern B unless the same fields surface in many manifests.
+
+### Pattern C — Server-Side Apply with field manager
+
+OpenShift GitOps 1.20 supports server-side apply (the `ServerSideApply=true` syncOption). Server-side apply lets each controller own specific fields by registering as a "field manager". When two managers disagree, the conflict is reported, not silently overwritten.
+
+```yaml
+syncOptions:
+  - ServerSideApply=true
+```
+
+The v6 fleet has SSA enabled everywhere via the AppSet template's `syncOptions`. SSA reduces but doesn't eliminate the need for `ignoreDifferences` — for fields the operator controller *adds* after creation (rather than mutates from a value we set), SSA still surfaces the diff. `ignoreDifferences` is the explicit "this is intentional" annotation.
+
+## Finding fields to ignore
+
+When a sync goes `OutOfSync` and `selfHeal: true` keeps reverting a controller's changes:
+
+```bash
+# See exactly what's diffing
+oc --kubeconfig "$K" -n openshift-gitops describe app <app-name>
+# Look for "DriftDetail" or "Differences"
+
+argocd app diff <app-name> --grpc-web
+# Shows the live vs desired diff with line numbers
+```
+
+Walk the diff output. Each red/green field is a candidate. If the controller is the source of truth for the field, add it to `ignoreDifferences`. If our manifest should be the source of truth, fix the manifest.
+
+## A list of operators known to add fields after creation
+
+From the v6 fleet's observed behavior:
+
+| Operator | CR | Fields added |
+| --- | --- | --- |
+| External Secrets Operator 1.1.0 | `ExternalSecret` | `spec.target.deletionPolicy`, `spec.data[].remoteRef.{conversionStrategy,decodingStrategy,metadataPolicy}` |
+| OADP 1.5.5 | `DataProtectionApplication` | `spec.logFormat`, `spec.configuration.velero.disableFsBackup` |
+| LVMS 4.20.0 | `LVMCluster` | `spec.storage.deviceClasses[].thinPoolConfig.{chunkSizeCalculationPolicy,metadataSizeCalculationPolicy}` |
+| ODF 4.20.10 | `StorageCluster` | `spec.{storageDeviceSets[].config.tuneFastDeviceClass,monPVCTemplate.metadata}` (many fields; see ODF docs) |
+| OpenShift cert-manager 1.19.0 | `Certificate` | `spec.privateKey.{algorithm,encoding,size,rotationPolicy}` defaults |
+| Service Mesh 3 | `Istio` | `spec.values.global.proxy.image` resolved digest |
+
+Most of these only need `ignoreDifferences` if a manifest doesn't explicitly set the field; the AppSet covers the ones the v6 fleet hit during install.
+
+## When ignoreDifferences hides a real bug
+
+The risk with `ignoreDifferences` is silencing a real drift. If a controller's mutation is unexpected, ignoring it lets the cluster diverge from the intent in Git without complaint.
+
+Two safeguards:
+
+1. **Be specific.** `jsonPointers` and `jqPathExpressions` should name exact paths, never broad globs. `/spec` is too coarse — use `/spec/target/deletionPolicy`.
+2. **Periodic audit.** Quarterly, check the AppSet's `ignoreDifferences` list against current operator versions. Some defaults change between minor versions; old ignores may now be ignoring fields that aren't there.
+
+## References
+
+- platform-gitops `clusters/hub-dc-v6/gitops-control/applicationset-spoke-cluster-config-pull.yaml` — the active rules.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — the pull-model decision.
+- `adr/0003-gitops-basic-pull-model.md` — pre-v6 origin (and the hub-push pattern it replaced).
+- Argo CD docs on [Diffing](https://argo-cd.readthedocs.io/en/stable/user-guide/diffing/) — the upstream reference for ignoreDifferences syntax.

@@ -1,8 +1,262 @@
 ---
-title: "Application and ApplicationSet"
-description: "Section 03-openshift-platform/05-gitops-operating-model: Application and ApplicationSet (placeholder)."
-sidebar_label: "Application and ApplicationSet"
+title: "ApplicationSet and Per-Spoke Applications"
+description: "The spoke-cluster-config-pull ApplicationSet in detail: clusterDecisionResource generator, the per-spoke Application template, pull-model annotations, ignoreDifferences, and how status flows back."
+sidebar_label: "ApplicationSet"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The hub's `ApplicationSet/spoke-cluster-config-pull` is the engine that fans out one Argo CD `Application` per spoke. It reads the ACM `PlacementDecision` for the `gitops-managed` placement and templates an Application labelled for ACM's pull-mode dispatch. This page is the manifest, annotated.
+
+## The full manifest
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spoke-cluster-config-pull
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "70"
+spec:
+  generators:
+    - clusterDecisionResource:
+        configMapRef: acm-placement
+        labelSelector:
+          matchLabels:
+            cluster.open-cluster-management.io/placement: gitops-managed
+        requeueAfterSeconds: 30
+  template:
+    metadata:
+      name: "{{name}}-cluster-config"
+      annotations:
+        apps.open-cluster-management.io/ocm-managed-cluster: "{{name}}"
+        apps.open-cluster-management.io/ocm-managed-cluster-app-namespace: openshift-gitops
+        argocd.argoproj.io/skip-reconcile: "true"
+      labels:
+        apps.open-cluster-management.io/pull-to-ocm-managed-cluster: "true"
+        platform.comptech-lab.com/cluster: "{{name}}"
+    spec:
+      project: default
+      source:
+        repoURL: http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git
+        targetRevision: main
+        path: "clusters/{{name}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: openshift-gitops
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ApplyOutOfSyncOnly=true
+          - SkipDryRunOnMissingResource=true
+          - ServerSideApply=true
+      ignoreDifferences:
+        - group: external-secrets.io
+          kind: ExternalSecret
+          jsonPointers:
+            - /spec/target/deletionPolicy
+          jqPathExpressions:
+            - .spec.data[].remoteRef.conversionStrategy
+            - .spec.data[].remoteRef.decodingStrategy
+            - .spec.data[].remoteRef.metadataPolicy
+        - group: oadp.openshift.io
+          kind: DataProtectionApplication
+          jsonPointers:
+            - /spec/logFormat
+            - /spec/configuration/velero/disableFsBackup
+        - group: lvm.topolvm.io
+          kind: LVMCluster
+          jqPathExpressions:
+            - .spec.storage.deviceClasses[].thinPoolConfig.chunkSizeCalculationPolicy
+            - .spec.storage.deviceClasses[].thinPoolConfig.metadataSizeCalculationPolicy
+```
+
+## The `clusterDecisionResource` generator
+
+The generator is the bridge from ACM Placement to Argo ApplicationSet. It reads a `PlacementDecision` resource and produces one parameter set per `decision` entry.
+
+```yaml
+generators:
+  - clusterDecisionResource:
+      configMapRef: acm-placement       # the schema-mapping ConfigMap
+      labelSelector:
+        matchLabels:
+          cluster.open-cluster-management.io/placement: gitops-managed
+      requeueAfterSeconds: 30
+```
+
+`configMapRef: acm-placement` points at the ConfigMap the fleet-registration kustomization applied:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acm-placement
+  namespace: openshift-gitops
+data:
+  apiVersion: cluster.open-cluster-management.io/v1beta1
+  kind: placementdecisions
+  statusListKey: decisions
+  matchKey: clusterName
+```
+
+The ConfigMap is the schema map: it tells the generator which CR to read (`placementdecisions`), where to find the decision list (`.status.decisions`), and which field in each decision item to use as the parameter name (`clusterName`).
+
+`labelSelector` filters which `PlacementDecision` objects to read. The label `cluster.open-cluster-management.io/placement: gitops-managed` is set automatically by the Placement controller, naming which Placement owns the decision.
+
+`requeueAfterSeconds: 30` re-evaluates every 30 seconds. New spokes appear in the generated Applications within 30 seconds of being placed.
+
+The output is one parameter set per matched cluster, with `{{name}}` set to the spoke's cluster name (e.g., `spoke-dc-v6`).
+
+## The pull-model annotations and labels
+
+Three annotations + one label make this Application a pull-mode Application instead of a hub-managed one:
+
+| Field | Purpose |
+| --- | --- |
+| `metadata.labels.apps.open-cluster-management.io/pull-to-ocm-managed-cluster: "true"` | Signals ACM's `multicluster-operators-application` controller to wrap the Application as `ManifestWork` in the target spoke's hub-side namespace. |
+| `metadata.annotations.apps.open-cluster-management.io/ocm-managed-cluster: "{{name}}"` | Names which spoke is the target. ACM uses this to choose the destination namespace. |
+| `metadata.annotations.apps.open-cluster-management.io/ocm-managed-cluster-app-namespace: openshift-gitops` | Names the namespace **on the spoke** where the Application will be materialized. |
+| `metadata.annotations.argocd.argoproj.io/skip-reconcile: "true"` | Tells **hub** Argo CD's application controller to **not** apply this Application. The hub Argo is the owner-of-record only; ACM is the dispatch path. |
+
+Without `skip-reconcile`, the hub Argo would try to apply the Application's resources against `kubernetes.default.svc` (i.e., the hub itself) and would either fail (operators/CRDs that don't exist on the hub) or — worse — succeed and install spoke-only resources on the hub.
+
+The extra label `platform.comptech-lab.com/cluster: "{{name}}"` is for fleet operators' own labelling — useful for `oc get apps -A -l platform.comptech-lab.com/cluster=spoke-dc-v6` queries.
+
+## `project: default` on the generated Application
+
+The Application lands on the spoke, where the spoke Argo CD knows only the `default` AppProject. The hub-side AppProject `hub-dc-v6-platform` doesn't exist on the spoke. So the generated Application has to specify `project: default`. This is intentional — the memory `feedback_acm_gitops_pull_pattern.md` flags it explicitly as a pattern feature, not drift.
+
+The `default` AppProject on the spoke ships with permissive defaults (everything in every namespace is allowed). The real privilege boundary on the spoke is the spoke Argo's **service account** — not the AppProject. The service account holds the least-privilege ClusterRole `argocd-platform-extensions`, which is the actual security gate (see [§5.5](/docs/03-openshift-platform/05-gitops-operating-model/05-spoke-rbac-extensions/)).
+
+## `source.path` parameterized by `{{name}}`
+
+The path on the spoke is `clusters/spoke-dc-v6/`. Generalised:
+
+```yaml
+source:
+  repoURL: http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git
+  targetRevision: main
+  path: "clusters/{{name}}"
+```
+
+When a future `spoke-dr-v6` is added with the matching `env=dc, role=spoke, gitops-managed=true` labels, the ApplicationSet will generate `spoke-dr-v6-cluster-config` pointing at `clusters/spoke-dr-v6/` automatically. The new spoke's directory must exist in the repo first (or the spoke Argo will sit `Degraded` on a missing path).
+
+## `syncPolicy.automated` with `prune: true` and `selfHeal: true`
+
+- `automated: true` — sync without operator click.
+- `prune: true` — delete resources removed from Git.
+- `selfHeal: true` — actively revert manual cluster changes.
+
+This is the v6 default. It enforces "Git is the single source of truth" — drift triggers immediate reconcile back to the declared state. Combined with [ADR 0025](/docs/06-architecture-decisions/) ("GitOps-Only Operations") this means any live change is either temporary (gone within ~3 minutes) or break-glass (recorded in `reports/break-glass/`).
+
+## `syncOptions` explained
+
+- `CreateNamespace=true` — Argo creates target namespaces when needed.
+- `ApplyOutOfSyncOnly=true` — only apply resources that are actually out-of-sync (skip patching identical objects, faster reconciliation).
+- `SkipDryRunOnMissingResource=true` — when a CRD is in the same Application but hasn't been created yet, the dry-run for its CR will fail. This option skips the dry-run in that case, letting the apply happen in dependency order via sync-wave.
+- `ServerSideApply=true` — use Kubernetes server-side apply, which handles field manager conflicts gracefully when multiple controllers touch the same resource.
+
+## The `ignoreDifferences` rules
+
+Three of the operands the spoke installs are known to add controller-side fields that Argo CD treats as drift:
+
+### ExternalSecret (external-secrets.io)
+
+```yaml
+- group: external-secrets.io
+  kind: ExternalSecret
+  jsonPointers:
+    - /spec/target/deletionPolicy
+  jqPathExpressions:
+    - .spec.data[].remoteRef.conversionStrategy
+    - .spec.data[].remoteRef.decodingStrategy
+    - .spec.data[].remoteRef.metadataPolicy
+```
+
+ESO's `ExternalSecret` controller defaults `deletionPolicy: "Retain"`, `conversionStrategy: "Default"`, `decodingStrategy: "None"`, `metadataPolicy: "None"` after the resource is created. If our manifests don't specify those, Argo would see "managed = absent, live = Retain" and report `OutOfSync`. Ignoring these fields lets the controller own them.
+
+### DataProtectionApplication (oadp.openshift.io)
+
+```yaml
+- group: oadp.openshift.io
+  kind: DataProtectionApplication
+  jsonPointers:
+    - /spec/logFormat
+    - /spec/configuration/velero/disableFsBackup
+```
+
+OADP's DPA controller adds `logFormat: "text"` and `configuration.velero.disableFsBackup: false` defaults.
+
+### LVMCluster (lvm.topolvm.io)
+
+```yaml
+- group: lvm.topolvm.io
+  kind: LVMCluster
+  jqPathExpressions:
+    - .spec.storage.deviceClasses[].thinPoolConfig.chunkSizeCalculationPolicy
+    - .spec.storage.deviceClasses[].thinPoolConfig.metadataSizeCalculationPolicy
+```
+
+LVMS adds `chunkSizeCalculationPolicy: "Host"` and `metadataSizeCalculationPolicy: "Host"` defaults after creation.
+
+The `ignoreDifferences` approach is the v6 pattern for **mutating operator controllers** — see [§5.4 ignoreDifferences drift pattern](/docs/03-openshift-platform/05-gitops-operating-model/04-ignoredifferences-drift-pattern/) for the broader pattern and when to use it vs. spec'ing the fields explicitly.
+
+## Status flow back
+
+How does the hub know the spoke Application is healthy?
+
+1. The spoke Argo CD's application controller updates the local Application's `status.sync.status` and `status.health.status` after each reconciliation.
+2. ACM's `multicluster-operators-subscription` controller on the hub aggregates spoke Application status into a `MulticlusterApplicationSetReport`:
+
+```bash
+oc --kubeconfig "$K_HUB" -n openshift-gitops get multiclusterapplicationsetreport spoke-cluster-config-pull -o yaml
+```
+
+The Report lists per-cluster `synced`, `healthOk`, `clusterConditions`. This is the fleet-wide health view for the ApplicationSet output.
+
+3. Optionally, the spoke's status is shipped back to the hub-side ManifestWork's status. The hub can query `oc -n spoke-dc-v6 get manifestwork` for the same information.
+
+## Validation
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+K_SPOKE=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+# ApplicationSet on hub
+oc --kubeconfig "$K_HUB" -n openshift-gitops get applicationset spoke-cluster-config-pull
+oc --kubeconfig "$K_HUB" -n openshift-gitops get applicationset spoke-cluster-config-pull \
+  -o jsonpath='{.status.conditions[?(@.type=="ResourcesUpToDate")].status}{"\n"}'
+
+# Generated Application on hub (skip-reconcile=true; never Synced)
+oc --kubeconfig "$K_HUB" -n openshift-gitops get app spoke-dc-v6-cluster-config
+
+# ManifestWork on hub (wrapped Application)
+oc --kubeconfig "$K_HUB" -n spoke-dc-v6 get manifestwork
+
+# Materialized Application on spoke
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get app spoke-dc-v6-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+
+# Fleet-wide report
+oc --kubeconfig "$K_HUB" -n openshift-gitops get multiclusterapplicationsetreport
+```
+
+Expected steady state:
+
+- ApplicationSet `ResourcesUpToDate: True`.
+- Hub-side generated Application present with `argocd.argoproj.io/skip-reconcile: "true"` annotation (not synced by hub Argo — that's the point).
+- ManifestWork present in `spoke-dc-v6` hub-side namespace, status `Applied: True`.
+- Spoke-side materialized Application `Synced Healthy <commit-sha>`.
+- `MulticlusterApplicationSetReport` shows `synced: 1, healthOk: 1`.
+
+## References
+
+- platform-gitops `clusters/hub-dc-v6/gitops-control/applicationset-spoke-cluster-config-pull.yaml` (the live manifest).
+- platform-gitops `clusters/hub-dc-v6/platform/fleet-registration/configmap-acm-placement.yaml` — the schema map.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — pull-model decision.
+- Memory: `feedback_acm_gitops_pull_pattern.md` — `project: default` on generated Application is intentional.

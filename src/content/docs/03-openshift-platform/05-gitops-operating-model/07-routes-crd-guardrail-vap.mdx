@@ -1,8 +1,242 @@
 ---
-title: "Routes CRD Guardrail (VAP)"
-description: "Section 03-openshift-platform/05-gitops-operating-model: Routes CRD Guardrail (VAP) (placeholder)."
-sidebar_label: "Routes CRD Guardrail (VAP)"
+title: "Hub AppProject, RBAC, and the Routes-CRD VAP Guardrail"
+description: "The hub-dc-v6-platform AppProject scope, the cluster-admin binding to the hub Argo CD application controller, the routes.route.openshift.io CRD incident, and the ValidatingAdmissionPolicy that prevents it from coming back."
+sidebar_label: "Hub RBAC + Routes-CRD Guardrail"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The hub Argo CD has `cluster-admin` because it has to install operators and write cluster-scoped resources on the management hub itself. That's a strong privilege, so the compensating controls have to be explicit: the `AppProject/hub-dc-v6-platform` restricts the hub Argo's source to the LAN GitLab URL only, and CODEOWNERS in GitLab gates who can land changes. On top of that, one of the operationally painful failures in the v6 fleet — ACM's `gitops-addon` shipping a `routes.route.openshift.io` CRD that breaks the hub OpenAPI/v2 — is now blocked by a `ValidatingAdmissionPolicy`. This page covers both topics.
+
+## The hub Argo CD privilege posture
+
+### `cluster-admin` ClusterRoleBinding
+
+The hub Argo's application controller service account (`openshift-gitops/openshift-gitops-argocd-application-controller`) is bound to the `cluster-admin` ClusterRole:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-hub-dc-v6-platform-cluster-admin
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  labels:
+    app.kubernetes.io/name: hub-dc-v6-platform
+    app.kubernetes.io/part-of: hub-dc-v6
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-argocd-application-controller
+    namespace: openshift-gitops
+```
+
+This is at sync-wave 0 so it lands before anything else on the hub.
+
+### Why cluster-admin
+
+The hub Argo has to:
+
+- Install ACM, MCE, OpenShift GitOps, LVMS, RHACS, ESO, cert-manager — all of which create CRDs and cluster-scoped operands.
+- Write the `MultiClusterHub`, `ManagedCluster`, `Placement`, `GitOpsCluster`, `ApplicationSet` (cluster-scoped or namespaced-but-cluster-impacting).
+- Manage RBAC for spoke registration and ACM addons.
+- Configure `OperatorHub/cluster` (the cluster's default catalog source list).
+
+A least-privilege ClusterRole for the hub Argo would need to enumerate every API group and resource the platform needs — and it would lag every time a new operator is added. The spoke is exposed (it's the target of ManifestWork pulled over the network); the hub is not (everything is in-cluster), so the trade-off lands different.
+
+### The AppProject restriction
+
+The compensating control is **source restriction**:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: hub-dc-v6-platform
+  namespace: openshift-gitops
+spec:
+  description: hub-dc-v6 platform operations project restricted to the internal GitLab LAN source.
+  sourceRepos:
+    - http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: '*'
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  orphanedResources:
+    warn: true
+    ignore:
+      # ... many cluster-default resources Argo shouldn't warn about
+      - group: ""
+        kind: ServiceAccount
+        name: builder
+      - group: ""
+        kind: ServiceAccount
+        name: default
+      # ...
+```
+
+The strict field is `sourceRepos`. The hub Argo can only reconcile from one URL — the LAN GitLab endpoint for `openshift-platform-gitops`. Anything else (public GitHub, the legacy `lab-gitops`, a developer's fork) is rejected at the Argo CD application controller layer with `application repo URL is not permitted in project`.
+
+`clusterResourceWhitelist: ['*'/'*']` and `namespaceResourceWhitelist: ['*'/'*']` give the project broad reach inside the cluster — necessary because hub-Argo has to install operators that create arbitrary cluster-scoped CRDs. The actual access is constrained by:
+
+1. **`sourceRepos`** — what manifests can land
+2. **GitLab CODEOWNERS** — who can merge those manifests
+3. **Branch protection on main** — direct push disabled, MR-only
+
+The `orphanedResources.ignore` list is hygiene — the hub has hundreds of cluster-default ConfigMaps, ServiceAccounts, and RoleBindings (openshift internal stuff) that aren't in `platform-gitops` but shouldn't trigger orphan warnings.
+
+### Hub destinations
+
+`destinations.server: https://kubernetes.default.svc` and `namespace: '*'` — the hub Argo writes only to the hub itself, every namespace.
+
+Crucially: **there is no `destination` for the spoke API server**. The hub Argo has no spoke kubeconfig, no spoke cluster secret, no way to apply to the spoke directly. The pull model enforces this in code, not just in convention.
+
+## The routes-CRD incident
+
+### What happened
+
+On 2026-05-10 during the BACKUP-1 MR (`!8`), Argo CD on `hub-dc-v6` started silently failing every sync with `ComparisonError`:
+
+```text
+failed to load open api schema while syncing cluster cache:
+  error getting openapi resources:
+    the server is currently unable to handle the request
+```
+
+Cluster otherwise looked healthy: nodes Ready, ClusterOperators steady, APIServices Available. The diagnostic that pinpointed it:
+
+```bash
+# v2 OpenAPI fails:
+oc get --raw /openapi/v2
+# Error from server (ServiceUnavailable): the server is currently unable to handle the request
+
+# v3 OpenAPI works:
+oc get --raw /openapi/v3 | head -c 50
+# {"paths":{".well-known/openid-configuration":...
+
+# kube-apiserver log:
+oc -n openshift-kube-apiserver logs -c kube-apiserver kube-apiserver-<master> | grep "OpenAPI handler"
+# E .... handler.go:160] Error in OpenAPI handler: failed to build merge specs:
+#   unable to merge: duplicated path /apis/route.openshift.io/v1/routes
+```
+
+### Root cause
+
+ACM's `gitops-addon` installs a CRD `routes.route.openshift.io` labeled `apps.open-cluster-management.io/gitopsaddon: "true"`. It is intended for **non-OpenShift** managed clusters (e.g., a plain Kubernetes cluster managed by ACM, where Argo needs to create Route objects as CRD-backed types).
+
+On an actual OpenShift cluster, the `Route` API is served by the `openshift-apiserver` aggregated APIService — `route.openshift.io/v1` is a built-in. When the addon's CRD lands on an OpenShift cluster, it **duplicates** the aggregated API. kube-apiserver's `/openapi/v2` compilation hits `unable to merge: duplicated path /apis/route.openshift.io/v1/routes` and returns 503. `/openapi/v3` handles overlap differently and keeps working — but Argo CD uses v2.
+
+Net effect: every Argo sync stalls silently with `ComparisonError`. All GitOps reconciliation freezes until the CRD is removed.
+
+### Quick fix (recovery)
+
+```bash
+oc delete crd routes.route.openshift.io
+```
+
+`Route` objects survive — they are stored against the legitimate APIService, not the CRD. `oc get routes -A` continues to work throughout. After deletion, `/openapi/v2` recovers within seconds, Argo can re-sync.
+
+### Permanent fix
+
+Tracked under issue #153 (INC-ROUTES-CRD-1). The CRD may be recreated by the gitops-addon reconciler on next ACM sync. The permanent options:
+
+1. **Upstream patch** — ACM `gitops-addon` should detect that the target cluster is OpenShift (via the OpenShift-specific APIs) and skip the Route CRD installation. Tracked with Red Hat.
+2. **Hub-side ManifestWork override** — instruct the addon to skip the Routes CRD via the `gitops-addon` config. Not yet implemented; under evaluation.
+3. **ValidatingAdmissionPolicy guardrail** (below) — block the CRD from being created in the first place. **This is the v6 fleet's current safeguard.**
+
+## The VAP guardrail
+
+`platform-gitops` carries a `ValidatingAdmissionPolicy` that blocks creation of `routes.route.openshift.io` CRD on any cluster running OpenShift:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: deny-routes-crd-on-openshift
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:   ["apiextensions.k8s.io"]
+        apiVersions: ["v1"]
+        operations:  ["CREATE", "UPDATE"]
+        resources:   ["customresourcedefinitions"]
+  validations:
+    - expression: |
+        object.metadata.name != "routes.route.openshift.io"
+      message: "routes.route.openshift.io CRD must not exist on an OpenShift cluster — duplicates the aggregated Route APIService and breaks kube-apiserver /openapi/v2 (incident #153)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: deny-routes-crd-on-openshift
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  policyName: deny-routes-crd-on-openshift
+  validationActions: [Deny]
+```
+
+This lives at `clusters/hub-dc-v6/platform/admission-policies/vap-deny-routes-crd.yaml` (and the same on the spoke under `clusters/spoke-dc-v6/platform/admission-policies/`).
+
+When the gitops-addon reconciler attempts to recreate the CRD, the admission webhook rejects it with the configured `message`. The CRD does not land; the addon retries; the cluster stays healthy.
+
+### Why VAP and not OPA Gatekeeper
+
+`ValidatingAdmissionPolicy` is the in-tree Kubernetes admission mechanism since 1.30 / OpenShift 4.16. It runs in kube-apiserver with no external webhook controller, so:
+
+- **No additional pod to maintain** (Gatekeeper would need to be installed first).
+- **No webhook latency** — VAP evaluates in-process.
+- **Survives operator unavailability** — Gatekeeper crashing wouldn't take down its own policies if installed, but VAP has no operator at all.
+
+The trade-off: VAP's CEL expression language is less expressive than Rego (Gatekeeper). For "block this specific CRD by name" it is more than enough.
+
+### Detecting if the VAP is doing its job
+
+```bash
+# The CRD should not be present
+oc get crd routes.route.openshift.io --no-headers 2>&1 \
+  | grep -v 'NotFound\|not found' \
+  && echo "ROUTES_CRD_PRESENT — DELETE IT" \
+  || echo "ok"
+
+# The VAP should be present and binding active
+oc get validatingadmissionpolicy deny-routes-crd-on-openshift -o wide
+oc get validatingadmissionpolicybinding deny-routes-crd-on-openshift -o wide
+```
+
+The check `oc get crd routes.route.openshift.io --no-headers 2>&1 | grep -v 'NotFound\|not found' && echo "ROUTES_CRD_PRESENT — DELETE IT"` is suitable for a periodic monitoring run — if anything ever surfaces a non-NotFound output, the CRD has reappeared and recovery is "delete it".
+
+## Related ACM CRD risks
+
+The same pattern (ACM ships a CRD that duplicates a built-in OpenShift API) could affect other types. If `/openapi/v2` fails again with a different `duplicated path` error, the recipe is the same:
+
+1. Identify the offending CRD from the error message.
+2. `oc delete crd <name>`.
+3. Add a similar VAP guardrail under `platform/admission-policies/`.
+4. Track the upstream issue.
+
+Known candidate CRDs (not yet observed but flagged by memory `project_acm_gitops_addon_routes_crd.md`):
+
+- Anything in `apps.openshift.io` (DeploymentConfig) if the addon ever ships one
+- Anything in `image.openshift.io` (ImageStream)
+- Anything in `template.openshift.io`
+
+## References
+
+- platform-gitops `clusters/hub-dc-v6/gitops-control/appproject-hub-dc-v6-platform.yaml`, `argocd-platform-cluster-admin.yaml`.
+- platform-gitops `clusters/hub-dc-v6/platform/admission-policies/vap-deny-routes-crd.yaml` (the live VAP guardrail).
+- Memory: `project_acm_gitops_addon_routes_crd.md` — the incident in detail.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0024-openshift-only-platform-gitops-boundary.md`.
+- Tracker: codex-opp-agent issue #153 (INC-ROUTES-CRD-1).

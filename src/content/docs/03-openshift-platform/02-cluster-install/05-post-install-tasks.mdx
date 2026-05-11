@@ -1,8 +1,258 @@
 ---
 title: "Post-Install Tasks"
-description: "Section 03-openshift-platform/02-cluster-install: Post-Install Tasks (placeholder)."
+description: "What to do after agent-based install reaches install-complete: capture state, disable default OperatorHub sources, apply IDMS/ITMS, install GitOps, hand off to platform-gitops, and stop before ODF."
 sidebar_label: "Post-Install Tasks"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+`openshift-install agent wait-for install-complete` exits when `ClusterVersion` is `Available=True, Progressing=False` and every ClusterOperator is healthy. Before any platform operator install can run, four things still have to happen: state capture, disconnected-catalog baseline, GitOps install, and platform-gitops handoff. This page is the post-install checklist that the v6 hub and spoke both ran through.
+
+## Day-0 capture
+
+Immediately after install completes, record:
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+
+# Cluster version + base manifest fingerprint
+oc --kubeconfig "$K" get clusterversion version -o yaml \
+  > reports/<cluster>-clusterversion-$(date -u +%Y%m%d-%H%M%S).yaml
+
+# Node inventory
+oc --kubeconfig "$K" get nodes -o wide \
+  > reports/<cluster>-nodes-$(date -u +%Y%m%d-%H%M%S).txt
+
+# ClusterOperator health
+oc --kubeconfig "$K" get co -o wide \
+  > reports/<cluster>-co-$(date -u +%Y%m%d-%H%M%S).txt
+
+# Auth secrets snapshot (names only, not values)
+oc --kubeconfig "$K" -n kube-system get secret kubeadmin \
+  -o jsonpath='{.metadata.name}{"\n"}'
+```
+
+This is the "day-1 checkpoint" baseline — the platform-admin handoff calls it the read-only state capture you compare future drift against.
+
+## Disable default OperatorHub sources
+
+Default external OperatorHub sources must be disabled per [ADR 0019](/docs/06-architecture-decisions/). Without this step, OLM will try to reach upstream catalog indices that are not in the mirror, and the cluster's `openshift-marketplace` namespace will fill with `ImagePullBackOff` catalog pods.
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: OperatorHub
+metadata:
+  name: cluster
+spec:
+  disableAllDefaultSources: true
+```
+
+Apply directly during the disconnected-catalog baseline. The hub and spoke both did this on 2026-05-09 immediately after install.
+
+## Apply IDMS / ITMS / CatalogSource / ClusterCatalog
+
+The `oc mirror --v2` run generated these resources at:
+
+```text
+~/ocp-clusters/<cluster>/mirror-resources/idms-oc-mirror.yaml
+~/ocp-clusters/<cluster>/mirror-resources/itms-oc-mirror.yaml
+~/ocp-clusters/<cluster>/mirror-resources/cs-redhat-operator-index-v4-20.yaml
+~/ocp-clusters/<cluster>/mirror-resources/cs-certified-operator-index-v4-20.yaml
+~/ocp-clusters/<cluster>/mirror-resources/clustercatalog-*.yaml
+~/ocp-clusters/<cluster>/mirror-resources/signature-configmaps/
+```
+
+Apply them in order: signature configmaps first (so the cluster can verify mirrored release images), then IDMS / ITMS (so node pulls rewrite to the mirror), then CatalogSource / ClusterCatalog.
+
+```bash
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/signature-configmaps/
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/idms-oc-mirror.yaml
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/itms-oc-mirror.yaml
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/cs-redhat-operator-index-v4-20.yaml
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/cs-certified-operator-index-v4-20.yaml
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/clustercatalog-redhat-operator-index-v4-20.yaml
+oc --kubeconfig "$K" apply -f ~/ocp-clusters/<cluster>/mirror-resources/clustercatalog-certified-operator-index-v4-20.yaml
+```
+
+The IDMS / ITMS apply triggers a MachineConfig rollout — the master MCP rolls each master in turn, draining and rebooting, applying the new `/etc/containers/registries.conf.d/*` files. On a compact 3-master cluster this takes ~15-25 minutes. Watch with:
+
+```bash
+oc --kubeconfig "$K" get mcp -w
+```
+
+Once `master` (and `worker` if applicable) shows `UPDATED=True, UPDATING=False, DEGRADED=False`, the mirror rules are in place.
+
+These manifests are not the durable home for the configuration — they live in platform-gitops once GitOps takes over (next section). The apply step here is the post-install bootstrap that makes the cluster able to talk to the local catalogs in the first place.
+
+## Disable built-in OLM v1 ClusterCatalogs
+
+OpenShift 4.20 ships built-in OLM v1 `ClusterCatalog` objects under the `openshift-*` namespace prefix. They are upstream-pull-only and not usable in disconnected mode. Disable them with:
+
+```bash
+for cc in $(oc --kubeconfig "$K" get clustercatalog -o name | grep openshift-); do
+  oc --kubeconfig "$K" patch "$cc" --type=merge -p '{"spec":{"availabilityMode":"Unavailable"}}'
+done
+```
+
+The mirrored `cs-redhat-operator-index-v4-20` and `cs-certified-operator-index-v4-20` remain `Available`.
+
+## Install OpenShift GitOps
+
+OpenShift GitOps is the first operator installed on both clusters. On the hub it runs as an OLM CSV; on the spoke it runs as a Deployment installed by ACM's gitops-addon (after the spoke is registered).
+
+For the hub:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-gitops-operator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-gitops-operator
+  namespace: openshift-gitops-operator
+spec: {}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-gitops-operator
+  namespace: openshift-gitops-operator
+spec:
+  channel: latest
+  installPlanApproval: Automatic
+  name: openshift-gitops-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: openshift-gitops-operator.v1.20.3
+```
+
+After OLM processes the Subscription:
+
+```bash
+oc --kubeconfig "$K_HUB" -n openshift-gitops-operator get sub,installplan,csv,pods
+oc --kubeconfig "$K_HUB" -n openshift-gitops get argocd,pods,route
+```
+
+Expected:
+
+- Subscription state `AtLatestKnown`.
+- CSV `openshift-gitops-operator.v1.20.3` phase `Succeeded`.
+- All `openshift-gitops` namespace pods `Running`.
+- Default Argo CD route resolvable at `https://openshift-gitops-server-openshift-gitops.apps.hub-dc-v6.sub.comptech-lab.com`.
+
+The Argo CD admin password is in a cluster Secret:
+
+```bash
+oc --kubeconfig "$K_HUB" -n openshift-gitops get secret openshift-gitops-cluster \
+  -o jsonpath='{.data.admin\.password}' | base64 -d
+printf '\n'
+```
+
+Do not paste it. Use the route's UI or the kubeconfig directly for `argocd` CLI auth.
+
+## Connect Argo CD to platform-gitops
+
+Seed the GitLab repo credential (PAT) under the `openshift-gitops` namespace, never committed:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-platform-gitops
+  namespace: openshift-gitops
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git
+  username: <bot-account>
+  password: <PAT>     # placeholder; actually applied from local-only PAT file
+```
+
+Then commit `clusters/hub-dc-v6/gitops-control/application-hub-dc-v6-bootstrap.yaml` referencing `clusters/hub-dc-v6/bootstrap` and `gitops-control`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hub-dc-v6-bootstrap
+  namespace: openshift-gitops
+spec:
+  project: hub-dc-v6-platform
+  source:
+    repoURL: http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git
+    targetRevision: main
+    path: clusters/hub-dc-v6
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+```
+
+Apply once (`oc apply`), let it reconcile. From this point on, every change is a merge request against `platform-gitops`, never `oc apply` (per [ADR 0025](/docs/06-architecture-decisions/)).
+
+## Move IDMS / ITMS / Catalogs to GitOps
+
+The IDMS / ITMS / CatalogSource / ClusterCatalog manifests applied during the bootstrap step move into `platform-gitops` under:
+
+```text
+clusters/<cluster>/platform/image-mirrors/idms-oc-mirror.yaml
+clusters/<cluster>/platform/image-mirrors/itms-oc-mirror.yaml
+clusters/<cluster>/platform/catalogs/catalogsource-redhat-operator-index-v4-20.yaml
+clusters/<cluster>/platform/catalogs/catalogsource-certified-operator-index-v4-20.yaml
+clusters/<cluster>/platform/catalogs/clustercatalog-redhat-operator-index-v4-20.yaml
+clusters/<cluster>/platform/catalogs/clustercatalog-certified-operator-index-v4-20.yaml
+clusters/<cluster>/platform/admission-policies/      # OperatorHub disable + future VAP
+```
+
+Commit, push, let Argo CD reconcile. The cluster is now fully GitOps-driven from this point.
+
+## Validate hub state matches the handoff
+
+```bash
+oc --kubeconfig "$K_HUB" -n openshift-gitops get applications.argoproj.io -o wide
+oc --kubeconfig "$K_HUB" -n openshift-gitops get app hub-dc-v6-bootstrap \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+```
+
+Expected: `Synced Healthy <commit-sha>`. If `OutOfSync` or `Degraded`, run the Argo CD CLI to inspect:
+
+```bash
+argocd app get hub-dc-v6-bootstrap --grpc-web
+```
+
+## Stop before ODF (spoke only)
+
+The spoke install reaches install-complete with no storage configuration. Local Storage Operator and ODF are deliberately **not installed by the agent installer**. They land later through GitOps once:
+
+- the disk inventory is captured (NS204i RAID1 boot volumes identified and excluded);
+- `wipefs -n` shows no leftover `crypto_LUKS`/`ocs-deviceset-*` signatures on the MR408i data devices (after issue #117's destructive cleanup, 20/20 are clean);
+- MON/MGR scheduling is proven on the intended workers;
+- worker failure-domain labels are applied (`worker-0: rack=gold-1`, `worker-1: rack=gold-2`, `worker-2: rack=gpu-01`, all in `zone=dc-lab`).
+
+See [§8 storage / ODF on spoke](/docs/03-openshift-platform/08-storage/03-odf-on-spoke/) for the full preflight gate.
+
+## Don't do these post-install
+
+- Don't enable default OperatorHub sources to "fix" a missing package. Fix the mirror instead.
+- Don't `oc apply` `LocalVolumeSet` / `StorageCluster` before the disk inventory and `wipefs -n` review are recorded.
+- Don't distribute the `kubeadmin` password. Use named admin onboarding through GitLab + IdP later.
+- Don't commit auth files (kubeconfig, kubeadmin password, pull-secret, PATs) anywhere. They live under `secrets/` on the workstation and `auth/` on `ocp-bootstrap`, full stop.
+- Don't return to a hub-push model for spoke operators. Hub coordinates placement; spoke reconciles its own desired state ([ADR 0018](/docs/06-architecture-decisions/)).
+
+## References
+
+- `connection-details/platform-admin-handoff.md` — full post-install workflow, validation commands, break-glass rules.
+- `connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md` — validated baseline endpoints + node inventory.
+- `connection-details/openshift-gitops-hub-dc-v6.md` — hub Argo CD details + repo wiring.
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0025-gitops-only-operations-break-glass.md`
+- `plans/disconnected-rebuild/environments/dc-lab/hub-dc-v6/README.md`, `spoke-dc-v6/README.md` — post-install current state for each cluster.

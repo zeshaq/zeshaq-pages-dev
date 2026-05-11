@@ -1,8 +1,344 @@
 ---
 title: "ManagedCluster Registration"
-description: "Section 03-openshift-platform/04-acm-multicluster: ManagedCluster Registration (placeholder)."
+description: "How spoke-dc-v6 is registered into hub-dc-v6: the ManagedCluster CR, KlusterletAddonConfig, the spoke-side klusterlet, and the GitOpsCluster wiring that drives the pull model."
 sidebar_label: "ManagedCluster Registration"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const stepBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const regNodes = [
+  // hub side
+  { id: "ns",     position: { x: 40,  y: 0 },   data: { label: "Namespace\nspoke-dc-v6\n(on hub)" }, style: ctrlBox },
+  { id: "mc",     position: { x: 260, y: 0 },   data: { label: "ManagedCluster\nspoke-dc-v6\nlabels: env=dc, role=spoke" }, style: ctrlBox },
+  { id: "kac",    position: { x: 480, y: 0 },   data: { label: "KlusterletAddonConfig\nspoke-dc-v6\n(per-spoke addon enables)" }, style: ctrlBox },
+  { id: "mcsb",   position: { x: 700, y: 0 },   data: { label: "ManagedClusterSetBinding\ndefault → openshift-gitops" }, style: ctrlBox },
+
+  // ACM emits autoimport
+  { id: "autoimport", position: { x: 480, y: 130 }, data: { label: "ACM auto-import\nemits klusterlet manifests\n(crds + namespace + sa + deploy)" }, style: dataBox },
+
+  // spoke side: klusterlet
+  { id: "klust", position: { x: 480, y: 260 }, data: { label: "klusterlet (spoke)\nregistration agent\n+ work agent" }, style: agentBox },
+
+  // outbound register
+  { id: "reg", position: { x: 260, y: 260 }, data: { label: "outbound CSR → hub\nhandshake on registration controller" }, style: stepBox },
+
+  // GitOpsCluster
+  { id: "gc", position: { x: 700, y: 260 }, data: { label: "GitOpsCluster\ngitops-managed\n+ gitopsAddon.enabled=true" }, style: ctrlBox },
+
+  // addons
+  { id: "addons", position: { x: 480, y: 390 }, data: { label: "addons land on spoke\napplication-manager, policy,\ncert-policy, cluster-permission" }, style: dataBox },
+
+  // outcome
+  { id: "ready", position: { x: 480, y: 510 }, data: { label: "ManagedCluster\nAvailable=True\nspoke Argo CD running" }, style: ctrlBox },
+];
+
+export const regEdges = [
+  { id: "e-ns-mc", source: "ns", target: "mc", label: "scopes spoke namespace on hub", ...muted },
+  { id: "e-mc-kac", source: "mc", target: "kac", label: "matched by name", ...muted },
+  { id: "e-mc-ai", source: "mc", target: "autoimport", label: "triggers auto-import", ...reqEdge },
+  { id: "e-ai-k", source: "autoimport", target: "klust", label: "klusterlet bundle delivered", ...reqEdge },
+  { id: "e-k-reg", source: "klust", target: "reg", label: "register (outbound)", ...pullEdge },
+  { id: "e-reg-mc", source: "reg", target: "mc", label: "Available=True", ...pullEdge },
+  { id: "e-mc-gc", source: "mc", target: "gc", label: "decision feeds gitopsAddon", ...muted },
+  { id: "e-gc-k", source: "gc", target: "klust", label: "ships gitops-operator manifests", ...reqEdge },
+  { id: "e-k-add", source: "klust", target: "addons", label: "pull addon ManifestWork", ...pullEdge },
+  { id: "e-add-ready", source: "addons", target: "ready", ...muted },
+  { id: "e-mcsb-gc", source: "mcsb", target: "gc", label: "namespace placement scope", ...muted },
+];
+
+Registering `spoke-dc-v6` into `hub-dc-v6` is a one-merge-request operation in `platform-gitops` — six manifests under `clusters/hub-dc-v6/platform/fleet-registration/` that together create the spoke's hub-side namespace, ManagedCluster, addon config, ClusterSet binding, Placement, and GitOpsCluster. Once they reconcile, the spoke's klusterlet auto-imports, registers via outbound CSR, and ACM ships the gitops-addon to start the spoke Argo CD.
+
+## The registration flow, end to end
+
+<Whiteboard client:load data={{ nodes: regNodes, edges: regEdges }} height={620} />
+
+## The six manifests
+
+All under `clusters/hub-dc-v6/platform/fleet-registration/`, all in `kustomization.yaml`:
+
+```text
+configmap-acm-placement.yaml
+gitopscluster-gitops-managed.yaml
+klusterletaddonconfig-spoke-dc-v6.yaml
+managedclustersetbinding-default.yaml
+namespace-spoke-dc-v6.yaml
+managedcluster-spoke-dc-v6.yaml
+placement-gitops-managed.yaml
+```
+
+### 1. `namespace-spoke-dc-v6.yaml` — hub-side namespace
+
+ACM scopes each spoke's hub-side state to a namespace whose name **matches the ManagedCluster name**. So `spoke-dc-v6` registration needs a hub namespace literally named `spoke-dc-v6`.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spoke-dc-v6
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+  labels:
+    cluster.open-cluster-management.io/managedCluster: spoke-dc-v6
+    open-cluster-management.io/cluster-name: spoke-dc-v6
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+```
+
+The two ACM labels are mandatory — they're how MCE's registration controller knows this namespace is paired with the like-named `ManagedCluster`. PSA labels at `restricted` are because the namespace will hold no workload pods (only ManifestWork status objects).
+
+### 2. `managedcluster-spoke-dc-v6.yaml` — the cluster CR
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: spoke-dc-v6
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+  labels:
+    name: spoke-dc-v6
+    cloud: BareMetal
+    vendor: OpenShift
+    environment: dc-lab
+    env: dc
+    role: spoke
+    gitops-managed: "true"
+    cluster.open-cluster-management.io/clusterset: default
+spec:
+  hubAcceptsClient: true
+```
+
+Key fields:
+
+- `metadata.name: spoke-dc-v6` — must match the hub-side namespace name.
+- `metadata.labels.env=dc role=spoke gitops-managed=true` — three labels read by the Placement (next).
+- `metadata.labels.cluster.open-cluster-management.io/clusterset: default` — pre-assigns the spoke to the `default` ManagedClusterSet so we don't need a separate `ManagedClusterSet` resource.
+- `spec.hubAcceptsClient: true` — tells the hub to accept the auto-import / klusterlet handshake when it arrives.
+
+### 3. `klusterletaddonconfig-spoke-dc-v6.yaml` — addon enables
+
+```yaml
+apiVersion: agent.open-cluster-management.io/v1
+kind: KlusterletAddonConfig
+metadata:
+  name: spoke-dc-v6
+  namespace: spoke-dc-v6
+  annotations:
+    argocd.argoproj.io/sync-wave: "40"
+spec:
+  applicationManager:
+    enabled: true
+  certPolicyController:
+    enabled: true
+  policyController:
+    enabled: true
+  searchCollector:
+    enabled: false
+```
+
+`KlusterletAddonConfig` (note: capital `K`) tells ACM which add-ons to install on this spoke once registration completes. We enable:
+
+- `applicationManager` — Subscription/Channel pipe (used for ManifestWork delivery of ApplicationSet outputs).
+- `certPolicyController` — cert-policy evaluation.
+- `policyController` — Policy/ConfigPolicy evaluation.
+
+`searchCollector` is off because the hub's `search` component is off (no point shipping data the hub won't index).
+
+### 4. `managedclustersetbinding-default.yaml` — binding into `openshift-gitops`
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSetBinding
+metadata:
+  name: default
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+spec:
+  clusterSet: default
+```
+
+This binds the `default` ManagedClusterSet into the `openshift-gitops` namespace so Placement resources living in `openshift-gitops` can target spokes in `default`. Without it, the Placement returns zero decisions.
+
+### 5. `placement-gitops-managed.yaml` — which clusters
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: gitops-managed
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+spec:
+  clusterSets:
+    - default
+  tolerations:
+    - key: cluster.open-cluster-management.io/unreachable
+      operator: Exists
+      effect: NoSelect
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            env: dc
+            role: spoke
+            gitops-managed: "true"
+```
+
+What this does:
+
+- Selects clusters from the `default` ManagedClusterSet.
+- Tolerates the `unreachable` taint with `NoSelect` — this matters because [ADR 0018](/docs/06-architecture-decisions/) warns that an unavailable spoke can receive an ACM `unreachable` taint, leave Placement decisions, and trigger unexpected ManifestWork pruning. The toleration says: if the cluster is unreachable, we still want it in the decision (so its ApplicationSet doesn't get pruned).
+- Predicate: `env=dc, role=spoke, gitops-managed=true` — the three labels that `ManagedCluster/spoke-dc-v6` carries. Future spokes (`spoke-dr-v6` if/when built) would get the same labels to join the Placement.
+
+### 6. `gitopscluster-gitops-managed.yaml` — wire ACM placement into Argo
+
+```yaml
+apiVersion: apps.open-cluster-management.io/v1beta1
+kind: GitOpsCluster
+metadata:
+  name: gitops-managed
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "60"
+spec:
+  argoServer:
+    cluster: local-cluster
+    argoNamespace: openshift-gitops
+  placementRef:
+    apiVersion: cluster.open-cluster-management.io/v1beta1
+    kind: Placement
+    name: gitops-managed
+  gitopsAddon:
+    enabled: true
+```
+
+`GitOpsCluster` is the bridge from ACM Placement to Argo CD. It tells the hub Argo CD's `argocd-cluster-secret-generator` to read the Placement and write Argo cluster secrets for each matched cluster. With `gitopsAddon.enabled: true`, ACM also installs OpenShift GitOps on each matched cluster — as a Deployment via the gitops-addon, not via OLM CSV.
+
+`argoServer.cluster: local-cluster` is the hub itself; `argoNamespace: openshift-gitops` is where the hub Argo CD lives.
+
+### 7. `configmap-acm-placement.yaml` — ApplicationSet wiring
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acm-placement
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+data:
+  apiVersion: cluster.open-cluster-management.io/v1beta1
+  kind: placementdecisions
+  statusListKey: decisions
+  matchKey: clusterName
+```
+
+This ConfigMap teaches the Argo `clusterDecisionResource` generator (in [§5.4 AppSet](/docs/03-openshift-platform/05-gitops-operating-model/04-appset-and-applicationsets/)) how to read ACM `PlacementDecision` objects — the apiVersion / kind / status list key / match key.
+
+## What ACM does once these land
+
+After Argo CD reconciles the fleet-registration resources:
+
+1. ACM's registration controller sees the new `ManagedCluster` with `hubAcceptsClient: true`.
+2. It generates auto-import manifests (the `klusterlet` Deployment, ServiceAccount, ClusterRole, secret bundle) and packages them as a `ManifestWork`.
+3. Since the spoke is not yet registered, the manifests have to land via auto-import — ACM emits an `auto-import-secret` in the spoke's hub-side namespace, or (in the v6 fleet's case) the operator copies the klusterlet bundle to the spoke and `oc apply`s it once during initial onboarding.
+4. The spoke's klusterlet starts, opens an **outbound** connection to the hub's registration controller, and submits a CSR.
+5. The hub's registration controller approves the CSR (since `hubAcceptsClient: true`) and the `ManagedCluster.status.conditions[].type == "ManagedClusterConditionAvailable"` flips to `True`.
+6. The `KlusterletAddonConfig` tells ACM which add-ons to install. ACM ships application-manager, policy-controller, cert-policy-controller as ManifestWork.
+7. The `GitOpsCluster.gitopsAddon.enabled: true` makes ACM also ship the OpenShift GitOps Deployment to the spoke. The spoke now runs Argo CD locally.
+8. The `Placement` produces a `PlacementDecision` listing `spoke-dc-v6`. The ApplicationSet in [§5.4](/docs/03-openshift-platform/05-gitops-operating-model/04-appset-and-applicationsets/) generates an Application named `spoke-dc-v6-cluster-config`.
+
+## Initial onboarding shortcut (one-time)
+
+For a new spoke not yet registered, copy the auto-import bundle to the spoke and apply once:
+
+```bash
+# On hub: get auto-import bundle
+oc --kubeconfig "$K_HUB" -n spoke-dc-v6 get secret import-yaml \
+  -o jsonpath='{.data.crds\.yaml}' | base64 -d > /tmp/import-crds.yaml
+oc --kubeconfig "$K_HUB" -n spoke-dc-v6 get secret import-yaml \
+  -o jsonpath='{.data.import\.yaml}' | base64 -d > /tmp/import.yaml
+
+# On spoke: apply
+oc --kubeconfig "$K_SPOKE" apply -f /tmp/import-crds.yaml
+oc --kubeconfig "$K_SPOKE" apply -f /tmp/import.yaml
+
+# Verify on hub
+oc --kubeconfig "$K_HUB" get managedcluster spoke-dc-v6
+```
+
+After registration completes the bundle is no longer needed; the klusterlet handles subsequent reconnections on its own.
+
+## Validation
+
+```bash
+K_HUB=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+K_SPOKE=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+# ManagedCluster status
+oc --kubeconfig "$K_HUB" get managedcluster spoke-dc-v6
+oc --kubeconfig "$K_HUB" get managedcluster spoke-dc-v6 -o jsonpath=\
+'{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}{"\n"}'
+
+# Hub-side namespace
+oc --kubeconfig "$K_HUB" get ns spoke-dc-v6 --show-labels
+
+# Addon config + addons
+oc --kubeconfig "$K_HUB" -n spoke-dc-v6 get klusterletaddonconfig spoke-dc-v6
+oc --kubeconfig "$K_HUB" -n spoke-dc-v6 get managedclusteraddon
+
+# Placement decisions
+oc --kubeconfig "$K_HUB" -n openshift-gitops get placement gitops-managed
+oc --kubeconfig "$K_HUB" -n openshift-gitops get placementdecision -l \
+  cluster.open-cluster-management.io/placement=gitops-managed -o yaml
+
+# GitOpsCluster
+oc --kubeconfig "$K_HUB" -n openshift-gitops get gitopscluster gitops-managed
+
+# Spoke side: klusterlet
+oc --kubeconfig "$K_SPOKE" -n open-cluster-management-agent get pods
+oc --kubeconfig "$K_SPOKE" -n open-cluster-management-agent-addon get pods
+
+# Spoke side: gitops-addon Deployment
+oc --kubeconfig "$K_SPOKE" -n openshift-gitops get deploy openshift-gitops-operator-controller-manager
+```
+
+Expected:
+
+- `ManagedCluster/spoke-dc-v6` condition `ManagedClusterConditionAvailable=True`.
+- All `ManagedClusterAddon` instances `Available=True` (application-manager, cert-policy-controller, policy-controller, work-manager, governance-policy-framework, cluster-proxy).
+- `Placement/gitops-managed` `numberOfSelectedClusters: 1`; matching `PlacementDecision` lists `spoke-dc-v6`.
+- `GitOpsCluster/gitops-managed` `status.placementDecisionRef` populated.
+- Spoke klusterlet pods `Running` in `open-cluster-management-agent`.
+- Spoke OpenShift GitOps Deployment present in `openshift-gitops` namespace.
+
+## Failure modes seen
+
+- **Toleration missing → ManifestWork pruning during transient unreachability.** Pre-v6 outage pattern: a spoke briefly lost network, picked up the `unreachable` taint, left the Placement decision, and ACM pruned the ManifestWork. When the spoke came back, it was missing its workloads. The toleration `NoSelect` on `unreachable` (above) prevents this — the spoke stays in the decision even when unreachable, so the ManifestWork persists.
+
+- **Wrong namespace name.** The hub-side namespace **must** match the `ManagedCluster.metadata.name`. A mismatch (`spoke` vs `spoke-dc-v6`) leaves the namespace unmatched and registration never completes.
+
+- **Auto-import secret missing pull-secret.** When the spoke doesn't trust the hub's internal CA (RHACS, ACM image signing), klusterlet pods can fail to pull. The fix is to make sure the hub's image-supply rules are mirrored to the spoke too — but in the v6 fleet, both clusters share the same `mirror-registry.apps.sub.comptech-lab.com` so this doesn't bite.
+
+## References
+
+- platform-gitops `clusters/hub-dc-v6/platform/fleet-registration/` — all seven manifests.
+- `connection-details/openshift-spoke-dc-v6.md` — spoke endpoints / inventory.
+- `connection-details/platform-admin-handoff.md` — hub installed-operator baseline (ACM 2.16.1, MCE 2.11.1).
+- `adr/0018-acm-openshift-gitops-pull-model-v6.md` — the pull model + Placement toleration rationale.
+- Memory: `feedback_acm_gitops_pull_pattern.md` — gitops-addon Deployment pattern.
