@@ -1,0 +1,211 @@
+---
+title: "Deployment and storage"
+description: "The Vault OSS VM cluster — three Raft voters plus a separate transit-seal Vault — running on dedicated VMs to keep secret delivery independent of any OpenShift cluster."
+sidebar_label: "Deployment and storage"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const clientBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const vmBox     = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const sealBox   = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const pathBox   = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const ocpBox    = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted   = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dashed  = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const vNodes = [
+  { id: "client",  position: { x: 0,   y: 0   }, data: { label: "ESO on each cluster\n(hub, spoke)" }, style: ocpBox },
+  { id: "cli",     position: { x: 240, y: 0   }, data: { label: "Operator CLI / API\n(VAULT_ADDR)" }, style: clientBox },
+  { id: "minio",   position: { x: 480, y: 0   }, data: { label: "MinIO\n(snapshot target)" }, style: clientBox },
+
+  { id: "endpoint",position: { x: 240, y: 140 }, data: { label: "vault.sub.comptech-lab.com\n(DNS RR to 3 voters, :8200)" }, style: vmBox },
+
+  { id: "v0",      position: { x: 50,  y: 280 }, data: { label: "vault-0\nRaft voter" }, style: vmBox },
+  { id: "v1",      position: { x: 240, y: 280 }, data: { label: "vault-1\nRaft voter" }, style: vmBox },
+  { id: "v2",      position: { x: 430, y: 280 }, data: { label: "vault-2\nRaft voter" }, style: vmBox },
+
+  { id: "seal",    position: { x: 240, y: 420 }, data: { label: "vault-seal-0\nTransit-seal Vault\nShamir 5/3 (manual unseal)" }, style: sealBox },
+
+  { id: "secret",  position: { x: 0,   y: 540 }, data: { label: "secret/ocp/platform/*\nsecret/ocp/<cluster>/*\nsecret/apps/<div>/<app>/*" }, style: pathBox },
+];
+
+export const vEdges = [
+  { id: "c-ep",  source: "client",   target: "endpoint", label: "https :8200", ...reqEdge },
+  { id: "cli-ep",source: "cli",      target: "endpoint", ...reqEdge },
+  { id: "ep-v0", source: "endpoint", target: "v0", ...muted },
+  { id: "ep-v1", source: "endpoint", target: "v1", ...muted },
+  { id: "ep-v2", source: "endpoint", target: "v2", ...muted },
+  { id: "raft01",source: "v0",       target: "v1", label: "Raft :8201", ...muted },
+  { id: "raft12",source: "v1",       target: "v2", ...muted },
+  { id: "raft02",source: "v0",       target: "v2", ...muted },
+  { id: "v0-seal",source:"v0",       target: "seal", label: "auto-unseal\nencrypt/decrypt", ...dashed },
+  { id: "v1-seal",source:"v1",       target: "seal", ...dashed },
+  { id: "v2-seal",source:"v2",       target: "seal", ...dashed },
+  { id: "snap",   source: "v0",      target: "minio", label: "raft snapshot", ...dashed },
+  { id: "paths",  source: "v0",      target: "secret", ...muted },
+];
+
+Vault in this lab is **HashiCorp Vault OSS** running on dedicated Ubuntu VMs, on the lab `/16`, completely outside any OpenShift cluster. This page covers the topology, the storage backend choice, and the rationale.
+
+## The decision (per ADR `vault-oss-vm-plan.md`)
+
+> All previous RKE2/OpenShift-hosted Vault deployments are retired for the clean rebuild. The new active target is a Vault OSS service running directly on dedicated VMs on the private lab network. Vault must be independent of OpenShift and RKE2 so OpenShift secret delivery does not depend on a cluster that is itself being rebuilt.
+
+In one sentence: **OpenShift depends on Vault, not the other way around.**
+
+That principle means Vault cannot live in OpenShift. If it did, every cluster bootstrap (registry pull secrets, htpasswd identity, certs, ESO sync targets) would race against Vault's own bootstrap. By keeping Vault on VMs, the dependency graph is acyclic: build the lab → bring up Vault → install OpenShift → wire ESO from OpenShift to Vault.
+
+## The four VMs
+
+<Whiteboard client:load data={{ nodes: vNodes, edges: vEdges }} height={680} />
+
+| Hostname | Role |
+| --- | --- |
+| `vault-seal-0` | Transit-seal Vault. Single-node. Shamir 5/3 (5 unseal shares, threshold 3). Manual unseal after restart. |
+| `vault-0` | Main Vault Raft voter. |
+| `vault-1` | Main Vault Raft voter. |
+| `vault-2` | Main Vault Raft voter. |
+
+DNS:
+
+- `vault-seal-0.sub.comptech-lab.com` — direct VM name; not used by ESO clients, only by the main Vault nodes for transit auto-unseal traffic.
+- `vault-0.sub.comptech-lab.com`, `vault-1.sub.comptech-lab.com`, `vault-2.sub.comptech-lab.com` — direct VM names; used for Raft cluster traffic and operator CLI.
+- `vault.sub.comptech-lab.com` — **DNS round-robin** to the three Raft voters. This is what every ESO `SecretStore`, every `VAULT_ADDR` environment variable, every operator CLI session points at. The Raft cluster handles "this client got the standby" via HA redirects.
+
+## The version
+
+| Item | Value |
+| --- | --- |
+| Vault | OSS `1.21.1` |
+| Source | Official HashiCorp release archive, checksum-verified at install |
+| Storage backend | Vault Integrated Storage (Raft) — no separate Consul or etcd |
+| API endpoint | `https://vault.sub.comptech-lab.com:8200` |
+| Raft cluster traffic | `:8201` (peer-to-peer between the three voters) |
+
+Vault OSS, not Enterprise. The lab does not need Enterprise namespaces or DR replication; OSS Raft handles three-node HA, snapshot/restore, and autopilot.
+
+## Storage: Raft, on dedicated data disk per VM
+
+Each of the four VMs (three voters + seal) has a dedicated data disk:
+
+- OS disk: small (~100G), root + binaries.
+- Data disk: dedicated qcow2 mounted at `/var/lib/vault/raft` (for voters) or `/var/lib/vault/raft` (for the seal Vault — same path, just a one-node Raft).
+
+The Vault config points the storage backend at this dedicated path:
+
+```hcl
+storage "raft" {
+  path    = "/var/lib/vault/raft"
+  node_id = "vault-0"   # unique per voter
+}
+```
+
+Why dedicated:
+
+- **Independent fsync.** Vault's Raft path needs to fsync on every entry; sharing the OS disk would couple the OS's buffered writes (apt, journald) with Vault's durability path.
+- **Independent sizing.** Vault's data path grows with secret count + revision history; the OS disk shouldn't have to.
+- **Clean snapshot/restore.** Replacing a node means rebuilding the OS, leaving the data disk intact, and starting the daemon again. Cleaner than a full qcow2 swap.
+
+## Listener
+
+```hcl
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  tls_cert_file = "/etc/vault.d/tls/vault.crt"
+  tls_key_file  = "/etc/vault.d/tls/vault.key"
+}
+
+api_addr     = "https://vault-0.sub.comptech-lab.com:8200"
+cluster_addr = "https://vault-0.sub.comptech-lab.com:8201"
+```
+
+- **`address = 0.0.0.0:8200`** — listens on every NIC. Firewall (`ufw` / `iptables`) is what restricts who can reach it.
+- **TLS required.** No plaintext Vault traffic anywhere.
+- **`api_addr` and `cluster_addr` use the per-node FQDN.** This is what HA redirects send clients to: when a client asks the standby for a write, the standby sends a redirect to `api_addr` of the active node. The DNS RR endpoint isn't suitable for the redirect target — it has to point at a specific node — so each Vault node knows its own name.
+
+## Why three voters (and not five, or one)
+
+| Cluster size | Quorum survives loss of | Trade-off |
+| --- | --- | --- |
+| 1 voter | Nothing (any loss = quorum loss) | Cheapest; least durable |
+| 3 voters | 1 node | Lab-appropriate; survives a single VM failure or one hypervisor down |
+| 5 voters | 2 nodes | Better fault tolerance; doubles the disk + RAM cost |
+
+The lab picked three. With one operator, three hypervisors max, and a relatively small secret population, three voters is the right cost/availability balance. The hypervisor placement convention is to spread the three voters across distinct hosts so a single hypervisor failure doesn't take quorum.
+
+## Why a separate transit-seal Vault
+
+The main Vault Raft cluster auto-unseals against a *separate* Vault running on `vault-seal-0`. The seal Vault uses Shamir unseal (5 shares, threshold 3) — operators bring it out of seal manually after each restart. Once unsealed, it exposes a single transit key (`transit/keys/main-vault-auto-unseal`) that the main Vault encrypts/decrypts its root key with.
+
+That gives the cluster:
+
+- **Automatic restart of voters.** A reboot or `systemctl restart vault` on a voter brings it back without operator interaction; it asks the seal Vault to decrypt its sealed root key.
+- **Operator-gated re-bootstrap.** If the seal Vault is sealed (e.g., after a power loss), no voter can come up. That's the explicit guard: the lab refuses to fully auto-recover Vault from an unknown state without an operator.
+
+Auto-unseal flow:
+
+1. `vault-0` starts. Reads its sealed root key from `/var/lib/vault/raft`.
+2. Talks to `vault-seal-0:8200` via its transit token.
+3. Asks transit to decrypt the sealed root key.
+4. Unseals itself, joins Raft.
+
+If `vault-seal-0` is sealed, step 2 fails and `vault-0` stays sealed. The operator unseals `vault-seal-0` first (Shamir 3-of-5), and the voters then unseal themselves on next restart.
+
+The seal Vault's unseal shares are kept in offline custody, separated from the main Vault VMs. This is the "key not next to the data it protects" principle — auto-unseal that hides the key on the same disk would be theater.
+
+## VM hardening baseline (per `vault-oss-vm-plan.md`)
+
+- Minimal supported Linux OS, fully patched from the local mirror where possible.
+- Dedicated `vault` user and group; binary owned by `vault:vault`.
+- Vault binary pinned to `1.21.1` and checksum-verified before install.
+- `systemd` service with restricted filesystem access.
+- Swap disabled.
+- Core dumps disabled.
+- Firewall allows:
+  - `8200/tcp` from approved clients and the lab-internal HAProxy / DNS RR clients only;
+  - `8201/tcp` only between Vault nodes;
+  - SSH only from the approved admin subnet.
+- TLS required for all Vault client and cluster traffic.
+- Vault data directory writable only by the `vault` user.
+- Audit log path writable only where needed, with rotation and disk alerts.
+- VM disks protected with the lab disk-encryption standard where practical.
+
+## What clients see
+
+| Use case | What clients write |
+| --- | --- |
+| ESO (OpenShift) | `VaultConfig.spec.server: https://vault.sub.comptech-lab.com:8200` |
+| Operator CLI | `export VAULT_ADDR=https://vault.sub.comptech-lab.com:8200` |
+| Vault snapshot job (on a voter) | `VAULT_ADDR=https://127.0.0.1:8200` (loopback against the local voter) |
+
+In every case the resolver is the lab recursor; the DNS RR endpoint returns the three voter addresses; the client picks one and HA-redirects to the active node if needed.
+
+## Production readiness gates (still pending)
+
+From `vault-oss-vm-plan.md`, the gates that must pass before Vault is treated as production-trusted:
+
+1. `vault status` shows initialized, unsealed, HA enabled.
+2. `vault operator raft list-peers` shows three healthy voters.
+3. `vault operator raft autopilot state` is healthy.
+4. Active node failover works when the leader is stopped.
+5. Restart behavior matches the approved seal strategy.
+6. Audit device is enabled and log rotation is validated.
+7. Snapshot backup and isolated restore both pass.
+8. OpenShift ESO can reach Vault over TLS.
+9. Vault can reach each OpenShift API TokenReview endpoint.
+10. A low-risk smoke `ExternalSecret` syncs without printing values.
+
+The current state of the gates is in the rebuild plan; several of them (notably restore drill, audit device with rotation) remain open.
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md`
+- `codex-opp-agent/connection-details/vault-app-secrets.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md` (Vault OSS VM Allocation)
+- Memory: `reference_lab_infrastructure.md`
+- HashiCorp Vault docs: <https://developer.hashicorp.com/vault/docs>
