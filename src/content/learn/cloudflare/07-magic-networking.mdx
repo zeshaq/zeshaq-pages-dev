@@ -1,0 +1,179 @@
+---
+title: "Magic networking — Transit, WAN, Firewall"
+sidebar_label: "07 — Magic networking"
+description: "Cloudflare as a layer-3 / layer-4 network plane for entire offices and data centers — Magic Transit, Magic WAN, Magic Firewall — and how they relate to Tunnel and Zero Trust."
+estimated_minutes: 45
+last_updated: 2026-05-10
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const edge  = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const cleanEdge = { style: { stroke: "#15803d", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const ddosEdge = { style: { stroke: "#b91c1c", strokeWidth: 1.5, strokeDasharray: "3,3" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const magicNodes = [
+  { id: "attacker", position: { x: 40,  y: 50 },  data: { label: "DDoS traffic\n(spoofed sources)" }, style: ext },
+  { id: "users",    position: { x: 40,  y: 200 }, data: { label: "legitimate users" },                style: stage },
+  { id: "branch",   position: { x: 40,  y: 350 }, data: { label: "your branch office\n(MAGIC WAN)" }, style: stage },
+  { id: "edge",     position: { x: 320, y: 200 }, data: { label: "Cloudflare edge\n(330+ PoPs, anycast)" }, style: edge },
+  { id: "scrub",    position: { x: 320, y: 50 },  data: { label: "MAGIC TRANSIT\nscrubbing" }, style: ctrl },
+  { id: "fw",       position: { x: 320, y: 350 }, data: { label: "MAGIC FIREWALL\nL3-7 rules" }, style: ctrl },
+  { id: "dc",       position: { x: 620, y: 200 }, data: { label: "your data center\nor cloud VPC\n(via GRE / Anycast IP)" }, style: stage },
+];
+
+export const magicEdges = [
+  { id: "a1", source: "attacker", target: "scrub", label: "absorbed", ...ddosEdge },
+  { id: "u1", source: "users",    target: "edge",  ...reqEdge },
+  { id: "b1", source: "branch",   target: "fw",    label: "WAN traffic", ...cleanEdge },
+  { id: "e1", source: "edge",     target: "dc",    label: "clean traffic via GRE / IPsec", ...cleanEdge },
+  { id: "f1", source: "fw",       target: "edge",  ...cleanEdge },
+  { id: "s1", source: "scrub",    target: "edge",  label: "filtered", ...cleanEdge },
+];
+
+If [Cloudflare Tunnel](/learn/cloudflare/cloudflare-tunnel) is "Cloudflare as a layer-7 proxy for a single service," **Magic networking** is "Cloudflare as a layer-3 / layer-4 network plane for entire offices, data centers, and IP ranges." Same anycast network, different abstraction.
+
+The three Magic products — **Magic Transit, Magic WAN, Magic Firewall** — together form Cloudflare's enterprise networking layer. This module is what each does, how they fit together, and where they replace traditional networking gear.
+
+## The big picture
+
+<Whiteboard client:load data={{ nodes: magicNodes, edges: magicEdges }} height={500} />
+
+Reading the diagram:
+
+- **Magic Transit** ingests traffic for your IP prefixes at every Cloudflare PoP, scrubs DDoS attacks, then forwards clean traffic to your data center / cloud VPC over GRE tunnels (or Anycast IP).
+- **Magic WAN** connects branch offices and remote users into the same Cloudflare network, replacing traditional SD-WAN appliances and MPLS lines.
+- **Magic Firewall** is the L3-7 stateful firewall built into the Cloudflare network — once your traffic is on Cloudflare's network (via Transit, WAN, or WARP), you can apply network-wide firewall rules to it.
+
+All three run on the *same* anycast network you learned about in module 01. The Magic naming is product packaging — they're three different SKUs for "your traffic is on Cloudflare's network now."
+
+## Magic Transit, in depth
+
+The pitch: **Cloudflare scrubs your inbound traffic and ships you only the legitimate bits, over GRE tunnels.**
+
+How it works:
+
+1. **You bring your IP prefixes to Cloudflare.** Cloudflare announces them via BGP from every PoP (your /24 or larger is anycast-announced globally).
+2. **All inbound traffic to your prefixes lands at the nearest Cloudflare PoP.** DDoS, scans, legitimate users — everything.
+3. **Cloudflare scrubs the traffic.** Volumetric DDoS gets absorbed (Cloudflare can absorb Tbps-class attacks at any single PoP). The remaining clean traffic continues.
+4. **Clean traffic flows to your data center / cloud VPC** over GRE tunnels or Anycast IP. The decapsulated traffic arrives at your origin's actual IP.
+5. **Outbound traffic** can optionally flow back through the same tunnels for symmetry, or take normal egress paths.
+
+What you replace:
+
+- **DDoS-scrubbing appliances** (Arbor, Radware, etc.) — Cloudflare scrubs at a scale most enterprises can't afford to provision.
+- **Per-IP DDoS protection** at your ISP — moves the problem to Cloudflare's much larger infrastructure.
+- **L3/L4 firewalls in front of your data center** — Magic Firewall replaces these for many shops.
+
+When this fits:
+
+- You own **your own IP prefixes** (you have an ASN or a /24 or larger registered to your organization).
+- You're an enterprise with **on-prem or colo data centers** plus a need for DDoS protection at network scale.
+- You want to **shift packets to Cloudflare's network at the IP layer**, not just at the HTTP layer.
+
+When this doesn't fit:
+
+- You're a small site with no IP prefix of your own. The HTTP-layer Cloudflare CDN/proxy is what you want, not Transit.
+- Your origin is a managed cloud provider that already does DDoS scrubbing (AWS Shield, GCP Cloud Armor) and you don't need an additional network-layer scrubber.
+
+## Magic WAN, in depth
+
+The pitch: **replace MPLS, SD-WAN appliances, and per-site VPN gear with Cloudflare as the connecting fabric.**
+
+How it works:
+
+- **Each site** (branch office, data center, cloud VPC) connects to Cloudflare's nearest PoP — via IPsec, GRE, or the Cloudflare Magic WAN Connector (a small device or VM).
+- **Traffic between sites** transits Cloudflare's backbone, not the public internet, not MPLS.
+- **Routing is policy-based.** Define rules: "traffic from HQ to data-center: prefer low-latency path; traffic from branch X to SaaS Y: take direct internet egress with WARP-style scrubbing."
+- **The same Magic Firewall rules** apply across the WAN.
+
+What you replace:
+
+- **MPLS lines** — Cloudflare's backbone is meaningfully comparable for many workloads at a fraction of the cost.
+- **SD-WAN appliances** (Cisco Viptela, Silver Peak, VeloCloud, etc.) — Cloudflare's Magic WAN Connector subsumes the function.
+- **Per-site VPN tunnels** — collapses into one declarative configuration.
+
+When this fits:
+
+- Multi-site enterprises currently running **expensive MPLS** or **SD-WAN appliance fleets**.
+- Hybrid setups with **multiple cloud VPCs** and on-prem locations that need a unified routing model.
+- Organizations going through a **Zero Trust transformation** where the WAN and the security stack should be one platform.
+
+When it doesn't fit:
+
+- Small organizations with one cloud VPC and a handful of remote workers — overkill. Use Cloudflare One / WARP for the remote workers (module 04) and call it done.
+
+## Magic Firewall, in depth
+
+A **stateful L3-7 firewall** that runs natively on Cloudflare's network. Once your traffic is on Cloudflare's edge (via Transit, WAN, or any other product), Magic Firewall lets you apply firewall rules to it.
+
+What rules look like (Wirefilter syntax, similar to the WAF):
+
+```
+# Allow only specific source prefixes inbound to your DC's port 443.
+( ip.dst.country eq "US" and tcp.dstport in {443}
+  and ip.src in {203.0.113.0/24, 198.51.100.0/24} )
+=> allow
+
+# Drop all UDP except known good services.
+( udp and not udp.dstport in {53, 443, 5060} )
+=> drop
+
+# Log and rate-limit ICMP.
+icmp => log_and_rate_limit
+```
+
+The advantages over a physical firewall:
+
+- **Distributed** — rules are enforced at every PoP simultaneously, near the attacker.
+- **No hardware to capacity-plan.** You don't need to upgrade your firewall appliance for the next traffic surge.
+- **Unified configuration.** Same rule engine across Transit, WAN, WARP-managed devices.
+
+## How the three fit with the rest of Cloudflare
+
+| You want to... | Use |
+| --- | --- |
+| Expose a single private service to the internet | [Cloudflare Tunnel](/learn/cloudflare/cloudflare-tunnel) |
+| Make an internal app reachable via SSO without VPN | Tunnel + Cloudflare Access (module 05) |
+| Filter outbound traffic from a fleet of laptops | Cloudflare Gateway + WARP (module 06) |
+| Get DDoS protection for your IP prefixes at network scale | **Magic Transit** |
+| Replace MPLS / SD-WAN across an enterprise | **Magic WAN** |
+| Apply L3-7 firewall rules to all of the above | **Magic Firewall** |
+| All of the above in one bundle | Cloudflare One (module 04) — the umbrella SKU |
+
+## Pricing reality
+
+Magic products are **enterprise tier** — quote-based, not self-serve. The list pricing isn't public but the comparison is against:
+
+- **DDoS scrubbing services** (Akamai Prolexic, Neustar) — Magic Transit is generally cheaper at comparable scale.
+- **MPLS circuits** — Magic WAN is dramatically cheaper, often by an order of magnitude.
+- **Firewall appliances** + maintenance contracts — Magic Firewall removes most of the hardware bill.
+
+The economics generally make sense for organizations with $50K+/year currently going to DDoS protection, MPLS, or large firewall fleets.
+
+## Exercise
+
+This module's exercise is conceptual rather than hands-on (Magic products require an enterprise contract and your own IP prefix).
+
+1. **For your own organization** (or one you know): list which Magic-replaceable functions exist today. DDoS scrubbing? MPLS? SD-WAN appliances? Firewall fleet?
+2. **Estimate the current spend** on those line items. Many engineers don't know — the network team usually owns the contracts. Ask.
+3. **Compare to the Cloudflare One sales pitch.** Where would Magic Transit / WAN / Firewall replace the existing gear, where wouldn't it?
+4. **Consider the migration path.** Magic adoption is typically gradual — start with one site or one prefix; don't flip the whole network at once.
+
+## Why this matters for the rest of the track
+
+Magic networking is the **enterprise version** of the same anycast network that Tunnel uses at the per-service level. The mental model is:
+
+- **Tunnel + Access** = expose one service, identity-gated.
+- **Magic WAN** = expose entire offices, same network model at L3.
+- **Magic Transit** = ingest your IP space, scrub at network layer.
+- **Magic Firewall** = the rule plane that applies across all of them.
+
+All four ride on the same infrastructure as Workers, Pages, and the AI products — which is why Cloudflare's "one network, one platform" story is more than marketing.
+
+**Next:** [Module 08 — Workers](/learn/cloudflare/workers).

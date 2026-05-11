@@ -1,0 +1,179 @@
+---
+title: "Workers — edge compute"
+sidebar_label: "08 — Workers"
+description: "Cloudflare Workers, the V8-isolate runtime that runs at every PoP. How it differs from Lambda, what it's good at, what it isn't, and how to deploy your first one with wrangler."
+estimated_minutes: 45
+last_updated: 2026-05-10
+---
+
+**Cloudflare Workers** is the platform's compute layer. Each Worker is a small piece of code that runs **at every PoP** — not in some "edge region" separate from the CDN, but on the same servers that serve cache hits and terminate TLS. The execution model is **V8 isolates**, not containers, which means startup is sub-millisecond and cold-starts are effectively absent.
+
+This module is what Workers are, how they differ from Lambda / Cloud Functions / containers, and how to deploy your first one.
+
+## The shape of a Worker
+
+A Worker is a small JavaScript / TypeScript / WebAssembly module that exports a `fetch` handler:
+
+```ts
+// worker.ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/hello") {
+      return new Response("hello from " + (request.cf?.colo ?? "unknown") + "!");
+    }
+    return fetch("https://example.com" + url.pathname);
+  },
+};
+```
+
+`request.cf?.colo` is the IATA code of the PoP that received the request — proving the same code is running at hundreds of locations simultaneously.
+
+Deploy:
+
+```bash
+npm install -g wrangler
+wrangler init my-worker      # scaffolds a project
+cd my-worker
+wrangler dev                 # run locally
+wrangler deploy              # ship to every PoP, globally, in seconds
+```
+
+That's the whole loop. The Worker is now live at `my-worker.<your-subdomain>.workers.dev` and reachable from anywhere with sub-millisecond startup.
+
+## V8 isolates vs containers
+
+The architectural choice that defines Workers:
+
+| | Lambda / Cloud Functions / containers | Cloudflare Workers (V8 isolates) |
+| --- | --- | --- |
+| Startup time | 50ms–2s (cold) | &lt;1ms |
+| Isolation boundary | OS process / container | V8 isolate (a JS sandbox) |
+| Memory ceiling | 1–10 GB | ~128 MB per request |
+| CPU time ceiling | minutes | 30s default, up to 5min (paid tier) |
+| Languages | Node.js, Python, Go, Java, etc. | JavaScript / TypeScript, WebAssembly (Rust, Go, C++ via WASM) |
+| Filesystem | yes | no |
+| Long-lived stateful processes | yes | no — use Durable Objects |
+| Scale-to-N concurrency | per-instance, pre-warmed | per-request, instant |
+
+The V8 isolate model means a Worker is **almost free to start**. Every request to your Worker is essentially a function call inside a JS engine that's already running. No container to spin up, no Linux process boundary, no cold start.
+
+The cost is the **constraints** — you don't have a filesystem, you can't run arbitrary native binaries, and your memory + CPU envelope is much smaller than a container's. For HTTP-shaped workloads, this is almost always fine. For ML training or large data processing, it isn't.
+
+## What Workers are good at
+
+- **HTTP request transformation** — read the request, do something, return a response. The "function as a service" sweet spot.
+- **API aggregation / fan-out** — call multiple upstream services in parallel, merge the results, return. Lambda-shaped but faster.
+- **Content modification at the edge** — A/B testing variants, rewriting HTML before delivery, injecting headers, redirecting based on geo.
+- **Auth proxies** — sit in front of your origin, validate JWTs, sign requests downstream.
+- **CDN-with-logic** — the cache key for a route depends on the user's preferences; the Worker computes it.
+- **Webhook handlers** — receive a webhook, queue it, return 200 immediately. Pair with Workers Queues.
+- **Lightweight APIs** — full REST or RPC services for small workloads, especially read-heavy ones.
+- **Geographic routing logic** — `request.cf.country` lets you make decisions based on user location.
+- **AI inference proxies** — Workers AI runs models locally; Workers + AI Gateway sit in front of OpenAI / Anthropic for caching and observability.
+
+## What Workers aren't good at
+
+- **Long-running batch jobs.** 5-minute wall-time ceiling. Use a real compute platform.
+- **ML training.** Memory and CPU are too small. Use Workers AI for inference, separate compute for training.
+- **Large stateful processes.** A traditional Express/Flask app with in-memory caches isn't shaped like a Worker. Use Durable Objects for stateful patterns, or run the app elsewhere.
+- **Heavy native code.** Some libraries assume a Node.js + filesystem environment; they don't run on Workers. Many do, increasingly so as Cloudflare ships Node.js compatibility shims.
+- **Things requiring specific languages.** TypeScript and JavaScript are first-class. Rust / C++ via WebAssembly works. Python via Pyodide (newer, slower). No JVM, no .NET runtime.
+
+## The wrangler workflow
+
+`wrangler` is the CLI. The mental model:
+
+- **`wrangler init`** — scaffold a project (`wrangler.toml`, a `src/worker.ts`, tests, types).
+- **`wrangler dev`** — run locally with the Cloudflare runtime emulated. Hot reload.
+- **`wrangler deploy`** — ship to production. Seconds, globally.
+- **`wrangler tail`** — stream live logs from production Workers.
+- **`wrangler secret put NAME`** — set a runtime secret (don't put secrets in `wrangler.toml`).
+- **`wrangler kv:key`** — manage Workers KV from the CLI.
+- **`wrangler d1`** — manage Workers D1 databases.
+
+A typical `wrangler.toml`:
+
+```toml
+name = "my-worker"
+main = "src/worker.ts"
+compatibility_date = "2026-05-10"
+compatibility_flags = ["nodejs_compat"]
+
+# Custom domain.
+routes = [
+  { pattern = "api.example.com/*", custom_domain = true }
+]
+
+# Environment bindings (read-only, available as `env.VAR` in the Worker).
+[vars]
+APP_ENV = "production"
+
+# Bindings to other Cloudflare primitives:
+[[kv_namespaces]]
+binding = "USER_PREFS"
+id = "<kv-namespace-id>"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "main"
+database_id = "<d1-database-id>"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "uploads"
+```
+
+Bindings are the integration point — accessing KV, D1, R2, Queues, Durable Objects, AI all happens via these typed `env.X` bindings, with no per-request auth needed because the Worker is running inside the same trust boundary.
+
+## What Workers integrate with (preview of module 09)
+
+The compute layer is interesting in isolation. The **data stack** that pairs with it is what makes Workers production-viable. Module 09 goes deep, but at a glance:
+
+- **KV** — eventually-consistent key-value store. Global. Read-heavy workloads.
+- **D1** — SQLite at the edge. Read replicas everywhere; writes go to the primary.
+- **R2** — S3-compatible object storage. No egress fees.
+- **Durable Objects** — stateful coordination primitives. A single canonical instance per object, anywhere on the network.
+- **Queues** — async job dispatching between Workers.
+- **Hyperdrive** — connection-pooling proxy for traditional Postgres / MySQL databases, with smart connection reuse from Workers.
+- **Vectorize** — vector database. Native to Workers AI workflows.
+- **Analytics Engine** — high-cardinality time-series aggregation.
+
+Each is a Cloudflare primitive accessible from a Worker via a binding.
+
+## Workers for Platforms
+
+A platform-tier feature: deploy Workers on behalf of *your customers*. If you're building a SaaS where customers want to write their own webhook handlers or transformations, Workers for Platforms lets you offer that without exposing your underlying Cloudflare account.
+
+Examples in the wild:
+
+- **Shopify Functions** — Shopify lets merchants write custom checkout logic; under the hood, this is Workers for Platforms.
+- **Hashnode, Ghost** — letting authors write custom rules on their sites.
+
+Out of scope for this track; mentioned because you'll see it in real product architectures.
+
+## Exercise
+
+1. **Install wrangler**: `npm install -g wrangler`.
+2. **Scaffold**: `wrangler init hello-edge`. Pick TypeScript, no Git, no deploy yet.
+3. **Modify** the generated `src/index.ts` to return the request's PoP (from `request.cf?.colo`) and country.
+4. **`wrangler dev`** — exercise it locally. Visit `http://localhost:8787`.
+5. **`wrangler deploy`** — ship to production. Note the `workers.dev` URL it gives you.
+6. **From your phone on cellular**: visit the URL, then again from your laptop on wifi. Different `colo` values most likely — the same code running at different PoPs.
+7. **Add a binding**: create a KV namespace via `wrangler kv:namespace create "PREFS"`, bind it in `wrangler.toml`, and modify the Worker to read/write a counter for the visitor's country.
+8. **Tail it**: in another terminal, `wrangler tail`. Refresh the URL — see your own request logged.
+
+You've now deployed a globally-distributed application in ~10 minutes. The same workflow scales to production services serving millions of requests per second.
+
+## Why this matters for the rest of the track
+
+Workers are the compute substrate for several products that follow:
+
+- **Workers AI** (module 10) runs models on Workers + Cloudflare-owned GPU PoPs.
+- **AI Gateway** (module 10) sits in front of LLM providers, running as a Worker.
+- **Pages Functions** (module 11) are Workers attached to Pages projects.
+- **A growing share of Cloudflare's own products** (Access, Stream, Email Routing, etc.) are built internally on the same Workers runtime that customers use.
+
+The platform-level point: **Workers is Cloudflare's general-purpose execution layer**. Once you know how to deploy and operate a Worker, you can use everything in modules 09-12 fluently.
+
+**Next:** [Module 09 — Workers data stack](/learn/cloudflare/workers-data).

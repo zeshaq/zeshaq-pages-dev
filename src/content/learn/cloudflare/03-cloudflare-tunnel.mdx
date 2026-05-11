@@ -1,0 +1,174 @@
+---
+title: "Cloudflare Tunnel"
+sidebar_label: "03 — Tunnel"
+description: "Expose a private origin to the internet without opening inbound ports or doing NAT traversal — how cloudflared works, when to use it, and the mental model for the rest of Zero Trust."
+estimated_minutes: 45
+last_updated: 2026-05-10
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const edge  = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const tunnelEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const blocked = { style: { stroke: "#b91c1c", strokeWidth: 1.5, strokeDasharray: "3,3" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const tunnelNodes = [
+  { id: "user",   position: { x: 60,  y: 200 }, data: { label: "user / browser" },                 style: stage },
+  { id: "edge",   position: { x: 280, y: 200 }, data: { label: "Cloudflare edge\n(anycast PoP)" }, style: edge },
+  { id: "fw",     position: { x: 500, y: 200 }, data: { label: "your firewall\n(no inbound 80/443)" }, style: ctrl },
+  { id: "agent",  position: { x: 720, y: 200 }, data: { label: "cloudflared\n(agent inside)" },    style: edge },
+  { id: "origin", position: { x: 920, y: 200 }, data: { label: "private origin\n(http://localhost:3000)" }, style: stage },
+];
+
+export const tunnelEdges = [
+  { id: "u1", source: "user",  target: "edge",   label: "https://app.example.com", ...reqEdge },
+  { id: "t1", source: "agent", target: "edge",   label: "outbound persistent\nQUIC tunnel (initiated from inside)", ...tunnelEdge },
+  { id: "p1", source: "edge",  target: "agent",  label: "request flows back", ...tunnelEdge },
+  { id: "a1", source: "agent", target: "origin", label: "local HTTP", ...reqEdge },
+];
+
+If you've ever set up a VPN, a reverse proxy, a NAT punch-through, ngrok, or a public IP + firewall rule + DNS record + TLS cert just to expose one internal service to one user — **Cloudflare Tunnel is the one tool that obsoletes most of that for most use cases**. It's also the load-bearing primitive underneath Cloudflare's entire Zero Trust suite, so understanding it well is what makes everything in modules 04-06 click.
+
+This module is what Tunnel is, how it works, when to use it, and where it sits in the broader Cloudflare picture.
+
+## The shape of the problem
+
+You have a service running somewhere — a dev server on your laptop, a self-hosted application in your home network, a database in a private VPC, an internal admin tool in a corporate data center. You want to reach it from outside that network. The traditional options:
+
+- **Open inbound ports + DNS + TLS cert** — works, exposes the service to the public internet, requires constant security work.
+- **VPN** — works for users on the VPN, doesn't work for browsers / API clients without VPN setup, has client-management overhead.
+- **Reverse SSH tunnel** — works for one-off cases, doesn't scale, breaks on network changes.
+- **Ngrok / similar SaaS tunnels** — works, but you're paying per-tunnel, you don't own the URL, and free tiers shift to public URLs.
+
+**Cloudflare Tunnel solves the same problem at the network layer with a permanent, identity-aware, free-for-most-use-cases primitive.**
+
+## How it works
+
+<Whiteboard client:load data={{ nodes: tunnelNodes, edges: tunnelEdges }} height={400} />
+
+Reading the diagram:
+
+1. **You run `cloudflared`** — a small Go agent — inside your network, on a host that can reach the origin (your service).
+2. The agent **initiates a persistent outbound connection** to Cloudflare's edge over QUIC (port 443). This is the green dashed line — the **only network change** Tunnel requires. No inbound ports. No firewall holes. No port forwarding.
+3. **Your firewall doesn't need to allow inbound traffic.** Most firewalls allow outbound 443 by default; that's all Tunnel needs.
+4. A user requests `https://app.example.com`. Cloudflare's edge receives it (anycast, TLS-terminated at the PoP).
+5. The edge **forwards the request through the existing tunnel** back to `cloudflared`.
+6. `cloudflared` makes the local HTTP call to `http://localhost:3000` (or whatever you configured) and returns the response back through the tunnel.
+
+The user sees `https://app.example.com`. They never know there's no public origin. Your network sees only outbound 443. There is no "place the attacker can knock on the door."
+
+## Setup
+
+The actual configuration is short. Assuming you have a Cloudflare account and a domain you've added:
+
+```bash
+# Install the agent — Linux, macOS, Windows, ARM, Docker all supported.
+brew install cloudflare/cloudflare/cloudflared    # macOS
+# or: sudo apt install cloudflared                # Debian/Ubuntu
+# or: docker pull cloudflare/cloudflared          # container
+
+# Authenticate with Cloudflare.
+cloudflared tunnel login
+
+# Create a tunnel — generates credentials.
+cloudflared tunnel create my-app
+
+# Route a hostname to the tunnel (creates the DNS record + cert automatically).
+cloudflared tunnel route dns my-app app.example.com
+
+# Run it.
+cloudflared tunnel run --url http://localhost:3000 my-app
+```
+
+That's the entire setup. Visit `https://app.example.com` — you're reaching `localhost:3000` over the tunnel, via Cloudflare's network, with TLS terminated at the edge.
+
+For production deployment, run `cloudflared` as a service (systemd, launchd, Windows service, Kubernetes deployment). The agent reconnects automatically on network changes, gracefully handles network blips, and supports multiple replicas for HA.
+
+## Configuration via YAML
+
+Beyond the quick-start `--url` flag, real deployments use a `config.yml`:
+
+```yaml
+tunnel: my-app
+credentials-file: /root/.cloudflared/<tunnel-id>.json
+
+ingress:
+  # Route specific hostnames to specific local services.
+  - hostname: app.example.com
+    service: http://localhost:3000
+  - hostname: api.example.com
+    service: http://localhost:4000
+  - hostname: db.example.com
+    service: tcp://localhost:5432    # Yes, TCP / non-HTTP too.
+
+  # Optional: rewrite headers, set TLS verify behavior, etc.
+  - hostname: legacy.example.com
+    service: https://192.168.1.50:8443
+    originRequest:
+      noTLSVerify: true              # The internal origin's cert is self-signed.
+
+  # Catch-all (required as last rule).
+  - service: http_status:404
+```
+
+One `cloudflared` process can multiplex many hostnames to many local services. The single TCP-via-QUIC connection carries all of them.
+
+## What it's good at
+
+**Exposing private origins** — the headline use case. Replaces "public IP + firewall + DNS + cert" with `cloudflared`.
+
+**Dev environments** — instead of running ngrok or jumping through hoops, point a tunnel at your laptop's localhost. The hostname is stable; rotate developers without changing URLs.
+
+**Internal services without VPN** — paired with Cloudflare Access (module 05), every internal tool gets `https://tool.example.com` URLs that require SSO. No VPN client; no per-user firewall rules.
+
+**Remote access to home/lab networks** — self-hosters use Tunnel + Access to expose Plex, Home Assistant, Proxmox, etc., to themselves on the road without opening any inbound port.
+
+**Multi-cloud private origin** — your origin is in AWS but you don't want a public ALB; Tunnel works equally well from a private EC2 instance with no security-group ingress rules.
+
+**Non-HTTP protocols** — SSH (`ssh`), TCP, UDP services all tunnel. Combine with WARP client + Access for engineer-friendly SSH-without-VPN.
+
+## What to know about
+
+- **Free tier limits.** Tunnel itself is free for unlimited bandwidth and tunnels on your account, even on the free plan. There's no "TLS termination minutes" or hidden meter — Cloudflare's bandwidth-flat pricing model applies.
+- **Identity is separate.** Tunnel makes the *transport* secure (origin reachable without inbound holes); it does **not** authenticate users by itself. By default, anyone who knows the URL can hit it. Pair with **Cloudflare Access** (module 05) for identity-aware gating.
+- **Backend protocols are flexible.** `service:` supports `http://`, `https://`, `tcp://`, `ssh://`, `rdp://`, `unix:/path` and more.
+- **High availability.** Run two `cloudflared` instances on different hosts pointing at the same tunnel. Cloudflare load-balances between them. Failover is automatic.
+- **Observability.** Tunnel metrics flow into Cloudflare's dashboard (and Prometheus via the agent's `--metrics` flag). Logs are configurable.
+- **Replaces** Argo Tunnel — the older Cloudflare Tunnel product. If you see Argo Tunnel in legacy docs, it's the same thing under the new name.
+
+## What it's not
+
+- **Not a CDN.** A response served via Tunnel still goes back to your origin every time unless you also configure caching rules. Tunnel = transport, not edge cache.
+- **Not a load balancer for origin failure.** Tunnel HA handles cloudflared agent failure; for actual origin failure you also want Cloudflare Load Balancing or upstream redundancy.
+- **Not a WAF on its own.** Cloudflare WAF runs at the edge above Tunnel; configure it explicitly per zone.
+
+## Exercise
+
+1. **Install `cloudflared`** on a laptop or any VM. Authenticate it with `cloudflared tunnel login`.
+2. **Spin up a tiny local server**: `python -m http.server 8000` from any directory.
+3. **Create a tunnel + DNS record**: 
+   ```bash
+   cloudflared tunnel create demo-tunnel
+   cloudflared tunnel route dns demo-tunnel demo.<your-domain>
+   ```
+4. **Run the tunnel** pointing at the local server:
+   ```bash
+   cloudflared tunnel run --url http://localhost:8000 demo-tunnel
+   ```
+5. **Browse to `https://demo.<your-domain>`** from your phone on cellular data. You're now reaching your laptop from outside your local network, via Cloudflare's network, with no inbound holes.
+6. **Inspect the network**: from your laptop, `ss -tnp | grep cloudflared` shows only outbound 443 connections to Cloudflare. No inbound listening sockets.
+
+## Why this matters for the rest of the track
+
+Tunnel is the **primitive** underneath the broader Cloudflare Zero Trust suite:
+
+- **Cloudflare Access** (module 05) sits in front of a Tunnel and authenticates users before forwarding the request.
+- **Cloudflare One** (module 04) bundles Tunnel + Access + Gateway + WARP into the unified Zero Trust offering.
+- **Magic WAN** (module 07) extends the same outbound-only connection model to entire offices, replacing IPsec / SD-WAN appliances.
+
+The mental model: **all of Cloudflare's Zero Trust is "make the connection start from inside, never from outside."** Tunnel is the simplest expression of that pattern.
+
+**Next:** [Module 04 — Zero Trust / Cloudflare One](/learn/cloudflare/zero-trust).

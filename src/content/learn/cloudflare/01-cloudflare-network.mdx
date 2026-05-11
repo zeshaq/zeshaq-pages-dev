@@ -1,0 +1,120 @@
+---
+title: "The Cloudflare network"
+sidebar_label: "01 — The network"
+description: "Anycast, points of presence, the global backbone — the data-plane primitive that every other Cloudflare product builds on."
+estimated_minutes: 30
+last_updated: 2026-05-10
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const edge  = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const backboneEdge = { style: { stroke: "#15803d", strokeWidth: 1.5, strokeDasharray: "5,5" }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const netNodes = [
+  { id: "user1", position: { x: 60,  y: 60 },  data: { label: "user (NYC)" },          style: stage },
+  { id: "user2", position: { x: 60,  y: 200 }, data: { label: "user (Singapore)" },    style: stage },
+  { id: "user3", position: { x: 60,  y: 340 }, data: { label: "user (São Paulo)" },    style: stage },
+  { id: "popA",  position: { x: 290, y: 60 },  data: { label: "PoP — Newark" },         style: edge },
+  { id: "popB",  position: { x: 290, y: 200 }, data: { label: "PoP — Singapore" },      style: edge },
+  { id: "popC",  position: { x: 290, y: 340 }, data: { label: "PoP — São Paulo" },      style: edge },
+  { id: "backbone", position: { x: 540, y: 200 }, data: { label: "Cloudflare\nbackbone" }, style: ctrl },
+  { id: "origin", position: { x: 800, y: 200 }, data: { label: "your origin\n(any cloud / on-prem)" }, style: stage },
+];
+
+export const netEdges = [
+  { id: "u1", source: "user1", target: "popA", label: "anycast", ...reqEdge },
+  { id: "u2", source: "user2", target: "popB", label: "anycast", ...reqEdge },
+  { id: "u3", source: "user3", target: "popC", label: "anycast", ...reqEdge },
+  { id: "b1", source: "popA",  target: "backbone", ...backboneEdge },
+  { id: "b2", source: "popB",  target: "backbone", ...backboneEdge },
+  { id: "b3", source: "popC",  target: "backbone", ...backboneEdge },
+  { id: "o1", source: "backbone", target: "origin", label: "fewer, smarter routes", ...backboneEdge },
+];
+
+Every Cloudflare product — Tunnel, Access, Workers, Magic Transit, Pages — runs on the same underlying network. Understanding what that network is, and what it does that the public internet doesn't, is the foundation for everything else in this track.
+
+## The data plane
+
+<Whiteboard client:load data={{ nodes: netNodes, edges: netEdges }} height={460} />
+
+Reading the diagram:
+
+- A **user request goes to the closest Cloudflare Point of Presence (PoP)**, automatically, via **anycast**. The same IP address is announced from every PoP; standard internet routing picks the topologically nearest one.
+- The PoP either **serves the request locally** (cache hit, Worker execution, static asset, terminating TLS for a Tunnel) or **forwards it to your origin** over Cloudflare's **backbone network** — not the open internet.
+- The backbone is a **private interconnect** between PoPs. Cloudflare measures latency on every path constantly and routes traffic over the fastest one, which is often not the same as what BGP would have chosen.
+
+What this gives you, mechanically:
+
+- **TLS terminates near the user.** A user in São Paulo connects to São Paulo and finishes the TLS handshake there — not over the trans-Atlantic link to a Virginia origin.
+- **TCP terminates near the user.** Same idea — the slow-start ramp and congestion control happen in low-RTT distance to the user, not to your origin.
+- **Caching is global by default.** A cache hit on any PoP serves immediately; cache misses fall through to the origin once across the backbone.
+- **The backbone is faster than the internet.** When Cloudflare does have to reach your origin, it uses **Argo Smart Routing** to pick the lowest-latency path, often saving 30-40% of origin-fetch time.
+- **Every product co-locates.** Workers run at PoPs. Tunnel terminates at PoPs. Magic Transit scrubs at PoPs. The platform's products aren't in some "compute zone" separate from the CDN — they're the same servers.
+
+## The numbers (2026-ish)
+
+- **330+ cities** with PoPs across **120+ countries**. The number grows quarterly.
+- **~95% of internet users** are within ~50ms of a Cloudflare PoP.
+- The network handles double-digit-Tbps of attack traffic during major DDoS events without breaking a sweat.
+
+The "internet scale" framing isn't marketing here — Cloudflare's anycast IP space carries a meaningful fraction of all internet traffic on most days.
+
+## Anycast vs DNS-based load balancing
+
+A common misconception: that "geographic routing" is achieved via DNS (e.g., resolving a name to a different IP per region). It can be, and many CDNs do it that way. **Cloudflare uses anycast: one IP, advertised from every PoP, routed by BGP to the closest one.**
+
+Why this matters:
+
+- **DNS-based routing has TTL latency.** A user moves; their DNS cache still points at the old PoP until the record refreshes. Anycast routes the next packet.
+- **Anycast survives PoP failure transparently.** If a PoP drops off, BGP withdraws the route from that location; the same IP keeps working from the next-closest PoP. Users don't need a new DNS lookup.
+- **Anycast handles DDoS naturally.** An attack is spread across every PoP simultaneously. Each PoP only sees a fraction of the total volume.
+
+The "single IP for every user worldwide" model is a Cloudflare-defining architectural choice and underlies most of the products in this track.
+
+## What's on the edge vs at the origin
+
+The pattern across all Cloudflare products is **push computation toward the edge wherever possible, keep state at the origin only when you have to**:
+
+| At the edge (PoPs) | At your origin |
+| --- | --- |
+| TLS termination | Long-lived application state |
+| Caching (static assets, dynamic responses) | Authoritative database |
+| Workers (V8 isolates) | Heavy compute / training |
+| WAF + bot management | Bespoke business logic |
+| Access (identity check) | Internal services |
+| Magic Transit scrubbing | Anything you don't want to move |
+
+This is also why Cloudflare's data primitives (KV, D1, R2, Durable Objects) exist — they let you keep state at the edge when the application's shape allows.
+
+## How Cloudflare differs from the hyperscalers
+
+Cloudflare is not AWS, GCP, or Azure. The platform is:
+
+- **Network-first.** Everything starts with packets routed correctly. Compute is a layer on top.
+- **Anycast everywhere.** AWS and GCP have edge offerings (CloudFront, Cloud CDN) but their compute platforms are regional. Cloudflare Workers run at every PoP by default.
+- **Bandwidth-flat pricing.** Cloudflare doesn't charge per-GB egress. This is a fundamental difference for any product that moves data.
+- **Smaller compute primitives.** A Worker is a V8 isolate (sub-millisecond startup); a Lambda is a Linux container (50ms-2s cold start). Different shape of program.
+
+What Cloudflare is *not* good at, by comparison:
+
+- **Heavy training workloads.** No A100 fleet to rent. Workers AI runs on Cloudflare-owned GPU capacity but isn't where you train a 70B model.
+- **Long-running stateful applications.** Workers have CPU-time and wall-time limits. State lives in Durable Objects (good) or your origin (also good).
+- **Complex IAM models.** Cloudflare's permissioning is fine for ~50 engineers. AWS-style cross-account-role complexity isn't really there yet.
+
+## What this means for the rest of the track
+
+Every module that follows is a different way of using the network you just learned about:
+
+- **Tunnel (03)** uses the edge as the *destination* — your origin reaches out to Cloudflare, requests arrive there.
+- **Access (05)** uses the edge as an *identity-aware proxy* — users hit Cloudflare, prove who they are, then get forwarded to internal apps.
+- **Workers (08)** uses the edge as a *compute target* — your code runs at the PoP.
+- **Magic Transit (07)** uses the edge as a *layer-3 transit network* — entire prefixes route through it.
+- **Pages (11)** uses the edge as a *hosting plane* — static assets and dynamic functions co-located everywhere.
+
+Every product is "I want to put X on Cloudflare's network." This module is the network. The rest is what to put on it.
+
+**Next:** [Module 02 — DNS and CDN fundamentals](/learn/cloudflare/dns-and-cdn).
