@@ -1,8 +1,89 @@
 ---
 title: "Operator Version Lock (current)"
-description: "Section 07-references: Operator Version Lock (current) (placeholder)."
-sidebar_label: "Operator Version Lock (current)"
+description: "Locked OpenShift release + operator versions for the dc-lab disconnected rebuild — channel, version, source catalog."
+sidebar_label: "Operator Version Lock"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Locked baseline for the `dc-lab` disconnected rebuild. The intent is to
+mirror OpenShift `4.20.18` plus the operator set used (or planned) in the
+previous lab so implementation work does not repeatedly depend on slow
+public pulls. Architecture is `amd64` only; the update graph is disabled in
+this first install mirror; operator catalog content is pinned to exact
+package/channel/version ranges where prior CSV evidence exists rather than
+entire channels.
+
+- **OpenShift release payload:** `4.20.18`
+- **Architecture:** `amd64`
+- **Update graph:** disabled for this first install mirror
+- **Active image set:** `plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`
+
+## Operators included in first mirror
+
+| Operator | Channel | Version | Source catalog | Notes |
+| --- | --- | --- | --- | --- |
+| `openshift-gitops-operator` | `latest` | `1.20.3` | `redhat-operator-index:v4.20` | Hub GitOps bootstrap and desired-state delivery. |
+| `advanced-cluster-management` | `release-2.16` | `2.16.1` | `redhat-operator-index:v4.20` | `hub-dc-v6` management plane. |
+| `multicluster-engine` | `stable-2.11` | `2.11.1` | `redhat-operator-index:v4.20` | Required dep for ACM `2.16.1`. |
+| `lvms-operator` | `stable-4.20` | `4.20.0` | `redhat-operator-index:v4.20` | Compact hub VM storage. |
+| `local-storage-operator` | `stable` | `4.20.0-202604140241` | `redhat-operator-index:v4.20` | Local disk discovery for spoke ODF. |
+| `odf-operator` | `stable-4.20` | `4.20.10-rhodf` | `redhat-operator-index:v4.20` | Spoke cluster storage. |
+| `redhat-oadp-operator` | `stable` | `1.5.5` | `redhat-operator-index:v4.20` | Backup/restore baseline. |
+| `openshift-cert-manager-operator` | `stable-v1` | `1.19.0` | `redhat-operator-index:v4.20` | Certificate automation. |
+| `openshift-external-secrets-operator` | `stable-v1` | `1.1.0` | `redhat-operator-index:v4.20` | Vault/secret integration baseline. |
+| `openshift-pipelines-operator-rh` | `pipelines-1.22` | `1.22.0` | `redhat-operator-index:v4.20` | Jenkins/Nexus CI smoke path + future in-cluster pipelines option. |
+| `rhacs-operator` | `stable` | `4.10.2` | `redhat-operator-index:v4.20` | Previous ACS central/secured-cluster baseline. |
+| `compliance-operator` | `stable` | `1.9.0` | `redhat-operator-index:v4.20` | Compliance baseline. |
+| `gatekeeper-operator-product` | `stable` | `3.21.0` | `redhat-operator-index:v4.20` | Policy/OPA baseline. |
+| `container-security-operator` | `stable-3.16` | `3.16.3` | `redhat-operator-index:v4.20` | Quay image scanning operator. |
+| `cluster-observability-operator` | `stable` | `1.4.0` | `redhat-operator-index:v4.20` | Observability operator. |
+| `loki-operator` | `stable-6.5` | `6.5.0` | `redhat-operator-index:v4.20` | Logging backend. |
+| `cluster-logging` | `stable-6.5` | `6.5.0` | `redhat-operator-index:v4.20` | Cluster logging. |
+| `tempo-product` | `stable` | `0.20.0-3` | `redhat-operator-index:v4.20` | Tracing baseline. |
+| `opentelemetry-product` | `stable` | `0.144.0-3` | `redhat-operator-index:v4.20` | OpenTelemetry baseline. |
+| `netobserv-operator` | `stable` | `1.11.1` | `redhat-operator-index:v4.20` | Network observability. |
+| `servicemeshoperator3` | `stable-3.3` | `3.3.2` | `redhat-operator-index:v4.20` | OSSM 3 ambient mesh. |
+| `kiali-ossm` | `stable` | `2.22.2` | `redhat-operator-index:v4.20` | Service mesh UI. |
+| `quay-operator` | `stable-3.17` | `3.17.1` | `redhat-operator-index:v4.20` | Quay registry. |
+| `cluster-kube-descheduler-operator` | `stable` | `5.3.2` | `redhat-operator-index:v4.20` | Kube descheduler. |
+| `file-integrity-operator` | `stable` | `1.3.8` | `redhat-operator-index:v4.20` | File integrity. |
+| `security-profiles-operator` | `release-alpha-rhel-8` | `0.10.0` | `redhat-operator-index:v4.20` | Security profiles. |
+| `nfd` | `stable` | `4.20.0-202604140241` | `redhat-operator-index:v4.20` | Node Feature Discovery for GPU workers. |
+| `kubevirt-hyperconverged` | `stable` | `4.20.11` | `redhat-operator-index:v4.20` | OpenShift Virtualization (under issue #139). |
+| `cloudnative-pg` | `stable-v1` | `1.29.0` | `certified-operator-index:v4.20` | PostgreSQL operator. |
+| `open-liberty-certified` | `v1.6` | `1.6.1` | `certified-operator-index:v4.20` | Open Liberty Operator. |
+
+## Additional non-operator images
+
+| Image | Source |
+| --- | --- |
+| `registry.redhat.io/ubi9/ubi:latest` | Red Hat |
+| `registry.redhat.io/ubi9/ubi-minimal:latest` | Red Hat |
+| `registry.access.redhat.com/ubi9/nodejs-22-minimal:latest` | Red Hat |
+| `icr.io/appcafe/open-liberty:25.0.0.6-kernel-slim-java17-openj9-ubi-minimal` | IBM (Open Liberty) |
+
+## Deferred operator packages
+
+| Catalog | Package | Channel | Version | Reason |
+| --- | --- | --- | --- | --- |
+| `redhat-operator-index:v4.20` | `rhods-operator` | `stable` | `2.25.6` | Deferred to avoid large RHOAI images during ACM/GitOps build. Reintroduce only when OpenShift AI is in scope. |
+| `certified-operator-index:v4.20` | `gpu-operator-certified` | `v26.3` | `26.3.1` | Deferred to avoid NVIDIA GPU images during ACM/GitOps build. Reintroduce only when GPU worker enablement is in scope. |
+
+## Evidence summary
+
+- Wiki records OpenShift `4.20.18` as the fleet baseline.
+- `lab-gitops-full` records package names, catalog sources, channels, and
+  several `startingCSV` values.
+- Report `20260506-215619-live-focused.md` records previous installed CSV
+  versions (ACM `2.16.1`, MCE `2.11.1`, Open Liberty `1.6.1`, ODF
+  `4.20.9-rhodf`, Pipelines `1.22.0`, ESO `1.1.0`, RHACS `4.10.2`, Quay
+  `3.17.1`, OpenShift AI `2.25.6`).
+- Expanded dry-run on 2026-05-08 produced 702 mappings.
+- 2026-05-10 ODF dependency refresh completed at 193/193 release images,
+  425/425 operator images, 4/4 additional images. ImageSet now pins ODF
+  and generated dependency packages to `4.20.10-rhodf`.
+
+Last regenerated from
+`plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+(dated 2026-05-08, refreshed 2026-05-10).

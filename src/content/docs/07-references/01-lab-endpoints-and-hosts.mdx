@@ -1,8 +1,65 @@
 ---
 title: "Lab Endpoints and Hosts"
-description: "Section 07-references: Lab Endpoints and Hosts (placeholder)."
+description: "Quick-lookup table of logical hostnames, their roles, public DNS, and where to find canonical operator detail."
 sidebar_label: "Lab Endpoints and Hosts"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Single-page lookup for every named host in the CompTech OpenShift lab. The
+table lists the **logical name** (the one used in runbooks and config), the
+**role** the host plays, the **public DNS** that resolves to it (if any), and a
+pointer to the canonical operator detail document. Specific IP addresses,
+subnet positions, and SSH custody are intentionally redacted — those live in
+`codex-opp-agent/connection-details/` under change-controlled custody.
+
+## Plane overview
+
+Hosts fall into four broad planes:
+
+- **Edge plane** — DNS + reverse proxy + TLS termination at the lab boundary.
+- **Cluster plane** — OpenShift control planes and workers (`hub-dc-v6`,
+  `spoke-dc-v6`).
+- **Platform-VM plane** — supporting VMs for CI, registry, secrets,
+  observability, IAM, runtime.
+- **Bootstrap plane** — the operator workstation and the install host.
+
+## Hosts
+
+| Host (logical) | Role | Public DNS | Internal? | Reference doc |
+| --- | --- | --- | --- | --- |
+| haproxy-edge | TLS terminator + SNI router for platform VMs | `haproxy.apps.sub.comptech-lab.com` (stats) | No (public) | `reference_haproxy_vm.md` |
+| pdns | Authoritative + recursor for `sub.comptech-lab.com` | — | Internal only | `reference_pdns_vm.md` |
+| nexus-mirror | Disconnected mirror + dev pull + app push registry | `nexus-mirror.apps.sub.comptech-lab.com`, `mirror-registry.apps.sub.comptech-lab.com`, `docker-group.apps.sub.comptech-lab.com`, `app-registry.apps.sub.comptech-lab.com` | No (HAProxy fronted) | `connection-details/nexus.md` |
+| minio | S3 object storage (CI evidence, OADP, backups) | `minio.apps.sub.comptech-lab.com`, `minio-console.apps.sub.comptech-lab.com` | No (HAProxy fronted) | `connection-details/minio.md` |
+| gitlab | Self-hosted GitLab CE for platform GitOps + app source | `gitlab.apps.sub.comptech-lab.com` | No (HAProxy fronted) | `connection-details/gitlab-operator-guide.md` |
+| jenkins | App-build CI orchestrator | `jenkins.apps.sub.comptech-lab.com` | No (HAProxy fronted) | `connection-details/jenkins.md` |
+| signoz | Production observability (OTLP traces/metrics/logs) | `signoz.apps.sub.comptech-lab.com` | No (HAProxy fronted) | `connection-details/signoz.md` |
+| monitoring-0 | LGTM observability sandbox | `*.mon.sub.comptech-lab.com` | No (HAProxy fronted, `mon` SNI) | `reference_lab_infrastructure.md` |
+| docker-runtime-vm | Standalone Docker host for non-OpenShift apps | `docker-runtime-vm.sub.comptech-lab.com` (alias `docker-runtime.sub.comptech-lab.com`) | Per-app exposure decision | `connection-details/docker-runtime-vm.md` |
+| trivy | Image vulnerability scanner | `trivy.apps.sub.comptech-lab.com` | No (HAProxy fronted) | Platform handbook |
+| defectdojo | Vulnerability triage / SecOps | `defectdojo.apps.sub.comptech-lab.com` | No (HAProxy fronted) | Platform handbook |
+| vault-vm | HashiCorp Vault (KV-v2, Kubernetes auth) | `vault.sub.comptech-lab.com` | No (HAProxy fronted) | `plans/disconnected-rebuild/environments/dc-lab/vault-vm-plan.md` |
+| wso2-is | WSO2 Identity Server | `is.apps.sub.comptech-lab.com`, `auth.apps.sub.comptech-lab.com` | No (HAProxy fronted) | Platform handbook |
+| wso2-apim | WSO2 API Manager (publisher / devportal / admin / gateway) | `apim.apps.sub.comptech-lab.com`, `publisher.apps.sub.comptech-lab.com`, `devportal.apps.sub.comptech-lab.com`, `admin.apps.sub.comptech-lab.com`, `gateway.apps.sub.comptech-lab.com` | No (HAProxy fronted) | Platform handbook |
+| hub-dc-v6 | Management OpenShift cluster (ACM/MCE, hub GitOps) | `api.hub-dc-v6.sub.comptech-lab.com:6443`, `*.apps.hub-dc-v6.sub.comptech-lab.com` | Direct (not HAProxy) | `connection-details/openshift-hub-dc-v6.md` |
+| spoke-dc-v6 | Workload OpenShift cluster (ODF, app tenants) | `api.spoke-dc-v6.sub.comptech-lab.com:6443`, `*.apps.spoke-dc-v6.sub.comptech-lab.com` | Direct (not HAProxy) | `connection-details/openshift-spoke-dc-v6.md` |
+| ocp-bootstrap | Operator install workstation, holds kubeconfigs and install artifacts | — | Internal only | `reference_lab_infrastructure.md` |
+
+## Internal only
+
+> Specific values (private IPs, port-bind addresses, SSH custody, kubeconfig
+> paths, kubeadmin password files) are kept in
+> `codex-opp-agent/connection-details/`. The blog does not republish them.
+
+- Operator workstation home, kubeconfig custody, kubeadmin password files —
+  `connection-details/platform-admin-handoff.md`.
+- HAProxy public IP allocation (primary + DR) — `reference_haproxy_vm.md`.
+- VM-side IP map for every entry above — `reference_lab_infrastructure.md`.
+
+Last regenerated from
+`reference_lab_infrastructure.md`,
+`reference_haproxy_vm.md`,
+`connection-details/platform-admin-handoff.md`,
+`connection-details/nexus.md`,
+`connection-details/minio.md`.

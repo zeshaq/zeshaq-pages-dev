@@ -1,8 +1,123 @@
 ---
 title: "Cluster Domains and CIDRs"
-description: "Section 07-references: Cluster Domains and CIDRs (placeholder)."
+description: "Cluster-level domain and CIDR allocation for the dc-lab fleet — root domain, app wildcard, cluster ingress, and pod/service CIDRs."
 sidebar_label: "Cluster Domains and CIDRs"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../components/Whiteboard";
+
+DNS domains and CIDRs at the **cluster** level for the `dc-lab` fleet
+(`hub-dc-v6` + `spoke-dc-v6`). The lab uses a single root authoritative
+zone with a wildcard for platform-VM apps and per-cluster wildcards for
+OpenShift ingress. CIDR allocation is described at the `/24` (and bigger)
+granularity; specific host IPs are not republished here.
+
+## Domain plane
+
+The whiteboard below shows how the root zone divides into the
+platform-VM wildcard (`*.apps.sub.comptech-lab.com` -> HAProxy edge) and the
+per-cluster wildcards (`*.apps.<cluster>.sub.comptech-lab.com` -> cluster
+ingress VIPs).
+
+export const rootBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 240, textAlign: "center", fontWeight: 600 };
+export const zoneBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" };
+export const ingressBox = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" };
+export const edgeBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 240, textAlign: "center" };
+
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const domainNodes = [
+  { id: "root", position: { x: 260, y: 0 }, data: { label: "sub.comptech-lab.com\n(authoritative on pdns VM)" }, style: rootBox },
+  { id: "host", position: { x: 0, y: 140 }, data: { label: "<host>.sub.comptech-lab.com\nplatform VM A records" }, style: zoneBox },
+  { id: "apps", position: { x: 260, y: 140 }, data: { label: "*.apps.sub.comptech-lab.com\nplatform-VM wildcard" }, style: zoneBox },
+  { id: "mon",  position: { x: 520, y: 140 }, data: { label: "*.mon.sub.comptech-lab.com\nmonitoring sandbox" }, style: zoneBox },
+  { id: "hubapi",   position: { x: 0,   y: 300 }, data: { label: "api.hub-dc-v6.sub...\n:6443 (hub API VIP)" }, style: ingressBox },
+  { id: "hubapps",  position: { x: 260, y: 300 }, data: { label: "*.apps.hub-dc-v6.sub...\nhub ingress VIP" }, style: ingressBox },
+  { id: "spokeapi", position: { x: 0,   y: 420 }, data: { label: "api.spoke-dc-v6.sub...\n:6443 (spoke API VIP)" }, style: ingressBox },
+  { id: "spokeapps",position: { x: 260, y: 420 }, data: { label: "*.apps.spoke-dc-v6.sub...\nspoke ingress VIP" }, style: ingressBox },
+  { id: "haproxy",  position: { x: 520, y: 300 }, data: { label: "HAProxy edge\n(public + lab binds)" }, style: edgeBox },
+];
+
+export const domainEdges = [
+  { id: "r-h",  source: "root", target: "host",      ...muted },
+  { id: "r-a",  source: "root", target: "apps",      ...muted },
+  { id: "r-m",  source: "root", target: "mon",       ...muted },
+  { id: "r-hubapi",   source: "root", target: "hubapi",   ...muted },
+  { id: "r-hubapps",  source: "root", target: "hubapps",  ...muted },
+  { id: "r-spokeapi", source: "root", target: "spokeapi", ...muted },
+  { id: "r-spokeapps",source: "root", target: "spokeapps",...muted },
+  { id: "a-h", source: "apps", target: "haproxy", label: "SNI route", ...muted },
+  { id: "m-h", source: "mon",  target: "haproxy", label: "SNI route", ...muted },
+];
+
+<Whiteboard client:load data={{ nodes: domainNodes, edges: domainEdges }} height={560} />
+
+## Domains
+
+| Domain | Purpose | Resolves to |
+| --- | --- | --- |
+| `sub.comptech-lab.com` | Lab root zone (authoritative on `pdns` VM) | — (delegation point) |
+| `*.apps.sub.comptech-lab.com` | Platform-VM wildcard fronted by HAProxy | HAProxy edge (public + lab binds) |
+| `*.mon.sub.comptech-lab.com` | Monitoring sandbox exposure (added 2026-05-09) | HAProxy edge with `wildcard-mon.pem` cert |
+| `api.hub-dc-v6.sub.comptech-lab.com:6443` | hub-dc-v6 OpenShift API | hub API VIP (cluster network) |
+| `*.apps.hub-dc-v6.sub.comptech-lab.com` | hub-dc-v6 ingress | hub ingress VIP |
+| `api.spoke-dc-v6.sub.comptech-lab.com:6443` | spoke-dc-v6 OpenShift API | spoke API VIP (cluster network) |
+| `*.apps.spoke-dc-v6.sub.comptech-lab.com` | spoke-dc-v6 ingress | spoke ingress VIP |
+
+## CIDR allocation
+
+| Item | Value | Notes |
+| --- | --- | --- |
+| Lab bridge / machine network | `30.30.0.0/16` | Private `br30` bridge; all platform VMs and OpenShift nodes attach here. |
+| OpenShift node subnet | `30.30.75.0/24` | Allocated for hub + spoke control planes and spoke workers. |
+| OpenShift cluster pod CIDR | OpenShift installer default | Not customized in cluster install artifacts. |
+| OpenShift service CIDR | OpenShift installer default | Not customized in cluster install artifacts. |
+| IPv6 | disabled | Lab is IPv4-only by policy. |
+
+## OpenShift VIPs (per cluster)
+
+| Cluster | API VIP (logical) | Ingress VIP (logical) |
+| --- | --- | --- |
+| `hub-dc-v6` | hub API VIP on `30.30.75.0/24` | hub ingress VIP on `30.30.75.0/24` |
+| `spoke-dc-v6` | spoke API VIP on `30.30.75.0/24` | spoke ingress VIP on `30.30.75.0/24` |
+
+Exact VIP addresses are held in
+`codex-opp-agent/connection-details/platform-admin-handoff.md`.
+
+## DNS resolver behavior
+
+- Default lab resolver runs on the `pdns` VM (recursor).
+- Recursor forwards `sub.comptech-lab.com` to the locally-running
+  authoritative on the same VM.
+- Everything else recurses through Google + Cloudflare.
+- Recursor refuses queries from outside the lab `/16`.
+
+## Gateway
+
+- Default gateway for the lab `/16` is allocated at `.0.1` on the bridge.
+- Specific IP held in `connection-details/platform-admin-handoff.md`.
+
+## Why this domain split
+
+| Decision | Rationale |
+| --- | --- |
+| Single root zone | Single SQLite-backed PowerDNS instance keeps zone maintenance to one VM. |
+| `*.apps.sub.*` for platform VMs | Reuses the LE wildcard cert across many platform-VM hostnames with a single TLS terminator (HAProxy). |
+| `*.apps.<cluster>.sub.*` for clusters | OpenShift install creates this wildcard automatically. Avoids overlap with the platform wildcard. |
+| `*.mon.sub.*` sibling | Lets the monitoring sandbox have its own cert + cleaner identity without polluting `*.apps.*`. |
+| HAProxy not in OpenShift path | OpenShift cluster APIs and routes bind to dedicated public IPs — no double-hop. See `feedback_haproxy_scope.md`. |
+
+## Internal only
+
+> Specific API VIP and ingress VIP addresses, exact gateway IP, and per-host
+> A records are kept in
+> `codex-opp-agent/connection-details/platform-admin-handoff.md` and on the
+> `pdns` VM.
+
+Last regenerated from
+`connection-details/platform-admin-handoff.md`,
+`reference_lab_infrastructure.md`,
+`reference_pdns_vm.md`,
+`reference_haproxy_vm.md`.

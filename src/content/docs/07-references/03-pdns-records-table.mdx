@@ -1,8 +1,123 @@
 ---
-title: "PDNS Records Table"
-description: "Section 07-references: PDNS Records Table (placeholder)."
-sidebar_label: "PDNS Records Table"
+title: "PowerDNS Records"
+description: "Logical record inventory for the lab PowerDNS zone — record types, names, and routing notes; IPs redacted."
+sidebar_label: "PDNS Records"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The lab is authoritative for the single zone `sub.comptech-lab.com`,
+served by PowerDNS Authoritative 4.8.3 (SQLite backend) on a dual-homed
+`pdns.local` VM. The same VM also runs PowerDNS Recursor 4.9.3 as the lab's
+default resolver, forwarding the lab subdomain to the locally-running
+authoritative and the rest of the world to public recursors.
+
+Two sub-tables follow: the `sub.comptech-lab.com` zone (per-host A records)
+and the `*.apps.sub.comptech-lab.com` wildcard layer that fronts platform VMs
+through HAProxy. Specific IPv4 values are redacted — the table records the
+**routing target class** instead.
+
+## Zone: `sub.comptech-lab.com`
+
+| Record type | Name | Notes |
+| --- | --- | --- |
+| `SOA` | `sub.comptech-lab.com` | Single-VM authoritative, no secondary. |
+| `NS` | `sub.comptech-lab.com` | Self (`pdns.local`). |
+| `A` | `pdns.sub.comptech-lab.com` | The DNS VM (lab address). |
+| `A` | `pdns-public.sub.comptech-lab.com` | DNS VM (public address). |
+| `A` | `haproxy.sub.comptech-lab.com` | HAProxy edge (lab address). |
+| `A` | `gitlab.sub.comptech-lab.com` | GitLab VM. |
+| `A` | `minio.sub.comptech-lab.com` | MinIO VM. |
+| `A` | `nexus-mirror.sub.comptech-lab.com` | Nexus VM. |
+| `A` | `jenkins.sub.comptech-lab.com` | Jenkins VM. |
+| `A` | `signoz.sub.comptech-lab.com` | SigNoz VM. |
+| `A` | `monitoring-0.sub.comptech-lab.com` | LGTM sandbox VM. |
+| `A` | `defectdojo.sub.comptech-lab.com` | DefectDojo VM. |
+| `A` | `trivy.sub.comptech-lab.com` | Trivy VM. |
+| `A` | `vault.sub.comptech-lab.com` | Vault VM. |
+| `A` | `wso2-is.sub.comptech-lab.com` | WSO2 IS VM. |
+| `A` | `wso2-apim.sub.comptech-lab.com` | WSO2 APIM VM. |
+| `A` | `docker-runtime-vm.sub.comptech-lab.com` | Docker runtime VM. |
+| `CNAME` | `docker-runtime.sub.comptech-lab.com` | Alias -> `docker-runtime-vm`. |
+| `A` | `ocp-bootstrap.sub.comptech-lab.com` | Install workstation. |
+| `A` | `api.hub-dc-v6.sub.comptech-lab.com` | OpenShift hub API VIP. |
+| `A` | `api.spoke-dc-v6.sub.comptech-lab.com` | OpenShift spoke API VIP. |
+| `A` | `*.apps.hub-dc-v6.sub.comptech-lab.com` | Hub cluster ingress wildcard. |
+| `A` | `*.apps.spoke-dc-v6.sub.comptech-lab.com` | Spoke cluster ingress wildcard. |
+
+## Wildcard layer: `*.apps.sub.comptech-lab.com`
+
+All entries below resolve to the **HAProxy edge** (primary or DR public bind,
+or lab-network bind). HAProxy then SNI-routes to the matching platform VM.
+This is the lab DNS plane used by browsers, `curl`, and `oc`/`docker`/`podman`
+clients alike.
+
+| Record type | Name (pattern) | Notes |
+| --- | --- | --- |
+| `A` | `*.apps.sub.comptech-lab.com` | Wildcard pointing at HAProxy primary. May be served as an explicit per-host A record (preferred) or via the wildcard. |
+| `A` | `nexus-mirror.apps.sub.comptech-lab.com` | Nexus UI/API. |
+| `A` | `mirror-registry.apps.sub.comptech-lab.com` | Nexus install mirror (port 5000 behind HAProxy). |
+| `A` | `docker-group.apps.sub.comptech-lab.com` | Nexus developer pulls (port 5001 behind HAProxy). |
+| `A` | `app-registry.apps.sub.comptech-lab.com` | Nexus app pushes (port 5002 behind HAProxy). |
+| `A` | `minio.apps.sub.comptech-lab.com` | MinIO S3 API via HAProxy. |
+| `A` | `minio-console.apps.sub.comptech-lab.com` | MinIO web console via HAProxy. |
+| `A` | `gitlab.apps.sub.comptech-lab.com` | GitLab via HAProxy. |
+| `A` | `jenkins.apps.sub.comptech-lab.com` | Jenkins via HAProxy. |
+| `A` | `signoz.apps.sub.comptech-lab.com` | SigNoz via HAProxy. |
+| `A` | `monitoring.apps.sub.comptech-lab.com` | LGTM sandbox UI via HAProxy. |
+| `A` | `grafana.apps.sub.comptech-lab.com` | Grafana via HAProxy. |
+| `A` | `trivy.apps.sub.comptech-lab.com` | Trivy via HAProxy. |
+| `A` | `defectdojo.apps.sub.comptech-lab.com` | DefectDojo via HAProxy. |
+| `A` | `haproxy.apps.sub.comptech-lab.com` | HAProxy stats. |
+| `A` | `is.apps.sub.comptech-lab.com` | WSO2 IS. |
+| `A` | `auth.apps.sub.comptech-lab.com` | WSO2 IS (OIDC alias). |
+| `A` | `apim.apps.sub.comptech-lab.com` | WSO2 APIM. |
+| `A` | `publisher.apps.sub.comptech-lab.com` | APIM publisher. |
+| `A` | `devportal.apps.sub.comptech-lab.com` | APIM devportal. |
+| `A` | `admin.apps.sub.comptech-lab.com` | APIM admin. |
+| `A` | `gateway.apps.sub.comptech-lab.com` | APIM gateway. |
+| `A` | `bootstrap.kafka.apps.sub.comptech-lab.com` | Kafka bootstrap (legacy RKE2). |
+| `A` | `broker-{0,1,2}.kafka.apps.sub.comptech-lab.com` | Kafka brokers (legacy RKE2). |
+
+## Sibling zone: `*.mon.sub.comptech-lab.com`
+
+Added 2026-05-09 for monitoring sandbox exposure separate from app
+workloads. Same HAProxy public bind, but presented via a different wildcard
+certificate (`wildcard-mon.pem`).
+
+| Record type | Name (pattern) | Notes |
+| --- | --- | --- |
+| `A` | `grafana.mon.sub.comptech-lab.com` | Grafana on monitoring-0. |
+| `A` | `*.mon.sub.comptech-lab.com` | Reserved for future LGTM-side hostnames. |
+
+## Resolver behavior (recursor)
+
+| Setting | Behavior |
+| --- | --- |
+| `forward-zones=sub.comptech-lab.com=127.0.0.1:53` | Lab domain forwarded to local authoritative. |
+| `forward-zones-recurse=.=8.8.8.8;1.1.1.1` | Everything else recurses through Google + Cloudflare. |
+| `allow-from=127.0.0.0/8,30.30.0.0/16` | Recursor refuses queries from outside the lab subnet. |
+| Authoritative listen | Authoritative answers on lab + public IPs; recursor listens on a separate lab IP. |
+
+## Operational notes
+
+- All lab VMs use the recursor as their resolver; test new records with
+  `dig @<recursor-host> <fqdn> A +short`.
+- Canonical change method is the PowerDNS HTTP API (key local to the VM);
+  CLI alternative `pdnsutil add-record / replace-rrset / delete-rrset`.
+- SQLite backend, single VM — no AXFR / NOTIFY / secondary. HA is a future
+  ADR.
+- Dated backups (`pdns.conf.bak.<timestamp>-<reason>`) are admin convention
+  before significant edits.
+
+## Internal only
+
+> Specific IPv4 addresses for every `A` record above are kept in
+> `codex-opp-agent/connection-details/` and on the `pdns` VM. The PowerDNS
+> API key, authoritative public address, and recursor lab address are not
+> republished here.
+
+Last regenerated from
+`reference_pdns_vm.md`,
+`reference_lab_infrastructure.md`,
+`connection-details/nexus.md`.
