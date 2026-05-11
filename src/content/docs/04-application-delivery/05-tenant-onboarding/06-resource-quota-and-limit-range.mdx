@@ -1,0 +1,286 @@
+---
+title: "ResourceQuota and LimitRange"
+description: "Default per-env quota and limit-range shapes for tenant namespaces, the rationale for the numbers, and how a tenant requests a budget increase."
+sidebar_label: "Quota + LimitRange"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Every tenant namespace ships with a `ResourceQuota` and a `LimitRange`. They are sized per environment (dev / stg / prd), small enough that a runaway workload cannot starve the cluster, large enough that a normal Liberty / Node / Spring Boot app can run comfortably without re-quota requests on day one.
+
+## What / Why / How
+
+### What
+
+| Object | Kind | Effect |
+| --- | --- | --- |
+| `<ns>-quota` | `v1/ResourceQuota` | Hard-caps total CPU / memory / pod / PVC / object counts in the namespace. |
+| `<ns>-defaults` | `v1/LimitRange` | Defaults `resources.requests` and `resources.limits` on containers that omit them; sets minimums and maximums. |
+
+### Why two objects, not one
+
+`ResourceQuota` is an admission-time aggregate check on the whole namespace. `LimitRange` is an admission-time **per-Pod** check that mutates the Pod spec when it omits requests/limits. They serve different jobs:
+
+- `LimitRange` defaults a "developer forgot to set requests" Pod to sensible numbers, so it does not get either OOMKilled silently or scheduled with zero requests and starve neighbors.
+- `ResourceQuota` is the budget envelope — once the namespace's total requests exceed it, new Pods get a `FailedQuota` admission error.
+
+The RHACS policy `No CPU request or memory limit specified` is the third layer; if a Pod somehow lands without both (`LimitRange` removed, `ResourceQuota` bypassed), RHACS scales the Deployment to zero. Defense in depth.
+
+### How — the canonical default shapes
+
+#### `dev` environment
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: apps-platform-liberty-hello-dev-quota
+  namespace: apps-platform-liberty-hello-dev
+spec:
+  hard:
+    requests.cpu:        "4"
+    limits.cpu:          "8"
+    requests.memory:     "8Gi"
+    limits.memory:       "16Gi"
+    requests.storage:    "0"            # dev does not provision PVCs by default
+    persistentvolumeclaims: "0"
+    pods:                "10"
+    services:            "10"
+    services.loadbalancers: "0"
+    services.nodeports:  "0"
+    secrets:             "30"
+    configmaps:          "30"
+    count/deployments.apps:  "5"
+    count/jobs.batch:    "5"
+    count/cronjobs.batch:"5"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: apps-platform-liberty-hello-dev-defaults
+  namespace: apps-platform-liberty-hello-dev
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      min:
+        cpu: 10m
+        memory: 32Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+    - type: Pod
+      max:
+        cpu: "4"
+        memory: 8Gi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 5Gi
+```
+
+#### `stg` environment
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: apps-platform-liberty-hello-stg-quota
+  namespace: apps-platform-liberty-hello-stg
+spec:
+  hard:
+    requests.cpu:        "8"
+    limits.cpu:          "16"
+    requests.memory:     "16Gi"
+    limits.memory:       "32Gi"
+    requests.storage:    "50Gi"
+    persistentvolumeclaims: "5"
+    pods:                "20"
+    services:            "20"
+    services.loadbalancers: "0"
+    services.nodeports:  "0"
+    secrets:             "60"
+    configmaps:          "60"
+    count/deployments.apps:  "10"
+    count/jobs.batch:    "10"
+    count/cronjobs.batch:"10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: apps-platform-liberty-hello-stg-defaults
+  namespace: apps-platform-liberty-hello-stg
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: 500m, memory: 512Mi }
+      defaultRequest: { cpu: 250m, memory: 256Mi }
+      min:            { cpu: 10m,  memory: 32Mi }
+      max:            { cpu: "4",  memory: 8Gi }
+    - type: Pod
+      max:            { cpu: "8",  memory: 16Gi }
+    - type: PersistentVolumeClaim
+      max:            { storage: 20Gi }
+```
+
+#### `prd` environment
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: apps-platform-liberty-hello-prd-quota
+  namespace: apps-platform-liberty-hello-prd
+spec:
+  hard:
+    requests.cpu:        "16"
+    limits.cpu:          "32"
+    requests.memory:     "32Gi"
+    limits.memory:       "64Gi"
+    requests.storage:    "200Gi"
+    persistentvolumeclaims: "10"
+    pods:                "40"
+    services:            "40"
+    services.loadbalancers: "0"
+    services.nodeports:  "0"
+    secrets:             "120"
+    configmaps:          "120"
+    count/deployments.apps:  "20"
+    count/jobs.batch:    "20"
+    count/cronjobs.batch:"20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: apps-platform-liberty-hello-prd-defaults
+  namespace: apps-platform-liberty-hello-prd
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: "1",  memory: 1Gi }
+      defaultRequest: { cpu: 500m, memory: 512Mi }
+      min:            { cpu: 10m,  memory: 32Mi }
+      max:            { cpu: "8",  memory: 16Gi }
+    - type: Pod
+      max:            { cpu: "16", memory: 32Gi }
+    - type: PersistentVolumeClaim
+      max:            { storage: 50Gi }
+```
+
+## Inventory — defaults at a glance
+
+| Field | dev | stg | prd |
+| --- | --- | --- | --- |
+| `requests.cpu` | 4 | 8 | 16 |
+| `limits.cpu` | 8 | 16 | 32 |
+| `requests.memory` | 8 Gi | 16 Gi | 32 Gi |
+| `limits.memory` | 16 Gi | 32 Gi | 64 Gi |
+| `persistentvolumeclaims` | 0 | 5 | 10 |
+| `requests.storage` | 0 | 50 Gi | 200 Gi |
+| `pods` | 10 | 20 | 40 |
+| `services` | 10 | 20 | 40 |
+| `services.loadbalancers` | 0 | 0 | 0 |
+| `services.nodeports` | 0 | 0 | 0 |
+| `count/deployments.apps` | 5 | 10 | 20 |
+| `count/jobs.batch` | 5 | 10 | 20 |
+| `count/cronjobs.batch` | 5 | 10 | 20 |
+| Container default CPU | 200m | 500m | 1 |
+| Container default memory | 256 Mi | 512 Mi | 1 Gi |
+| Container defaultRequest CPU | 100m | 250m | 500m |
+| Container defaultRequest memory | 128 Mi | 256 Mi | 512 Mi |
+| Container max CPU | 2 | 4 | 8 |
+| Container max memory | 4 Gi | 8 Gi | 16 Gi |
+| Pod max CPU | 4 | 8 | 16 |
+| Pod max memory | 8 Gi | 16 Gi | 32 Gi |
+| PVC max storage | 5 Gi | 20 Gi | 50 Gi |
+
+## Rationale for the numbers
+
+- **Dev gets no PVCs by default** because the lab's storage class is finite (ODF on the spoke). Tenants who need persistence in `dev` (e.g., for CNPG development) request a budget increase in the same MR that adds the workload — common case, low friction.
+- **No LoadBalancer or NodePort services anywhere.** Exposure is via OpenShift Route only. The HAProxy frontends serve platform VMs only (per platform memory `feedback_haproxy_scope.md`); per-tenant exposure goes through OCP ingress.
+- **Storage budget grows non-linearly across envs** because prod typically retains real data and runs more replicas, while dev/stg can use ephemeral volumes for most workflows.
+- **Pod count is 2-4× the deployment count** so a Deployment can roll without exhausting the quota during the rollout.
+- **Secrets and configmaps are generous** — ESO + Vault produces a `Secret` per `ExternalSecret`, and tenants often have many.
+
+## Requesting an increase
+
+A tenant requests a quota increase by opening an MR against `platform-gitops` that edits the namespace's `resourcequota.yaml`. The MR MUST include:
+
+1. The numerical change (old → new for each field).
+2. The reason (e.g., "we are adding a second Deployment that runs at 2 CPU / 4 Gi requests").
+3. A capacity note from the requester (e.g., "we ran with old quota for two weeks; current peak utilisation is 80%").
+
+Platform admin reviews. If the cluster has capacity (check `oc adm top nodes`, `oc describe quota` cluster-wide), the increase is merged. If not, the tenant is asked to optimise first.
+
+Quota increases for `prd` are reviewed more strictly than `dev` / `stg`. A `prd` increase that doubles the namespace's footprint requires a second platform reviewer.
+
+## ServiceAccount opt-out — the privileged escape hatch
+
+A tenant occasionally needs to override `LimitRange` defaults (e.g., a CNPG Postgres instance whose memory request is naturally 4 Gi rather than the dev default of 128 Mi). The pattern is **not** to weaken the LimitRange — that would weaken it for every Pod in the namespace. Instead, the Pod sets its own requests/limits explicitly:
+
+```yaml
+spec:
+  containers:
+    - name: postgres
+      resources:
+        requests: { cpu: 500m, memory: 4Gi }
+        limits:   { cpu: "2",  memory: 8Gi }
+```
+
+As long as the values fit within the LimitRange's `min` and `max` (and the namespace's `ResourceQuota`), Kubernetes accepts them. The CNPG-backed-app sample at [03 — CNPG-backed app](../06-golden-path-samples/03-cnpg-backed-app) shows the exact pattern.
+
+If the values exceed the LimitRange `max`, the Pod is rejected at admission. The tenant either decreases the request or files a budget-increase MR that bumps the LimitRange max for that namespace specifically.
+
+## What happens at the boundaries
+
+| Action | Effect |
+| --- | --- |
+| Pod with no requests/limits | LimitRange mutates to add defaults. Pod admits. |
+| Pod with requests within limits | Admits as-is. |
+| Pod with requests > LimitRange container max | API server rejects with `forbidden: maximum cpu usage per Container is 2, but request is 3`. |
+| Pod with requests > namespace ResourceQuota free budget | API server rejects with `exceeded quota: requests.cpu: requested ..., used ..., limited ...`. |
+| Pod with requests = 0 | LimitRange `min` enforces `≥ min`. If min is 10m, Pod is rejected unless it explicitly requests ≥ 10m. |
+| Pod with limits < requests | API server rejects (invalid; limits must be ≥ requests). |
+| RHACS detects Pod missing CPU request or memory limit | Scales the Deployment to zero (post-admission). LimitRange should have prevented this; if it didn't (e.g., LimitRange deleted), RHACS catches. |
+
+## Inspecting current usage
+
+```bash
+NS=apps-platform-liberty-hello-dev
+
+# What's the quota?
+oc -n $NS describe quota
+
+# What's the limit range?
+oc -n $NS describe limitrange
+
+# What's the current usage vs quota?
+oc -n $NS get resourcequota -o jsonpath='{.items[0].status}' | jq
+
+# Per-pod CPU/memory usage (live).
+oc -n $NS adm top pods
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `Pod creation forbidden: exceeded quota: requests.memory` on Argo sync | Tenant is at quota ceiling for memory. | Either rollback the Deployment's replica count or open a quota-increase MR. | Monitor `kube_resourcequota` metric in Prometheus; alert at 80%. |
+| Pod admits but immediately OOMKilled | `LimitRange` default memory limit too low for the workload. | Set `resources.limits.memory` explicitly in the Deployment spec. | Tenant template includes explicit limits in `base/deployment.yaml`. |
+| `Job` with 50 parallel Pods immediately fails at quota | `count/jobs.batch` quota exceeded, or per-Pod CPU request × 50 > namespace CPU quota. | Set `parallelism` lower; or split into multiple Jobs across time. | Document Job sizing patterns in tenant onboarding. |
+| Quota silently bumps from manual edit | A platform admin made a console edit. Argo selfHeal reverts on next sync. | Make the change via `platform-gitops` MR. | Argo selfHeal=true on the tenants Application is the safety net. |
+| LimitRange `min: 10m` blocks a `cpu: 5m` workload that genuinely needs less | A sidecar's idle CPU is below the floor. | Either set `cpu: 10m` explicitly (small over-request) or open an MR to lower the `min` for that namespace. | Document floor rationale (avoid pathological scheduling on cpu=0). |
+| `ResourceQuota` includes `count/deployments.apps: 5` but tenant has 6 overlays | Each (app, env) is one Deployment; the count is per-namespace, so 5 apps in one env is fine. | Verify the operator counted by namespace, not by app monorepo. | The count is intentional ceiling per-env. |
+| PVC creation rejected `forbidden: persistentvolumeclaims: requested 1, limited 0` | The namespace is `dev` and PVC count default is 0. | Open a quota-increase MR if persistence is needed. | Use ephemeral volumes for `dev`; document. |
+
+## References
+
+- Kubernetes `ResourceQuota` API — `v1/ResourceQuota`.
+- Kubernetes `LimitRange` API — `v1/LimitRange`.
+- RHACS policy `No CPU request or memory limit specified` (`connection-details/rhacs-app-policy.md`).
+- ADR 0020 — PCI-DSS profile compliance on spoke-dc-v6.
+- ADR 0014 — Developer readiness platform contract (resource requests/limits requirement).

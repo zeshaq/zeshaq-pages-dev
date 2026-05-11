@@ -1,0 +1,221 @@
+---
+title: "Tenant onboarding — overview"
+description: "End-to-end checklist a platform operator follows to onboard a new (division, team, app) — Vault role, AppProject, ESO Secret, pull secret, AppSet entry, RHACS exception flow."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox  = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+export const stepBox  = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center" };
+export const extBox   = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 200, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const onboardNodes = [
+  { id: "s1",   position: { x: 0,   y: 0   }, data: { label: "1. Vault role + policy\nscript: vault-apps-onboard.sh" }, style: stepBox },
+  { id: "s2",   position: { x: 280, y: 0   }, data: { label: "2. AppProject + RoleBinding\nplatform-gitops MR" }, style: stepBox },
+  { id: "s3",   position: { x: 560, y: 0   }, data: { label: "3. Tenant namespace + SA\nplatform-gitops MR" }, style: stepBox },
+  { id: "s4",   position: { x: 0,   y: 150 }, data: { label: "4. ResourceQuota + LimitRange\nplatform-gitops MR" }, style: stepBox },
+  { id: "s5",   position: { x: 280, y: 150 }, data: { label: "5. SecretStore (vault-apps)\ntenant overlay" }, style: stepBox },
+  { id: "s6",   position: { x: 560, y: 150 }, data: { label: "6. app-registry pull Secret\nlabel + SA patch" }, style: stepBox },
+  { id: "s7",   position: { x: 0,   y: 300 }, data: { label: "7. AppSet entry (if new monorepo)\nplatform-gitops MR" }, style: stepBox },
+  { id: "s8",   position: { x: 280, y: 300 }, data: { label: "8. RHACS policy scope check\nadd exclusion only if needed" }, style: stepBox },
+  { id: "s9",   position: { x: 560, y: 300 }, data: { label: "9. Tenant lints + commits\noverlay change → MR" }, style: stepBox },
+  { id: "s10",  position: { x: 280, y: 450 }, data: { label: "10. Smoke deploy + Route 200\noperator validates" }, style: ctrlBox },
+];
+
+export const onboardEdges = [
+  { id: "e1", source: "s1", target: "s2", ...muted },
+  { id: "e2", source: "s2", target: "s3", ...muted },
+  { id: "e3", source: "s3", target: "s4", ...muted },
+  { id: "e4", source: "s4", target: "s5", ...muted },
+  { id: "e5", source: "s5", target: "s6", ...muted },
+  { id: "e6", source: "s6", target: "s7", ...muted },
+  { id: "e7", source: "s7", target: "s8", ...muted },
+  { id: "e8", source: "s8", target: "s9", ...muted },
+  { id: "e9", source: "s9", target: "s10", ...muted },
+];
+
+This page is the **single checklist** a platform operator follows to take a new (division, team, app) from "nothing" to "Argo syncs a working `Deployment` that pulls images, reads Vault secrets, and serves a Route." It is concrete enough that a new operator can follow it end to end without back-channel guidance.
+
+The five "platform-side" pages below each expand one step in detail.
+
+## Whiteboard — onboarding step order
+
+<Whiteboard client:load data={{ nodes: onboardNodes, edges: onboardEdges }} height={620} />
+
+The numbering matters. Steps 1-4 are platform setup that must complete before any tenant manifest is reconciled. Step 5 is the per-tenant ESO bridge. Step 6 is the cluster-wide pull secret materialisation. Step 7 is one-time per division (skipped for new apps in an existing monorepo). Steps 8-10 are the tenant's actual app delivery.
+
+## Checklist
+
+The full sequence for **a new division + new team + new app** is:
+
+### 1. Pick a division name
+
+Lowercase, no underscores. Examples: `platform`, `payments`, `risk`, `retail`.
+
+This becomes part of:
+
+- the namespace prefix (`apps-<division>-*`)
+- the Vault role (`apps-<cluster>-<division>`)
+- the Vault policy (`apps-<division>-read`)
+- the Vault path subtree (`secret/apps/<division>/...`)
+
+Add the entry to `platform-gitops/divisions.yaml` (one-line addition).
+
+### 2. Run the Vault onboarding script
+
+```bash
+/home/ze/claude-agent/scripts/vault-apps-onboard.sh <division> <cluster>
+# e.g.
+/home/ze/claude-agent/scripts/vault-apps-onboard.sh platform spoke-dc-v6
+```
+
+This creates (or rewrites — idempotent):
+
+- Vault ACL policy `apps-<division>-read`
+- Vault role `apps-<cluster>-<division>` under `auth/kubernetes-<cluster>/`
+
+Full details: [02 — Vault path and bound role](./02-vault-path-and-bound-role).
+
+### 3. Create the AppProject + team RoleBinding
+
+One MR to `platform-gitops`:
+
+- `clusters/<cluster>/appprojects/team-<team>.yaml` — Argo AppProject scoped to the team's app monorepo and `apps-<division>-*` destinations.
+- `clusters/<cluster>/tenants/_template/rolebinding-edit.yaml` — copied into `clusters/<cluster>/tenants/apps-<division>-<team>/rolebinding-team-developers.yaml` with placeholders substituted.
+
+Full details: [03 — Project + RoleBinding template](./03-project-rolebinding-template).
+
+### 4. Create the tenant namespace
+
+Same MR as step 3, adds:
+
+- `clusters/<cluster>/tenants/apps-<division>-<team>-<env>/namespace.yaml` (one per env: dev, stg, prd).
+- Labels: `apps.platform/division=<division>`, `apps.platform/team=<team>`, `apps.platform/env=<env>`, `apps.platform/tenant=true` (this last label is what triggers the cluster-wide pull-secret fan-out).
+- PSA labels: `pod-security.kubernetes.io/enforce=restricted` (PCI profile, ADR 0020).
+- The `argocd.argoproj.io/managed-by: openshift-gitops` annotation so Argo recognises the namespace.
+
+### 5. Create the ResourceQuota + LimitRange
+
+Same MR. See [06 — ResourceQuota and LimitRange](./06-resource-quota-and-limit-range) for the canonical shapes.
+
+Default budgets:
+
+- `dev`: 4 CPU / 8 Gi memory / 10 pods / 0 PVCs
+- `stg`: 8 CPU / 16 Gi memory / 20 pods / 5 PVCs
+- `prd`: 16 CPU / 32 Gi memory / 40 pods / 10 PVCs
+
+Tenants can request increases via a GitLab MR to the namespace's quota YAML, reviewed by the platform team.
+
+### 6. Materialise the per-tenant `SecretStore`
+
+In the tenant's app monorepo, create `apps/<team>/<app>/base/secretstore-vault-apps.yaml` from the template at `platform-gitops/clusters/<cluster>/tenants/_template/secretstore-vault-apps.yaml`, substituting `<DIVISION>`, `<APP>`, and `<CLUSTER>` placeholders.
+
+This is the only namespaced `SecretStore` for the tenant — not a `ClusterSecretStore`. It points the namespace's `app-eso` ServiceAccount at the Vault role created in step 2.
+
+Full details: [04 — ESO Secret and pullSecret](./04-eso-secret-and-pullsecret).
+
+### 7. Verify the cluster-wide app-registry pull Secret
+
+The `ClusterExternalSecret/app-registry-pull` (shipped from `platform-gitops/clusters/<cluster>/secrets/app-registry-pull/`) watches namespaces labelled `apps.platform/tenant=true` and materialises a `Secret/app-registry-pull` of type `kubernetes.io/dockerconfigjson` inside each.
+
+Confirm:
+
+```bash
+oc get clusterexternalsecret app-registry-pull -o jsonpath='{.status}'
+oc -n apps-<division>-<team>-<env> get secret app-registry-pull
+```
+
+Attach it to the `default` ServiceAccount:
+
+```bash
+oc -n apps-<division>-<team>-<env> patch sa default \
+  -p '{"imagePullSecrets":[{"name":"app-registry-pull"}]}'
+```
+
+For workloads using a non-default SA, attach to that SA instead.
+
+### 8. Add an AppSet entry (only if a new app monorepo)
+
+If this division's apps live in an app monorepo that the `tenant-apps` `ApplicationSet` is not already watching, one platform MR adds the new `repoURL` to the AppSet's `git` generator. See [02 — ApplicationSet generator pattern](../04-gitops-consume/02-appset-generator-pattern).
+
+If the new app is in an already-watched monorepo, this step is skipped — the AppSet auto-discovers the new overlay directory on its next refresh (default 3 min).
+
+### 9. RHACS policy scope check
+
+The five built-in deploy-time RHACS policies (`Latest tag`, `No CPU request or memory limit specified`, `Privileged Container`, `CAP_SYS_ADMIN capability added`, `Required Image Label`) auto-scope to `apps-.*`, so a new tenant namespace is covered without action. Verify scope is correct:
+
+```bash
+ROX_PW=$(oc -n stackrox get secret central-htpasswd -o jsonpath='{.data.password}' | base64 -d)
+curl -fsSk -u "admin:$ROX_PW" \
+  "https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies" \
+  | jq '.policies[] | select(.name == "Latest tag") | .scope'
+```
+
+If the tenant needs an exception, follow [05 — RHACS tenant exception process](./05-rhacs-tenant-exception-process). The default is **no exception** — fix the violation in the manifest first.
+
+### 10. Tenant onboards the app
+
+Tenant opens an MR against their app monorepo that adds `apps/<team>/<newapp>/{base,overlays/{dev,stg,prd}}/` following the [overlay contract](../04-gitops-consume/03-app-repo-overlay-contract).
+
+### 11. Smoke validation
+
+Once tenant merges:
+
+```bash
+# AppSet should have created Applications for dev/stg/prd.
+oc -n openshift-gitops get applications | grep '<team>-<newapp>'
+
+# Argo should be Synced/Healthy on dev (no CI digest yet, so on initial onboard the
+# placeholder digest causes ImagePullBackOff — that's expected. CI's first build patches it.)
+oc -n openshift-gitops get app team-<team>-<newapp>-dev -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+# Tenant runs a manual build through Path A (Jenkins) or Path B (Tekton). After CI's
+# first successful build merges the digest patch MR, Argo re-syncs and the Pod runs.
+
+# Final smoke:
+oc -n apps-<division>-<team>-dev get pods
+oc -n apps-<division>-<team>-dev get route <newapp> -o jsonpath='{.status.ingress[0].host}{"\n"}'
+curl -fsS https://$ROUTE_HOST/health
+```
+
+## What the five sub-pages cover
+
+| Page | Step | Purpose |
+| --- | --- | --- |
+| [02 — Vault path and bound role](./02-vault-path-and-bound-role) | 1, 2 | The per-division Vault role, policy, and path-tree convention. |
+| [03 — Project + RoleBinding template](./03-project-rolebinding-template) | 3 | The Argo AppProject + the team's RoleBinding to the namespace. |
+| [04 — ESO Secret and pullSecret](./04-eso-secret-and-pullsecret) | 5, 6, 7 | The per-tenant SecretStore + the cluster-wide app-registry pull Secret. |
+| [05 — RHACS tenant exception process](./05-rhacs-tenant-exception-process) | 9 | The exception-MR pattern when a tenant legitimately needs to bypass a RHACS policy. |
+| [06 — ResourceQuota and LimitRange](./06-resource-quota-and-limit-range) | 4 | The default per-env quota / limit shapes and how to request increases. |
+
+## Pre-onboarding requirements
+
+Before step 1, these MUST be in place (they are platform install-time work, not per-tenant):
+
+- The `vault-apps-onboard.sh` script is on the operator's machine with reachable Vault.
+- The platform `ClusterExternalSecret/app-registry-pull` is shipped on the spoke and its Vault dependency (`secret/ocp/<cluster>/registries/app-registry-pull`) is populated. See [04 — ESO Secret and pullSecret](./04-eso-secret-and-pullsecret).
+- The `tenant-apps` `ApplicationSet` and its `GitOpsCluster` Placement wiring are on the hub. See [02 — ApplicationSet generator pattern](../04-gitops-consume/02-appset-generator-pattern).
+- The five RHACS built-in policies are scoped to `apps-.*` and set to `SCALE_TO_ZERO_ENFORCEMENT` on the DEPLOY lifecycle. Run `scripts/rhacs-enable-app-policies.sh` once.
+
+## What is NOT in scope of "onboarding"
+
+A few things commonly conflated with tenant onboarding but governed elsewhere:
+
+- **The build pipeline itself.** Jenkins job (Path A) or Tekton Pipeline (Path B) is the tenant's responsibility; the platform provides templates only. See [03 — Build paths](../03-build-paths/01-overview).
+- **The cluster's identity provider integration.** Tenant identity (the GitLab group the RoleBinding references) is platform-install work; per-tenant entries are just RoleBindings to existing groups.
+- **App configuration.** Anything inside the tenant's `base/` and `overlays/` is the tenant's content. Platform onboarding only creates the *frame* — namespaces, quotas, ESO bridge, AppProject — that the tenant fills.
+
+## References
+
+- `codex-opp-agent/connection-details/vault-app-secrets.md` (issue #174, DEV-OCP-0.4)
+- `codex-opp-agent/connection-details/app-registry-pullsecret.md` (issue #172, DEV-OCP-0.2)
+- `codex-opp-agent/connection-details/rhacs-app-policy.md` (issue #198, DEV-OCP-4.3)
+- `codex-opp-agent/connection-details/vap-tenant-exclusions.md` (issue #199, DEV-OCP-4.4)
+- Issue #173 (DEV-OCP-0.3) — tenant Project + Role + RoleBinding template.
