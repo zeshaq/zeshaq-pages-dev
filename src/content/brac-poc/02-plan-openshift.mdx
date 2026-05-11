@@ -13,6 +13,7 @@ This page consolidates the two BRAC source documents into one plan: the requirem
 - **Demo apps run on OpenShift** (spoke-dc-v6). Not on the `docker-runtime-vm` we built earlier for the broader app-dev path.
 - **dc-lab platform VMs are reused as-is.** SigNoz, DefectDojo, Kafka KRaft, Redis Sentinel, WSO2 APIM/IS, Jenkins, GitLab, Nexus, Trivy — no Helm/operator rebuild of services that already run on lab VMs.
 - **New work is OCP-side**: the demo apps + Service Mesh + OTel collector + integration glue (ESO bindings, Routes, NetworkPolicies, mesh canary, the few new operators).
+- **The live demo is browser-driven.** A single-page app ("BRAC POC Demo Dashboard") served by the MFE Router has one panel per demo requirement. Each panel triggers the actual backend action (canary calls, mTLS verify, Redis primary kill, trace storm, Nexus pull) and renders the result inline. Native admin UIs (Kiali, SigNoz, WSO2 Publisher, DefectDojo, RHACS) are linked or iframed from the SPA; no terminal walls during the demo.
 
 The two source documents (preserved verbatim for the audit trail):
 
@@ -51,21 +52,23 @@ Original email also mentions **"Support Service for 13 Products"** but the PDF i
 The v2 PDF's reference image translated to OCP + dc-lab terms:
 
 ```
-User
+User (browser)
   │ HTTPS (TLS terminate #1 — OCP Route + cert-manager)
   ▼
-MFE Router               ───┐
-  │ HTTP                    │ in `brac-demo-frontend`
-  ▼                         │ namespace on spoke-dc-v6
-WSO2 API GW              ───┘
+MFE Router  ── serves ── ► BRAC POC Demo Dashboard (SPA)
+  │                          │   one panel per demo req
+  │ HTTP                     │   (canary control, redis kill,
+  ▼                          │   mTLS verify, trace storm, etc.)
+WSO2 API GW              ◀──┘
   │ HTTPS (TLS terminate #2 — existing WSO2 VM, lab CA)
   ▼
-BFF Router               ───┐
-  │ HTTP                    │ in `brac-demo-frontend`
-  ▼                         │ (mesh sidecar attached)
-Mesh boundary ─────┐        │
-  │ mTLS strict    │        │
-  ▼                │        │
+BFF Router  ── exposes ── ► /demo/* endpoints (canary, mtls-check,
+  │                          redis-kill, trigger-traces, nexus-pull)
+  │ HTTP
+  ▼
+Mesh boundary ─────┐
+  │ mTLS strict    │
+  ▼                │
 Identity ◀────── WSO2 IAM (lateral, token introspection / authz callout — existing WSO2 IS VM)
   │ mTLS           │
   ▼                │
@@ -79,14 +82,40 @@ Pieces and their hosts:
 | Layer | Component | Host |
 |---|---|---|
 | Edge TLS | OCP Route + cert-manager + lab CA | `spoke-dc-v6` |
-| MFE Router | NGINX `Deployment` | `brac-demo-frontend` ns on spoke-dc-v6 |
+| MFE Router | NGINX `Deployment` (serves the SPA static bundle + reverse-proxies API calls) | `brac-demo-frontend` ns on spoke-dc-v6 |
+| **Demo Dashboard SPA** | **Static React app (or Astro static build) with one panel per demo req** | **`brac-demo-frontend` ns — served by the MFE Router** |
 | API Gateway | WSO2 APIM (existing distributed CP/DP setup) | dc-lab WSO2 VMs |
-| BFF Router | Liberty or Node `Deployment` | `brac-demo-frontend` ns |
+| BFF Router | Node or Liberty `Deployment` exposing `/demo/*` endpoints for the SPA | `brac-demo-frontend` ns |
 | Mesh data plane | OSSM 3 ambient | `brac-demo-services` ns (label `istio.io/dataplane-mode=ambient`) |
 | Identity service | Open Liberty `OpenLibertyApplication` v1+v2 (canary'd) | `brac-demo-services` ns |
 | Product service | Open Liberty `OpenLibertyApplication` | `brac-demo-services` ns |
 | IAM (authz callouts) | WSO2 IS (existing) | dc-lab WSO2 IS VM |
 | Trace + log pipeline | OTel Collector (Gateway) → Kafka → SigNoz | Collector on `brac-demo-otel` ns; Kafka + SigNoz on existing dc-lab VMs |
+
+## The BRAC POC Demo Dashboard (SPA)
+
+A single browser app is the demo cockpit. The evaluator opens one URL and clicks through eight tabs. Each tab triggers real backend calls against the actual demo stack and renders the result inline. Native admin UIs (Kiali, SigNoz, WSO2 Publisher, DefectDojo, RHACS, OCP console) are either iframed inside a panel or opened in a new tab via a button — so the SPA stays the orchestrating surface, not the only surface.
+
+**Stack:** React 18 (or static Astro build for parity with the zahid blog) + Tailwind. Diagrams reuse `@xyflow/react` (Whiteboard) for the mesh request graph. Live charts via Recharts. WebSocket or Server-Sent Events for live updates (Redis primary changes, request streams).
+
+**Served by:** MFE Router (NGINX) as a static bundle at `/`. API calls go through the MFE Router's reverse-proxy to the BFF Router's `/demo/*` endpoints.
+
+**Panels (one per v2 demo requirement):**
+
+| Tab | What you see in the browser | What it actually does | Backend it touches |
+|---|---|---|---|
+| **1. API Gateway** | "Try the sample API" button → response viewer with status, latency, full request/response. Inline link "Open WSO2 Publisher" button. | Calls a published API on the WSO2 API GW with a demo key. | dc-lab WSO2 APIM. |
+| **2. IAM** | Current-user panel: name, claims, token expiry, federated source. Buttons: Logout, Re-login (SAML), Re-login (OIDC), Switch IdP. | OIDC + SAML SP flows against WSO2 IS. Token introspection on every render. | dc-lab WSO2 IS. |
+| **3. Service Mesh + mTLS** | Live request graph (React Flow) of the mesh — identity → product nodes with green edges when mTLS verified, red when not. "Verify mTLS now" button. | BFF calls a backend helper that runs the equivalent of `istioctl authn tls-check` via Istiod's API and returns MUTUAL / PERMISSIVE / NONE per edge. | OSSM control plane on spoke-dc-v6. |
+| **4. Canary via mesh** | Slider 0-100% to set v1/v2 split. "Send 100 requests" button. Live bar chart counting v1 hits vs v2 hits as they arrive. Header toggle "x-canary: beta" for sticky-to-v2. | SPA fires 100 parallel `fetch()` calls to identity-svc. The Istio VirtualService routes per the slider's setting (BFF dynamically updates the VS via Kubernetes API, or the slider just maps to the canary header). | identity-svc v1 + v2 + Istio VirtualService. |
+| **5. Observability + Kafka** (HIGH PRIORITY) | "Trigger 50 traces" button → fires varied requests (some error, some slow, some OK). Inline iframe of the SigNoz "service map" view scoped to the BRAC services. Buttons: open .NET runtime dashboard, app perf, system, tracing — each in a new tab. | SPA fires requests through BFF → mesh → identity → product. Traces propagate through Istio→OTel Collector→Kafka topics→SigNoz. ClickHouse queries surface in the SigNoz iframe. | OTel Collector + existing Kafka + existing SigNoz. |
+| **6. Redis HA** | Status panel: current primary host (live, polling), replica health. Live read/write rate counter (driven by a background trickle of dummy ops). Big red button "Hard-kill primary". Watch primary swap, counter dip, recovery. | BFF exposes `POST /demo/redis/kill-primary` that runs `redis-cli -h <primary> DEBUG SEGFAULT` over the lab `/24`. Background polling via Sentinel `+switch-master` topic detects the swap. | existing Redis Sentinel VMs. |
+| **7. SigNoz** | Iframe of the SigNoz dashboards (4 tabs) or four large "Open dashboard" cards. | SigNoz itself, browser-native. | existing SigNoz VM. |
+| **8. Nexus OSS** | List of demo artifacts across Maven/PyPI/npm/Docker. "Pull this" buttons → backend performs the pull from Nexus, returns digest + size + format-specific metadata. Inline iframe of the Nexus browse UI. | BFF calls Nexus REST API (and shells out to `mvn`/`npm`/`docker pull` in a sandbox pod for the real-format demo). | existing Nexus three-endpoint split. |
+
+**Tender-item tour (bottom of the SPA):** smaller cards linking out to the native UIs — Compliance scan results (OCP console), RHACS policy violations (RHACS UI), DefectDojo SBOM view, the BRAC monorepo + Jenkins build page (GitLab + Jenkins UIs), JBoss admin console (port 9990).
+
+**Why one SPA, not one app per panel:** the evaluator gets a single mental model — open the URL, walk top-to-bottom. The story is the SPA itself, not the cobbled tooling underneath. Every panel renders live data, so the demo is always real-time, not pre-recorded.
 
 ## Target environment
 
@@ -117,7 +146,8 @@ New tenant namespaces created for the POC, on `spoke-dc-v6`:
 | **Redis HA** | Redis Sentinel VMs (ADR 0006) — used as-is for the demo | OCP-side mock client only — a small `Deployment` in `brac-demo-evidence` that uses `redis-py` `Sentinel` to connect to the lab Sentinel pool; demonstrates client reconnect after a VM-side hard-kill. No new Redis on OCP. |
 | **SigNoz** | SigNoz VM with ClickHouse + retention | None — the four BRAC dashboards are authored against the existing SigNoz |
 | **Nexus OSS** | Existing Nexus three-endpoint split (`mirror-registry` / `docker-group` / `app-registry`, ADR 0019) | None — demo the existing setup |
-| **MFE Router + BFF Router** | None | NGINX `Deployment` for MFE; Liberty/Node `Deployment` for BFF, both in `brac-demo-frontend`; cert-manager Route at the edge |
+| **MFE Router + BFF Router** | None | NGINX `Deployment` for MFE (serves the SPA + reverse-proxies API); Node `Deployment` for BFF exposing `/demo/*` endpoints; cert-manager Route at the edge |
+| **Demo Dashboard SPA** | None | New React + Tailwind SPA in `brac-demo-frontend` with 8 panels (API GW, IAM, Mesh+mTLS, Canary, Observability, Redis, SigNoz, Nexus). Static bundle served by NGINX. React Flow for the mesh graph, Recharts for live counters, SSE for live primary/swap updates. |
 | **Open Liberty demo apps** | Open Liberty Operator + Liberty hello-world (DEV-OCP-5.1 #200) | `identity-svc` v1 + v2 (canary'd) + `product-svc`, all `OpenLibertyApplication` CRs with MicroProfile features enabled |
 | **OpenShift platform foundation** | spoke-dc-v6 cluster, ODF (Block + Object), all baseline operators | Walkthrough of `scripts/rebuild/` Terraform/Ansible as the "automation" demo (no fresh cluster needed) |
 | **Compliance / PCI-DSS** | ScanSettingBinding `ocp4-pci-dss-4-0` already running on spoke-dc-v6 (ADR 0020) | Filtered view of latest ComplianceCheckResult + ComplianceRemediation, exported as a report artifact |
@@ -130,43 +160,48 @@ New tenant namespaces created for the POC, on `spoke-dc-v6`:
 
 ## Phase sequencing
 
-Block A items are reuse-walkthroughs (no new code; just narration + screencasts). Block B is the actual build work, sequenced so highest-priority demo items land first.
+Block A items are reuse-walkthroughs (no new code; just narration + screencasts). Block B is the actual build work, sequenced so highest-priority demo items land first. The Demo Dashboard SPA runs as a parallel track from P1 onward — each backend capability ships with its SPA panel ready.
 
 | Phase | Wall-clock | What lands | Demo'able by end |
 |---|---|---|---|
-| **P0: Block A foundation walkthroughs** | Day 1-2 | Cluster provisioning narrative + ODF + Compliance + RHACS + Prom alerts + Loki forwarder, all with BRAC-scoped views applied | Cluster + compliance + RHACS + log forwarding demos |
-| **P1: Observability + Kafka pipeline** *(HIGH PRIORITY)* | Day 3-5 | OTel Collector deployed; sample microservice w/+w/o SDK; pipeline OTel→Kafka→SigNoz wired; 4 dashboards authored | End-to-end trace appears in SigNoz; sampling/filter/routing visible |
-| **P2: Service Mesh + mTLS + canary** *(v2 priority)* | Day 5-7 | OSSM scoped to `brac-demo-services`; STRICT mTLS; VirtualService canary on identity-svc v1/v2; Istio→OTel trace export | Kiali shows mTLS green; canary curl demo passes |
-| **P3: MFE + BFF + WSO2 wiring** | Day 7-10 | MFE Router (NGINX edge), BFF Router, egress NetworkPolicy to WSO2 VMs, SAML + OIDC + Federation flows verified end-to-end | Full user → MFE → API GW → BFF → mesh → Identity → Product chain |
-| **P4: Redis client + Trivy + CI/CD glue** | Day 10-12 | OCP-side Redis mock client connecting to the existing VM Sentinel pool; SBOM pipeline extension; BRAC monorepo + conditional Jenkinsfile; hybrid CD to OCP + one VM target | Hard-kill failover demo (VM-side, with OCP client reconnect); DefectDojo SBOM view; monorepo-aware build triggers only the affected app |
-| **P5: JBoss managed domain + evidence pack** | Day 12-14 | EAP Operator + Domain/Host Controllers + 2 Server Groups; deploy + reload demo; full evidence pack written | All demo steps recorded + filed in `reports/brac-poc/<section>/` |
+| **P0: Block A foundation walkthroughs** | Day 1-2 | Cluster provisioning narrative + ODF + Compliance + RHACS + Prom alerts + Loki forwarder, all with BRAC-scoped views applied | Cluster + compliance + RHACS + log forwarding demos (linked from the SPA later) |
+| **P1: Observability + Kafka pipeline + SPA scaffold** *(HIGH PRIORITY)* | Day 3-5 | OTel Collector deployed; sample microservice w/+w/o SDK; pipeline OTel→Kafka→SigNoz wired; 4 dashboards authored. **SPA scaffold + panel 5 (Observability) shipped.** | Hit "Trigger 50 traces" in the SPA → traces appear in the embedded SigNoz iframe |
+| **P2: Service Mesh + mTLS + canary + SPA panels 3-4** *(v2 priority)* | Day 5-7 | OSSM scoped; STRICT mTLS; VirtualService canary on identity-svc v1/v2; Istio→OTel trace export. **SPA panels: Mesh+mTLS (live React Flow graph), Canary (slider + bar chart).** | Live canary slider in the SPA drives traffic shift; Kiali iframe shows mesh; "Verify mTLS now" button returns MUTUAL |
+| **P3: MFE + BFF + WSO2 wiring + SPA panels 1-2** | Day 7-10 | MFE Router (NGINX edge serving the SPA), BFF Router (`/demo/*` endpoints), egress NetworkPolicy to WSO2 VMs, SAML + OIDC + Federation flows. **SPA panels: API Gateway (Try-it), IAM (user/claims).** | Full user → MFE → SPA → BFF → API GW → mesh → Identity → Product flow visible in the browser |
+| **P4: Redis client + Nexus + SPA panels 6-8** | Day 10-12 | OCP-side Redis mock client + background polling for `+switch-master`; SBOM pipeline extension; BRAC monorepo + conditional Jenkinsfile; hybrid CD. **SPA panels: Redis (kill button + live status), SigNoz (iframe), Nexus (artifact list + pull).** | "Hard-kill primary" in the SPA triggers VM-side kill; live status panel shows swap |
+| **P5: JBoss managed domain + tender-tour cards + evidence pack** | Day 12-14 | EAP Operator + Domain/Host Controllers + Server Groups; deploy + reload demo. **SPA bottom: tender-item card grid linking to Compliance, RHACS, DefectDojo, GitLab, Jenkins, JBoss admin.** Full evidence pack written. | One-click access from the SPA to every native UI; all 18 demo steps recorded |
 
-## Live demo flow (v2 priority order)
+## Live demo flow — browser-only
 
-The live demo runs in v2 PDF order so the HIGH-PRIORITY items land first if time runs short. The tender items follow as a secondary block.
+The evaluator opens **one URL** (the SPA) and walks down the page. Every panel is interactive; nothing requires terminal access. The full session is ~90 minutes — about 5-10 min per panel, with the HIGH-PRIORITY Observability + Kafka section getting the longest slot.
 
-**Block 1 — v2 PDF priority subset:**
+**Pre-demo morning-of:** all panels render with green health pips. The Demo Dashboard footer shows a Last-Validated timestamp ≤ 1 hour old.
 
-1. **API Gateway** (existing WSO2 APIM): publish a sample API, show the policy + key flow + IS-as-Key-Manager link.
-2. **IAM** (existing WSO2 IS): SAML SP demo + OIDC client demo + Federation against a second IdP source.
-3. **Service Mesh — mTLS** (new OCP): `istioctl authn tls-check` returns MUTUAL; Kiali shows all-green mTLS edges.
-4. **Canary via mesh** (new OCP): `curl` with and without `x-canary: beta`; show traffic split + Kiali request graph.
-5. **Observability + Kafka — high priority** (new collector + existing Kafka + SigNoz): hit the demo app, watch traces traverse identity → product in SigNoz, show Kafka topic lag, expand spans.
-6. **Redis** (existing VM Sentinel + OCP-side mock client): hard-kill the primary on the VM side; tail the mock client's logs (running on OCP) showing it reconnects through Sentinel to the newly-promoted primary.
-7. **SigNoz** (existing VM): tour the 4 dashboards (app perf, .NET runtime, system, tracing).
-8. **Nexus OSS** (existing VM): show three-endpoint split; demo multi-format pull (Maven + npm + Docker) from the same Nexus.
+**Walk order (the SPA tabs from left to right):**
 
-**Block 2 — tender-only items (if time permits):**
+1. **API Gateway** (5 min) — click "Try the sample API" → response viewer fills in. Open "WSO2 Publisher" tab from the panel; show the policy + key + IS-as-Key-Manager link. Back to SPA.
+2. **IAM** (10 min) — Click Logout → Re-login via OIDC (browser redirect to IS, return with token visible in the user panel). Repeat via SAML. Click "Switch IdP" → Federation to a second IdP source. The user panel updates each time, with claims + federated-source live.
+3. **Service Mesh + mTLS** (10 min) — Live React Flow graph already showing identity → product green edges. Click "Verify mTLS now" → button flashes, returns MUTUAL inline. Open Kiali tab from the panel for the full mesh-wide view.
+4. **Canary via mesh** (5 min) — Slider at 90/10 by default. Click "Send 100 requests" → bar chart fills in real time (~90 to v1, ~10 to v2). Toggle the "x-canary: beta" sticky header → next 100 all land on v2. Slide to 50/50 → next 100 split evenly.
+5. **Observability + Kafka — HIGH PRIORITY** (15 min) — Click "Trigger 50 traces" → varied requests fire. Embedded SigNoz iframe shows the service map filling in. Click "Open .NET Runtime dashboard" → opens dedicated tab showing GC heap moving with the load. Same for App Perf, System, Tracing. Mention sampling/filtering/routing (visible in the trace counts).
+6. **Redis HA** (5 min) — Status panel shows current primary (e.g., `redis-0`) + replicas. Live read/write rate ticking (~50/s). Click the big red "Hard-kill primary" button. Status panel switches to `redis-1` in ~15 seconds. Rate counter dips to zero briefly, then resumes. Sentinel `+switch-master` event surfaced inline.
+7. **SigNoz** (5 min) — Already mostly seen in step 5. Click the four dashboard cards for a coherent tour. Use the natural flow to show Kafka topic lag (also in SigNoz).
+8. **Nexus OSS** (5 min) — Artifact list shows 4 entries (one each Maven / PyPI / npm / Docker). Click "Pull this" on each — backend returns digest + size + format-specific metadata. "Open Nexus browse" link to the existing Nexus UI for the three-endpoint split.
 
-9. **OpenShift Platform foundation**: walkthrough `scripts/rebuild/` profile-aware automation; ODF Block + Object PVCs.
-10. **Compliance + PCI-DSS**: export latest ComplianceCheckResult + remediation report.
-11. **RHACS critical-block**: try to deploy a CVE-rich image; show scale-to-zero.
-12. **Prom alerts + Loki**: trigger a BRAC-scoped alert; query Loki for an `audit` log; show external-mock log forward.
-13. **Trivy SCA + SBOM dashboard**: DefectDojo product view with both engagements side-by-side.
-14. **GitLab + Jenkins monorepo conditional**: push to `apps/brac-payment-api/`; show only that build triggers.
-15. **Hybrid CD**: same build artifact deploys to OCP (Liberty CR) and to one existing VM target.
-16. **Kafka Schema Registry + DLQ**: produce a malformed Avro message; show Registry reject. Inject a poison record into Connect; show DLQ.
-17. **JBoss EAP managed domain**: CLI navigation, WAR deploy to one Server Group, rolling reload.
+**Tender-item tour (15 min, bottom of the SPA):**
+
+Card grid links out to native UIs — one click each:
+
+9. **OCP cluster + ODF** — opens the OCP console (Storage page).
+10. **Compliance + PCI-DSS** — opens the OCP console ComplianceCheckResult view.
+11. **RHACS critical-block** — opens RHACS Violations page; tab back to SPA, click "Try to deploy CVE-rich image" → policy hit toast appears.
+12. **Trivy + DefectDojo (SCA + SBOM)** — opens DefectDojo product view with both engagements side-by-side.
+13. **BRAC monorepo + conditional Jenkinsfile** — opens GitLab + Jenkins build page; demonstrate by pushing a change to `apps/brac-payment-api/` and watching only that build trigger.
+14. **Hybrid CD** — Jenkins page shows the same build artifact deployed to both an OCP Liberty CR and one existing VM target.
+15. **Kafka Schema Registry + DLQ** — small inline panel in the SPA: "Produce valid Avro" / "Produce invalid Avro" buttons; reject message shown inline. "Inject poison record" → DLQ topic count increments.
+16. **JBoss EAP managed domain** — opens the JBoss admin console (port 9990). Show server-group list; trigger a Server Group A rolling reload from the SPA; B keeps serving (visible in the console).
+
+**Wrap (5 min)**: SPA footer has a "View evidence pack" link → `reports/brac-poc/`. Final slide: thank-you + open Q&A.
 
 ## Evidence pack
 
@@ -190,10 +225,13 @@ No secret values, no kubeconfigs, no credential bytes in the evidence pack. Vaul
 6. **Truncated requirements PDF:** original email mentions "13 Products" but PDF ends at section 9. Request sections 10-13 before P5 finalizes.
 7. **MFE / BFF stack choice:** NGINX-only for MFE, or a real micro-frontend aggregator (Module Federation / single-spa)? BFF as Liberty (Java ecosystem fit) or Node (lighter)?
 8. **"Comply MTLS" interpretation:** v2 PDF says "MTLS (Commply MTLS / Service mesh)". Likely typo for "Compliance-grade mTLS" — strict mTLS + FIPS-ish posture + audit. Confirm.
+9. **Demo Dashboard SPA stack choice:** React 18 (familiar, lots of components) vs. static Astro build (matches the zahid blog stack, simpler hosting). Default: React for the interactive panels (live charts, SSE, React Flow), but consider Astro + React islands if zero-deps is a goal.
+10. **Redis kill-primary auth model:** the SPA's "Hard-kill primary" button calls a BFF endpoint that runs `redis-cli DEBUG SEGFAULT` against the lab Sentinel pool. Should the BFF authenticate as a specific Vault-stored user, or is the BFF's own service identity sufficient? Tradeoff: audit trail vs simplicity.
 
 **Resolved:**
 
 - *(2026-05-11)* **Redis HA stays on existing VM Sentinel** — no OCP-side Redis deployment. OCP carries only a small mock client to demonstrate Sentinel reconnect.
+- *(2026-05-11)* **Demo is browser-driven via a single SPA**. Live demo cockpit served by the MFE Router. One panel per requirement, real backend calls, no terminal walls.
 
 ## What's intentionally not in this plan
 
