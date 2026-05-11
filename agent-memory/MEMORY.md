@@ -1,0 +1,10 @@
+- [User identity](user_identity.md) — name/email/GH handle/CF account ID
+- [Local secrets directory](secrets_location.md) — `/Users/ze/Desktop/mysecrets/` token files and naming convention
+- [zahid personal blog](project_zahid_blog.md) — Astro+ReactFlow blog at zeshaq.pages.dev (GH repo zeshaq/zahid; CF project renamed because zahid.pages.dev is taken globally)
+- [comptech platform docs](project_comptech_docs.md) — second content collection at /docs/ for OpenShift-based platform documentation; numbered-prefix folder ordering; separate from blog posts
+- [Full-width layout preference](feedback_layout_preferences.md) — no max-width caps on content or prose; diagrams must fill the main column
+- [Post writing voice](feedback_post_voice.md) — validated structure and tone for new blog posts (open framing → problem → diagram → table → close-up → limitations → landscape → start sequence)
+- [No minimap on diagrams](feedback_no_minimap.md) — never include <MiniMap> in ReactFlow diagrams; keep Background + Controls
+- [No mermaid diagrams](feedback_no_mermaid.md) — always use ReactFlow (`<Whiteboard>`); mermaid was giving rendering errors
+- [Always push after writing](feedback_always_push_posts.md) — after writing/expanding a blog post, commit and push automatically without waiting to be asked
+- [No JS // comments in MDX exports](feedback_mdx_no_js_comments.md) — `//` line comments inside `export const ...Nodes = [ ... ]` blocks break MDX parsing

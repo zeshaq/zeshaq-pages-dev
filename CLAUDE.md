@@ -300,7 +300,7 @@ For radial diagrams, copy the `mkBranch()` helper used in many posts (see `src/c
 
 ## 8. Memory rules — quick reference
 
-The full memory lives at `~/.claude/projects/-Users-ze-Documents-zeshaq-pages-dev/memory/`. Summary of the standing rules:
+The full memory is **git-tracked in this repo** at `agent-memory/`. The original Claude Code path `~/.claude/projects/-Users-ze-Documents-zeshaq-pages-dev/memory/` is a **symlink** to `agent-memory/` so Claude Code reads/writes it transparently. Changes to memory show up in `git status` like any other file. Summary of the standing rules:
 
 | Memory | TL;DR |
 | --- | --- |
