@@ -1,8 +1,255 @@
 ---
-title: "NetObserv"
-description: "Section 03-openshift-platform/14-platform-services: NetObserv (placeholder)."
-sidebar_label: "NetObserv"
+title: "Network Observability (NetObserv) and Tekton Trivy Task"
+description: "How NetObserv captures OVN-Kubernetes flow logs and ships them to Loki, the Console UI integration, and the Tekton Trivy task that pairs the platform's network and image-security observability."
+sidebar_label: "NetObserv + Trivy Task"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const noNodes = [
+  { id: "ovn",     position: { x: 0,   y: 0   }, data: { label: "OVN-Kubernetes\nflow source" }, style: dataBox },
+  { id: "ebpf",    position: { x: 0,   y: 130 }, data: { label: "eBPF agent\n(per node, DS)" }, style: agentBox },
+  { id: "flp",     position: { x: 260, y: 65  }, data: { label: "flowlogs-pipeline" }, style: ctrlBox },
+  { id: "loki",    position: { x: 520, y: 65  }, data: { label: "LokiStack\n(network tenant)" }, style: ctrlBox },
+  { id: "console", position: { x: 520, y: 230 }, data: { label: "Console plugin\nObserve → Network" }, style: dataBox },
+  { id: "fc",      position: { x: 260, y: 230 }, data: { label: "FlowCollector CR" }, style: crBox },
+];
+
+export const noEdges = [
+  { id: "o1", source: "ovn",   target: "ebpf", label: "captures", ...reqEdge },
+  { id: "e1", source: "ebpf",  target: "flp",  label: "flow records", ...reqEdge },
+  { id: "f1", source: "flp",   target: "loki", label: "writes (LogQL tenant)", ...pullEdge },
+  { id: "f2", source: "fc",    target: "ebpf", label: "configures", ...muted },
+  { id: "f3", source: "fc",    target: "flp",  label: "configures", ...muted },
+  { id: "c1", source: "console", target: "loki", label: "queries", ...reqEdge },
+];
+
+NetObserv captures network flow records from OVN-Kubernetes and ships them to LokiStack. The OCP Console gains an Observe → Network panel that visualises pod-to-pod traffic, drops, and policy events. This page is the operand wiring on `spoke-dc-v6`, and pairs with the Tekton Trivy Task as the two platform-services that complete the build evidence + network observability picture.
+
+## NetObserv architecture
+
+<Whiteboard client:load data={{ nodes: noNodes, edges: noEdges }} height={420} />
+
+Reading the diagram:
+
+- **OVN-Kubernetes** is the cluster's CNI. It emits flow records natively.
+- The **eBPF agent** (DaemonSet, one pod per node) captures flows at the kernel level. It can also do its own flow generation if the CNI does not natively emit.
+- **flowlogs-pipeline** is a Deployment that aggregates flows, enriches with K8s metadata (pod names, namespaces, labels), and writes them out.
+- **LokiStack** receives the enriched flow records as a separate tenant. The Console plugin queries the tenant for visualisation.
+
+## FlowCollector CR
+
+```yaml
+apiVersion: flows.netobserv.io/v1beta2
+kind: FlowCollector
+metadata:
+  name: cluster
+spec:
+  namespace: netobserv
+  deploymentModel: Direct
+  agent:
+    type: eBPF
+    ebpf:
+      sampling: 50           # 1/50 sampling — adjust for traffic volume
+      logLevel: info
+      privileged: false
+  processor:
+    logTypes: Flows
+    metrics:
+      server:
+        port: 9102
+  loki:
+    enable: true
+    mode: LokiStack
+    lokiStack:
+      name: logging-loki
+      namespace: openshift-logging
+  consolePlugin:
+    enable: true
+    portNaming:
+      enable: true
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `namespace: netobserv` | Conventional. Operands land here. |
+| `deploymentModel: Direct` | eBPF agent writes flows to flowlogs-pipeline directly (vs Kafka-backed for high-volume). |
+| `agent.type: eBPF` | eBPF agent is the OVN-K compatible path; the alternative IPFIX path is for non-OVN-K clusters. |
+| `agent.ebpf.sampling: 50` | 1/50 sampling — enough for visibility, manageable in storage. |
+| `agent.ebpf.privileged: false` | eBPF program runs unprivileged where possible; some platforms still require privileged. |
+| `loki.mode: LokiStack` | Reuse the existing LokiStack; NetObserv gets its own tenant via the gateway. |
+| `consolePlugin.enable: true` | Auto-registers the Network plugin into the OCP Console. |
+
+## The Network view
+
+After the FlowCollector reconciles and the Console refreshes, **Observe → Network** appears. It offers:
+
+- **Traffic table** — flow records with src/dst IP, ns, pod, port, protocol, bytes, packets, action (allowed/dropped).
+- **Topology view** — a directed graph of pod-to-pod flows over the selected window, with edge thickness encoding volume.
+- **Charts** — top sources, top destinations, top dropped flows, per-protocol breakdown.
+- **NetworkPolicy filters** — filter the topology by which Policies are allowing/denying flow.
+
+This pairs powerfully with the Service Mesh and Kiali views: Kiali shows L4/L7 from istiod's perspective; NetObserv shows L3 from OVN-K's perspective. The intersection catches misconfigurations on either side.
+
+## The Tekton Trivy Task
+
+The companion content on this page is the Tekton `trivy-scan` Task — the platform's image vulnerability gate. NetObserv and Trivy are two halves of "what's running on this cluster doing security-wise": NetObserv shows what's talking to what; Trivy shows what's in the images.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: trivy-scan
+  namespace: openshift-pipelines
+spec:
+  params:
+    - { name: image, type: string }
+    - { name: team,  type: string }
+    - { name: app,   type: string }
+    - { name: git-sha, type: string }
+    - name: trivy-server
+      type: string
+      default: "https://trivy.sub.comptech-lab.com:4443"
+    - name: minio-endpoint
+      type: string
+      default: "https://minio.sub.comptech-lab.com:9000"
+    - name: minio-bucket
+      type: string
+      default: "developer-ci-evidence"
+    - name: severity
+      type: string
+      default: "CRITICAL,HIGH"
+  workspaces:
+    - name: source
+      optional: true
+  results:
+    - name: trivy-report-url
+    - name: sbom-url
+  steps:
+    - name: scan
+      image: aquasec/trivy:0.70.0
+      env:
+        - name: TRIVY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: trivy-client-creds
+              key: token
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        mkdir -p /tmp/evidence
+        trivy image \
+          --server "$(params.trivy-server)" \
+          --token "${TRIVY_TOKEN}" \
+          --severity "$(params.severity)" \
+          --exit-code 1 \
+          --format json \
+          --output /tmp/evidence/trivy.json \
+          "$(params.image)"
+        trivy image \
+          --server "$(params.trivy-server)" \
+          --token "${TRIVY_TOKEN}" \
+          --format spdx-json \
+          --output /tmp/evidence/sbom.spdx.json \
+          "$(params.image)"
+      volumeMounts:
+        - { name: evidence, mountPath: /tmp/evidence }
+    - name: upload
+      image: amazon/aws-cli:2.17.0
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: minio-evidence-creds, key: AWS_ACCESS_KEY_ID } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: minio-evidence-creds, key: AWS_SECRET_ACCESS_KEY } }
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        PREFIX="$(params.team)/$(params.app)/$(params.git-sha)"
+        aws --endpoint-url "$(params.minio-endpoint)" \
+          s3 cp /tmp/evidence/trivy.json "s3://$(params.minio-bucket)/${PREFIX}/trivy.json"
+        aws --endpoint-url "$(params.minio-endpoint)" \
+          s3 cp /tmp/evidence/sbom.spdx.json "s3://$(params.minio-bucket)/${PREFIX}/sbom.spdx.json"
+        printf "s3://%s/%s/trivy.json" "$(params.minio-bucket)" "${PREFIX}" > "$(results.trivy-report-url.path)"
+        printf "s3://%s/%s/sbom.spdx.json" "$(params.minio-bucket)" "${PREFIX}" > "$(results.sbom-url.path)"
+      volumeMounts:
+        - { name: evidence, mountPath: /tmp/evidence }
+  volumes:
+    - name: evidence
+      emptyDir: {}
+```
+
+Notes:
+
+- **Client mode against the lab Trivy server.** Both Jenkins (Path A) and Tekton (Path B) point at the same Trivy VM, so the policy is centralised and identical.
+- **Severity policy `CRITICAL,HIGH`** with `--exit-code 1` is the gate. Different from the §13 `ci-evidence-schema.md` doc, which sets the gate at CRITICAL — the Task here is stricter; that is intentional for Path B which is the newer track and consumers wanted a tighter gate. Adjustable per Pipeline if a tenant has an approved exception.
+- **Two artifacts** — `trivy.json` and `sbom.spdx.json` — written to MinIO under the prefix `<team>/<app>/<git-sha>/`. This matches the parity contract.
+
+## How NetObserv + Trivy combine in practice
+
+A real-world investigation:
+
+1. NetObserv shows an unusual destination — a pod in `apps-team-x` is making outbound DNS requests to an unfamiliar resolver.
+2. Trivy report for that image (read from MinIO at `<team>/<app>/<git-sha>/trivy.json`) shows a CVE in a DNS library or a known-malicious package.
+3. The build evidence cross-references give you a quick "shipped on $date by $commit" answer.
+4. NetworkPolicy is amended to constrain egress; the Trivy gate is tightened to prevent future builds shipping the same package.
+
+The two tools live in different overlays; the evidence convention (MinIO bucket + key prefix) is what makes them composable.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# NetObserv
+oc --kubeconfig "$K" -n netobserv get sub,csv
+oc --kubeconfig "$K" get flowcollector cluster
+oc --kubeconfig "$K" -n netobserv get ds,deploy
+
+# Console plugin
+oc --kubeconfig "$K" get consoleplugin netobserv-plugin
+
+# Trivy task
+oc --kubeconfig "$K" -n openshift-pipelines get task trivy-scan
+
+# Trivy server reachable from the cluster
+oc --kubeconfig "$K" -n openshift-pipelines run trivy-probe --rm -it --image curlimages/curl --command -- \
+  curl -kvs https://trivy.sub.comptech-lab.com:4443/healthz
+```
+
+Expected:
+
+- FlowCollector `Conditions[type=Ready].status=True`.
+- eBPF DaemonSet 100% ready.
+- Network panel appears in the Console.
+- `trivy-scan` Task present; Trivy server returns 200 on `/healthz`.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| FlowCollector stuck `Pending`. | eBPF agent needs `hostNetwork: true` which conflicts with a NodeSelector. | Adjust selectors/tolerations; some node taints block eBPF. | Lab convention: all workers tolerate the netobserv agent. |
+| Network view shows zero flows. | Sampling rate too aggressive vs traffic volume. | Drop `sampling` from 50 to 10. | Tune sampling iteratively; alert on per-node flow-record gauge. |
+| LokiStack fills up with NetObserv tenant. | Network flow logs are large at low sampling. | Move NetObserv to its own LokiStack instance, or set retention. | Plan storage budget per-tenant on LokiStack. |
+| Trivy Task exits 1 frequently in a stable repo. | DB freshness — Trivy DB updated, new CVEs landed. | This is the gate working as intended. Triage the CVE; tighten in code or add an approved `.trivyignore` exception. | DB pinning by date for reproducible scans; nightly refresh tied to a known revision. |
+| Trivy server unreachable. | Trivy VM down, or NetworkPolicy in `openshift-pipelines` blocks egress. | Verify Trivy VM health; allow egress in the namespace. | Document Trivy VM dependency in the platform inventory. |
+
+## References
+
+- `codex-opp-agent/connection-details/ci-evidence-schema.md` — the Trivy gate parity contract.
+- DEV-OCP-3B.3 #191 (Tekton Trivy Task).
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines-tasks/task-trivy-scan.yaml`.
+- NetObserv operator docs: `FlowCollector` v1beta2, eBPF agent.

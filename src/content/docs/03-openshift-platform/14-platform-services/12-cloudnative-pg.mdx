@@ -1,8 +1,263 @@
 ---
-title: "CloudNativePG"
-description: "Section 03-openshift-platform/14-platform-services: CloudNativePG (placeholder)."
+title: "CloudNativePG — operator-managed Postgres for tenants"
+description: "The CNPG operator on spoke-dc-v6, the Cluster CR with its 3-instance topology + ODF Ceph RBD storage + scheduled backups to MinIO, and the auto-created application credentials Secret tenants consume."
 sidebar_label: "CloudNativePG"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const cnpgNodes = [
+  { id: "op",       position: { x: 380, y: 0   }, data: { label: "CNPG operator\n(ghcr.io/cloudnative-pg)" }, style: ctrlBox },
+  { id: "cluster",  position: { x: 380, y: 130 }, data: { label: "Cluster CR\napp-postgres" }, style: crBox },
+  { id: "primary",  position: { x: 80,  y: 280 }, data: { label: "Primary instance\n(Pod 0)" }, style: ctrlBox },
+  { id: "replica1", position: { x: 280, y: 280 }, data: { label: "Replica 1" }, style: ctrlBox },
+  { id: "replica2", position: { x: 480, y: 280 }, data: { label: "Replica 2" }, style: ctrlBox },
+  { id: "svc",      position: { x: 680, y: 280 }, data: { label: "Service\napp-postgres-rw\napp-postgres-ro" }, style: dataBox },
+  { id: "pvc",      position: { x: 380, y: 410 }, data: { label: "PVCs (per pod)\nODF Ceph RBD" }, style: dataBox },
+  { id: "appcred",  position: { x: 680, y: 410 }, data: { label: "Auto-Secret\napp-postgres-app" }, style: crBox },
+  { id: "minio",    position: { x: 80,  y: 410 }, data: { label: "MinIO\ncnpg-backups bucket" }, style: extBox },
+  { id: "scheduled",position: { x: 80,  y: 540 }, data: { label: "ScheduledBackup CR" }, style: crBox },
+];
+
+export const cnpgEdges = [
+  { id: "e1", source: "op",       target: "cluster",  ...muted },
+  { id: "e2", source: "cluster",  target: "primary",  label: "creates", ...reqEdge },
+  { id: "e3", source: "cluster",  target: "replica1", label: "creates", ...reqEdge },
+  { id: "e4", source: "cluster",  target: "replica2", label: "creates", ...reqEdge },
+  { id: "e5", source: "cluster",  target: "svc",      label: "creates", ...reqEdge },
+  { id: "e6", source: "primary",  target: "pvc",      ...muted },
+  { id: "e7", source: "replica1", target: "pvc",      ...muted },
+  { id: "e8", source: "replica2", target: "pvc",      ...muted },
+  { id: "e9", source: "cluster",  target: "appcred",  label: "creates app SA + cred", ...reqEdge },
+  { id: "e10", source: "scheduled", target: "minio",  label: "WAL + base backup", ...pullEdge },
+];
+
+CloudNativePG is the Kubernetes-native Postgres operator. It replaces the Crunchy / Percona / Postgres-operator-of-the-month with a CNCF-Sandbox project that owns the full Postgres lifecycle: replica orchestration, failover, base backups, WAL archive, point-in-time recovery, and connection-poolers (pgBouncer). This page is the spoke-dc-v6 install, the Cluster CR shape, and the tenant integration pattern.
+
+## Why CNPG vs alternatives
+
+- **Crunchy Postgres for Kubernetes.** Mature, commercial-friendly, larger CRD surface. The pricing model and the proprietary container build choices were the reasons we went CNPG.
+- **Zalando postgres-operator.** Robust, but the operator model is more imperative — Kubernetes-native CRs are less elegant.
+- **CNPG.** Apache 2.0 upstream, declarative CRs, in-place rolling Postgres upgrades, native WAL archive to S3, image at `ghcr.io/cloudnative-pg/postgresql`. Allowed in the image registry allowlist per the `image-registry-allowlist.md` connection-details (entry: `ghcr.io/cloudnative-pg`).
+
+The image is rewritten at pull time through IDMS so the actual pull goes through the lab Nexus, but the spec retains the upstream reference for portability.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: cnpgNodes, edges: cnpgEdges }} height={640} />
+
+Reading the diagram:
+
+- **CNPG operator** runs in `openshift-cnpg-operator` (or `cnpg-system`). Watches `Cluster`, `ScheduledBackup`, `Pooler`, `Backup` CRs cluster-wide.
+- A **`Cluster` CR** in a tenant namespace creates a StatefulSet plus per-pod PVCs on ODF Ceph RBD.
+- The operator generates two Services: `<cluster>-rw` (read-write endpoint, points at primary) and `<cluster>-ro` (read-only, points at any replica). Apps connect to `-rw` for writes and `-ro` for reads.
+- An auto-generated `<cluster>-app` Secret contains the app user's credentials. Apps mount it as env vars.
+- `ScheduledBackup` CRs drive WAL + base backups into a MinIO bucket using an S3-compatible config.
+
+## Operator install
+
+The operator is installed via OperatorHub (the `cloudnative-pg` operator) with the matching catalog source:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cloudnative-pg
+  namespace: cnpg-system
+spec:
+  channel: stable-v1.23
+  installPlanApproval: Automatic
+  name: cloudnative-pg
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+```
+
+(The lab also experimented with the community operator; the version-lock plan and the registry allowlist agreed on the `ghcr.io/cloudnative-pg` image source so either channel works as long as the image set is mirrored.)
+
+## A tenant Cluster CR
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-postgres
+  namespace: apps-team-x
+spec:
+  instances: 3
+  primaryUpdateStrategy: unsupervised   # operator can switch primary
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.3
+  postgresUID: 26
+  postgresGID: 26
+
+  storage:
+    size: 10Gi
+    storageClass: ocs-storagecluster-ceph-rbd
+
+  monitoring:
+    enablePodMonitor: true
+
+  bootstrap:
+    initdb:
+      database: app
+      owner: app                         # creates the app user + DB
+      secret:
+        name: app-postgres-app           # auto-created if missing; can be pre-seeded
+      encoding: UTF8
+      localeCollate: en_US.utf8
+      localeCType: en_US.utf8
+
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://cnpg-backups/apps-team-x/app-postgres
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-minio-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-minio-creds
+          key: SECRET_ACCESS_KEY
+      endpointURL: http://<lab-minio-host>:9000
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+        immediateCheckpoint: false
+        jobs: 2
+    retentionPolicy: "30d"
+```
+
+Field-by-field:
+
+| Field | Why this value |
+| --- | --- |
+| `instances: 3` | One primary + two synchronous replicas. Quorum keeps writes safe on a 2-node loss. |
+| `primaryUpdateStrategy: unsupervised` | Operator owns failover. The alternative `supervised` requires a human approval. |
+| `imageName: ghcr.io/cloudnative-pg/postgresql:16.3` | Postgres 16.x. CNPG tracks Postgres minor versions; the allowlist matches. |
+| `storage.storageClass: ocs-storagecluster-ceph-rbd` | ODF Ceph RBD — durable replicated storage. |
+| `bootstrap.initdb` | First-time database creation. After bootstrap this section is ignored. |
+| `bootstrap.initdb.owner: app` | Creates a non-superuser `app` role. The auto-Secret references this user. |
+| `backup.barmanObjectStore` | Barman is the Postgres backup engine CNPG embeds. WAL + base backups go to S3 (MinIO). |
+| `backup.retentionPolicy: "30d"` | Backups older than 30 days are pruned. |
+
+## What the operator creates
+
+| Resource | Purpose |
+| --- | --- |
+| `StatefulSet/app-postgres` | The Pods (Postgres + WAL archiver sidecar). |
+| `Service/app-postgres-rw` | Selector points at primary (label rotated on failover). |
+| `Service/app-postgres-ro` | Selector points at any replica. |
+| `Service/app-postgres-r` | Read-only (excludes primary). |
+| `Secret/app-postgres-superuser` | `postgres` superuser cred. |
+| `Secret/app-postgres-app` | App user `app` cred. The Secret the tenant app consumes. |
+| `PodMonitor/app-postgres` | If `monitoring.enablePodMonitor: true`. |
+| PVCs per pod | Storage. |
+
+## Tenant app integration
+
+A consuming Deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: apps-team-x
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: app-registry.apps.sub.comptech-lab.com/team-x/my-app:1.2.3
+          env:
+            - name: DB_HOST
+              value: app-postgres-rw.apps-team-x.svc.cluster.local
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: app-postgres-app, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: app-postgres-app, key: password } }
+            - name: DB_NAME
+              valueFrom: { secretKeyRef: { name: app-postgres-app, key: dbname } }
+```
+
+The Secret keys CNPG generates (`username`, `password`, `dbname`, `host`, `port`, `uri`) are documented and stable across Postgres versions.
+
+## Scheduled backups + restore
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: app-postgres-daily
+  namespace: apps-team-x
+spec:
+  schedule: "0 4 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: app-postgres
+```
+
+A point-in-time restore (PITR):
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-postgres-restored
+  namespace: apps-team-x
+spec:
+  instances: 1
+  bootstrap:
+    recovery:
+      source: app-postgres-archive
+      recoveryTarget:
+        targetTime: "2026-05-11 03:30:00"
+  externalClusters:
+    - name: app-postgres-archive
+      barmanObjectStore:
+        destinationPath: s3://cnpg-backups/apps-team-x/app-postgres
+        s3Credentials:
+          accessKeyId: { name: cnpg-minio-creds, key: ACCESS_KEY_ID }
+          secretAccessKey: { name: cnpg-minio-creds, key: SECRET_ACCESS_KEY }
+        endpointURL: http://<lab-minio-host>:9000
+```
+
+The restored Cluster is independent — it runs in parallel to the source. After validating data is intact, the tenant can rename Services to flip traffic.
+
+## Why CNPG (not OADP) for Postgres backups
+
+OADP backs up *all* PVCs, but a CSI snapshot of a Postgres data dir is *crash-consistent*, not transaction-consistent. CNPG's barman path:
+
+- Streams WAL continuously to S3 (RPO seconds).
+- Takes base backups on schedule.
+- Compresses both.
+- Restores to any point in the WAL window.
+
+The lab convention is: CNPG owns its own backups; do not also include the Cluster's PVCs in an OADP Backup. Exclude them via pod annotation if you do scoop them up in a Backup that's targeting the whole namespace.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Cluster `Generating instance pods` forever. | Storage class out of quota. | Increase ODF quota; or use a smaller `storage.size`. | Capacity-plan ODF allocation per tenant. |
+| Failover happens but reads hang. | Service selector update lag. | Wait ~30s; CNPG flips Service labels promptly. | Connection pooler (pgBouncer) absorbs the gap. |
+| WAL archive stuck. | MinIO credentials wrong; or NetworkPolicy blocks egress. | Check `cnpg-minio-creds` Secret; check `oc logs <pod> -c postgres`. | Connect MinIO to tenant via SecretStore; lint policies on tenant onboarding. |
+| Backup grows unboundedly. | `retentionPolicy` missing or unparseable. | Set `retentionPolicy: "30d"`. | Default scheduled backup template has retention. |
+| `Pooler` (pgBouncer) cannot connect. | Pooler image not in allowlist or pull-through. | Add to IDMS; allow the image prefix. | Reference image-registry-allowlist on every tenant onboarding. |
+
+## References
+
+- DEV-OCP-5.2 #201 (CNPG-backed app sample).
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` — `ghcr.io/cloudnative-pg` allowlist entry.
+- CNPG upstream docs: `Cluster`, `ScheduledBackup`, `Pooler`, barman objectstore.
+- ADR 0014 — developer readiness platform contract (CNPG mentioned as a tenant data backend).

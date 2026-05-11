@@ -1,8 +1,234 @@
 ---
-title: "cert-manager"
-description: "Section 03-openshift-platform/14-platform-services: cert-manager (placeholder)."
-sidebar_label: "cert-manager"
+title: "Platform services overview and cert-manager"
+description: "Map of the platform-services overlay on spoke-dc-v6 (Tekton, Loki, Tempo, COO, OSSM, Kiali, Quay, CNPG, Liberty, ESO, NetObserv, Gatekeeper, Descheduler, cert-manager), and the cert-manager wiring that supplies TLS to almost all of them."
+sidebar_label: "Overview + cert-manager"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const groupBox = { background: "#f3f4f6", border: "1.5px dashed #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const overviewNodes = [
+  // top: gitops driver
+  { id: "argo",     position: { x: 380, y: 0   }, data: { label: "Argo CD\n(hub-dc-v6)" }, style: ctrlBox },
+  { id: "appset",   position: { x: 380, y: 90  }, data: { label: "ApplicationSet\nspoke-dc-v6 platform-services" }, style: crBox },
+
+  // ci/cd column
+  { id: "pipelines",position: { x: 0,   y: 240 }, data: { label: "OpenShift Pipelines\n(Tekton)" }, style: ctrlBox },
+  { id: "evtlist",  position: { x: 0,   y: 340 }, data: { label: "EventListener\n+ Triggers" }, style: dataBox },
+  { id: "trivy",    position: { x: 0,   y: 440 }, data: { label: "Trivy Task" }, style: dataBox },
+  { id: "gitcli",   position: { x: 0,   y: 540 }, data: { label: "git-cli\nupdate-overlay-digest" }, style: dataBox },
+  { id: "push",     position: { x: 0,   y: 640 }, data: { label: "push-image-quay" }, style: dataBox },
+
+  // observability column
+  { id: "logging",  position: { x: 260, y: 240 }, data: { label: "Logging (LokiStack +\nClusterLogForwarder)" }, style: ctrlBox },
+  { id: "tracing",  position: { x: 260, y: 340 }, data: { label: "TempoStack +\nOpenTelemetryCollector" }, style: ctrlBox },
+  { id: "coo",      position: { x: 260, y: 440 }, data: { label: "Cluster Observability\nOperator" }, style: ctrlBox },
+  { id: "netobs",   position: { x: 260, y: 540 }, data: { label: "NetObserv +\nFlowCollector" }, style: ctrlBox },
+
+  // mesh column
+  { id: "ossm",     position: { x: 520, y: 240 }, data: { label: "OSSM 3 (ambient)\nistio + ztunnel + CNI" }, style: ctrlBox },
+  { id: "kiali",    position: { x: 520, y: 340 }, data: { label: "Kiali" }, style: ctrlBox },
+
+  // policy + housekeeping column
+  { id: "gatekeeper", position: { x: 520, y: 440 }, data: { label: "Gatekeeper / OPA" }, style: ctrlBox },
+  { id: "descheduler",position: { x: 520, y: 540 }, data: { label: "Kube Descheduler" }, style: ctrlBox },
+
+  // data-services column
+  { id: "quay",     position: { x: 780, y: 240 }, data: { label: "Quay Registry" }, style: ctrlBox },
+  { id: "cnpg",     position: { x: 780, y: 340 }, data: { label: "CloudNativePG" }, style: ctrlBox },
+  { id: "liberty",  position: { x: 780, y: 440 }, data: { label: "Open Liberty Operator" }, style: ctrlBox },
+
+  // foundations row
+  { id: "certmgr",  position: { x: 260, y: 760 }, data: { label: "cert-manager\n(ClusterIssuer + Certificate)" }, style: ctrlBox },
+  { id: "eso",      position: { x: 520, y: 760 }, data: { label: "ESO operands\n(ExternalSecret + SecretStore)" }, style: ctrlBox },
+  { id: "odf",      position: { x: 0,   y: 760 }, data: { label: "ODF NooBaa S3\n(OBC bridge)" }, style: dataBox },
+  { id: "vault",    position: { x: 780, y: 760 }, data: { label: "Vault VM" }, style: extBox },
+];
+
+export const overviewEdges = [
+  { id: "a1", source: "argo",     target: "appset",  ...muted },
+  { id: "a2", source: "appset",   target: "pipelines", ...muted },
+  { id: "a3", source: "appset",   target: "logging",  ...muted },
+  { id: "a4", source: "appset",   target: "tracing",  ...muted },
+  { id: "a5", source: "appset",   target: "coo",      ...muted },
+  { id: "a6", source: "appset",   target: "ossm",     ...muted },
+  { id: "a7", source: "appset",   target: "quay",     ...muted },
+  { id: "a8", source: "appset",   target: "cnpg",     ...muted },
+  { id: "a9", source: "appset",   target: "liberty",  ...muted },
+  { id: "p1", source: "pipelines",target: "evtlist",  ...muted },
+  { id: "p2", source: "pipelines",target: "trivy",    ...muted },
+  { id: "p3", source: "pipelines",target: "gitcli",   ...muted },
+  { id: "p4", source: "pipelines",target: "push",     ...muted },
+  { id: "p5", source: "push",     target: "quay",     label: "pushes to", ...reqEdge },
+  { id: "l1", source: "logging",  target: "odf",      label: "OBC", ...pullEdge },
+  { id: "t1", source: "tracing",  target: "odf",      label: "OBC", ...pullEdge },
+  { id: "q1", source: "quay",     target: "odf",      label: "OBC", ...pullEdge },
+  { id: "o1", source: "ossm",     target: "kiali",    ...muted },
+  { id: "o2", source: "kiali",    target: "tracing",  label: "Jaeger query", ...reqEdge },
+  { id: "c1", source: "certmgr",  target: "logging",  label: "TLS", ...muted },
+  { id: "c2", source: "certmgr",  target: "tracing",  label: "TLS", ...muted },
+  { id: "c3", source: "certmgr",  target: "quay",     label: "TLS", ...muted },
+  { id: "c4", source: "certmgr",  target: "liberty",  label: "TLS", ...muted },
+  { id: "e1", source: "eso",      target: "vault",    label: "reads", ...pullEdge },
+  { id: "e2", source: "eso",      target: "logging",  label: "OBC bridge", ...muted },
+  { id: "e3", source: "eso",      target: "tracing",  label: "OBC bridge", ...muted },
+  { id: "e4", source: "eso",      target: "quay",     label: "config-bundle", ...muted },
+];
+
+The `platform-services` overlay on `spoke-dc-v6` is the set of operators and operand CRs that sit between the cluster baseline (storage, networking, ACM, GitOps, ESO) and the tenant application namespaces. Everything in `clusters/spoke-dc-v6/platform-services/` of the platform-gitops repo. Together, they are the platform contract a tenant app inherits when it onboards.
+
+This page is two things: an orientation diagram for the whole overlay, and the cert-manager deep-dive (the file name on disk is `01-cert-manager.mdx`, which is also the natural lead because cert-manager underwrites most of the other components). The remaining 13 pages each cover a single component or pair.
+
+## What's in the overlay
+
+| Component | Page | Role |
+| --- | --- | --- |
+| OpenShift Pipelines (Tekton) | §14.2 | Path B build engine; runs PipelineRuns triggered by GitLab webhooks. |
+| EventListener + Triggers | §14.2 (companion) | GitLab webhook → PipelineRun fan-out. |
+| Trivy Task | §14.3 | Tekton Task wrapping the lab Trivy VM. Same gate as Jenkins. |
+| git-cli Task | §14.4 | Tekton Task that patches the GitOps overlay with the new image digest. |
+| push-image-quay Task | §14.5 | Tekton Task that copies the built image into the tenant's Quay org. |
+| Cluster Logging + LokiStack | §14.6 | Log aggregation across the cluster; LokiStack backed by NooBaa S3. |
+| TempoStack + OpenTelemetryCollector | §14.7 | Distributed tracing backend; same NooBaa pattern as Loki. |
+| Cluster Observability Operator | §14.8 | UIPlugins for Console (Distributed Tracing, Logging), user-workload monitoring. |
+| NetObserv | §14.9 | Flow logs from the OVN-K data plane, collected to Loki. |
+| Kube Descheduler | §14.10 | Rebalance workloads against node entropy. |
+| Gatekeeper / OPA | §14.11 | Cluster-wide policy admission (alongside RHACS). |
+| CloudNativePG | §14.12 | Operator-managed Postgres for tenant apps. |
+| Open Liberty Operator | §14.13 | `OpenLibertyApplication` CRD shipped by IBM/cloud-pak runtime. |
+| Quay Registry | §14.14 | OCP-native registry for the Tekton (Path B) push target. |
+
+A few platform fundamentals (cert-manager, ESO, ODF NooBaa) are *inputs* to the overlay rather than members of it. They live in adjacent directories under `clusters/spoke-dc-v6/`, but the overlay assumes they exist. cert-manager in particular is everywhere on the data flow diagram below.
+
+## The platform-services map
+
+<Whiteboard client:load data={{ nodes: overviewNodes, edges: overviewEdges }} height={840} />
+
+Reading the diagram, top to bottom:
+
+- **Argo CD** on the hub drives a single **ApplicationSet** that fans out to the platform-services overlay on the spoke (and other clusters).
+- The overlay produces four families of services: **CI/CD (Tekton)**, **Observability (Loki, Tempo, COO, NetObserv)**, **Mesh + UI (OSSM + Kiali)**, **Data services (Quay, CNPG, Liberty)** plus **Policy/Housekeeping (Gatekeeper, Descheduler)**.
+- The **dashed green** edges are the operand-backed S3 dependencies that flow through ODF NooBaa (the `objectbucketclaim` pattern documented in §10 ESO).
+- **cert-manager** underwrites TLS for Loki, Tempo, Quay, and the Open Liberty applications. **ESO** delivers config-bundle secrets to Quay and OBC bridges to Loki/Tempo.
+
+What is *not* in the platform-services overlay: ESO itself, cert-manager itself, ODF, OADP, RHACS sensor, MCE / GitOps. Those are platform foundations that get a separate sync-wave on the spoke.
+
+## cert-manager — why it is foundational
+
+cert-manager runs as a single operator in `cert-manager` namespace, installed via the Red Hat cert-manager Operator subscription. The operand is `OperatorConfig` plus a `ClusterIssuer` (or two), and then every other namespace files `Certificate` CRs as needed.
+
+In the lab, the spoke runs two ClusterIssuers:
+
+| ClusterIssuer | Purpose | Issuance mode |
+| --- | --- | --- |
+| `lab-step-ca` | Internal `*.apps.sub.comptech-lab.com` certs | ACME via the lab smallstep CA, HTTP-01 challenges resolved by the OCP Router |
+| `selfsigned-bootstrap` | Bootstrap CAs and very short-lived experiments | `selfSigned: {}`; not for production use |
+
+The smallstep CA path is the one almost all platform services use. cert-manager solves an HTTP-01 challenge by adding a temporary `HTTPRoute` (or, for Routes, by patching the Route's TLS config), the smallstep ACME server checks the challenge, and a `Certificate` is issued. The certificate lands as a Secret in the requesting namespace.
+
+A typical `Certificate` resource:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: quay-platform
+  namespace: quay-enterprise
+spec:
+  secretName: quay-platform-tls          # the Secret cert-manager creates
+  duration: 2160h                         # 90 days
+  renewBefore: 360h                       # rotate 15 days before expiry
+  issuerRef:
+    name: lab-step-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  commonName: quay.apps.sub.comptech-lab.com
+  dnsNames:
+    - quay.apps.sub.comptech-lab.com
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+```
+
+Notes:
+
+- The Secret name (`spec.secretName`) is what consumers reference. Routes mount it via `route.tls.certificateSecretName`; ingresses via `tls[].secretName`; operands (Loki, Tempo, Quay) via their own config-bundle pattern.
+- `duration: 90d` and `renewBefore: 15d` gives a 75-day-old certificate a two-week renewal window. cert-manager handles the rotation automatically.
+- ECDSA-256 is the lab default; it gives short certs and small handshakes.
+
+## How platform components consume certs
+
+Each component does it slightly differently, which is the cost of cert-manager being foundational rather than a piece of any one component:
+
+| Component | Pattern |
+| --- | --- |
+| Routes (OCP) | `route.spec.tls.externalCertificate.name = "<secret>"` referencing the cert-manager-issued Secret. Available since OCP 4.16 via the `RouteExternalCertificate` feature gate. |
+| Ingresses (HTTPRoute / Gateway) | `tls[].secretName` referencing the Secret directly. |
+| Quay | A `Certificate` produces a Secret; the Quay operator's `quay-config-bundle-secret` references it via `config.yaml` (or `tls` component is set to `managed: true` and Quay manages its own — see §14.14). |
+| LokiStack | The LokiStack operator does not consume cert-manager directly. mTLS between components is managed by the operator. External access uses a Route that does. |
+| TempoStack | Same as Loki — operator-managed internal TLS; Route uses cert-manager. |
+| Open Liberty | `OpenLibertyApplication.spec.route.certificateSecretName` references the Secret. |
+
+The unifying pattern: cert-manager creates Secrets; downstream resources reference those Secrets. cert-manager does not push certs at consumers; consumers pull them by name.
+
+## Installation shape
+
+The operator is installed via Subscription (sync-wave `5`); the `OperatorConfig` and the two ClusterIssuers follow at sync-wave `10`:
+
+```yaml
+apiVersion: operator.openshift.io/v1alpha1
+kind: CertManager
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  logLevel: Normal
+  operatorLogLevel: Normal
+```
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-step-ca
+spec:
+  acme:
+    server: https://step-ca.sub.comptech-lab.com/acme/acme/directory
+    privateKeySecretRef:
+      name: acme-account-key-lab-step-ca
+    skipTLSVerify: false
+    solvers:
+      - http01:
+          ingress:
+            class: openshift-default
+```
+
+The HTTP-01 solver uses the OCP Router's default ingress class because the lab does not run a separate ingress controller. The smallstep CA's root certificate is trusted by every node in the fleet via the cluster's image-registry-config trust bundle — that wiring is in §6 Disconnected Image Supply.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| `Certificate` stuck `Issuing`. | HTTP-01 challenge fails — Router cannot reach `step-ca`, or DNS for the SAN does not resolve. | `oc describe certificate <name>`; check `Order` and `Challenge` CRs in same ns. | Verify lab DNS resolves the SAN to the cluster ingress before requesting. |
+| Certificate Secret exists but Route still serves a stale cert. | OCP Route reload was missed; Router pod cached previous TLS. | `oc rollout restart -n openshift-ingress deployment/router-default`. | Use `RouteExternalCertificate` (which the Router watches) over manual TLS blocks. |
+| `step-ca` rejects an ACME request with `bad-csr`. | Order's CSR has an unauthorised DNS name. | Validate the `Certificate.spec.dnsNames` against the step-ca's `acme` provisioner's allow list. | Keep step-ca's provisioner config in `vm-platform-ops` so the allow list is reviewable. |
+| Bunch of Certificates degrade overnight. | ClusterIssuer rotation failed during a step-ca outage. | `oc get certificaterequest -A` — they'll be `Pending`; restart cert-manager to retry. | Monitor step-ca availability; alert on issuance latency. |
+
+## References
+
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — cluster baseline.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/` — overlay root.
+- ADR 0014, 0015 — developer readiness and federated GitOps.
+- cert-manager upstream: `ClusterIssuer`, `Certificate`, ACME HTTP-01.
+- Smallstep CA docs: ACME provisioner configuration.

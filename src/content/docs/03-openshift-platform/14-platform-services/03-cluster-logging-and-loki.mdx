@@ -1,8 +1,312 @@
 ---
-title: "Cluster Logging + Loki"
-description: "Section 03-openshift-platform/14-platform-services: Cluster Logging + Loki (placeholder)."
-sidebar_label: "Cluster Logging + Loki"
+title: "Cluster Logging and LokiStack"
+description: "How the OpenShift Logging 6.x operator drives a LokiStack backed by NooBaa S3, the ClusterLogForwarder tenancy model, and the ESO bridge that translates OBC outputs into the lowercase-key Secret LokiStack expects."
+sidebar_label: "Cluster Logging + LokiStack"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const lokiNodes = [
+  { id: "pods",    position: { x: 0,   y: 0   }, data: { label: "Workload pods\n(stdout/stderr)" }, style: dataBox },
+  { id: "nodes",   position: { x: 0,   y: 130 }, data: { label: "Node journals\n+ kubelet logs" }, style: dataBox },
+  { id: "audit",   position: { x: 0,   y: 260 }, data: { label: "API server audit\n(static log files)" }, style: dataBox },
+  { id: "vector",  position: { x: 260, y: 130 }, data: { label: "Vector collector DS\n(logging-collector SA)" }, style: agentBox },
+  { id: "clf",     position: { x: 520, y: 130 }, data: { label: "ClusterLogForwarder\ninstance" }, style: crBox },
+  { id: "loki",    position: { x: 780, y: 130 }, data: { label: "LokiStack\nlogging-loki" }, style: ctrlBox },
+  { id: "tenants", position: { x: 780, y: 280 }, data: { label: "Tenants\napplication / audit / infra" }, style: crBox },
+  { id: "obc",     position: { x: 520, y: 410 }, data: { label: "ObjectBucketClaim\nloki-bucket" }, style: crBox },
+  { id: "es",      position: { x: 260, y: 410 }, data: { label: "ExternalSecret\nloki-bucket (bridge)" }, style: crBox },
+  { id: "noobaa",  position: { x: 780, y: 410 }, data: { label: "NooBaa MCG\n(ODF S3 endpoint)" }, style: extBox },
+  { id: "console", position: { x: 0,   y: 410 }, data: { label: "OCP Console\nLogs view" }, style: dataBox },
+];
+
+export const lokiEdges = [
+  { id: "p1", source: "pods",    target: "vector", label: "stdout", ...reqEdge },
+  { id: "p2", source: "nodes",   target: "vector", label: "journal", ...reqEdge },
+  { id: "p3", source: "audit",   target: "vector", label: "files", ...reqEdge },
+  { id: "v1", source: "vector",  target: "clf",    label: "follows", ...muted },
+  { id: "c1", source: "clf",     target: "loki",   label: "lokiStack output", ...reqEdge },
+  { id: "l1", source: "loki",    target: "tenants", label: "openshift-logging mode", ...muted },
+  { id: "l2", source: "loki",    target: "obc",    label: "reads bucket spec via", ...muted },
+  { id: "o1", source: "obc",     target: "noobaa", label: "provisions bucket", ...pullEdge },
+  { id: "e1", source: "es",      target: "obc",    label: "reads outputs", ...muted },
+  { id: "e2", source: "es",      target: "loki",   label: "produces s3 Secret", ...reqEdge },
+  { id: "cn1", source: "console",target: "loki",   label: "LogQL via Console plugin", ...reqEdge },
+];
+
+OpenShift Logging 6.x is the supported way to aggregate logs across the cluster. The data plane is Vector (the collector); the storage is `LokiStack`. The two are wired together by `ClusterLogForwarder`. This page is the full picture on `spoke-dc-v6`: the operator install, the LokiStack on NooBaa S3, the ClusterLogForwarder pipelines, the OBC-to-Secret bridge, and the integration with the Console "Logs" view.
+
+It is for the platform team that owns observability and any app owner trying to figure out where their app's logs ended up.
+
+## What changed from Logging 5.x to 6.x
+
+A few things matter, because they change how you write the manifests:
+
+| Aspect | Logging 5.x | Logging 6.x |
+| --- | --- | --- |
+| Default collector | Fluentd | Vector |
+| ClusterLogForwarder API | `logging.openshift.io/v1` | `observability.openshift.io/v1` |
+| LokiStack output schema | per-output `tenant` field | tenant routing derived from `inputRef` |
+| Operator name | `cluster-logging` | `cluster-logging` (unchanged) |
+| Tenancy mode | manual per-output | `tenants.mode: openshift-logging` does it |
+
+The lab is on 6.x. The pipelines below use the `observability.openshift.io/v1` API.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: lokiNodes, edges: lokiEdges }} height={580} />
+
+Reading the diagram:
+
+- **Vector** runs as a DaemonSet under the `logging-collector` ServiceAccount. It reads from container stdout/stderr, host journal, and (for audit) the API server's static audit log files. The collector role has cluster-scoped read permissions on these via the `collect-application-logs`, `collect-audit-logs`, `collect-infrastructure-logs` ClusterRoles.
+- **ClusterLogForwarder** routes the three input streams to the LokiStack output.
+- **LokiStack** is a multi-tenant Loki deployment. Tenants `application`, `audit`, `infrastructure` are derived from each pipeline's `inputRef`.
+- **NooBaa MCG** is the S3 endpoint. The bucket is provisioned by an `ObjectBucketClaim`; the OBC's outputs are bridged through an `ExternalSecret` into the Secret shape LokiStack expects.
+- The **OCP Console "Logs" view** queries LokiStack through a UIPlugin (covered in §14.8).
+
+## LokiStack — sizing and storage
+
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: logging-loki
+  namespace: openshift-logging
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,ServerSideApply=true
+spec:
+  size: 1x.demo
+  managementState: Managed
+  storage:
+    schemas:
+      - version: v13
+        effectiveDate: "2024-10-22"
+    secret:
+      name: loki-bucket
+      type: s3
+  storageClassName: ocs-storagecluster-ceph-rbd
+  tenants:
+    mode: openshift-logging
+```
+
+| Field | Why this value |
+| --- | --- |
+| `size: 1x.demo` | Minimal-footprint preset (development tier). For real fleets, `1x.extra-small` and above add HA replicas. |
+| `storage.schemas[0]` | Loki schema v13; effectiveDate must be in the past at apply time. |
+| `storage.secret.name: loki-bucket, type: s3` | LokiStack reads bucket creds from this Secret. The Secret name must match the ExternalSecret-produced target. |
+| `storageClassName: ocs-storagecluster-ceph-rbd` | The index + chunk PVCs land on ODF Ceph RBD. |
+| `tenants.mode: openshift-logging` | Pre-canned tenancy: `application`, `audit`, `infrastructure`. Avoids hand-rolling per-team tenants. |
+
+The `size` presets in 6.x:
+
+- `1x.demo` — single replica of every component, no HA, ~1 GiB/day budget.
+- `1x.extra-small` — two replicas of compactor/distributor/ingester/querier; HA across two failure domains.
+- `1x.small`, `1x.medium`, `1x.large` — successively larger ingest budgets.
+
+The lab runs `1x.demo` because the spoke is a single-AZ cluster. ODF gives us the durability; Loki's HA modes add only latency.
+
+## NooBaa S3 bucket — the OBC
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: loki-bucket
+  namespace: openshift-logging
+spec:
+  generateBucketName: ""
+  bucketName: loki-bucket          # deterministic; disables UUID prefix
+  storageClassName: openshift-storage.noobaa.io
+```
+
+The OBC produces:
+
+- A Secret `loki-bucket` in `openshift-logging` with keys `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`.
+- A ConfigMap `loki-bucket` with `BUCKET_HOST`, `BUCKET_NAME`, `BUCKET_PORT`, `BUCKET_REGION`, `BUCKET_SUBREGION`.
+
+But LokiStack's `storage.secret` (type `s3`) does not consume those key names. It expects:
+
+```text
+endpoint
+bucketnames
+access_key_id
+access_key_secret
+```
+
+## The OBC-to-Secret bridge (ESO)
+
+The bridge takes the OBC's outputs and produces a new Secret with the lowercase key names LokiStack reads. It is an ESO `ExternalSecret` using the `kubernetes` provider (NOT vault) — ESO reads the OBC's Secret as if it were any other Kubernetes Secret in the cluster.
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: kubernetes-openshift-logging
+  namespace: openshift-logging
+spec:
+  provider:
+    kubernetes:
+      remoteNamespace: openshift-logging
+      server:
+        caProvider:
+          type: ConfigMap
+          name: kube-root-ca.crt
+          key: ca.crt
+      auth:
+        serviceAccount:
+          name: eso-loki-obc-reader
+```
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: loki-bucket-bridge
+  namespace: openshift-logging
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: kubernetes-openshift-logging
+  target:
+    name: loki-bucket
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        endpoint: "https://s3.openshift-storage.svc"
+        bucketnames: "loki-bucket"
+        access_key_id: "{{ .access_key_id }}"
+        access_key_secret: "{{ .access_key_secret }}"
+  data:
+    - secretKey: access_key_id
+      remoteRef:
+        key: loki-bucket
+        property: AWS_ACCESS_KEY_ID
+    - secretKey: access_key_secret
+      remoteRef:
+        key: loki-bucket
+        property: AWS_SECRET_ACCESS_KEY
+```
+
+A few things worth pointing out:
+
+- `endpoint` is hardcoded to the in-cluster NooBaa S3 service because ESO's kubernetes provider can only read Secrets, not ConfigMaps. The OBC's `BUCKET_HOST` is in the ConfigMap; we don't need it because we know the deterministic endpoint.
+- `bucketnames` is hardcoded because we set `bucketName` on the OBC (disables the UUID prefix).
+- `target.name: loki-bucket` overwrites the OBC's Secret — that's fine because LokiStack reads only `endpoint/bucketnames/access_key_id/access_key_secret`. The original `AWS_*` keys are gone; nothing else needed them.
+- The ESO provider's ServiceAccount needs a Role giving `get` on Secrets in `openshift-logging`. That Role is in the platform overlay.
+
+## ClusterLogForwarder
+
+```yaml
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+  annotations:
+    argocd.argoproj.io/sync-wave: "60"
+spec:
+  managementState: Managed
+  serviceAccount:
+    name: logging-collector
+  outputs:
+    - name: lokistack-out
+      type: lokiStack
+      lokiStack:
+        target:
+          name: logging-loki
+          namespace: openshift-logging
+        authentication:
+          token:
+            from: serviceAccount
+  pipelines:
+    - name: application-logs
+      inputRefs: [application]
+      outputRefs: [lokistack-out]
+    - name: infrastructure-logs
+      inputRefs: [infrastructure]
+      outputRefs: [lokistack-out]
+    - name: audit-logs
+      inputRefs: [audit]
+      outputRefs: [lokistack-out]
+```
+
+Notes:
+
+- `serviceAccount.name: logging-collector` is the SA Vector runs as. The collect-* ClusterRoles must be bound to this SA in `loki-rbac.yaml`.
+- `authentication.token.from: serviceAccount` makes Vector authenticate to LokiStack with the collector SA's token. LokiStack's gateway accepts that token and routes to the right tenant based on the SA's identity.
+- Three pipelines — one per built-in input. The `inputRef` is what tenant LokiStack routes them into (because of `tenants.mode: openshift-logging`).
+
+This is the "single output, three pipelines" 6.x shape — different from 5.x where you'd write three outputs each with a `tenant` field.
+
+## Console integration
+
+The OCP Console has a built-in "Logs" view since OCP 4.12. To wire it to LokiStack, install the Cluster Observability Operator's `UIPlugin/logging` resource (covered in §14.8). Once installed, the Console queries LokiStack through the logging-view backend and you get LogQL directly in the browser.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Operator
+oc --kubeconfig "$K" -n openshift-logging get sub,csv
+
+# LokiStack is Ready
+oc --kubeconfig "$K" -n openshift-logging get lokistack logging-loki \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+# OBC + bridge Secret
+oc --kubeconfig "$K" -n openshift-logging get obc loki-bucket
+oc --kubeconfig "$K" -n openshift-logging get secret loki-bucket -o jsonpath='{.data}{"\n"}' | tr ',' '\n' | head
+
+# CLF
+oc --kubeconfig "$K" -n openshift-logging get clusterlogforwarder instance \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+# Vector pods on every worker
+oc --kubeconfig "$K" -n openshift-logging get ds/collector
+
+# Live query
+oc --kubeconfig "$K" -n openshift-logging exec -it deploy/logging-loki-query-frontend -- \
+  logcli --tls-skip-verify --addr http://localhost:3100 \
+  query --limit=5 '{kubernetes_namespace_name="default"}'
+```
+
+Expected:
+
+- `LokiStack` Ready=True.
+- `loki-bucket` Secret contains `endpoint`, `bucketnames`, `access_key_id`, `access_key_secret` (not the AWS_* shape).
+- `ClusterLogForwarder` Ready=True.
+- `ds/collector` Desired=Current=Ready=<worker-count>.
+- A logcli query returns rows.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| LokiStack `Warning Degraded`, ingesters cannot start. | The OBC was created but the bridge ExternalSecret was not — Secret has AWS_* keys, not lowercase. | Apply the ESO bridge from above; LokiStack reconciles automatically. | Treat OBC + bridge ExternalSecret as a single committed pair; lint requires both. |
+| Logs do not appear in Console. | UIPlugin not installed or LokiStack `Gateway` route disabled. | Install the COO UIPlugin/logging; ensure LokiStack `spec.gateway.enabled=true`. | Include the UIPlugin in the observability overlay. |
+| Vector collector pods OOMKilled. | Memory budget too low for the application log volume. | Bump the collector memory limit in the Logging operator config. | Capacity-plan based on per-namespace EPS. |
+| Audit logs do not flow. | The `collect-audit-logs` ClusterRoleBinding is missing for `logging-collector` SA. | Apply `loki-rbac.yaml`. | Include in the overlay; CI lint verifies the three collect-* role bindings exist. |
+| Tenant logs visible across teams. | Used `tenants.mode: static` and a single tenant; or the gateway's authorisation policy is permissive. | Switch to `tenants.mode: openshift-logging` (the lab default); audit gateway policy. | Stick with the openshift-logging mode unless multi-tenant Loki for non-OCP workloads is required. |
+
+## References
+
+- DEV-OCP-1.2 #176 (LokiStack + ClusterLogForwarder).
+- Memory: `project_obc_to_operand_secret_bridge.md` — the OBC bridge pattern.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/logging/`.
+- Red Hat OpenShift Logging 6.x docs: `observability.openshift.io/v1` CLF, LokiStack sizing.

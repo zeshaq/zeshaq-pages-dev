@@ -1,8 +1,207 @@
 ---
-title: "Cluster Observability Operator"
-description: "Section 03-openshift-platform/14-platform-services: Cluster Observability Operator (placeholder)."
-sidebar_label: "Cluster Observability Operator"
+title: "Cluster Observability Operator (COO)"
+description: "How the Cluster Observability Operator stitches together the OCP Console UIPlugins for Logging and Distributed Tracing, enables user-workload monitoring, and provides MonitoringStack for custom Prometheus deployments."
+sidebar_label: "COO + UIPlugins"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const cooNodes = [
+  { id: "coo",     position: { x: 380, y: 0   }, data: { label: "COO operator" }, style: ctrlBox },
+  { id: "uilog",   position: { x: 80,  y: 130 }, data: { label: "UIPlugin/logging" }, style: crBox },
+  { id: "uitr",    position: { x: 280, y: 130 }, data: { label: "UIPlugin/distributed-tracing" }, style: crBox },
+  { id: "uimon",   position: { x: 480, y: 130 }, data: { label: "UIPlugin/monitoring (optional)" }, style: crBox },
+  { id: "mstack",  position: { x: 680, y: 130 }, data: { label: "MonitoringStack (optional)" }, style: crBox },
+  { id: "console", position: { x: 80,  y: 280 }, data: { label: "OCP Console" }, style: dataBox },
+  { id: "loki",    position: { x: 80,  y: 420 }, data: { label: "LokiStack" }, style: ctrlBox },
+  { id: "tempo",   position: { x: 280, y: 420 }, data: { label: "TempoStack" }, style: ctrlBox },
+  { id: "uwm",     position: { x: 480, y: 420 }, data: { label: "user-workload\n monitoring (Prom)" }, style: ctrlBox },
+];
+
+export const cooEdges = [
+  { id: "c1", source: "coo",    target: "uilog",  ...muted },
+  { id: "c2", source: "coo",    target: "uitr",   ...muted },
+  { id: "c3", source: "coo",    target: "uimon",  ...muted },
+  { id: "c4", source: "coo",    target: "mstack", ...muted },
+  { id: "p1", source: "uilog",  target: "console", label: "registers plugin", ...reqEdge },
+  { id: "p2", source: "uitr",   target: "console", label: "registers plugin", ...reqEdge },
+  { id: "l1", source: "console",target: "loki",    label: "Logs view → LogQL", ...reqEdge },
+  { id: "t1", source: "console",target: "tempo",   label: "Traces view → JaegerQuery", ...reqEdge },
+  { id: "u1", source: "console",target: "uwm",     label: "User-workload metrics", ...reqEdge },
+];
+
+The Cluster Observability Operator (COO) is the umbrella for "second-generation OCP observability": UIPlugins that extend the OCP Console with Logs and Traces views, an optional `MonitoringStack` for ad-hoc Prometheus deployments, and the trigger for enabling user-workload monitoring in the cluster-monitoring stack. This page is how it ties Loki, Tempo, and Prometheus into one Console experience.
+
+## What COO is and is not
+
+COO is a thin coordinator. It does not store data; it does not generate metrics. It installs and reconciles a small set of CRs:
+
+- `UIPlugin` — a way to register a dynamic plugin into the OCP Console. The plugin code is shipped by the corresponding operator (LokiStack ships the Logs plugin image; Tempo Operator ships the Traces plugin image).
+- `MonitoringStack` — a self-contained Prometheus + Thanos Querier you can stand up alongside the cluster-monitoring stack for special use cases (custom retention, custom rules, isolated tenants).
+
+The cluster's primary monitoring stack (`cluster-monitoring-operator` in `openshift-monitoring`) is *not* COO. COO complements it.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: cooNodes, edges: cooEdges }} height={520} />
+
+Reading the diagram:
+
+- COO reconciles three `UIPlugin` resources that register dynamic plugins into the **OCP Console**.
+- The Logs plugin makes the Console talk to **LokiStack** for the Observe → Logs view.
+- The Tracing plugin does the same for **TempoStack** for the Observe → Traces view.
+- A separate piece — the `cluster-monitoring-config` ConfigMap in `openshift-monitoring` with `enableUserWorkload: true` — enables the **user-workload monitoring** stack so app metrics land in a tenant-aware Prometheus.
+
+## The UIPlugin CRs
+
+```yaml
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: logging
+spec:
+  type: Logging
+  logging:
+    lokiStack:
+      name: logging-loki
+      namespace: openshift-logging
+```
+
+```yaml
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: distributed-tracing
+spec:
+  type: DistributedTracing
+```
+
+Notes:
+
+- The Logs plugin needs a pointer at the LokiStack so the Console knows which logging-view backend to query.
+- The Tracing plugin auto-discovers TempoStack instances; no explicit pointer is required, but the TempoStack must be Ready.
+- COO installs `ConsolePlugin` and `Deployment` for each plugin in `openshift-cluster-observability-operator`.
+
+After applying both, the OCP Console will, after a refresh, show:
+
+- **Observe → Logs** — LogQL queries against LokiStack, with the same auth (OCP OAuth) the rest of the Console uses.
+- **Observe → Traces** — trace search and visualisation via Tempo's JaegerQuery.
+- **Observe → Metrics** — already present from `cluster-monitoring-operator`; not a COO plugin.
+
+## Enabling user-workload monitoring
+
+The OCP cluster-monitoring stack is bifurcated: a *platform* monitoring side (in `openshift-monitoring`, scraping platform components) and a *user-workload* monitoring side (in `openshift-user-workload-monitoring`, scraping app-namespace `ServiceMonitor`/`PodMonitor` CRs). The user-workload side is off by default; enable it via the cluster's monitoring ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+    userWorkloadMonitoring:
+      retention: 15d
+      resources:
+        requests:
+          memory: 256Mi
+```
+
+Once applied:
+
+- A `prometheus-user-workload` StatefulSet and a `thanos-ruler-user-workload` StatefulSet come up in `openshift-user-workload-monitoring`.
+- `ServiceMonitor` / `PodMonitor` CRs in tenant namespaces are picked up.
+- Tenant alerts (`PrometheusRule` in tenant ns) are evaluated by the Thanos Ruler.
+- The Console's Observe → Metrics page transparently queries both platform and user-workload stores.
+
+This is technically not COO — it's the platform monitoring stack. But it is in the same `observability/` overlay because it complements COO and the COO plugins need it for the metrics that drive their UIs.
+
+## MonitoringStack — when you'd use it
+
+`MonitoringStack` is a CR for standing up a *separate* Prometheus + Querier outside the cluster-monitoring stack. Use cases:
+
+- Custom retention (60 days, 180 days) for a specific app without inflating cluster-monitoring's storage.
+- A multi-tenant Prometheus for an external customer.
+- An A/B Prometheus to validate a config change before applying to cluster-monitoring.
+
+In the lab we do not run a custom MonitoringStack — user-workload monitoring plus federated metrics on the hub (via ACM observability) cover the use cases. The COO operator is installed because we want the UIPlugins; MonitoringStack is available but unused.
+
+## Sample MonitoringStack manifest
+
+```yaml
+apiVersion: monitoring.rhobs/v1alpha1
+kind: MonitoringStack
+metadata:
+  name: extended-app-monitoring
+  namespace: my-app-monitoring
+spec:
+  logLevel: info
+  retention: 30d
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "1Gi"
+  prometheusConfig:
+    replicas: 2
+  resourceSelector:
+    matchLabels:
+      monitoring-stack: extended-app
+```
+
+Workloads opt in by labelling their `ServiceMonitor` with `monitoring-stack: extended-app`. The COO operator stands up the Prometheus and Querier in `my-app-monitoring`.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# COO operator
+oc --kubeconfig "$K" -n openshift-cluster-observability-operator get sub,csv
+
+# UIPlugins
+oc --kubeconfig "$K" get uiplugin
+
+# Console plugin registration (made by COO)
+oc --kubeconfig "$K" get consoleplugin
+
+# Console rollout picks them up
+oc --kubeconfig "$K" -n openshift-console rollout status deployment/console
+
+# User-workload monitoring
+oc --kubeconfig "$K" -n openshift-monitoring get cm cluster-monitoring-config -o yaml | grep enableUserWorkload
+oc --kubeconfig "$K" -n openshift-user-workload-monitoring get pods
+```
+
+Expected:
+
+- COO CSV `Succeeded`.
+- `uiplugin/logging` and `uiplugin/distributed-tracing` exist.
+- `consoleplugin/logging-view-plugin` and `consoleplugin/distributed-tracing-plugin` exist and are registered with the Console.
+- `prometheus-user-workload` and `thanos-ruler-user-workload` running.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Observe → Logs returns errors. | LokiStack name in UIPlugin doesn't match the actual CR. | Edit `uiplugin/logging.spec.logging.lokiStack.name`. | Pin LokiStack name `logging-loki` as platform contract. |
+| Observe → Traces blank. | TempoStack not Ready, or JaegerQuery disabled in TempoStack. | Verify TempoStack and re-enable `template.queryFrontend.jaegerQuery.enabled: true`. | Document Tempo's `jaegerQuery` flag as required when paired with COO. |
+| Console plugin shows as "loading" forever. | The plugin's Deployment in `openshift-cluster-observability-operator` is failing to pull. | Mirror catalog might be missing the plugin image. | Verify operator-version-lock includes the plugin image set. |
+| User-workload monitoring not picking up ServiceMonitors. | Tenant namespace has the `openshift.io/cluster-monitoring=true` label, which puts it in *platform* monitoring instead. | Remove that label; UWM picks up "everything that isn't platform". | Tenant namespace template doesn't include the platform-monitoring label. |
+| Custom MonitoringStack's Prometheus has no targets. | resourceSelector did not match any ServiceMonitors. | Verify label match; bump COO operator if a recent upgrade reset the controller. | Make label conventions part of the MonitoringStack onboarding doc. |
+
+## References
+
+- DEV-OCP-1.5 #179 (Cluster Observability stack).
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/observability/`.
+- COO upstream docs: `UIPlugin`, `MonitoringStack`.
+- OCP docs: `cluster-monitoring-config` ConfigMap, user-workload monitoring.

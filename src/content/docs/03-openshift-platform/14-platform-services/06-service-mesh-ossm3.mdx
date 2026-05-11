@@ -1,8 +1,247 @@
 ---
-title: "Service Mesh (OSSM 3)"
-description: "Section 03-openshift-platform/14-platform-services: Service Mesh (OSSM 3) (placeholder)."
-sidebar_label: "Service Mesh (OSSM 3)"
+title: "OpenShift Service Mesh 3 — ambient mode"
+description: "How OSSM 3 is installed on spoke-dc-v6 using the sail-operator's openshift-ambient profile (Istio + IstioCNI + ZTunnel), how ambient differs from sidecar mode, and how workloads opt into the mesh."
+sidebar_label: "OSSM 3 ambient"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const dsBox   = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const dataFlow = { animated: true, style: { stroke: "#1d4ed8", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1d4ed8" }, labelStyle: { fill: "#1d4ed8", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const ossmNodes = [
+  { id: "ssmop",   position: { x: 380, y: 0   }, data: { label: "sail-operator (OSSM 3)" }, style: ctrlBox },
+  { id: "istio",   position: { x: 380, y: 130 }, data: { label: "Istio CR\nistio-system" }, style: crBox },
+  { id: "cni",     position: { x: 100, y: 130 }, data: { label: "IstioCNI CR\nistio-cni ns" }, style: crBox },
+  { id: "ztcr",    position: { x: 660, y: 130 }, data: { label: "ZTunnel CR\nztunnel ns" }, style: crBox },
+  { id: "istiod",  position: { x: 380, y: 260 }, data: { label: "istiod\n(control plane)" }, style: ctrlBox },
+  { id: "cniDS",   position: { x: 100, y: 260 }, data: { label: "istio-cni DaemonSet\n(per node)" }, style: dsBox },
+  { id: "ztDS",    position: { x: 660, y: 260 }, data: { label: "ztunnel DaemonSet\n(per node, L4 proxy)" }, style: dsBox },
+  { id: "podA",    position: { x: 100, y: 420 }, data: { label: "Pod A\n(ambient ns)" }, style: dataBox },
+  { id: "podB",    position: { x: 380, y: 420 }, data: { label: "Pod B\n(ambient ns)" }, style: dataBox },
+  { id: "waypoint",position: { x: 660, y: 420 }, data: { label: "Waypoint Pod\n(per ns L7 — optional)" }, style: dataBox },
+];
+
+export const ossmEdges = [
+  { id: "s1", source: "ssmop",   target: "istio",  ...muted },
+  { id: "s2", source: "ssmop",   target: "cni",    ...muted },
+  { id: "s3", source: "ssmop",   target: "ztcr",   ...muted },
+  { id: "i1", source: "istio",   target: "istiod", label: "creates", ...reqEdge },
+  { id: "c1", source: "cni",     target: "cniDS",  label: "creates", ...reqEdge },
+  { id: "z1", source: "ztcr",    target: "ztDS",   label: "creates", ...reqEdge },
+  { id: "xds1", source: "istiod", target: "ztDS",  label: "xDS", ...muted },
+  { id: "xds2", source: "istiod", target: "waypoint", label: "xDS (L7 cfg)", ...muted },
+  { id: "redir1", source: "cniDS", target: "podA", label: "redirects traffic", ...dataFlow },
+  { id: "redir2", source: "cniDS", target: "podB", label: "redirects traffic", ...dataFlow },
+  { id: "p1", source: "podA",    target: "ztDS",   label: "L4 mTLS", ...dataFlow },
+  { id: "p2", source: "ztDS",    target: "podB",   label: "L4 mTLS", ...dataFlow },
+  { id: "wp", source: "podA",    target: "waypoint", label: "L7 (if labelled)", ...dataFlow },
+];
+
+OpenShift Service Mesh 3 is the productised wrap of upstream Istio. On `spoke-dc-v6` it runs in **ambient mode** — no per-pod sidecars; an L4 proxy DaemonSet (ztunnel) and an optional per-namespace L7 proxy (waypoint) instead. This page is the operator/operand layout, why ambient, and how workloads opt in.
+
+## Why ambient mode
+
+Sidecar mode (Istio 1.x classic) injects an Envoy sidecar into every pod. It is mature and well-known, but has two persistent costs:
+
+- **Memory/CPU per pod.** Every workload pod carries an Envoy. On a busy cluster that adds up to gigabytes of memory and noticeable extra CPU.
+- **Operational friction.** Sidecar injection is a mutating webhook; pods need annotations; existing apps need restart cycles. Restarts to upgrade Istio.
+
+Ambient (Istio 1.22+) splits the data plane:
+
+- **ztunnel** — a per-node DaemonSet that handles L4 mTLS between pods.
+- **Waypoint proxy** — a per-namespace (or per-service-account) Envoy Pod for L7 features (HTTP routing, authorisation policies, retries, fault injection).
+- **No sidecar.** Workload pods are unmodified.
+
+Apps that need only L4 mTLS pay only the per-node ztunnel cost (a few pods cluster-wide). Apps that need L7 pay for a Waypoint, but only those namespaces. Upgrades reroll ztunnel or waypoints — not every workload.
+
+The trade-offs are real:
+
+| Ambient pro | Sidecar pro |
+| --- | --- |
+| Lower per-pod overhead | Workload-attributed CPU/memory accounting |
+| No app restart for upgrades | More mature security profile (longer in production) |
+| No mutating webhook gotcha | Per-pod traffic control independent of namespace |
+| L4-only is a real free tier | Some advanced Envoy features only in sidecars |
+
+The lab is on ambient. The platform-gitops files are under `platform-services/service-mesh/`.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: ossmNodes, edges: ossmEdges }} height={580} />
+
+Reading the diagram:
+
+- The **sail-operator** is the OSSM 3 operator. It owns three CRs: `Istio`, `IstioCNI`, `ZTunnel`.
+- **`Istio` → `istiod`** is the control plane.
+- **`IstioCNI` → `istio-cni` DaemonSet** runs the CNI plugin that redirects pod traffic into ztunnel.
+- **`ZTunnel` → `ztunnel` DaemonSet** is the per-node L4 proxy.
+- **Workload pods** in labelled namespaces have their traffic redirected by the CNI to the local ztunnel for outbound encryption.
+- A **Waypoint** is optional; it provides L7 features for namespaces or service accounts that need them.
+
+## The operand CRs
+
+### `Istio`
+
+```yaml
+apiVersion: sailoperator.io/v1
+kind: Istio
+metadata:
+  name: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "26"   # after IstioCNI
+spec:
+  namespace: istio-system
+  profile: openshift-ambient
+  version: v1.28-latest
+  updateStrategy:
+    type: InPlace
+    inactiveRevisionDeletionGracePeriodSeconds: 30
+```
+
+| Field | Why this value |
+| --- | --- |
+| `namespace: istio-system` | Conventional namespace for the Istio control plane. |
+| `profile: openshift-ambient` | OSSM-flavoured ambient profile — sets OCP SCC handling, ambient defaults, and Istio knobs Red Hat support. |
+| `version: v1.28-latest` | Pins to 1.28; `-latest` follows patches within 1.28. |
+| `updateStrategy.type: InPlace` | Upgrade-in-place, vs `RevisionBased` which keeps two revisions side-by-side. |
+| `inactiveRevisionDeletionGracePeriodSeconds: 30` | If we ever switch to RevisionBased, this is the cleanup window. |
+
+### `IstioCNI`
+
+```yaml
+apiVersion: sailoperator.io/v1
+kind: IstioCNI
+metadata:
+  name: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+spec:
+  namespace: istio-cni
+  profile: openshift-ambient
+  version: v1.28-latest
+```
+
+The CNI DaemonSet handles the iptables/eBPF redirect that captures pod traffic for ambient mode. It needs the OCP-tuned profile because OVN-Kubernetes has specific config-directory conventions for CNI chaining.
+
+### `ZTunnel`
+
+```yaml
+apiVersion: sailoperator.io/v1
+kind: ZTunnel
+metadata:
+  name: default
+  annotations:
+    argocd.argoproj.io/sync-wave: "27"   # after Istio
+spec:
+  namespace: ztunnel
+  version: v1.28-latest
+```
+
+Three CRs, three DaemonSets/Deployments, in three namespaces. The split lets you upgrade ztunnel independently of istiod when only a data-plane patch is needed.
+
+## How a namespace joins the mesh
+
+Three options:
+
+| Mode | How to opt in | Effect |
+| --- | --- | --- |
+| Ambient (L4) | `kubectl label ns my-ns istio.io/dataplane-mode=ambient` | Pods get L4 mTLS via ztunnel. No sidecar. |
+| Ambient + waypoint (L7) | Add a `Gateway` resource of type `waypoint` in the ns | Adds a per-ns waypoint Pod for L7. |
+| Sidecar (legacy) | `kubectl label ns my-ns istio-injection=enabled` | Standard Istio injection. Works alongside ambient on the same cluster. |
+
+The lab convention is: **ambient by default**; waypoints opt-in per namespace; sidecar reserved for workloads that need Envoy-specific features not exposed by ambient.
+
+```bash
+# Opt-in a tenant namespace to ambient
+oc label namespace apps-team-x istio.io/dataplane-mode=ambient
+
+# Verify the redirect is wired
+oc -n apps-team-x exec -it deploy/sample -- ss -tlnp
+# Look for the Istio dnat hooks.
+```
+
+No pod restarts are required to join ambient — the CNI redirect captures live traffic.
+
+## mTLS
+
+Ambient automatically does **strict mTLS** between ambient-labelled pods. There is no per-workload knob; the data plane upgrades all in-cluster traffic to mTLS as soon as both sides are ambient. Traffic to non-ambient destinations falls back to plaintext (configurable).
+
+For ambient policy enforcement you write `AuthorizationPolicy` CRs in `istio-system` or in the workload namespace; they apply to ambient traffic the same way as sidecar traffic.
+
+## L7 with Waypoints
+
+A waypoint is a Gateway resource of type `istio.io/waypoint`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: Gateway
+metadata:
+  name: waypoint
+  namespace: apps-team-x
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+```
+
+Once the Gateway exists, all L7 features (HTTP routing, retries, faults, request/response transformations, authorization at L7) can be applied via `HTTPRoute` or Istio's `VirtualService` and `AuthorizationPolicy`. The waypoint runs as a single Envoy Pod (Deployment), not a sidecar.
+
+Per-namespace waypoint is the lab default. Per-service-account waypoints are an option for workloads that need different L7 policy by SA.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Operator
+oc --kubeconfig "$K" -n openshift-operators get sub,csv | grep -i servicemesh
+
+# CRs
+oc --kubeconfig "$K" -n istio-system get istio default
+oc --kubeconfig "$K" -n istio-cni    get istiocni default
+oc --kubeconfig "$K" -n ztunnel      get ztunnel default
+
+# Workloads
+oc --kubeconfig "$K" -n istio-system get deploy/istiod
+oc --kubeconfig "$K" -n istio-cni    get ds
+oc --kubeconfig "$K" -n ztunnel      get ds
+
+# An ambient namespace
+oc --kubeconfig "$K" get ns apps-team-x -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}{"\n"}'
+```
+
+Expected:
+
+- `Istio`, `IstioCNI`, `ZTunnel` all `Ready=True`.
+- `istiod` Deployment 1/1; `istio-cni` and `ztunnel` DaemonSets at full readiness.
+- Ambient namespaces show `ambient` for their dataplane-mode label.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Traffic between two ambient pods is plaintext. | CNI plugin not active on the node; or namespace not labelled. | Verify `oc get ds -n istio-cni`; relabel ns. | Lint workloads' namespaces; require the ambient label on app namespaces. |
+| Service Mesh upgrade rolls everything. | `updateStrategy: InPlace`. | Expected behaviour for InPlace. For zero-downtime, switch to RevisionBased. | Plan upgrades during low-traffic windows. |
+| L7 policies have no effect. | Namespace has no Waypoint Gateway. | Add a `Gateway` of class `istio-waypoint`. | Onboarding template includes the waypoint if the tenant requests L7. |
+| `istiod` cannot push xDS. | Network policy in `istio-system` blocks egress. | `oc get networkpolicy -n istio-system`; allow controller→ztunnel/waypoint. | Don't change `istio-system` policies without rerunning the conformance set. |
+| Sidecar-mode workload coexists badly. | Mixed mode on the same ns. | Pick one mode per ns. | Document the convention; lint catches mixed labels. |
+
+## References
+
+- DEV-OCP-1.4 #178 (Istio + Kiali OSSM 3 ambient).
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/service-mesh/`.
+- Sail Operator docs: `Istio`, `IstioCNI`, `ZTunnel` v1.
+- Istio ambient docs: `dataplane-mode`, Waypoint, HBONE.
