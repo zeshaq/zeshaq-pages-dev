@@ -1,0 +1,270 @@
+---
+title: "Ingress, IngressController, and Routes"
+description: "How north-south HTTP(S) traffic reaches workloads on dc-lab clusters: IngressController topology, Route TLS termination, wildcard DNS, and the HAProxy boundary."
+sidebar_label: "Ingress & Routes"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The OpenShift Route is the cluster-native way to expose a Service over HTTP(S). On dc-lab v6 clusters, Routes are served by the cluster's own **IngressController** — a `haproxy` Deployment in `openshift-ingress` bound to the cluster's Ingress VIP. This page covers the topology, the TLS termination modes, the wildcard certificate, the lab DNS plane that makes it work, and the firm boundary between this cluster-internal HAProxy and the lab edge HAProxy.
+
+## The path of a Route request
+
+1. A client resolves `<route>.apps.<cluster>.sub.comptech-lab.com` via PowerDNS.
+2. PowerDNS returns the **Ingress VIP** of the cluster.
+3. The client TCP-connects to the Ingress VIP:443.
+4. The packet is routed to a node currently advertising the Ingress VIP.
+5. On that node, the IngressController's `haproxy` router pod receives the connection.
+6. The router reads its compiled `haproxy.cfg`, finds the SNI hostname's backend, and forwards.
+7. The backend is a list of Endpoint IPs (Pod IPs) for the Route's target Service.
+8. The router opens a connection to one of the pods (TLS termination depends on the Route mode — see below).
+9. Response flows back the same path.
+
+## IngressController components
+
+| Component | Where | Purpose |
+| --- | --- | --- |
+| `openshift-ingress-operator` | `openshift-ingress-operator` namespace | reconciles `IngressController` CR(s) |
+| `IngressController` CR (`default`) | `openshift-ingress-operator` | declares the desired ingress configuration |
+| `router-default-*` pods | `openshift-ingress` | actual haproxy router pods |
+| `metrics` Service | `openshift-ingress` | router metrics scraped by cluster monitoring |
+
+A healthy default IngressController has ≥2 router replicas (often the master count) so failover is possible.
+
+## Ingress VIP
+
+The Ingress VIP is one of the addresses in the cluster's reserved `/24` from ADR 0005. It's advertised by:
+
+- Keepalived on the masters (the OCP installer default for IPI on baremetal / vSphere installs).
+- Or MetalLB if you've moved to the MetalLB-based ingress model (not the dc-lab default).
+
+On dc-lab v6 clusters the installer-default Keepalived-on-master pattern is used. The Ingress VIP is one of the reserved addresses, fronting traffic to the active router pod.
+
+PowerDNS resolves `*.apps.<cluster>.sub.comptech-lab.com` to this VIP via a wildcard A record. Workloads that need to be reachable just publish a Route — wildcard DNS picks it up automatically.
+
+## Route TLS termination modes
+
+| Mode | Where TLS terminates | Pod sees | Used in dc-lab |
+| --- | --- | --- | --- |
+| `edge` | Router | plain HTTP | yes — most app Routes |
+| `passthrough` | Pod | TLS bytes (router does TCP) | yes — `console-openshift-console`, OAuth, RHACS Central |
+| `reencrypt` | Router (then new TLS to pod) | TLS bytes (new handshake) | yes — ODF S3 RGW, internal-CA-terminated services |
+
+### `edge` termination (the common case)
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: app-frontend
+  namespace: tenant-platform-app-prod
+spec:
+  host: app.apps.spoke-dc-v6.sub.comptech-lab.com
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: app-frontend
+  port:
+    targetPort: http
+```
+
+The router terminates TLS with the **cluster default ingress certificate**. The connection from router to pod is plain HTTP on `targetPort: http`. `insecureEdgeTerminationPolicy: Redirect` causes :80 to redirect to :443.
+
+### `passthrough` (TLS terminates in the pod)
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: rhacs-central
+  namespace: stackrox
+spec:
+  host: central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com
+  tls:
+    termination: passthrough
+  to:
+    kind: Service
+    name: central
+  port:
+    targetPort: https
+```
+
+The router does TCP-level forwarding via SNI. The pod terminates TLS with its own certificate. Used when:
+
+- The backend requires mutual TLS that the router can't participate in (e.g. OAuth flows where the backend validates client certs).
+- The backend uses a non-Let's-Encrypt cert (internal CA, operator-managed cert).
+- The backend wants to see the original TLS bytes (RHACS Central, OCP console).
+
+### `reencrypt` (TLS terminated at router, new TLS to pod)
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: s3-rgw
+  namespace: openshift-storage
+spec:
+  host: s3.apps.spoke-dc-v6.sub.comptech-lab.com
+  tls:
+    termination: reencrypt
+    destinationCACertificate: |
+      -----BEGIN CERTIFICATE-----
+      <CA that signed the backend cert>
+      -----END CERTIFICATE-----
+  to:
+    kind: Service
+    name: s3-rgw-service
+  port:
+    targetPort: https
+```
+
+The router presents the cluster's external TLS to the client, then opens a fresh TLS handshake to the pod (validating against `destinationCACertificate`). Used when:
+
+- The pod has TLS but with a different CA than the client expects.
+- The router's external cert needs to be the public Let's Encrypt one but the pod's cert is operator-managed.
+
+## The wildcard certificate
+
+The dc-lab convention for app Routes (per ADR 0005):
+
+- The IngressController's `defaultCertificate` is the lab's **Let's Encrypt wildcard** for `*.apps.<cluster>.sub.comptech-lab.com`.
+- A `cert-manager` `Certificate` resource refreshes this cert via DNS-01 challenge against PowerDNS.
+- The DNS API token is in Vault; cert-manager pulls it via ESO.
+
+```yaml
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: default
+  namespace: openshift-ingress-operator
+spec:
+  defaultCertificate:
+    name: apps-wildcard-tls
+  domain: apps.spoke-dc-v6.sub.comptech-lab.com
+  endpointPublishingStrategy:
+    type: HostNetwork                       # or LoadBalancerService on cloud
+  replicas: 2
+  routeAdmission:
+    namespaceOwnership: Strict              # one Route per host per namespace
+    wildcardPolicy: WildcardsDisallowed      # explicit hostname per Route
+```
+
+The Secret `apps-wildcard-tls` in `openshift-ingress` holds the certificate. Cert-manager creates and refreshes it.
+
+### `namespaceOwnership: Strict` vs `InterNamespaceAllowed`
+
+| Setting | Behavior |
+| --- | --- |
+| `Strict` (dc-lab default) | only one namespace can own a hostname; later Routes for the same host get rejected with `HostAlreadyClaimed` |
+| `InterNamespaceAllowed` | multiple namespaces can publish Routes for the same hostname (first one served) |
+
+`Strict` is safer — `InterNamespaceAllowed` lets a misbehaving tenant hijack another tenant's hostname.
+
+### `wildcardPolicy: WildcardsDisallowed`
+
+Routes with `spec.host: '*.tenant.example.com'` are rejected. Tenants must publish explicit hostnames. Wildcard certs at the IngressController level are fine; wildcard Routes are not.
+
+## Wildcard DNS
+
+Per cluster, PowerDNS has one wildcard A record:
+
+```text
+*.apps.spoke-dc-v6.sub.comptech-lab.com   A   <Ingress VIP>
+```
+
+Plus explicit records for cluster-wide concerns:
+
+```text
+api.spoke-dc-v6.sub.comptech-lab.com       A   <API VIP>
+api-int.spoke-dc-v6.sub.comptech-lab.com   A   <API-int VIP>
+```
+
+The wildcard resolves any Route hostname without per-Route DNS work. Adding a Route is purely a Kubernetes-API event — no PowerDNS change.
+
+## The HAProxy boundary
+
+ADR 0005 §HAProxy is firm: the lab edge HAProxy VM **is not** part of OpenShift Route exposure. Application Routes go through the **cluster's** IngressController only. There are two reasons:
+
+1. Two layers of HAProxy double the failure surface — and the cluster router already does what HAProxy does.
+2. SNI passthrough through the lab HAProxy would break edge-terminated Routes (the lab HAProxy can't terminate TLS for the cluster's certificate).
+
+The exception, which has its own page in Section 6: the lab HAProxy fronts Nexus / mirror-registry endpoints. That traffic is **not** through OpenShift Routes; it's HTTPS to a Nexus VM. The HAProxy boundary is enforced by the memory entry *feedback_haproxy_scope.md*.
+
+## Public exposure
+
+For a public route (lab user reaches an OpenShift workload over the public internet), the lab pattern is to **create a separate public IngressController** with its own public VIP and public-domain wildcard cert. The dc-lab v6 fleet does not currently have a public IngressController — public exposure for the lab is not in scope.
+
+If/when public exposure is added:
+
+- A new `IngressController` CR with a different `domain` (e.g. `public.apps.spoke-dc-v6.example.com`).
+- A separate public VIP, routed from the public network into the cluster.
+- A separate Let's Encrypt cert (DNS-01 against the public DNS zone).
+- `routeSelector` on the new IngressController so only Routes labelled `public: "true"` are admitted.
+
+This keeps the public ingress path opt-in per Route.
+
+## Operating the IngressController
+
+### Inspect route admission
+
+```bash
+K=/path/to/cluster.kubeconfig
+oc --kubeconfig "$K" -n openshift-ingress get pod
+oc --kubeconfig "$K" -n openshift-ingress-operator get ingresscontroller default -o yaml \
+  | yq '.spec'
+```
+
+### Check a Route is admitted
+
+```bash
+oc --kubeconfig "$K" -n <ns> get route <name> -o yaml \
+  | yq '.status.ingress[] | {host, conditions: .conditions}'
+# expected: Admitted=True
+```
+
+If `Admitted=False`, check `.status.ingress[].conditions[].message`. Typical reasons:
+
+- `HostAlreadyClaimed` — another namespace already owns the hostname (Strict policy).
+- `RouteNotAdmitted` — `routeSelector` on the IngressController excludes this Route's labels.
+
+### Test from outside the cluster
+
+```bash
+curl -sSI https://<route>.apps.<cluster>.sub.comptech-lab.com/ | head -3
+# expected: HTTP/2 200 (or whatever the app returns)
+```
+
+## Cluster certificate health
+
+```bash
+oc --kubeconfig "$K" -n openshift-ingress get secret apps-wildcard-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d \
+  | openssl x509 -noout -enddate -subject
+# expected: notAfter > now+30d; CN includes *.apps.<cluster>.sub.comptech-lab.com
+```
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Route admitted but 503 from outside | router can't reach the backend pods (NetworkPolicy denies router → backend) | add NetworkPolicy ingress from `openshift-ingress` |
+| TLS error from outside, cert mismatch | `defaultCertificate` Secret not updated by cert-manager | check cert-manager / DNS-01 ESO chain |
+| `HostAlreadyClaimed` | another Route owns the hostname (Strict policy) | rename hostname or remove the other Route |
+| Connection refused on Ingress VIP | router pods scheduled but Keepalived not advertising VIP | inspect masters' Keepalived state |
+| Multiple Routes for same Service, only some work | `routeSelector` on IngressController; or different `namespaceOwnership` quirks | inspect IngressController config |
+| Browser shows cluster-internal CA error | Route is `passthrough` and the pod's cert is internal-CA | install the internal CA in the browser trust store, or move to `edge` / `reencrypt` |
+
+## What this page does not cover
+
+- Custom IngressController CRDs for additional shards.
+- Specific public-exposure design (not in v6 scope yet).
+- Operator-specific Route CRs (e.g. `OAuthClient`, `ConsoleLink`).
+
+## References
+
+- ADR 0005 — OpenShift rebuild network, ingress, PKI, IPv6 baseline.
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — VIPs and DNS.
+- Memory: *feedback_haproxy_scope.md* — HAProxy not for OpenShift routes.
+- OpenShift docs (Red Hat): *IngressController CR* + *Route v1*.

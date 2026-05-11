@@ -1,0 +1,257 @@
+---
+title: "Local Storage Operator and LocalVolumeSet"
+description: "How the Local Storage Operator discovers raw data disks on spoke physical workers and exposes them as PersistentVolumes for ODF to consume."
+sidebar_label: "LSO & local volumes"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The Local Storage Operator (LSO) is the bridge between **physical disks** attached to spoke worker nodes and the **Kubernetes storage primitives** (PV / PVC) that ODF then consumes. This page covers how LSO is set up on `spoke-dc-v6`, what its CRs look like, and how it interacts with ODF.
+
+## Why LSO is needed
+
+OpenShift's CSI ecosystem expects pluggable storage backends. ODF is itself a CSI driver — but it needs an underlying block-device pool to manage. On `spoke-dc-v6`'s physical workers, that pool is the data disks attached to each box.
+
+LSO's job is to:
+
+1. **Discover** raw disks on each worker (by matching device paths or attributes).
+2. **Format** them with a chosen filesystem or leave them raw, depending on the consumer.
+3. **Create** a `PersistentVolume` for each discovered device, with a label that maps it back to the discovering node.
+4. **Track** them as the node lifecycle changes.
+
+ODF then consumes those PVs through its `StorageCluster.spec.storageDeviceSets` configuration — telling ODF "find PVs of class `localblock`, use them as OSD disks."
+
+The alternative — pointing ODF directly at raw `/dev/sdX` paths — is unsupported. LSO is the supported abstraction.
+
+## The version lock
+
+| Component | Version | Channel | Source |
+| --- | --- | --- | --- |
+| local-storage-operator | `4.20.0-202604140241` | `stable` | `cs-redhat-operator-index-v4-20` |
+
+Pinned in `operator-version-lock.md`. Same version is mirrored via `oc mirror`. Subscription example:
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-local-storage-og
+  namespace: openshift-local-storage
+spec:
+  targetNamespaces:
+    - openshift-local-storage
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: local-storage-operator
+  namespace: openshift-local-storage
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: local-storage-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: local-storage-operator.v4.20.0-202604140241
+```
+
+## Disk-inventory discovery
+
+Before configuring LSO, the lab convention is to **read-only inspect** disk state on every spoke worker. This is required by the spoke install plan (`openshift-spoke-dc-v6.md` §Install Notes): *"Stop before ODF. Disk inventory and read-only `wipefs -n` review are still required before any ODF data-device selection."*
+
+The procedure (run from an operator workstation against each worker):
+
+```bash
+K=/path/to/spoke-dc-v6.kubeconfig
+
+for NODE in spoke-dc-v6-worker-0 spoke-dc-v6-worker-1 spoke-dc-v6-worker-2; do
+  echo "=== $NODE ==="
+  oc --kubeconfig "$K" debug node/"$NODE" -- chroot /host bash -c '
+    lsblk -d -e7,11 -o NAME,SIZE,TYPE,MODEL,ROTA,WWN
+    echo "---"
+    for d in /dev/sd[a-z] /dev/nvme[0-9]n[0-9]; do
+      [ -e "$d" ] || continue
+      wipefs -n "$d" 2>/dev/null | head -3
+    done
+  '
+done
+```
+
+The output gets recorded in `plans/disconnected-rebuild/environments/dc-lab/odf-storage-inventory.md`. The two questions to answer:
+
+1. **Which devices are the OS root disk?** (LUKS-encrypted RHCOS boot disk — must NOT be selected for ODF.)
+2. **Which devices are intended as ODF data disks?** (Typically additional disks per worker, often the larger or NVMe ones.)
+
+Only after this inventory is recorded does LSO get configured.
+
+## LocalVolumeSet — the standard CR
+
+For ODF, the right LSO CR is **`LocalVolumeSet`** (not `LocalVolume`). `LocalVolumeSet` discovers devices by predicate; `LocalVolume` requires hand-listing each device. With three workers × multiple disks, `LocalVolumeSet` is the maintainable choice.
+
+```yaml
+apiVersion: local.storage.openshift.io/v1alpha1
+kind: LocalVolumeSet
+metadata:
+  name: localblock
+  namespace: openshift-local-storage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: cluster.ocs.openshift.io/openshift-storage
+            operator: In
+            values:
+              - ""
+  storageClassName: localblock
+  volumeMode: Block                            # ODF wants raw block, not Filesystem
+  fsType: ""                                   # not formatted; ODF formats with its own format
+  maxDeviceCount: 3                            # cap per node
+  deviceInclusionSpec:
+    deviceTypes:
+      - disk
+    deviceMechanicalProperties:
+      - NonRotational                         # NVMe / SSD only — exclude HDDs if present
+    minSize: 100Gi
+    maxSize: 4Ti
+```
+
+Key fields:
+
+| Field | Why |
+| --- | --- |
+| `nodeSelector` | restricts discovery to nodes labelled `cluster.ocs.openshift.io/openshift-storage` — the same label ODF uses to identify storage nodes |
+| `storageClassName` | the StorageClass the discovered PVs join; ODF consumes `localblock` by convention |
+| `volumeMode: Block` | non-negotiable for ODF; Ceph OSDs format the raw block themselves |
+| `deviceInclusionSpec.deviceTypes: disk` | exclude partitions and loopback devices |
+| `deviceMechanicalProperties: NonRotational` | exclude legacy HDDs in mixed boxes; spoke workers in dc-lab are SSD/NVMe only |
+| `minSize: 100Gi` | filter out tiny boot/spare devices |
+| `maxDeviceCount: 3` | cap per-node device count so a misplaced extra disk doesn't get auto-claimed |
+
+## Node labelling
+
+The `cluster.ocs.openshift.io/openshift-storage` label must be applied to the workers ODF will use. This is **not** done by `LocalVolumeSet`; it's a one-time step before ODF install:
+
+```bash
+K=/path/to/spoke-dc-v6.kubeconfig
+oc --kubeconfig "$K" label node spoke-dc-v6-worker-0 cluster.ocs.openshift.io/openshift-storage=
+oc --kubeconfig "$K" label node spoke-dc-v6-worker-1 cluster.ocs.openshift.io/openshift-storage=
+oc --kubeconfig "$K" label node spoke-dc-v6-worker-2 cluster.ocs.openshift.io/openshift-storage=
+```
+
+The same label drives ODF's MON/OSD scheduling. In dc-lab, ODF runs on all three workers (3-replica Ceph cluster). The masters are not labelled and don't run ODF pods.
+
+## What LSO produces
+
+After `LocalVolumeSet` reconciles, each matching device becomes a `PersistentVolume`:
+
+```bash
+oc --kubeconfig "$K" -n openshift-local-storage get pv
+# NAME                                       CAPACITY  STORAGECLASS  CLAIM  ...
+# local-pv-abc123                            500Gi     localblock           Available
+# local-pv-def456                            500Gi     localblock           Available
+# ...
+```
+
+Each PV has a `nodeAffinity` constraint binding it to the specific worker. ODF's OSDs will be scheduled to the same node as the PV they consume.
+
+The corresponding StorageClass:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: localblock
+provisioner: kubernetes.io/no-provisioner          # static provisioning
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+`WaitForFirstConsumer` is critical: it defers binding until a Pod / PVC actually requests storage, so the cluster scheduler can pick a node that has both the PV and the requesting pod's compute affinities together.
+
+## How ODF consumes localblock
+
+In `StorageCluster`, the consumption is:
+
+```yaml
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  storageDeviceSets:
+    - count: 1
+      dataPVCTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1                          # ignored when localblock; OSDs use whole device
+          storageClassName: localblock
+          volumeMode: Block
+      name: ocs-deviceset-localblock
+      portable: false                             # OSD pods pinned to their PV's node
+      replica: 3                                  # one OSD per device per node
+      resources: {}
+```
+
+The `count: 1` × `replica: 3` shape means "3 OSDs total, one per replica/zone." If you add more devices per node (e.g., another disk per worker), bump `count` and let LSO discover the new device first.
+
+## Adding a disk
+
+The full procedure when a new data disk is physically added to a worker:
+
+1. **Boot the worker** with the new disk attached.
+2. **Confirm device visibility** via the inventory pattern above.
+3. **Inspect `wipefs -n`** to ensure it's not carrying old data. If it does, intentional `wipefs -a` is required (a separate decision; do not auto-wipe).
+4. **LSO discovers and creates a PV** automatically because `LocalVolumeSet` matches.
+5. **Update `StorageCluster.spec.storageDeviceSets[0].count`** to `2` (or whatever the new device count is).
+6. **ODF schedules a new OSD** on the new device.
+
+This is GitOps territory. The disk-add is recorded in a tracking issue (per ADR 0016) and the `storagecluster.yaml` change goes through `platform-gitops`.
+
+## Validation
+
+```bash
+K=/path/to/spoke-dc-v6.kubeconfig
+
+# LSO operator healthy
+oc --kubeconfig "$K" -n openshift-local-storage get csv | grep local-storage-operator
+# expected: local-storage-operator.v4.20.0-202604140241 ... Succeeded
+
+# LocalVolumeSet active
+oc --kubeconfig "$K" -n openshift-local-storage get localvolumeset localblock
+
+# Discovered PVs match expected count
+oc --kubeconfig "$K" -n openshift-local-storage get pv -l storage.openshift.com/local-volume-owner-name=localblock
+# expected: one PV per data disk × number of labelled workers
+
+# StorageClass exists
+oc --kubeconfig "$K" get storageclass localblock
+
+# No orphan localvolume claims
+oc --kubeconfig "$K" -n openshift-local-storage get pvc
+# expected: only the PVCs claimed by ODF OSDs
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| LSO running but no PVs created | `nodeSelector` label not applied to workers | apply `cluster.ocs.openshift.io/openshift-storage=` label |
+| PVs created but ODF doesn't claim them | `storageClassName` mismatch between LVS and StorageDeviceSet | align both to `localblock` |
+| New disk not picked up | already partitioned (`wipefs -n` shows entries) | intentional `wipefs -a`, then trigger LSO reconciliation |
+| OSD pod stuck `Pending` after new disk added | `count` in StorageCluster still at old value | bump `count`, sync via GitOps |
+| LSO discovers root disk (catastrophe!) | `minSize`/`maxSize` filter too loose, or root disk is large | tighten filters; verify via `lsblk` that root partition isn't in the matched set |
+| PV stuck `Available` even after PVC creation | `volumeBindingMode: WaitForFirstConsumer` and no scheduled Pod yet | schedule the Pod (e.g., OSD), binding will proceed |
+
+The "LSO discovers root disk" is the failure mode the read-only inventory step is designed to prevent. Always inspect before configuring.
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/odf-storage-inventory.md` — disk inventory.
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — worker node MAC / interface notes.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — version pin.
+- OpenShift docs: *Local Storage Operator — LocalVolumeSet*.
+- [03-odf-on-spoke](/docs/openshift-platform/storage/odf-on-spoke) — the ODF side.

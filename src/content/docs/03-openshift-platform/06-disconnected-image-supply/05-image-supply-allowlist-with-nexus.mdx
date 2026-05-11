@@ -1,0 +1,229 @@
+---
+title: "Image-supply allowlist (VAP + RHACS)"
+description: "How the dc-lab fleet enforces the Nexus-only image rule at admission time using a ValidatingAdmissionPolicy on every cluster and an RHACS deploy-time policy at Central."
+sidebar_label: "Allowlist (VAP + RHACS)"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The IDMS / ITMS rewrite story makes pulls from Nexus *possible*. The allowlist enforces that they are the *only* pulls. This page documents the two-layer enforcement model — cluster-side **ValidatingAdmissionPolicy** plus RHACS Central **deploy-time policy** — that closes the loop on ADR 0019.
+
+The canonical operator reference for this enforcement is `codex-opp-agent/connection-details/image-registry-allowlist.md` (tracked under issue **#126** / DEV-OCP-2.5 / **#186**). What follows is the public-facing version of the same controls.
+
+## Why two layers
+
+| | VAP (cluster-side) | RHACS Central policy |
+| --- | --- | --- |
+| **Lives in** | each OpenShift cluster | Central (on hub-dc-v6) |
+| **Enforced at** | Kubernetes admission webhook chain | RHACS sensor + Central |
+| **Lifecycle stages** | CREATE / UPDATE on Pod | DEPLOY (pre-admission + alert) |
+| **Granularity** | path prefix (`ghcr.io/cloudnative-pg/` is allowed, `ghcr.io/anyone-else` is not) | registry host only (`ghcr.io`) |
+| **Source of truth** | `platform-gitops` repo (GitOps) | Central database (Central API + helper script) |
+| **Strength** | precise, hard-fail Kubernetes admission | broad surface coverage, with alerts and Central UI |
+| **Weakness** | requires per-cluster rollout via GitOps | host-level only — coarser than VAP |
+
+Layer 1 is the **defense-in-depth** Kubernetes admission policy. Layer 2 is the **primary surface** that gives Central operators a single pane of glass across the fleet. ADR 0019 §Decision 7 explicitly says enforcement comes **after** the allowlist is validated — running VAP enforcement before the list was right would block OpenShift system pods, an outage class.
+
+## Current allowlist (2026-05-10)
+
+| Registry | Purpose |
+| --- | --- |
+| `mirror-registry.apps.sub.comptech-lab.com` | Disconnected OpenShift install + operator mirror |
+| `registry.redhat.io` | Red Hat operator / product image references (transient; IDMS rewrites locally) |
+| `quay.io/openshift-release-dev` | OpenShift release payload references |
+| `image-registry.openshift-image-registry.svc:5000` | In-cluster registry (BuildConfig outputs, ImageStreams) |
+| `app-registry.apps.sub.comptech-lab.com` | Nexus app-registry push target (legacy Path A push) |
+| `quay.apps.sub.comptech-lab.com` | Path B Tekton push target (DEV-OCP-2.5 / #186) |
+| `ghcr.io/cloudnative-pg` | cnpg-operator (IDMS rewrites at pull time; spec retains upstream ref) |
+| `icr.io/appcafe` | open-liberty-operator (same pattern as cnpg) |
+
+Note the `registry.redhat.io` and `quay.io/openshift-release-dev` entries: those upstream names appear in manifests but the **actual** pull is rewritten to Nexus by IDMS. The allowlist must permit the manifest-text registry, not the post-rewrite one — admission sees the manifest, not the runtime URL.
+
+## Layer 1: the ValidatingAdmissionPolicy
+
+Source of truth (`platform-gitops` repo, identical hub + spoke):
+
+```
+clusters/hub-dc-v6/platform/admission-policies/allowed-image-registries.yaml
+clusters/spoke-dc-v6/platform/admission-policies/allowed-image-registries.yaml
+```
+
+The policy is one `ValidatingAdmissionPolicy` + one `ValidatingAdmissionPolicyBinding`. It:
+
+- Watches Pod **CREATE** and **UPDATE**.
+- Excludes the system namespaces: `openshift-*`, `kube-*`, `open-cluster-management*`, `default`, `openshift`.
+- Iterates `containers`, `initContainers`, and `ephemeralContainers`.
+- Denies any container whose `image:` does not start with one of the allowed prefixes.
+- Emits a `messageExpression` that lists every allowed registry so the deny payload tells you what *would* be acceptable.
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: allowed-image-registries
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: allowedPrefixes
+      expression: |
+        [
+          "mirror-registry.apps.sub.comptech-lab.com/",
+          "registry.redhat.io/",
+          "quay.io/openshift-release-dev/",
+          "image-registry.openshift-image-registry.svc:5000/",
+          "app-registry.apps.sub.comptech-lab.com/",
+          "quay.apps.sub.comptech-lab.com/",
+          "ghcr.io/cloudnative-pg/",
+          "icr.io/appcafe/"
+        ]
+  validations:
+    - expression: |
+        object.spec.containers.all(c, variables.allowedPrefixes.exists(p, c.image.startsWith(p))) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(c, variables.allowedPrefixes.exists(p, c.image.startsWith(p)))) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(c, variables.allowedPrefixes.exists(p, c.image.startsWith(p))))
+      messageExpression: |
+        "image must use one of: mirror-registry.apps.sub.comptech-lab.com/, registry.redhat.io/, quay.io/openshift-release-dev/, image-registry.openshift-image-registry.svc:5000/, app-registry.apps.sub.comptech-lab.com/, quay.apps.sub.comptech-lab.com/, ghcr.io/cloudnative-pg/, icr.io/appcafe/"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: allowed-image-registries
+spec:
+  policyName: allowed-image-registries
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - default
+            - openshift
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: []
+        # plus the openshift-*/kube-*/open-cluster-management* exclusions
+```
+
+### Path-prefix granularity
+
+VAP entries have **trailing slashes** on purpose. `ghcr.io/cloudnative-pg/` allows `ghcr.io/cloudnative-pg/anything` but rejects `ghcr.io/some-other-project/...`. This is finer-grained than RHACS host-only matching — see "granularity mismatch" below.
+
+### To add a registry
+
+1. Edit **both** cluster YAMLs (`hub-dc-v6` and `spoke-dc-v6`). Update three places per file:
+   - the header comment listing the allowed prefixes;
+   - the `allowedPrefixes` variable;
+   - the `messageExpression` string (so the deny message stays accurate).
+2. Open MR in the GitLab `platform-gitops` repo, merge to `main`.
+3. Argo CD `hub-dc-v6-bootstrap` and the spoke equivalent reconcile within about 3 minutes.
+4. Verify on cluster:
+   ```bash
+   oc get validatingadmissionpolicy allowed-image-registries -o yaml \
+     | grep allowedPrefixes -A 12
+   ```
+
+### Live allow / deny test
+
+```bash
+KCFG=/path/to/cluster.kubeconfig
+
+# expect ALLOWED (returns pod/<name>):
+KUBECONFIG=$KCFG oc run vap-test-ok \
+  --image=<new-registry>/test/foo:latest \
+  --dry-run=server --image-pull-policy=Never \
+  -n external-secrets-operator -o name
+
+# expect DENIED (returns ValidatingAdmissionPolicy ... denied request):
+KUBECONFIG=$KCFG oc run vap-test-deny \
+  --image=evil.example.com/test/foo:latest \
+  --dry-run=server --image-pull-policy=Never \
+  -n external-secrets-operator -o name
+```
+
+If validating pre-merge (e.g. testing the policy before pushing to `main`), temporarily disable Argo auto-sync for the bootstrap Application, `oc apply` the modified policy locally, run the test, then re-enable. The Argo `selfHeal: true` flag reverts any manual `oc apply` within seconds otherwise.
+
+## Layer 2: RHACS Central deploy-time policy
+
+RHACS policies are stored in Central's database, not GitOps. The matching policy:
+
+- **Name:** `IMG-SUPPLY-3 disallowed image registries`
+- **Lifecycle stage:** `DEPLOY` (admission + alert)
+- **Shape:** one `policySection` "Disallowed registries" with one `policyGroup` on field `Image Registry`, `negate: true`, values = allowed registries.
+
+`negate: true` is the trick — RHACS policy semantics phrase the rule as "*violate* when registry is **not** in the allow list," so the same control surface as VAP but expressed in policy-builder terms.
+
+### How it gets updated
+
+A helper script lives at `/home/ze/claude-agent/scripts/rhacs-update-img-allowlist.sh`. It:
+
+1. Pulls the htpasswd admin password from `oc -n stackrox get secret central-htpasswd` (same pattern as ESO wiring).
+2. GETs the current policy via `https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies/<id>`.
+3. Compares existing `Image Registry` values against the `DESIRED_REGISTRIES` array embedded in the script. If they match, exits without writing.
+4. Otherwise builds the updated policy JSON (preserves everything else), PUTs it back, and verifies the post-write state.
+
+The script is **idempotent**. To add a registry: edit the `DESIRED_REGISTRIES` array at the top, rerun, confirm.
+
+> The exact Central hostname, policy ID, and helper script auth pattern are kept in `codex-opp-agent/connection-details/image-registry-allowlist.md`.
+
+### Spoke propagation
+
+The spoke cluster runs the RHACS Sensor only. The deploy-time policy applies at **Central** (on `hub-dc-v6`) and propagates to managed clusters via the sensor channel. No per-cluster RHACS update is needed.
+
+## The granularity mismatch (and why it's fine)
+
+VAP matches by path prefix; RHACS matches by host only. Concretely:
+
+- VAP: `ghcr.io/cloudnative-pg/` (allow cnpg only)
+- RHACS: `ghcr.io` (allow any image under `ghcr.io`)
+
+This means an attacker who tries `ghcr.io/some-other-project/evil:latest` would:
+
+- pass RHACS (host matches);
+- fail VAP (no path prefix match).
+
+Both layers fail-closed. They are designed to overlap, not to mirror each other exactly. ADR 0019 §Decision 7 accepts this; the operator handoff doc treats VAP+RHACS disagreement as a configuration-drift signal, not a defect.
+
+## Combined add-a-registry checklist
+
+```text
+1. Edit both VAP files in platform-gitops (hub + spoke YAMLs).
+2. Open MR / commit + push to main.
+3. Wait for Argo sync, run VAP allow + deny live tests on hub-dc-v6.
+4. Edit DESIRED_REGISTRIES in rhacs-update-img-allowlist.sh.
+5. Run the script; confirm post-write state contains the new registry.
+6. Update the "Current allowlist" table on this page and on
+   image-registry-allowlist.md.
+```
+
+## What this does NOT enforce
+
+| Out of scope here | Where it lives |
+| --- | --- |
+| Image digest pinning | `image-digest-overlay.md` and the application overlay convention |
+| Image vulnerability scanning | RHACS Central (separate policy, not this one) |
+| Pull-secret distribution | ESO / Vault wiring; see Section 4 |
+| Operator catalog source allowlist (different surface) | [04-catalogsources-and-icsp](/docs/openshift-platform/disconnected-image-supply/catalogsources-and-icsp) |
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| New app pod denied admission with VAP message | image not in allowlist | add the registry (full checklist above) — do not weaken VAP locally |
+| RHACS UI shows a violation that VAP allowed | host added to VAP but not to RHACS | run `rhacs-update-img-allowlist.sh` |
+| RHACS allows but VAP denies | host added to RHACS but not to VAP | edit both VAP files and re-MR |
+| New OperatorHub deploy denied | system namespace classification mismatch (a namespace doesn't start with `openshift-`) | confirm namespace excluded; if it's a Red Hat product namespace add it to the `namespaceSelector` exclusion |
+| `oc apply` shows VAP changes that vanish | Argo `selfHeal: true` reverting drift — expected | merge the change through MR, not via `oc apply` |
+
+## References
+
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` (issue #126, extended #186).
+- ADR 0019 — Nexus-only image supply chain, §Decision 7 + Runtime Allowlist.
+- [03-idms-itms-and-cluster-pull](/docs/openshift-platform/disconnected-image-supply/idms-itms-and-cluster-pull) — rewrite layer underneath this.
+- `codex-opp-agent/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays.

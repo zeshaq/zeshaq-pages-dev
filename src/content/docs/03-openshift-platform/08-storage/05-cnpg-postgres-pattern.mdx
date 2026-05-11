@@ -1,0 +1,311 @@
+---
+title: "CloudNativePG (CNPG) — the Postgres pattern"
+description: "How application Postgres workloads run on spoke-dc-v6 via the CloudNativePG operator, with ODF block storage, ESO-sourced credentials, and digest-pinned images."
+sidebar_label: "CNPG Postgres pattern"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The dc-lab fleet runs application-managed Postgres through the **CloudNativePG (CNPG)** operator. CNPG is the certified operator pattern for Postgres on OpenShift — it manages clusters with primary + replica streaming, point-in-time recovery, and an HA controller written specifically for the Kubernetes lifecycle.
+
+This page covers the dc-lab CNPG setup: the version lock, the image-supply nuance, the cluster CR shape, ODF storage binding, and the ESO secret pattern.
+
+## Versions
+
+| Component | Channel | Version | Source |
+| --- | --- | --- | --- |
+| `cloudnative-pg` | `stable-v1` | `1.29.0` | `cs-certified-operator-index-v4-20` |
+
+Pinned in `operator-version-lock.md`. The package is in the **certified** catalog, not the Red Hat catalog, which is why the Subscription's `source:` is `cs-certified-operator-index-v4-20` not the redhat one.
+
+## Image-supply nuance
+
+CNPG's operand images reference upstream `ghcr.io/cloudnative-pg/...`. This is an unusual case because:
+
+- The CSV references `ghcr.io/cloudnative-pg/postgresql:<digest>` (the Postgres image).
+- We mirror `ghcr.io/cloudnative-pg/` content into Nexus under the same name path.
+- IDMS rewrites `ghcr.io/cloudnative-pg` → `mirror-registry.apps.sub.comptech-lab.com/cloudnative-pg`.
+- The CSV's references **stay** `ghcr.io/cloudnative-pg/...` — the rewrite is invisible to the manifest.
+- The VAP allowlist (page 05 of Section 6) lists `ghcr.io/cloudnative-pg/` with a **trailing slash** — only this prefix, not `ghcr.io` broadly.
+
+The end result: CNPG works in a disconnected cluster without modifying its upstream manifests, and the allowlist is narrowly scoped to the project under `ghcr.io`. This is the same pattern as `icr.io/appcafe` for Open Liberty.
+
+The Subscription:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cloudnative-pg
+  namespace: cnpg-operator
+spec:
+  channel: stable-v1
+  installPlanApproval: Manual
+  name: cloudnative-pg
+  source: cs-certified-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: cloudnative-pg.v1.29.0
+```
+
+## The `Cluster` CR
+
+CNPG's main CR is `cnpg.io/v1` `Cluster`:
+
+```yaml
+apiVersion: cnpg.io/v1
+kind: Cluster
+metadata:
+  name: app-postgres
+  namespace: tenant-platform-app-prod
+spec:
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.4@sha256:<digest>
+  instances: 3                              # 1 primary + 2 standby
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: 50Gi
+    storageClass: ocs-storagecluster-ceph-rbd
+  monitoring:
+    enablePodMonitor: true
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: 512MB
+      effective_cache_size: 1536MB
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+      secret:
+        name: app-postgres-app-creds        # ESO-managed
+  superuserSecret:
+    name: app-postgres-superuser            # ESO-managed
+```
+
+Key fields:
+
+| Field | Why |
+| --- | --- |
+| `imageName` | digest-pinned (the application-overlay convention from `image-digest-overlay.md`); tag would be mutable |
+| `instances: 3` | one primary + two standby, on three different workers via anti-affinity |
+| `storage.storageClass` | `ocs-storagecluster-ceph-rbd` — RBD is the right shape for Postgres data files (block, RWO, fsync-correct) |
+| `bootstrap.initdb.secret` / `superuserSecret` | references to ESO-managed Secrets containing user/superuser passwords |
+| `monitoring.enablePodMonitor: true` | exposes the CNPG metrics endpoint to the cluster Prometheus / cluster observability operator |
+
+## Storage pattern
+
+Each Postgres pod gets its **own** PVC (`<cluster-name>-N`), bound to a 50Gi RBD PV. The three pods sit on three different workers — the CNPG operator schedules them with anti-affinity by default.
+
+```bash
+oc -n tenant-platform-app-prod get pvc
+# NAME             STATUS  VOLUME ...  STORAGECLASS              ...
+# app-postgres-1   Bound   pv-...      ocs-storagecluster-ceph-rbd
+# app-postgres-2   Bound   pv-...      ocs-storagecluster-ceph-rbd
+# app-postgres-3   Bound   pv-...      ocs-storagecluster-ceph-rbd
+```
+
+If a node fails:
+
+1. The Postgres pod stops.
+2. CNPG's controller observes; if the pod was the primary, it promotes a standby.
+3. The original pod's RBD PVC remains bound to the failed node.
+4. When the node returns, the original pod can re-attach to its PVC; CNPG either accepts it back as a standby or as primary depending on lag.
+5. If the node never returns, the pod's PVC is orphan; the cluster continues with 2 instances and an administrator decides whether to scale-up onto a new node.
+
+RBD's RWO semantics make this safe: only one pod ever has the volume attached. CNPG's controller ensures no two pods think they're primary at once (it uses a leader-election lease).
+
+## Secret sourcing via ESO
+
+Postgres user passwords come from Vault via ESO. Per-tenant pattern:
+
+```yaml
+# 1) Vault SecretStore (tenant-scoped)
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: vault-tenant
+  namespace: tenant-platform-app-prod
+spec:
+  provider:
+    vault:
+      server: https://vault.<lab>:8200
+      path: secret
+      version: v2
+      auth:
+        kubernetes:
+          mountPath: kubernetes/spoke-dc-v6
+          role: tenant-platform-app
+          serviceAccountRef:
+            name: vault-eso-sa
+---
+# 2) ExternalSecret for app user
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: app-postgres-app-creds
+  namespace: tenant-platform-app-prod
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-tenant
+    kind: SecretStore
+  target:
+    name: app-postgres-app-creds
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/basic-auth
+      data:
+        username: "app"
+        password: "{{ .password }}"
+  data:
+    - secretKey: password
+      remoteRef:
+        key: tenants/platform/app/db/app-user
+        property: password
+---
+# 3) ExternalSecret for superuser
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: app-postgres-superuser
+  namespace: tenant-platform-app-prod
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-tenant
+    kind: SecretStore
+  target:
+    name: app-postgres-superuser
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/basic-auth
+      data:
+        username: "postgres"
+        password: "{{ .password }}"
+  data:
+    - secretKey: password
+      remoteRef:
+        key: tenants/platform/app/db/superuser
+        property: password
+```
+
+CNPG's `Cluster.spec.bootstrap.initdb.secret.name` and `superuserSecret.name` point to the ESO-managed Secrets. ESO refresh is hourly; rotation propagates automatically.
+
+> The Vault paths, role names, and the `vault-eso-sa` ServiceAccount are tenant-specific. Internal-only role mappings live in `codex-opp-agent/connection-details/`.
+
+## NetworkPolicy
+
+The tenant namespace has a baseline default-deny ingress + selective allow:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app-to-postgres
+  namespace: tenant-platform-app-prod
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: app-postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: app-frontend
+      ports:
+        - port: 5432
+          protocol: TCP
+```
+
+CNPG exposes the cluster via three internal Services:
+
+| Service | Purpose |
+| --- | --- |
+| `app-postgres-rw` | always points to the current primary; use for read/write traffic |
+| `app-postgres-r` | round-robin across primary + replicas; use for read-only traffic |
+| `app-postgres-ro` | round-robin across replicas only |
+
+Tenant applications use `app-postgres-rw:5432` for the connection string.
+
+## Backups and PITR
+
+CNPG ships with **Barman Cloud** integration for continuous archiving and point-in-time recovery. In dc-lab, the backup target is the in-cluster NooBaa S3 endpoint (page 04):
+
+```yaml
+spec:
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://app-postgres-backup
+      endpointURL: https://s3.openshift-storage.svc
+      endpointCA:
+        name: openshift-service-ca
+        key: service-ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: app-postgres-backup-s3
+          key: access_key_id
+        secretAccessKey:
+          name: app-postgres-backup-s3
+          key: access_key_secret
+      wal:
+        compression: gzip
+        maxParallel: 8
+    retentionPolicy: "30d"
+  ...
+```
+
+The `app-postgres-backup-s3` Secret is bridged from an OBC (`bucketName: app-postgres-backup`) using the [same pattern as Tempo](/docs/openshift-platform/storage/noobaa-and-object-bucket-claims).
+
+For cross-cluster / cross-lab backups, OADP is the answer (Section 11 — Backup), not Barman. Barman covers in-cluster PITR.
+
+## Validation
+
+```bash
+K=/path/to/spoke-dc-v6.kubeconfig
+NS=tenant-platform-app-prod
+
+# Operator healthy
+oc --kubeconfig "$K" -n cnpg-operator get csv | grep cloudnative-pg
+# expected: cloudnative-pg.v1.29.0 ... Succeeded
+
+# Cluster Ready
+oc --kubeconfig "$K" -n "$NS" get cluster app-postgres
+# expected: STATUS Cluster in healthy state
+
+# All 3 pods Running
+oc --kubeconfig "$K" -n "$NS" get pod -l cnpg.io/cluster=app-postgres
+# expected: app-postgres-1, -2, -3 Ready 1/1
+
+# Primary identified
+oc --kubeconfig "$K" -n "$NS" get cluster app-postgres -o jsonpath='{.status.currentPrimary}{"\n"}'
+# expected: app-postgres-1 (or whatever pod was elected)
+
+# RW service resolves
+oc --kubeconfig "$K" -n "$NS" exec deploy/app-frontend -- nslookup app-postgres-rw
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| Cluster stuck `Setting up` | image pull failure for `ghcr.io/cloudnative-pg/postgresql:...` | check IDMS coverage for `ghcr.io/cloudnative-pg`; confirm `ImagePullBackOff` and rectify |
+| All 3 pods Pending | RBD class unavailable / OSD down | check ODF; check PVC events |
+| Replica lagging significantly | network / IO bottleneck on a worker | inspect that worker's resource utilization; rare since RBD is fast |
+| Primary failover doesn't happen | CNPG controller pod down | restart `cnpg-operator-controller` in `cnpg-operator` |
+| `bootstrap.initdb.secret` not found | ExternalSecret not Ready yet | check ESO; CNPG retries until Secret exists |
+| Postgres image fails VAP | `ghcr.io/cloudnative-pg/` not in allowlist | add the prefix (with trailing slash) to VAP + RHACS — see Section 6 page 05 |
+
+## What this page does not cover
+
+- Application connection-pooling (PgBouncer) — separate operand, app-team decision.
+- Cross-cluster backup-restore — handled by OADP.
+- Schema migrations — app-tier concern.
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — CNPG pin.
+- `codex-opp-agent/connection-details/image-digest-overlay.md` — digest-pinning convention.
+- `codex-opp-agent/connection-details/image-registry-allowlist.md` — `ghcr.io/cloudnative-pg/` entry.
+- CloudNativePG docs (upstream): *Cluster CR reference*.
+- [03-odf-on-spoke](/docs/openshift-platform/storage/odf-on-spoke) — the storage backend.
+- [04-noobaa-and-object-bucket-claims](/docs/openshift-platform/storage/noobaa-and-object-bucket-claims) — the S3 backup target.

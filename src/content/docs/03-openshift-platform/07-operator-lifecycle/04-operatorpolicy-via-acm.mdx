@@ -1,0 +1,239 @@
+---
+title: "OperatorPolicy via ACM"
+description: "Fleet-wide enforcement of operator installation state — versions, channels, approval mode — using RHACM Policy + OperatorPolicy."
+sidebar_label: "OperatorPolicy via ACM"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The per-cluster GitOps story installs operators. The fleet-wide governance story makes sure they **stay** installed at the right version, in the right channel, with the right approval mode. That second story belongs to **RHACM Policy** — specifically, **`OperatorPolicy`** distributed via the ACM governance pillar.
+
+This page documents how the dc-lab fleet uses OperatorPolicy on `hub-dc-v6` to govern operator installs across the spokes.
+
+## Why a second layer
+
+You might ask: if every operator install is already declared in `platform-gitops` and applied via Argo CD, what does OperatorPolicy add?
+
+It adds three things:
+
+1. **Cross-cluster reporting.** ACM aggregates compliance state across every managed cluster into one view. "Is ESO 1.1.0 installed in `Manual` mode on every spoke?" is a single dashboard, not 12 grep-loops.
+2. **Drift detection independent of Argo.** If someone manually `oc patch`-es a Subscription on a cluster, Argo `selfHeal: true` reverts it within ~3 minutes. But the drift might happen in between — OperatorPolicy reports it. Two independent watchdogs catch different mistakes.
+3. **Compliance-grade evidence.** RHACM Policy produces durable, time-stamped compliance records that auditors expect. PCI-DSS sign-off processes prefer reading `oc get policy -A -o yaml` over interpreting Argo CD's UI.
+
+The two layers are deliberately overlapping. ADR 0018 (pull-model ACM + OpenShift GitOps) explicitly accepts this overlap as the design.
+
+## What OperatorPolicy can express
+
+`OperatorPolicy` is a Red Hat-specific Policy template type. It declares the desired state of an OLM-managed operator:
+
+- which Subscription should exist (or not exist);
+- which channel;
+- which `startingCSV`;
+- approval mode (`Manual` / `Automatic`);
+- compliance type (`musthave` / `mustnothave`).
+
+Combined with the standard RHACM Policy machinery, it ships to spokes via ManifestWork, is evaluated locally by `governance-policy-framework`, and reports compliance back to the hub.
+
+## Distribution model
+
+<!-- Mermaid would clutter this; the four-step bullet list below is sufficient -->
+
+1. A `Policy` containing one or more `OperatorPolicy` templates is committed under `platform-gitops/clusters/hub-dc-v6/governance/`.
+2. Argo CD on the hub applies it to the `policies` namespace on the hub.
+3. RHACM's policy controllers match the Policy's `Placement` against `ManagedCluster` metadata, generate `PlacementDecision`, and create a `ManifestWork` on every matching spoke's hub-side namespace.
+4. The klusterlet on the spoke pulls the ManifestWork and reconciles the OperatorPolicy locally; the policy framework evaluates it and reports status back through the same long-running gRPC channel.
+
+The spoke never opens an inbound connection. ACM's pull model is preserved.
+
+## A concrete fleet policy
+
+The fleet-wide ESO policy ensures every spoke has External Secrets Operator 1.1.0 installed in `Manual` mode:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: eso-required
+  namespace: open-cluster-management-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST-CSF
+    policy.open-cluster-management.io/categories: SI System and Information Integrity
+    policy.open-cluster-management.io/controls: SI-2 Flaw Remediation
+spec:
+  disabled: false
+  remediationAction: inform           # "report only" — see below
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1beta1
+        kind: OperatorPolicy
+        metadata:
+          name: eso-1-1-0
+        spec:
+          remediationAction: inform
+          severity: medium
+          complianceType: musthave
+          subscription:
+            channel: stable-v1
+            name: openshift-external-secrets-operator
+            namespace: external-secrets-operator
+            installPlanApproval: Manual
+            source: cs-redhat-operator-index-v4-20
+            sourceNamespace: openshift-marketplace
+            startingCSV: openshift-external-secrets-operator.v1.1.0
+          upgradeApproval: None
+          versions:
+            - openshift-external-secrets-operator.v1.1.0
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: spokes-only
+  namespace: open-cluster-management-policies
+spec:
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: cluster.open-cluster-management.io/clusterset
+              operator: In
+              values: ["spokes"]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: eso-required-binding
+  namespace: open-cluster-management-policies
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: spokes-only
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: eso-required
+```
+
+### Reading the policy
+
+| Field | Meaning |
+| --- | --- |
+| `complianceType: musthave` | The Subscription described must exist on the spoke. |
+| `subscription.*` | The expected Subscription. ACM evaluates the live Subscription against this template, field by field. |
+| `installPlanApproval: Manual` | Required — disagreement is a violation. |
+| `startingCSV: ...v1.1.0` | Required — disagreement is a violation. |
+| `upgradeApproval: None` | OperatorPolicy will NOT auto-approve InstallPlans. |
+| `versions:` | The allowed list of running CSVs. A CSV outside the list violates. |
+| Outer `remediationAction: inform` | Report-only mode. ACM logs compliance; it does not converge state. |
+
+### inform vs enforce
+
+| Mode | What ACM does on a non-compliant cluster |
+| --- | --- |
+| `inform` | Records `NonCompliant`. Surfaces in the RHACM UI. Emits a Policy event. **Does not modify the cluster.** |
+| `enforce` | All of the above **plus** actively converges the live state to match the policy. |
+
+The dc-lab fleet operates every OperatorPolicy in **`inform`** mode. The rationale:
+
+- Argo CD is the desired-state source. Letting two independent controllers (Argo and Policy) both write to the same Subscription is a recipe for tug-of-war and surprise behaviour.
+- Drift detection is the primary value here — the alert that "something changed" is more useful than the auto-correction.
+- Compliance audits accept `inform` so long as the violation rate is low and findings are remediated through change control.
+
+## What gets a policy
+
+Not every operator gets an ACM policy. The dc-lab fleet uses policies for the operators where drift is most consequential:
+
+| Operator | Policy? | Why |
+| --- | --- | --- |
+| `openshift-external-secrets-operator` | Yes | secret distribution; drift = secrets stop flowing |
+| `openshift-gitops-operator` | Yes | the GitOps controller itself; drift breaks the rest of the system |
+| `advanced-cluster-management` (hub only) | Yes | the fleet management plane; hub-only scope |
+| `multicluster-engine` (hub only) | Yes | required dep for ACM |
+| `compliance-operator` | Yes | PCI scan target |
+| `odf-operator` | Yes (spoke) | storage; drift = workload disk loss |
+| `lvms-operator` | Yes (hub) | hub local storage |
+| `openshift-pipelines-operator-rh` | Yes (spoke) | CI delivery path |
+| Other operators | No (yet) | covered by Argo + canonical table; promoted into policies as time permits |
+
+A future enhancement is "everything in `operator-version-lock.md` has a policy," but that's a high-cardinality change that needs its own tracking issue and isn't the current state.
+
+## Where policies live
+
+```
+platform-gitops/clusters/hub-dc-v6/governance/operator-policies/
+  eso-required.yaml
+  gitops-required.yaml
+  acm-required.yaml
+  mce-required.yaml
+  compliance-required.yaml
+  odf-required.yaml
+  lvms-required.yaml
+  pipelines-required.yaml
+  placements.yaml         # Placement objects (spokes-only, hub-only)
+  placement-bindings.yaml
+```
+
+Argo CD on the hub applies these. RHACM's policy controllers then take over.
+
+## Operating the policies
+
+### View fleet-wide compliance
+
+In the RHACM web console (Governance dashboard):
+
+- A grid of policies × clusters.
+- Green = Compliant; red = NonCompliant; yellow = NoStatus / Pending.
+- Click a non-compliant cell to see the specific OperatorPolicy violation message.
+
+From CLI:
+
+```bash
+K=/path/to/hub.kubeconfig
+
+# Fleet-wide compliance:
+oc --kubeconfig "$K" -n open-cluster-management-policies \
+  get policy -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.compliant}{"\n"}{end}'
+
+# Per-cluster status for one policy:
+oc --kubeconfig "$K" -n <spoke-namespace-on-hub> \
+  get policy.policy.open-cluster-management.io \
+  open-cluster-management-policies.eso-required -o yaml \
+  | yq '.status'
+```
+
+### Tune evaluation frequency
+
+`OperatorPolicy` honours `spec.evaluationInterval`:
+
+```yaml
+spec:
+  evaluationInterval:
+    compliant: 10m         # re-evaluate every 10m when compliant (default)
+    noncompliant: 1m       # re-evaluate every 1m when violating (faster recovery surface)
+```
+
+The defaults are reasonable; tune only if a specific spoke is generating excessive policy-evaluation pod CPU.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Policy `NonCompliant` on a spoke, even though Argo shows the Subscription `Synced/Healthy` | a field in the live Subscription drifted (e.g. someone toggled `installPlanApproval`) | check `oc -n <ns> get subscription <name> -o yaml`; revert via GitOps |
+| Policy `NoStatus` indefinitely | governance-policy-framework pods unhealthy on the spoke | `oc -n open-cluster-management-agent-addon get pod`; restart if necessary |
+| Policy says `Compliant` but the CSV is actually wrong | `versions:` array missing the current CSV | extend the list of allowed versions in the policy YAML |
+| Policy applies but the spoke ignores it | Placement label mismatch — the ManagedCluster doesn't carry the expected label | `oc get managedcluster --show-labels`; add the label |
+| Two policies cover the same operator with different `startingCSV` | unintentional duplicate Policy | merge to a single Policy in GitOps; remove the duplicate |
+| Policy and Argo CD fight (Policy in `enforce` mode) | policy was switched to `enforce` against design intent | revert to `inform`; treat the incident as a configuration error |
+
+## Future direction
+
+- Cover every operator in `operator-version-lock.md` with a corresponding OperatorPolicy. Tracked under the milestone "R5 Post-Install GitOps."
+- Generate the OperatorPolicy YAMLs from `operator-version-lock.md` (single source of truth), with a CI job that diffs the generated vs committed.
+- Use PolicySets to group operator policies into a single "operator baseline" framework for cleaner compliance reporting.
+
+## References
+
+- ADR 0018 — ACM + OpenShift GitOps pull-model v6.
+- RHACM docs: *OperatorPolicy* — upstream reference.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — what the policies enforce.
+- [02-version-pinning-strategy](/docs/openshift-platform/operator-lifecycle/version-pinning-strategy) — same content, GitOps angle.
+- Memory: *feedback_acm_gitops_pull_pattern.md* — ACM + GitOps as design, not drift.

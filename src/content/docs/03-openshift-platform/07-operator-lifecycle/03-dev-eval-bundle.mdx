@@ -1,0 +1,231 @@
+---
+title: "Dev/eval operator bundle"
+description: "A scoped relaxation of the standard pinning rules for fast inner-loop evaluation, with strict re-entry to the canonical baseline."
+sidebar_label: "Dev / eval bundle"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The fleet's standard operator pinning rules (page 02) are deliberately strict: every operator pinned at `min == max`, every Subscription `installPlanApproval: Manual`, every install gated by an MR. That's the right answer for production behavior. It is the wrong answer for evaluating whether a new operator is worth introducing at all.
+
+This page describes the **dev / eval bundle** — a small, isolated, time-bounded relaxation of those rules used to evaluate a candidate operator on `hub-dc-v6` or `spoke-dc-v6` before it gets added to the canonical operator-version-lock.
+
+## Scope
+
+The dev / eval bundle exists for one purpose: **evaluating a candidate operator** that is not yet in `operator-version-lock.md`. It is **not** for:
+
+- bypassing the manual-approval gate on a production operator;
+- running an unmirrored CSV against a production workload;
+- carrying an operator forward indefinitely without a decision.
+
+The bundle is a short-lived stage. Either the operator graduates to the canonical table or it leaves the cluster.
+
+## What the bundle relaxes
+
+| Standard rule | Dev / eval bundle | Why |
+| --- | --- | --- |
+| `min == max` in ImageSet | a small range (e.g. `min: 1.2.0, max: 1.2.4`) | allows trying a couple of patch versions in one session |
+| `installPlanApproval: Manual` | `Manual` only — **same as production** | the manual gate is not relaxed; that's where production posture lives |
+| `startingCSV` explicit | explicit | unchanged |
+| Mirror-only allowlist | **same as production** | runtime allowlist must still block unmirrored images |
+| GitOps MR per change | feature branch under `platform-gitops` | merges only after eval closes |
+
+The single relaxation is the **version range**. Every other rule is preserved. The bundle is not a security-relaxed mode; it is a slightly-wider version window with a feature branch.
+
+## Where it lives in GitOps
+
+```
+platform-gitops/eval-bundles/
+  <yyyy-mm>-<operator-name>/
+    operator-version-lock.diff.md       # proposed delta to canonical table
+    imageset-config.eval.yaml           # eval-only ImageSet additions
+    clusters/spoke-dc-v6/eval-operators/<operator-name>/
+      operatorgroup.yaml
+      subscription.yaml
+      README.md                         # what's being evaluated and why
+```
+
+The eval directory is a sibling of the canonical `clusters/` tree, not under it. This means:
+
+- Argo CD does not auto-sync eval content unless the eval Application is explicitly created.
+- A merge to `main` does not accidentally land an eval operator in production.
+- A `platform-gitops` reviewer can immediately see whether an MR touches eval content or canonical content.
+
+## A worked example
+
+Suppose we want to evaluate `cool-new-operator` `1.3.0` from the certified catalog.
+
+### Step 1: feature branch + ImageSet addition
+
+Branch: `eval/2026-05-cool-new-operator`.
+
+`platform-gitops/eval-bundles/2026-05-cool-new-operator/imageset-config.eval.yaml`:
+
+```yaml
+# eval-only ImageSet additions — merged into the next oc mirror run
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v2alpha1
+mirror:
+  operators:
+    - catalog: registry.redhat.io/redhat/certified-operator-index:v4.20
+      packages:
+        - name: cool-new-operator
+          defaultChannel: stable
+          channels:
+            - name: stable
+              minVersion: 1.3.0
+              maxVersion: 1.3.0
+```
+
+The eval operator is added to the existing ImageSet for one mirror run on the `oc-mirror` VM. The merged ImageSet is **not** committed to canonical — it's used only on the workstation.
+
+Re-run `oc mirror --v2` to push the new CSV into Nexus. Regenerate IDMS / CatalogSource as page 02 / page 06 describe; commit only the IDMS deltas needed.
+
+### Step 2: eval Subscription
+
+`platform-gitops/eval-bundles/2026-05-cool-new-operator/clusters/spoke-dc-v6/eval-operators/cool-new-operator/operatorgroup.yaml`:
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: cool-new-operator-eval-og
+  namespace: cool-new-operator-eval
+spec:
+  targetNamespaces:
+    - cool-new-operator-eval
+```
+
+`.../subscription.yaml`:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cool-new-operator
+  namespace: cool-new-operator-eval
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: cool-new-operator
+  source: cs-certified-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: cool-new-operator.v1.3.0
+```
+
+Note the namespace is `cool-new-operator-eval` — eval operators live in their own clearly-named namespace, not in `openshift-operators`. This keeps them visible as evaluations.
+
+### Step 3: eval Argo Application (one-time)
+
+`platform-gitops/eval-bundles/2026-05-cool-new-operator/argo-app.yaml`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eval-cool-new-operator
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: <platform-gitops-url>
+    targetRevision: eval/2026-05-cool-new-operator
+    path: eval-bundles/2026-05-cool-new-operator/clusters/spoke-dc-v6/eval-operators
+  destination:
+    server: <spoke-cluster-server>
+    namespace: openshift-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+> Internal-only specifics (exact repo URL and cluster server) are kept in `codex-opp-agent/connection-details/`.
+
+The Argo Application points at the **feature branch**, not `main`. This is the explicit "I am evaluating something on a branch" signal.
+
+### Step 4: evaluation period
+
+Run the evaluation. Document on the eval README:
+
+- Does the operator install cleanly on a v6 spoke?
+- Does its operand reconcile as expected with the lab's storage / network / secrets?
+- Are there RBAC requirements we'd need to grant fleet-wide?
+- What's the resource footprint (request / limit, image size)?
+- How does it interact with the IDMS / catalog / allowlist?
+
+This is a real evaluation, not a tick-box. Capture what was tested, what worked, what didn't.
+
+### Step 5: graduate or remove
+
+After evaluation, exactly two outcomes are acceptable:
+
+**Graduate** (the operator is going into production):
+
+1. Open the canonical-side MR adding the operator to `operator-version-lock.md`.
+2. Merge the canonical ImageSet addition.
+3. Move the subscription YAMLs from `eval-bundles/` to `clusters/<cluster>/platform/operators/`.
+4. Update the canonical Argo Application to include the new path; remove the eval Application.
+5. Close the eval feature branch.
+
+**Remove** (the operator is not going into production):
+
+1. Open the eval-side MR that deletes the eval namespace and the eval Subscription.
+2. Argo Application syncs the deletion; the operator's CSV is uninstalled.
+3. Remove the eval ImageSet entry from the next `oc mirror` run input.
+4. Close the eval feature branch.
+5. Document the rejection rationale on the eval README (so a future operator considering the same evaluation has a record).
+
+In both cases, the eval feature branch's lifetime is bounded: weeks, not months. A feature branch that has lived for more than a quarter is itself drift and is closed without a decision.
+
+## What stays the same as production
+
+Every constraint that isn't on the "relaxed" table above continues to apply during eval:
+
+- Images must come from approved registries (the VAP applies in `cool-new-operator-eval` because it's a non-system namespace).
+- RHACS continues to evaluate deploy-time policy and may alert on the eval pod.
+- The cluster's IDMS / IDMS / CatalogSource are the same — the eval operator pulls from Nexus like everything else.
+- The `installPlanApproval: Manual` gate is unchanged. Approval still requires a (small) MR.
+- Compliance Operator scans still run; the eval namespace is in scope unless explicitly excluded via TailoredProfile, which we don't do for eval bundles.
+
+The point is to test in lab realism, not in a sandbox that pretends compliance constraints don't exist.
+
+## Allowed eval clusters
+
+| Cluster | Eval allowed? |
+| --- | --- |
+| `hub-dc-v6` | No — hub is fleet management; eval would risk shared services |
+| `spoke-dc-v6` | Yes — eval lands on the workload cluster |
+| Future workload clusters | Yes, by default — each is added explicitly when stood up |
+
+This matches ADR 0020 §Decision 7 (don't run PCI scans against hub) and the broader principle that hub stays storage-light and stable.
+
+## Eval bundle "shape" antipatterns
+
+These are mistakes seen during early v6 eval attempts; record them so we don't repeat:
+
+| Antipattern | Why it's bad |
+| --- | --- |
+| Putting eval Subscription in `openshift-operators` | Operators in `openshift-operators` share an OperatorGroup; eval can collide with a production install |
+| Setting `installPlanApproval: Automatic` to "speed up eval" | Removes the audit gate that production needs — eval is not the place to learn whether the gate is OK to remove |
+| Skipping the IDMS / ImageSet step | Pods stay in `ImagePullBackOff`; eval ends up testing nothing other than the allowlist |
+| Letting eval live for >3 months | The "eval" becomes de-facto production with none of the protections — at that point you have unsupported, untracked, undocumented production |
+| Eval on `hub-dc-v6` | Risk of breaking fleet management for a candidate that may never go to production |
+| Eval that needs cluster-admin role on the workload | A new operator that asks for cluster-admin is itself a finding — the eval should document this, not paper over it |
+
+## Failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Eval Subscription `UpgradePending` | catalog lacks the eval CSV — re-mirror didn't include it | check `imageset-config.eval.yaml` includes the package; rerun `oc mirror`; regenerate CatalogSource if needed |
+| Eval pod denied by VAP | new operator references an unlisted registry | DO NOT relax the allowlist for eval; eval needs to be representative of production; treat as a finding |
+| Eval Argo Application can't sync | branch protection on platform-gitops blocks Argo from reading the feature branch | adjust read access for Argo CD's deploy key/SA to the feature branch; do not move to `main` |
+| Eval lingers without a decision | governance gap | escalate via the GitHub tracker; eval bundles >3 months old are auto-cleaned |
+
+## References
+
+- [02-version-pinning-strategy](/docs/openshift-platform/operator-lifecycle/version-pinning-strategy) — production rules.
+- [04-operatorpolicy-via-acm](/docs/openshift-platform/operator-lifecycle/operatorpolicy-via-acm) — what ACM-driven governance enforces.
+- ADR 0019 — Nexus-only image supply chain.
+- ADR 0025 — GitOps-only operations.
+- ADR 0016 — Workspace execution governance (issue + ADR required before eval).

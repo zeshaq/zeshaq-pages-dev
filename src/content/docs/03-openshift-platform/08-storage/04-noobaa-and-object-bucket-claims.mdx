@@ -1,0 +1,310 @@
+---
+title: "NooBaa MCG and ObjectBucketClaims"
+description: "How LokiStack, TempoStack, and Quay get S3 storage in-cluster via NooBaa MCG — and the ESO bridge pattern that reshapes the OBC Secret into operand-expected keys."
+sidebar_label: "NooBaa & OBC"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+NooBaa Multi-Cloud Gateway (MCG) is the S3 plane that ODF ships. It exposes an S3-compatible endpoint inside the cluster and a Kubernetes-native way to claim buckets — the **`ObjectBucketClaim`** (OBC). This page is about the day-to-day reality of consuming NooBaa from operands like LokiStack, TempoStack, and Quay — and specifically about the **OBC → operand Secret bridge** pattern that closes a real shape mismatch in the disconnected fleet.
+
+## What NooBaa gives us
+
+| Component | Purpose | Endpoint |
+| --- | --- | --- |
+| S3 endpoint (in-cluster Service) | S3 API for workloads | `s3.openshift-storage.svc` |
+| `ObjectBucketClaim` (OBC) CR | tenant-side request for a bucket | per-namespace |
+| Auto-created `Secret` per OBC | access credentials | named after OBC |
+| Auto-created `ConfigMap` per OBC | bucket-name / host / region | named after OBC |
+| Auto-created `ObjectBucket` (cluster-scoped) | bucket metadata | the OB controlled by the OBC |
+| NooBaa backing store | physical placement (Ceph RGW under it) | configured at `StorageCluster` time |
+
+NooBaa is the right answer for in-cluster S3 in the disconnected fleet because:
+
+- It runs as an ODF operand — no extra operator install.
+- It speaks S3 v4.
+- It is one of the few S3 endpoints reachable inside the cluster even when the WAN is down.
+- Multiple operands (Loki, Tempo, Quay) already speak S3; getting them off-cluster S3 keeps them disconnected-safe.
+
+## A typical OBC
+
+An OBC is a tenant claim — the operand namespace creates one and consumes its outputs:
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: tempo-traces
+  namespace: openshift-tracing
+spec:
+  generateBucketName: ""               # bucketName below disables the prefix
+  bucketName: tempo-traces             # explicit name; no UUID prefix
+  storageClassName: openshift-storage.noobaa.io
+```
+
+After reconciliation, NooBaa creates:
+
+| Object | Name | Contents |
+| --- | --- | --- |
+| `Secret` | `tempo-traces` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| `ConfigMap` | `tempo-traces` | `BUCKET_HOST`, `BUCKET_NAME`, `BUCKET_PORT`, `BUCKET_REGION`, `BUCKET_SUBREGION` |
+| `ObjectBucket` (cluster) | `obc-openshift-tracing-tempo-traces` | references the underlying bucket |
+
+The Secret holds credentials; the ConfigMap holds non-secret connection metadata. This split is upstream NooBaa convention.
+
+### `bucketName` vs `generateBucketName`
+
+| Field | Behavior |
+| --- | --- |
+| `bucketName: tempo-traces` | exact name; no UUID prefix |
+| `generateBucketName: tempo` | NooBaa generates `tempo-<random-uuid>` |
+
+The dc-lab convention is **`bucketName` explicit**. Reasons:
+
+- Operand configuration becomes deterministic — the operand YAML hard-codes the bucket name and never reads a generated value.
+- Audit trail is human-readable.
+- The ESO bridge pattern (below) can hard-code the bucket name.
+
+## The shape mismatch problem
+
+OBC's auto-generated Secret has these keys:
+
+```
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+```
+
+But `LokiStack.spec.storage.secret` (type `s3`) and `TempoStack.spec.storage.secret` (type `s3`) expect a Secret with these keys:
+
+```
+endpoint
+bucketnames
+access_key_id
+access_key_secret
+```
+
+Quay also has its own config-bundle Secret format that doesn't directly match either.
+
+The shape mismatch is not configurable on either side. Two options exist: write a per-operand Secret by hand (drift-prone, requires copying NooBaa-generated credentials), or use a controller to bridge.
+
+We chose: **External Secrets Operator with the Kubernetes provider** templates the bridge Secret from the OBC's Secret. This is the W2.C / MR `!43` pattern (memory entry: *project_obc_to_operand_secret_bridge.md*).
+
+## The ESO bridge pattern
+
+The bridge has four pieces in the operand namespace:
+
+### 1. ServiceAccount + Role + RoleBinding
+
+The ESO Kubernetes-provider SA needs read on the OBC Secret in the operand namespace:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eso-obc-reader
+  namespace: openshift-tracing
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eso-obc-reader
+  namespace: openshift-tracing
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["tempo-traces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eso-obc-reader
+  namespace: openshift-tracing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eso-obc-reader
+subjects:
+  - kind: ServiceAccount
+    name: eso-obc-reader
+    namespace: openshift-tracing
+```
+
+### 2. SecretStore pointing at the operand namespace
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: obc-store
+  namespace: openshift-tracing
+spec:
+  provider:
+    kubernetes:
+      remoteNamespace: openshift-tracing
+      auth:
+        serviceAccount:
+          name: eso-obc-reader
+      server:
+        url: https://kubernetes.default.svc
+        caProvider:
+          type: ConfigMap
+          name: kube-root-ca.crt
+          key: ca.crt
+          namespace: openshift-tracing
+```
+
+### 3. ExternalSecret with a `template` block
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: tempo-storage
+  namespace: openshift-tracing
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: obc-store
+    kind: SecretStore
+  target:
+    name: tempo-storage                          # operand reads this name
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        endpoint: "https://s3.openshift-storage.svc"
+        bucketnames: "tempo-traces"
+        access_key_id: "{{ .access_key_id }}"
+        access_key_secret: "{{ .access_key_secret }}"
+  data:
+    - secretKey: access_key_id
+      remoteRef:
+        key: tempo-traces                         # the OBC Secret
+        property: AWS_ACCESS_KEY_ID
+    - secretKey: access_key_secret
+      remoteRef:
+        key: tempo-traces
+        property: AWS_SECRET_ACCESS_KEY
+```
+
+### 4. TempoStack consumes the bridge Secret
+
+```yaml
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata:
+  name: traces
+  namespace: openshift-tracing
+spec:
+  storage:
+    secret:
+      name: tempo-storage                         # ← the bridge Secret
+      type: s3
+```
+
+The same shape works for LokiStack (with `target.name: loki-storage` and the LokiStack `spec.storage.secret.name: loki-storage`).
+
+## Why hard-code the endpoint
+
+`endpoint` is hardcoded to `https://s3.openshift-storage.svc` because ESO's Kubernetes provider can only read **Secrets**, not ConfigMaps. NooBaa puts `BUCKET_HOST` in a ConfigMap. A cleaner path would template `endpoint` from that ConfigMap, but ESO doesn't support cross-resource reads — so we accept the hardcode.
+
+For in-cluster operand traffic this is correct anyway. `s3.openshift-storage.svc` is the stable in-cluster S3 endpoint; it never changes between OBCs.
+
+## Why hard-code the bucket name
+
+`bucketnames: "tempo-traces"` is hardcoded because the OBC's `bucketName` is also deterministic (we set it explicitly). The two values must match by construction — the bridge YAML and the OBC YAML both reference `tempo-traces`.
+
+This is acceptable because both pieces live next to each other in the same Argo Application's manifests. They version together; they ship together.
+
+## Bridge live state
+
+| OBC | Operand | Bridge Secret | Status |
+| --- | --- | --- | --- |
+| `tempo-traces` | TempoStack `traces` (openshift-tracing) | `tempo-storage` | Live (MR !43) |
+| `loki-storage` | LokiStack (openshift-logging) | `loki-storage` (target) | **Backport needed — #233** |
+| Quay config-bundle | QuayRegistry | `quay-config-bundle-secret` | Different — Vault-sourced (see Quay note) |
+
+The LokiStack backport (#233): the original LokiStack landed in MR `!41` without this bridge. As of 2026-05-10 the LokiStack reports `Warning Degraded` because its OBC Secret has the wrong key shape. The fix is to add `externalsecret-loki-storage.yaml` to `clusters/spoke-dc-v6/platform-services/logging/` mirroring the Tempo pattern.
+
+## Quay does not use the same bridge
+
+Quay's storage Secret is a **config-bundle** YAML, not an S3-only key set. The shape is:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quay-config-bundle-secret
+type: Opaque
+stringData:
+  config.yaml: |
+    DISTRIBUTED_STORAGE_CONFIG:
+      default:
+        - RHOCSStorage
+        - access_key: <access_key>
+          secret_key: <secret_key>
+          bucket_name: quay-blobs
+          hostname: s3.openshift-storage.svc
+          is_secure: true
+          port: 443
+          storage_path: /datastorage/registry
+    ...
+```
+
+The Quay config-bundle is generated by a Vault-sourced ExternalSecret with a richer template, **not** by the kubernetes-provider OBC bridge. The Vault path is `secret/ocp/spoke-dc-v6/quay/config-bundle` (field `config.yaml`).
+
+As of 2026-05-10 that Vault path was not populated, so `QuayRegistry` stalled until it was. The completion of the Vault path is the prerequisite for Quay reaching `Ready`.
+
+## NetworkPolicy implication
+
+Red Hat ESO 1.1.0 ships a default-deny `NetworkPolicy` in its operator namespace. The Kubernetes provider in ESO reaches the kube-apiserver at `https://kubernetes.default.svc:443`, which is allowed by ODF/OCP defaults, so the OBC bridge does **not** require additional NetworkPolicy egress. (The Vault-provider ESO needs egress to the Vault VM — see [memory: *project_eso_egress_to_vault.md*](#references), it's a different code path.)
+
+## Validation
+
+```bash
+K=/path/to/spoke-dc-v6.kubeconfig
+
+# OBC created and bucket bound
+oc --kubeconfig "$K" -n openshift-tracing get obc tempo-traces
+# expected: PHASE Bound
+
+# Auto-generated Secret + ConfigMap exist
+oc --kubeconfig "$K" -n openshift-tracing get secret tempo-traces
+oc --kubeconfig "$K" -n openshift-tracing get configmap tempo-traces
+
+# ESO ExternalSecret is Ready
+oc --kubeconfig "$K" -n openshift-tracing get externalsecret tempo-storage \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# expected: True
+
+# Bridge Secret has the expected keys
+oc --kubeconfig "$K" -n openshift-tracing get secret tempo-storage \
+  -o jsonpath='{.data}' | jq 'keys'
+# expected: ["access_key_id","access_key_secret","bucketnames","endpoint"]
+
+# TempoStack reports Ready
+oc --kubeconfig "$K" -n openshift-tracing get tempostack traces \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# expected: True
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| LokiStack / TempoStack `Warning Degraded` after fresh deploy | bridge Secret missing or has wrong keys | apply the ESO bridge; verify Secret has lowercase keys |
+| OBC stuck `Pending` | NooBaa core / operator not Ready | check `noobaa-core-0`; check StorageCluster |
+| ExternalSecret `Error` reading source | RBAC missing | confirm Role grants `get` on the OBC Secret by name |
+| Bridge Secret has empty `access_key_id` | OBC Secret hasn't been populated yet (race) | wait for OBC `Bound`; ExternalSecret resyncs |
+| `endpoint` in bridge Secret wrong | typo in template; usually `s3-openshift-storage.svc` (incorrect) instead of `s3.openshift-storage.svc` | fix the template and commit |
+| Quay stalls indefinitely | Vault path for `config-bundle` not populated | populate Vault path; Quay re-reconciles |
+
+## References
+
+- Memory: *project_obc_to_operand_secret_bridge.md* — the canonical pattern description.
+- Memory: *project_eso_egress_to_vault.md* — egress note for the Vault-provider variant (not this one).
+- ADR 0020 — PCI baseline, ODF route tailoring.
+- [03-odf-on-spoke](/docs/openshift-platform/storage/odf-on-spoke) — ODF setup.
+- LokiStack docs (Red Hat): *S3 storage secret keys*.
+- TempoStack docs (Red Hat): *S3 storage secret keys*.

@@ -1,0 +1,248 @@
+---
+title: "IDMS, ITMS, and the cluster pull path"
+description: "How ImageDigestMirrorSet and ImageTagMirrorSet rewrite every image reference at pull time so OpenShift can run from the Nexus mirror with stock upstream manifests."
+sidebar_label: "IDMS / ITMS"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Mermaid from "../../../../components/Mermaid";
+
+`oc mirror --v2` ends by emitting two CRs that turn the mirror into something OpenShift's image puller can use: **`ImageDigestMirrorSet`** (IDMS) and **`ImageTagMirrorSet`** (ITMS). This page explains how they wire into the node pull path, what each does, why both exist, and the rules we follow when applying them.
+
+## Why image rewriting exists at all
+
+OpenShift release manifests, operator bundles, and operand CSVs reference images by their **upstream coordinates** (`quay.io/openshift-release-dev/...`, `registry.redhat.io/...`, `icr.io/appcafe/open-liberty`, `ghcr.io/cloudnative-pg/...`). Those are the references baked into Red Hat and certified-vendor content; we don't get to rewrite them at the source.
+
+In a disconnected cluster the kubelet cannot reach those hosts. The fleet still needs:
+
+1. The manifests on disk to stay correct (no fork of upstream content).
+2. The actual byte transfer to go to a host the cluster can reach (the Nexus mirror).
+
+IDMS/ITMS solve this by telling the cluster's container runtime: *"when you see `registry.redhat.io/foo@sha256:X`, ask `mirror-registry.apps.sub.comptech-lab.com/foo@sha256:X` instead."*
+
+## How a pull becomes a Nexus pull
+
+<Mermaid client:load chart={`sequenceDiagram
+  participant K as kubelet
+  participant CR as crio
+  participant Cfg as /etc/containers/registries.conf.d/
+  participant Nx as Nexus mirror
+  participant Up as Upstream registry (unreachable)
+  K->>CR: pull registry.redhat.io/foo@sha256:X
+  CR->>Cfg: read mirror rules (compiled from IDMS/ITMS)
+  Cfg-->>CR: prefer mirror-registry.apps.../foo for registry.redhat.io/foo
+  CR->>Nx: GET /v2/foo/manifests/sha256:X
+  Nx-->>CR: 200 (manifest + signature)
+  CR->>Nx: GET /v2/foo/blobs/sha256:Y (layers)
+  Nx-->>CR: 200 (each blob)
+  Note over CR,Up: upstream is never contacted
+  CR-->>K: image ready
+`} />
+
+## IDMS vs ITMS: the difference
+
+| | ImageDigestMirrorSet | ImageTagMirrorSet |
+| --- | --- | --- |
+| **Matches references by** | digest (`@sha256:...`) | tag (`:v1.2`, `:latest`) |
+| **Used for** | release payload, operator bundles, operands, anything CSV-pinned | `additionalImages` with tags (UBI:`latest`, Open Liberty:`25.0.0.6-...`) |
+| **Failure mode if missing** | `crio` falls back to the upstream host (404 on disconnected nets) | same |
+| **Replaces** (4.13+) | `ImageContentSourcePolicy` (ICSP) | new in 4.13+ |
+| **Volume on disk per cluster** | ~1 (one IDMS, many `mirrors:` entries) | ~1 (one ITMS) |
+
+The split exists because tag and digest are different identity systems. A digest is content-addressed; a tag is mutable. Mirroring by tag *requires* `mirrorSourcePolicy: AllowContactingSource` if the cluster should fall back to upstream when the tag isn't found locally (we set it to `NeverContactSource` — see below).
+
+The legacy `ImageContentSourcePolicy` (ICSP) still works on 4.20 but is **deprecated** and emitted by `oc mirror v1` only. Our v2 pipeline emits IDMS+ITMS exclusively. We do not maintain ICSPs; if you see one, it's drift.
+
+## Anatomy of the generated IDMS
+
+A typical IDMS produced by `oc mirror --v2` for this lab:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: idms-oc-mirror
+spec:
+  imageDigestMirrors:
+    - source: quay.io/openshift-release-dev/ocp-release
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/openshift/release-images
+      mirrorSourcePolicy: NeverContactSource
+    - source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/openshift/release
+      mirrorSourcePolicy: NeverContactSource
+    - source: registry.redhat.io/odf4
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/odf4
+      mirrorSourcePolicy: NeverContactSource
+    - source: registry.redhat.io/openshift4
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/openshift4
+      mirrorSourcePolicy: NeverContactSource
+    - source: registry.redhat.io/rhacm2
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/rhacm2
+      mirrorSourcePolicy: NeverContactSource
+    - source: registry.redhat.io/multicluster-engine
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/multicluster-engine
+      mirrorSourcePolicy: NeverContactSource
+    - source: icr.io/appcafe
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/appcafe
+      mirrorSourcePolicy: NeverContactSource
+    - source: ghcr.io/cloudnative-pg
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/cloudnative-pg
+      mirrorSourcePolicy: NeverContactSource
+    # ... 30+ more entries for every upstream namespace that appears in the ImageSet
+```
+
+**`mirrorSourcePolicy: NeverContactSource` is mandatory in the dc-lab.** It is the explicit guarantee that crio will not attempt the upstream as a fallback. The default value would let the runtime "helpfully" try `registry.redhat.io` if a digest isn't in the mirror; on a disconnected cluster that turns into multi-minute timeouts and ImagePullBackOff loops.
+
+## Anatomy of the generated ITMS
+
+ITMS handles the four additional images that we mirror by tag (because they're upstream-mutable references intentionally):
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: itms-oc-mirror
+spec:
+  imageTagMirrors:
+    - source: registry.redhat.io/ubi9/ubi
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/ubi9/ubi
+      mirrorSourcePolicy: NeverContactSource
+    - source: registry.redhat.io/ubi9/ubi-minimal
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/ubi9/ubi-minimal
+      mirrorSourcePolicy: NeverContactSource
+    - source: registry.access.redhat.com/ubi9/nodejs-22-minimal
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/ubi9/nodejs-22-minimal
+      mirrorSourcePolicy: NeverContactSource
+    - source: icr.io/appcafe/open-liberty
+      mirrors:
+        - mirror-registry.apps.sub.comptech-lab.com/appcafe/open-liberty
+      mirrorSourcePolicy: NeverContactSource
+```
+
+The lab's preference is to pull-by-digest everywhere we can. The ITMS exists so that **install-time additional images** (UBI for ignition, Open Liberty for first smoke app) still work without forcing the install plan to inline 4 digests.
+
+## Where the CRs come from and how they reach the cluster
+
+1. `oc mirror --v2` emits both files into the `cluster-resources/` directory of its workspace.
+2. The operator reviews the diff against the previous run. Typical review questions:
+   - Did any new `source:` entries appear? If yes, is there a corresponding upstream registry that the cluster now depends on?
+   - Did any `source:` entries disappear? That's drift — `oc mirror` keeps the previous set unless the ImageSet stops including a package.
+3. The files are committed to the **platform-gitops** repo (the GitLab one), where they live alongside other cluster configuration:
+   ```
+   platform-gitops/clusters/hub-dc-v6/platform/image-mirror/
+     idms-oc-mirror.yaml
+     itms-oc-mirror.yaml
+   platform-gitops/clusters/spoke-dc-v6/platform/image-mirror/
+     idms-oc-mirror.yaml
+     itms-oc-mirror.yaml
+   ```
+4. Argo CD on each cluster syncs the IDMS/ITMS. The Machine Config Operator picks up the change and rolls a new node configuration.
+
+> **Internal-only specifics — exact GitLab repo URL and Argo Application names — are kept in `codex-opp-agent/connection-details/`.**
+
+## What happens on the node when IDMS lands
+
+Applying or updating an `ImageDigestMirrorSet` is a **MachineConfig event**. The cluster behaviour is well-defined and visible in `oc get mcp`:
+
+1. MCO renders the IDMS into `/etc/containers/registries.conf.d/<name>.conf` on every node.
+2. Each MachineConfigPool drains and reboots one node at a time.
+3. After reboot, `crio` reads the new file and starts honoring the new mirror rules.
+
+A "boring" IDMS update takes ~30-60 minutes on a six-node cluster (3 masters + 3 workers, one at a time, drain + reboot + uncordon). It is therefore **not zero-cost** — IDMS edits should be batched and ideally tied to actual ImageSet changes.
+
+### registries.conf.d format
+
+The on-disk file produced by MCO looks like this (excerpted):
+
+```ini
+[[registry]]
+  prefix = ""
+  location = "quay.io/openshift-release-dev/ocp-release"
+
+  [[registry.mirror]]
+    location = "mirror-registry.apps.sub.comptech-lab.com/openshift/release-images"
+    pull-from-mirror = "digest-only"
+
+[[registry]]
+  prefix = ""
+  location = "registry.redhat.io/odf4"
+
+  [[registry.mirror]]
+    location = "mirror-registry.apps.sub.comptech-lab.com/odf4"
+    pull-from-mirror = "digest-only"
+```
+
+`pull-from-mirror = "digest-only"` corresponds to our `NeverContactSource` policy on IDMS entries. Tag-based entries (from ITMS) render with `pull-from-mirror = "tag-only"`.
+
+## Two boundaries this design enforces
+
+### 1. Cluster trusts the mirror, not the manifest
+
+A pod manifest can say `image: registry.redhat.io/foo:bar` forever; the rewrite happens transparently at the runtime layer. This means **operator authors don't have to know about disconnected mode** — Red Hat ships the same CSVs to disconnected and connected clusters and they "just work" once IDMS/ITMS is in place.
+
+### 2. The mirror is the single source of truth
+
+If a digest is referenced from a pod or an operator CSV but doesn't exist in Nexus, the rewrite still happens — to a Nexus URL that returns 404. The kubelet keeps retrying; the pod stays in `ImagePullBackOff`. This is loud and good: it surfaces missing mirror coverage as a pod-level error rather than silently falling back to a stale upstream copy.
+
+The recipe when this happens: extend `ImageSetConfiguration`, re-mirror, regenerate IDMS, sync.
+
+## Validation
+
+After applying IDMS/ITMS, validate on every cluster:
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+# IDMS exists
+oc --kubeconfig "$K" get imagedigestmirrorset
+
+# ITMS exists
+oc --kubeconfig "$K" get imagetagmirrorset
+
+# MCP rollout completed (no Updating=True)
+oc --kubeconfig "$K" get mcp
+
+# A representative pull resolves via mirror — check from a debug pod
+oc --kubeconfig "$K" debug node/<some-node> -- chroot /host bash -c '
+  crictl pull registry.redhat.io/ubi9/ubi-minimal:latest
+'
+# expect success without any DNS lookup of registry.redhat.io
+```
+
+A second validation comes from the **image-supply check script**:
+
+```bash
+/home/ze/claude-agent/scripts/openshift-image-supply-check.sh <cluster>
+```
+
+The script enumerates every pod's container/initContainer/ephemeralContainer image, dedups, and reports any reference not covered by the allowlist or by an IDMS rule. ADR 0019 §Validation requires this report; ADR 0020 §Validation requires `0 uncovered references` for any PCI-relevant scan cycle.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Pod stuck in `ImagePullBackOff` with `registry.redhat.io/foo: 401` | mirror rule exists but pod's SA pull-secret doesn't have Nexus auth | link pull secret to ServiceAccount, or set up ESO-driven pull secret per namespace | enforce a per-namespace pull-secret bootstrap step |
+| ODF operand pod tries `registry.redhat.io/odf4/ceph-csi@sha256:...` directly | IDMS missing `source: registry.redhat.io/odf4`, or operand image not in mirror | add operand sub-packages explicitly to ImageSet, re-mirror, regenerate IDMS | dependency-expansion is manual in oc-mirror v2; always list operand sub-packages alongside the parent operator |
+| Cluster reboots all nodes when adding one mirror entry | every IDMS edit triggers MachineConfig rollout | accept the cost; batch edits | avoid trivial cosmetic edits to IDMS; only update when the underlying mirror does |
+| `mirrorSourcePolicy` accidentally set to `AllowContactingSource` | reviewer didn't notice the policy in the diff | revert to `NeverContactSource`; resync | code-review checklist; the lab convention is `NeverContactSource` everywhere |
+| New ICSP appears on cluster | someone applied an old v1-emitted `imageContentSources` patch | replace with IDMS; remove the ICSP | do not run `oc mirror v1` against this fleet |
+
+## References
+
+- `codex-opp-agent/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays (the application-side counterpart).
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current generated CR set.
+- Red Hat docs: *Disconnected environments — about IDMS/ITMS* (linked from `mirror-manifest.md`).
+- ADR 0019 — Nexus-only image supply chain (`mirrorSourcePolicy` rule is implicit in §Decision 1).
+- ADR 0020 — PCI baseline (image-supply check 0-uncovered requirement).

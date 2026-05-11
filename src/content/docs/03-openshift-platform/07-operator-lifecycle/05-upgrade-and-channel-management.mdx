@@ -1,0 +1,254 @@
+---
+title: "Upgrade and channel management"
+description: "How operator upgrades happen in the dc-lab fleet: when channels change, when startingCSV bumps, and the multi-step procedure that keeps clusters consistent."
+sidebar_label: "Upgrades & channels"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+Upgrades are the rare events. With `installPlanApproval: Manual` and `min == max` pinning, an operator only moves forward when we deliberately choose to move it. This page documents how that choice is implemented end to end — the mirror update, the GitOps changes, the cluster apply, and the validation.
+
+## Why an upgrade is a tracked event
+
+Day-to-day operations on the fleet do not upgrade operators. Operators run on the pinned version listed in `operator-version-lock.md` until an explicit decision to bump. The triggers that turn into upgrades:
+
+1. **A security CVE** in the running operator or its operand that has a fix in a newer version.
+2. **An OpenShift minor upgrade** (e.g. 4.20 → 4.22) that requires aligning operator versions with the new OCP release.
+3. **A new feature** in a later operator version that has been scoped and approved.
+4. **End-of-life on the current operator version** within the Red Hat support window.
+
+Each of these is a tracked GitHub issue per ADR 0016. The issue lays out:
+
+- the from-version and to-version;
+- the CVE or feature reference;
+- the OCP versions involved;
+- the affected clusters;
+- the planned downtime / impact;
+- the rollback path.
+
+## Two upgrade shapes
+
+| Shape | Example | Subscription change | Catalog change |
+| --- | --- | --- | --- |
+| **Patch upgrade in same channel** | ESO 1.1.0 → 1.1.1 (channel `stable-v1`) | bump `startingCSV` | re-mirror `min==max=1.1.1` |
+| **Channel change** | ACM 2.16 → 2.17 (`release-2.16` → `release-2.17`) | bump `channel` AND `startingCSV` | new channel index path in IDMS / catalog |
+
+Patch upgrades are simpler — the catalog index path is unchanged, the CatalogSource doesn't change, only the CSV does. Channel changes touch more layers.
+
+## The six-step procedure
+
+For every upgrade, the procedure runs in order. Skipping a step is the most common cause of partial upgrade and post-upgrade firefights.
+
+### Step 1 — Update the canonical table
+
+Edit `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` to reflect the new target version. Open the tracking issue. Cite ADRs (0019 for pinning, 0025 for GitOps-only operations, 0018 for the pull model — whichever apply).
+
+### Step 2 — Edit the ImageSetConfiguration
+
+In `imageset-config.yaml`, change the package's `minVersion` / `maxVersion` to the new target. For a channel change, also change the channel name.
+
+```yaml
+# Before
+- name: openshift-external-secrets-operator
+  defaultChannel: stable-v1
+  channels:
+    - name: stable-v1
+      minVersion: 1.1.0
+      maxVersion: 1.1.0
+
+# After (patch upgrade)
+- name: openshift-external-secrets-operator
+  defaultChannel: stable-v1
+  channels:
+    - name: stable-v1
+      minVersion: 1.1.1
+      maxVersion: 1.1.1
+```
+
+### Step 3 — Mirror the new content
+
+```bash
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+
+# Validate the new ImageSet first
+oc mirror --v2 \
+  --config imageset-config.yaml \
+  --workspace file://full-operators-dryrun-workspace \
+  docker://mirror-registry.apps.sub.comptech-lab.com \
+  --authfile pull-secret.merged.json \
+  --dry-run
+
+# Compare mapping count; the diff should reflect added/removed images
+diff <(sort full-operators-dryrun-workspace/working-dir/dry-run/mapping.txt) \
+     <(sort previous-mapping.txt)
+
+# If acceptable, run the real mirror
+tmux new-session -d -s oc-mirror-upgrade ./tools/run-oc-mirror-fast.sh
+```
+
+For a single-version patch upgrade, the diff is usually a handful of bundle images. For an OCP minor upgrade or a channel change, the diff can be tens of images.
+
+### Step 4 — Regenerate cluster resources
+
+`oc mirror --v2` regenerates the `cluster-resources/` tarball. Compare:
+
+```bash
+diff -u previous/cluster-resources/idms-oc-mirror.yaml current/cluster-resources/idms-oc-mirror.yaml
+diff -u previous/cluster-resources/cs-redhat-operator-index-v4-20.yaml current/cluster-resources/cs-redhat-operator-index-v4-20.yaml
+```
+
+For a patch upgrade:
+
+- IDMS rarely changes (same source registries).
+- CatalogSource image digest changes — that's the central change.
+
+For a channel change:
+
+- IDMS may add new `source:` entries if the new channel pulls from a new registry path.
+- CatalogSource image digest changes.
+
+Commit the updated IDMS and CatalogSource manifests to `platform-gitops`. This is one MR.
+
+### Step 5 — Update the Subscription(s)
+
+Edit the affected operator's `subscription.yaml`:
+
+```yaml
+# Before (patch upgrade)
+spec:
+  channel: stable-v1
+  installPlanApproval: Manual
+  startingCSV: openshift-external-secrets-operator.v1.1.0
+
+# After
+spec:
+  channel: stable-v1
+  installPlanApproval: Manual
+  startingCSV: openshift-external-secrets-operator.v1.1.1
+```
+
+For a channel change, both `channel` and `startingCSV` move. Commit as a separate MR from the catalog update, in case the catalog update needs to roll back.
+
+### Step 6 — Approve the InstallPlan
+
+Once the new Subscription is `Synced/Healthy` and OLM resolves the upgrade:
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+oc --kubeconfig "$K" -n <ns> get installplan
+# NAME            CSV                                          APPROVAL   APPROVED
+# install-abc12   openshift-external-secrets-operator.v1.1.1   Manual     false
+
+# Review the planned change
+oc --kubeconfig "$K" -n <ns> get installplan install-abc12 -o yaml \
+  | yq '.spec.clusterServiceVersionNames'
+```
+
+Then approve via GitOps — commit an `installplan-1.1.1.yaml` file in `platform-gitops` with `spec.approved: true`. Argo applies it; OLM continues; new CSV reconciles.
+
+Approving via `oc patch` is **break-glass only**. The default path is the GitOps MR because it captures who approved what and when.
+
+## Validation after upgrade
+
+For each operator upgrade:
+
+```bash
+K=/path/to/cluster.kubeconfig
+NS=<operator-namespace>
+OP=<operator-package>
+
+# CSV reached Succeeded
+oc --kubeconfig "$K" -n "$NS" get csv | grep "$OP"
+# expect: $OP.vNEW_VERSION    Succeeded
+
+# No more replaceable predecessor
+oc --kubeconfig "$K" -n "$NS" get csv -o jsonpath='{range .items[?(@.spec.replaces!="")]}{.metadata.name}{" replaces "}{.spec.replaces}{"\n"}{end}'
+# expect: empty after a clean upgrade
+
+# Subscription source matches target
+oc --kubeconfig "$K" -n "$NS" get subscription "$OP" -o jsonpath='{.spec.startingCSV}{"\n"}'
+# expect: $OP.vNEW_VERSION
+
+# Operator pod healthy
+oc --kubeconfig "$K" -n "$NS" get deploy
+
+# Operand health (operator-specific)
+# e.g. for ESO:
+oc --kubeconfig "$K" -n "$NS" get pods -l app.kubernetes.io/instance=external-secrets-operator
+
+# ACM policy compliance (if a policy exists for this operator):
+HUB=/path/to/hub.kubeconfig
+oc --kubeconfig "$HUB" -n open-cluster-management-policies \
+  get policy <policy-name> -o jsonpath='{.status.compliant}'
+# expect: Compliant
+```
+
+For OperatorPolicy-governed operators, the policy compliance becomes the long-lived audit record.
+
+## Rollback
+
+A clean rollback for OLM operators is **not generally supported**. CSV upgrades may apply CRD migrations that don't reverse. Plan accordingly:
+
+| Risk | Mitigation |
+| --- | --- |
+| CRD schema change in new CSV | back up operand CRs before upgrade; if rollback needed, restore CRs from backup after re-installing the old CSV |
+| Old version no longer in the catalog | keep the previous mirror state on the Nexus VM for at least one upgrade cycle |
+| Argo `selfHeal` interferes with the rollback | temporarily disable auto-sync on the operator's Application during rollback |
+
+If rollback is required, the procedure is:
+
+1. Revert the GitOps Subscription change (re-MR with the old `startingCSV`).
+2. Re-mirror the old version into Nexus if it was purged.
+3. Delete the new CSV and let OLM re-install the old one.
+4. Verify operand CRs reconcile correctly against the old operator.
+
+In practice this is painful, which is the reason the manual-approval gate exists: it's cheaper to delay an upgrade than to undo a bad one.
+
+## OCP minor upgrades and operator alignment
+
+An OCP minor upgrade (e.g. 4.20.18 → 4.21.x) typically requires moving several operators to versions that ship in the 4.21 catalog. The procedure:
+
+1. Decide the new OCP target version (tracking issue, ADR if needed).
+2. Update `imageset-config.yaml` `platform.channels[].minVersion/maxVersion` to the new release.
+3. For each operator that needs to move, update its package entry in `imageset-config.yaml`.
+4. Update CatalogSource manifests to point at the new `redhat-operator-index:v4.21` (the index image **path changes** — `v4.20` → `v4.21`).
+5. Re-mirror. Validate.
+6. Upgrade OCP via the standard cluster-upgrade procedure (separate from operator upgrades).
+7. Upgrade operators in waves matching the new versions.
+
+An OCP minor upgrade is a multi-day event with significant testing. It's outside the scope of "operator upgrade" and gets its own runbook.
+
+## Failure modes during upgrade
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| `oc mirror` upgrade run fails partway | upstream tag/digest changed during mirror | re-run; if persistent, freeze the target version explicitly |
+| Subscription stuck `UpgradePending` after CSV bump | new CSV's `replaces` chain doesn't go through the current CSV | verify the upgrade path; may need to install intermediate CSV first |
+| InstallPlan exists but `RequirementsNotMet` | dependent operator hasn't been upgraded yet | upgrade dependencies first (e.g. MCE before ACM) |
+| CSV upgrade succeeds but operand CR breaks | CRD schema migration; old operand CR no longer valid | manual operand reconfiguration; rare on patch upgrades, real risk on major version jumps |
+| Cluster nodes start rolling on upgrade (unexpected) | a MachineConfig change went out alongside the operator upgrade | inspect MCO history; this should be expected for storage / network operators |
+| Old CSV stuck in `Replacing` state | OLM hasn't garbage-collected; non-fatal | `oc delete csv <old>` after confirming the new one is healthy |
+
+## Channel-jump quick reference
+
+A few common channel jumps and what changes:
+
+| Operator | From | To | What else changes |
+| --- | --- | --- | --- |
+| `advanced-cluster-management` | `release-2.16` | `release-2.17` | check `multicluster-engine` channel compatibility |
+| `odf-operator` | `stable-4.20` | `stable-4.21` | requires OCP 4.21 first; ODF version aligned with OCP minor |
+| `openshift-gitops-operator` | `latest` (1.20.x) | `latest` (1.21.x) | Argo CD CRD changes possible; review ApplicationSets |
+| `openshift-pipelines-operator-rh` | `pipelines-1.22` | `pipelines-1.23` | Tekton CRDs evolve; check TaskRun / PipelineRun compatibility |
+| `loki-operator` + `cluster-logging` | `stable-6.5` | `stable-6.6` | upgrade in pair; cluster-logging depends on Loki schema |
+| `tempo-product` | `stable` (0.20.0-3) | `stable` (next) | Tempo CR schema sometimes adds required fields |
+
+## References
+
+- [02-version-pinning-strategy](/docs/openshift-platform/operator-lifecycle/version-pinning-strategy) — the pinning rules an upgrade temporarily breaks.
+- [04-operatorpolicy-via-acm](/docs/openshift-platform/operator-lifecycle/operatorpolicy-via-acm) — what governance reports during the upgrade window.
+- [02-oc-mirror-workflow](/docs/openshift-platform/disconnected-image-supply/oc-mirror-workflow) — the mirror side of the upgrade.
+- [03-idms-itms-and-cluster-pull](/docs/openshift-platform/disconnected-image-supply/idms-itms-and-cluster-pull) — IDMS regeneration after a catalog change.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — canonical version table.
+- ADR 0019 — Nexus-only image supply chain.
+- ADR 0025 — GitOps-only operations.

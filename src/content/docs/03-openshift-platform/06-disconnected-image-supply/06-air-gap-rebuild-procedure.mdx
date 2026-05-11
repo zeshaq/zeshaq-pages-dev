@@ -1,0 +1,348 @@
+---
+title: "Air-gap rebuild procedure"
+description: "End-to-end recovery procedure for restoring image-supply capability after Nexus mirror loss or full disconnected rebuild."
+sidebar_label: "Air-gap rebuild"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page documents how to rebuild the image supply chain from the ground up: standing up the Nexus mirror VM, the `oc-mirror` worker VM, the DNS records, the HAProxy frontends, the merged pull-secret, the mirror itself, and the cluster-side CRs that consume it.
+
+It is the "from zero" runbook. The day-to-day operating procedure for an *already-built* mirror is in [02-oc-mirror-workflow](/docs/openshift-platform/disconnected-image-supply/oc-mirror-workflow).
+
+## Triggers — when to follow this page
+
+1. **Full disconnected rebuild** (the original scenario this plan was designed for) — see ADR 0019 context.
+2. **Nexus mirror VM total loss** — disk corruption, accidental deletion, or storage pool unrecoverable.
+3. **OpenShift major-version jump** that requires a fresh ImageSet baseline (e.g. 4.20 → 4.22).
+4. **Compromise recovery** — the existing mirror credentials are revoked or the registry blob store is suspect.
+
+If only the catalog index changed but the mirror is otherwise healthy, the lighter procedure on page 02 is sufficient. This page is for "the whole supply chain is broken or absent."
+
+## Prerequisites
+
+Before starting, confirm:
+
+| Prereq | How to verify |
+| --- | --- |
+| DNS (PowerDNS) is reachable from the operator workstation | `dig @<lab-dns> nexus-mirror.apps.sub.comptech-lab.com A +short` returns the HAProxy address |
+| HAProxy edge VM is healthy | `curl -sSI https://nexus-mirror.apps.sub.comptech-lab.com/` from a lab host |
+| Let's Encrypt wildcard certificate is valid and >30 days from expiry | inspect `/etc/haproxy/certs/wildcard-apps.pem` on the HAProxy VM |
+| Upstream pull secret is current and accessible | `jq '.auths | keys' /home/ze/secrets/openshift-pull-secret.json` lists the expected registries |
+| Operator workstation can reach `30.30.30.0/24` lab subnet | `ssh oc-bootstrap` from operator workstation succeeds |
+| Sufficient storage budget | Nexus VM: at least 2 TiB; oc-mirror VM: at least 1 TiB |
+| Internet egress for upstream pulls works on the bootstrap path | upstream pull-secret check succeeds against `registry.redhat.io` |
+
+Any "no" here is a stop-and-fix item before mirror work begins.
+
+## The phase chain
+
+The rebuild follows a strict phase order so each phase's outputs are the next phase's prerequisites.
+
+```text
+P0  Prereqs verified
+P1  Network + DNS for the mirror endpoints
+P2  Nexus mirror VM provisioned
+P3  HAProxy frontends configured
+P4  oc-mirror worker VM provisioned
+P5  Merged pull-secret built
+P6  ImageSetConfiguration committed
+P7  Dry-run executed and reviewed
+P8  Full mirror run executed
+P9  Generated CRs committed to platform-gitops
+P10 Cluster-side validation per cluster
+P11 Allowlist enforcement re-enabled
+```
+
+A higher-numbered phase never starts before the previous phase's done-criteria are met.
+
+## P1 — Network and DNS
+
+Add (or restore) the private DNS records on PowerDNS:
+
+```text
+nexus-mirror.apps.sub.comptech-lab.com    A   <haproxy-edge-ip>
+mirror-registry.apps.sub.comptech-lab.com A   <haproxy-edge-ip>
+docker-group.apps.sub.comptech-lab.com    A   <haproxy-edge-ip>
+app-registry.apps.sub.comptech-lab.com    A   <haproxy-edge-ip>
+nexus-mirror.sub.comptech-lab.com         A   <nexus-vm-ip>
+mirror-registry.sub.comptech-lab.com      A   <nexus-vm-ip>
+oc-mirror.sub.comptech-lab.com            A   <oc-mirror-vm-ip>
+```
+
+(`<...>` placeholders: the actual addresses are internal-only and tracked in `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/dns-records.md`.)
+
+Validate from at least three vantage points (operator workstation, an OpenShift bootstrap host if one exists, a lab utility host) before continuing.
+
+## P2 — Nexus mirror VM
+
+The Nexus mirror is a single libvirt VM on the lab management subnet.
+
+Spec (from `plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md`):
+
+| Attribute | Value |
+| --- | --- |
+| Hostname | `nexus-mirror` |
+| Subnet | lab `/16` management network |
+| Default gateway | lab router |
+| DNS resolver | lab DNS |
+| Storage | 2 TiB virtual qcow2 (minimum) |
+| Service | Nexus Repository OSS (container) |
+| Docker hosted repo | `ocp-mirror` on port `5000` |
+| Docker group repo | `docker-group` on port `5001` |
+| Docker hosted app repo | `docker-dev-hosted` on port `5002` |
+
+Internal-only specifics (exact IP, MAC, libvirt pool, Nexus admin password file path) live in `connection-details/nexus.md`.
+
+Post-provision validation:
+
+```bash
+curl -sSI http://nexus-mirror.sub.comptech-lab.com:8081/service/rest/v1/status | head -1
+# expect: HTTP/1.1 200 OK
+
+curl -sSI http://mirror-registry.sub.comptech-lab.com:5000/v2/ | head -1
+# expect: HTTP/1.1 401 Unauthorized
+```
+
+Direct HTTP endpoints are for local private-network debugging only. Production access is always HTTPS via HAProxy.
+
+### Restoring the Nexus credential store
+
+Recreate the local-only credential custody on the operator workstation:
+
+```text
+/home/ze/codex-opp-agent/secrets/nexus-admin-password
+/home/ze/codex-opp-agent/secrets/nexus-jenkinsbot-password
+/home/ze/codex-opp-agent/secrets/nexus-oauth2-cookie-secret
+/home/ze/codex-opp-agent/secrets/nexus-oidc-client.json
+```
+
+The Git-ignored, mode-restricted layout is intentional. Never commit these files; never paste their values into chat or issue trackers.
+
+## P3 — HAProxy frontends
+
+The HAProxy edge VM exposes four HTTPS frontends, each bound to a different Nexus port:
+
+| Frontend hostname | Backend |
+| --- | --- |
+| `nexus-mirror.apps.sub.comptech-lab.com` | `<nexus-vm>:8081` (UI/API) |
+| `mirror-registry.apps.sub.comptech-lab.com` | `<nexus-vm>:5000` (Docker hosted, `ocp-mirror`) |
+| `docker-group.apps.sub.comptech-lab.com` | `<nexus-vm>:5001` (Docker group) |
+| `app-registry.apps.sub.comptech-lab.com` | `<nexus-vm>:5002` (Docker hosted, `docker-dev-hosted`) |
+
+TLS terminator uses the lab's Let's Encrypt wildcard `*.apps.sub.comptech-lab.com`. The certificate must be present at `/etc/haproxy/certs/wildcard-apps.pem` and valid for at least 30 days; renewal is owned outside this procedure.
+
+Validation:
+
+```bash
+for host in nexus-mirror mirror-registry docker-group app-registry; do
+  echo -n "$host: "
+  curl -sSI "https://$host.apps.sub.comptech-lab.com/v2/" | head -1
+done
+# expected: each line returns HTTP/2 401 (unauthenticated registry check)
+```
+
+## P4 — oc-mirror worker VM
+
+Spec:
+
+| Attribute | Value |
+| --- | --- |
+| Hostname | `oc-mirror` |
+| Subnet | lab management network |
+| Storage | 1 TiB virtual qcow2 |
+| Workspace path | `/home/ze/ocp-mirror-workspaces/dc-lab/` |
+| Tooling | `oc`, `openshift-install`, `oc-mirror` — all matching the target OpenShift version (currently `4.20.18`) |
+| Internet egress | reachable to `registry.redhat.io`, `quay.io`, `icr.io`, `ghcr.io`, `nvcr.io` |
+
+Tool installation steps run as a root-equivalent user, with `umask 0022` set in the shell profile so `oc-mirror` workspace files have predictable permissions.
+
+Post-provision validation:
+
+```bash
+oc version --client
+openshift-install version
+oc mirror --v2 version
+```
+
+All three should report the same major.minor as the target OCP release.
+
+## P5 — Merged pull-secret
+
+On the `oc-mirror` VM:
+
+```bash
+mkdir -p /home/ze/ocp-mirror-workspaces/dc-lab
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+
+# Start from the upstream pull-secret already on this host
+cp /home/ze/secrets/openshift-pull-secret.json pull-secret.merged.json
+chmod 0600 pull-secret.merged.json
+
+# Add the local mirror credential via podman login (writes into --authfile)
+export REGISTRY=mirror-registry.apps.sub.comptech-lab.com
+export NEXUS_USER=<nexus-username>
+read -rs NEXUS_PASSWORD
+printf '%s' "$NEXUS_PASSWORD" | podman login "$REGISTRY" \
+  --username "$NEXUS_USER" \
+  --password-stdin \
+  --authfile pull-secret.merged.json
+unset NEXUS_PASSWORD
+```
+
+The resulting file is never committed, never copied to clusters, never pasted anywhere. It is consumed only via the explicit `--authfile` arg to `oc mirror`.
+
+## P6 — ImageSetConfiguration
+
+Copy in the current pinned config:
+
+```bash
+cp /path/to/codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml \
+   /home/ze/ocp-mirror-workspaces/dc-lab/imageset-config.yaml
+```
+
+Inspect the file. The current dc-lab lock pins OpenShift `4.20.18` (amd64, no graph) plus 35+ operator packages plus 4 additional images. See [02-oc-mirror-workflow](/docs/openshift-platform/disconnected-image-supply/oc-mirror-workflow) for the package table.
+
+If this rebuild is associated with a new operator-version-lock, edit the file accordingly **and** update the source lock file under `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` and the ADR if any operator addition is non-trivial.
+
+## P7 — Dry-run
+
+```bash
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+umask 0022
+
+oc mirror --v2 \
+  --config imageset-config.yaml \
+  --workspace file://full-operators-dryrun-workspace \
+  docker://mirror-registry.apps.sub.comptech-lab.com \
+  --authfile pull-secret.merged.json \
+  --dry-run
+```
+
+Expected mapping count for the current lock: **702 image mappings**. The result file:
+
+```text
+full-operators-dryrun-workspace/working-dir/dry-run/mapping.txt
+```
+
+Inspect:
+
+```bash
+wc -l full-operators-dryrun-workspace/working-dir/dry-run/mapping.txt
+sort full-operators-dryrun-workspace/working-dir/dry-run/mapping.txt \
+  | awk -F'/' '{print $1}' | sort | uniq -c
+```
+
+The per-host breakdown should match the recorded baseline (493 / 193 / 3 / 1 / 3 / 3 / 15 / 2 — see `mirror-manifest.md`). Significant drift means upstream content shifted; investigate before proceeding.
+
+## P8 — Full mirror run
+
+```bash
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+tmux new-session -d -s oc-mirror-full ./tools/run-oc-mirror-fast.sh
+```
+
+Watch in a separate session:
+
+```bash
+tail -f logs/oc-mirror-progress-<run-id>.log
+```
+
+A full run for the current lock processes about 702 images at 7-12 MiB/s and finishes in 3-6 hours on a healthy WAN.
+
+Done-criteria:
+
+- `logs/oc-mirror-full-<run-id>.log` ends without errors.
+- `working-dir/` contains a `cluster-resources/` directory.
+- Workspace free space is still positive (a full mirror takes 800-1000 GiB on disk).
+
+## P9 — Commit generated CRs
+
+`cluster-resources/` contains the IDMS, ITMS, CatalogSource, and signature ConfigMap. Review each file:
+
+| File | What to look for |
+| --- | --- |
+| `idms-oc-mirror.yaml` | every `mirrors:` entry has `mirrorSourcePolicy: NeverContactSource` |
+| `itms-oc-mirror.yaml` | the four additional images each have a `mirrors:` entry |
+| `cs-redhat-operator-index-v4-20.yaml` | `image:` is a digest reference under `mirror-registry.apps.sub.comptech-lab.com/...` |
+| `cs-certified-operator-index-v4-20.yaml` | same shape |
+| `signature-config-map.yaml` | present if 4.13+ release signature verification is enabled |
+
+Commit to the platform-gitops repo under each cluster's path:
+
+```text
+platform-gitops/clusters/hub-dc-v6/platform/image-mirror/
+platform-gitops/clusters/spoke-dc-v6/platform/image-mirror/
+```
+
+Open MRs (one per cluster, or one combined MR with clear file scoping). Argo CD picks up the changes within ~3 minutes after merge.
+
+## P10 — Cluster-side validation
+
+For each cluster:
+
+```bash
+K=/path/to/<cluster>.kubeconfig
+
+# IDMS + ITMS
+oc --kubeconfig "$K" get imagedigestmirrorset
+oc --kubeconfig "$K" get imagetagmirrorset
+
+# MachineConfigPool rollout
+oc --kubeconfig "$K" get mcp -w   # wait until master/worker are Updated=True, Updating=False
+# A full IDMS-driven rollout takes ~30-60 minutes for 6 nodes
+
+# OperatorHub
+oc --kubeconfig "$K" get operatorhub cluster -o jsonpath='{.spec.disableAllDefaultSources}'
+# expect: true
+
+oc --kubeconfig "$K" -n openshift-marketplace get catalogsource
+# expect: only the local cs-*-v4-20 entries
+
+oc --kubeconfig "$K" -n openshift-marketplace get pod | grep cs-
+# expect: each catalog pod 1/1 Running
+
+# Image-supply check (uncovered references)
+/home/ze/claude-agent/scripts/openshift-image-supply-check.sh <cluster>
+# expect: 0 uncovered references
+```
+
+## P11 — Re-enable allowlist enforcement
+
+This step exists separately because, during a from-scratch rebuild, the allowlist may have been relaxed or temporarily removed. ADR 0019 §Decision 7 requires that hard admission policy is added only **after** the allowlist is validated.
+
+Steps:
+
+1. Confirm the VAP files in `platform-gitops` match the current allowlist (see [05-image-supply-allowlist-with-nexus](/docs/openshift-platform/disconnected-image-supply/image-supply-allowlist-with-nexus)).
+2. Run live allow / deny test against `external-secrets-operator` namespace.
+3. Run `rhacs-update-img-allowlist.sh` and confirm RHACS Central's policy values match.
+4. Update the public "Current allowlist" table on page 05 of this section if anything changed.
+
+## Done-criteria for the whole procedure
+
+- All four Nexus HTTPS endpoints return `401` on `/v2/` unauthenticated and `200` authenticated.
+- `oc mirror --v2 --dry-run` produces the expected mapping count.
+- Each cluster reports `0 uncovered references` from the image-supply check.
+- VAP on each cluster denies a known-bad image and allows a known-good image.
+- RHACS Central policy values match VAP values.
+- The mirror's `mirror-manifest.md` entry is updated with the new run-id, mapping count, log paths, and validation snapshot.
+- Session memory and the relevant GitHub issue are closed out per ADR 0016 (workspace execution governance).
+
+## Common rebuild failures
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `oc mirror` aborts in P7 / P8 with `unauthorized` | merged pull-secret missing one of the upstream entries | re-run the merge step; confirm `jq '.auths | keys'` lists all expected registries |
+| Mapping count is significantly lower than baseline | upstream registry temporarily blocked or unreachable | wait, re-run dry-run; check ISP/WAN status |
+| Generated IDMS has fewer `source:` entries than baseline | ImageSetConfiguration deleted operator packages without notice | diff against last good `imageset-config.yaml`; restore intentional packages |
+| MCP rollout in P10 stalls indefinitely | one or more nodes failing to drain | check `oc get nodes` and PodDisruptionBudgets; follow `runbooks/mco-stuck-node-recovery.md` |
+| Image-supply check reports >0 uncovered references after P10 | a newly-installed workload references an unmirrored image | extend `ImageSetConfiguration`, re-mirror just the missing package, regenerate IDMS, re-validate |
+
+## References
+
+- ADR 0019 — Nexus-only image supply chain.
+- `codex-opp-agent/plans/disconnected-rebuild/02-registry-mirror.md` — original rebuild plan.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current mirror state and validation evidence.
+- `codex-opp-agent/connection-details/nexus.md` — endpoint and credential model.
+- `codex-opp-agent/runbooks/mco-stuck-node-recovery.md` — node-level recovery during MCP rollout.
+- Memory: *project_nexus_endpoint_split.md*, *feedback_oc_mirror_off_limits.md*.

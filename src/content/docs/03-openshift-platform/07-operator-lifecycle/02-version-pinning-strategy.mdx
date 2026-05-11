@@ -1,0 +1,224 @@
+---
+title: "Operator version-pinning strategy"
+description: "Why every operator in the dc-lab fleet is pinned at min == max, lives behind installPlanApproval: Manual, and rolls forward only as an explicit ADR-tracked event."
+sidebar_label: "Version pinning"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The fleet runs about 35 operators across two clusters. Without strict version control they would each follow their own channel's drift, which on a 4.20 catalog means **silent re-promotion** of new CSV bundles on the order of every few weeks. This page documents the pinning rules and the operating model that keeps the inventory stable and auditable.
+
+## The four rules
+
+1. **Pin `minVersion == maxVersion` in `ImageSetConfiguration`.** The mirror only contains one version per package; OLM cannot select a different one even if the source channel ships a newer CSV.
+2. **`installPlanApproval: Manual` on every Subscription.** Even if a new CSV existed in the mirror, the cluster will not apply it without explicit approval.
+3. **`startingCSV` is set explicitly on every Subscription.** OLM resolves the install to exactly that CSV; channel re-promotion does not change which CSV the cluster picks up.
+4. **The single canonical table is `operator-version-lock.md`.** Whatever it says is what runs. The `ImageSetConfiguration` and every Subscription in platform-gitops must match it.
+
+Together these four constraints reduce "what's installed" to a question with one answer: read `operator-version-lock.md`.
+
+## Why we do all four
+
+Each constraint covers a different failure mode. Operating only one of them leaves a path for drift:
+
+| Rule | What it prevents | What it does NOT prevent (alone) |
+| --- | --- | --- |
+| Pin min==max in ImageSet | mirror containing more than one version of a package | someone running `oc adm catalog ...` against the in-cluster index and rewriting it |
+| `installPlanApproval: Manual` | automatic upgrades when a new bundle appears in the catalog | a subsequent mirror run pushing a different bundle that becomes the only one available |
+| `startingCSV` explicit | OLM resolving to a different CSV at install time | someone editing the Subscription to drop `startingCSV` later |
+| canonical table | drift between platform-gitops and what's actually running | manual `oc apply` on a cluster |
+
+All four together close the loop. Drop any one and the system can drift quietly.
+
+## The canonical table
+
+The single source of truth lives at:
+
+```
+codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md
+```
+
+Excerpt (current values as of 2026-05-11):
+
+| Source | Package | Channel | Version |
+| --- | --- | --- | --- |
+| redhat-operator-index:v4.20 | openshift-gitops-operator | latest | 1.20.3 |
+| redhat-operator-index:v4.20 | advanced-cluster-management | release-2.16 | 2.16.1 |
+| redhat-operator-index:v4.20 | multicluster-engine | stable-2.11 | 2.11.1 |
+| redhat-operator-index:v4.20 | lvms-operator | stable-4.20 | 4.20.0 |
+| redhat-operator-index:v4.20 | local-storage-operator | stable | 4.20.0-202604140241 |
+| redhat-operator-index:v4.20 | odf-operator | stable-4.20 | 4.20.10-rhodf |
+| redhat-operator-index:v4.20 | redhat-oadp-operator | stable | 1.5.5 |
+| redhat-operator-index:v4.20 | openshift-cert-manager-operator | stable-v1 | 1.19.0 |
+| redhat-operator-index:v4.20 | openshift-external-secrets-operator | stable-v1 | 1.1.0 |
+| redhat-operator-index:v4.20 | openshift-pipelines-operator-rh | pipelines-1.22 | 1.22.0 |
+| redhat-operator-index:v4.20 | rhacs-operator | stable | 4.10.2 |
+| redhat-operator-index:v4.20 | compliance-operator | stable | 1.9.0 |
+| redhat-operator-index:v4.20 | gatekeeper-operator-product | stable | 3.21.0 |
+| redhat-operator-index:v4.20 | container-security-operator | stable-3.16 | 3.16.3 |
+| redhat-operator-index:v4.20 | cluster-observability-operator | stable | 1.4.0 |
+| redhat-operator-index:v4.20 | loki-operator | stable-6.5 | 6.5.0 |
+| redhat-operator-index:v4.20 | cluster-logging | stable-6.5 | 6.5.0 |
+| redhat-operator-index:v4.20 | tempo-product | stable | 0.20.0-3 |
+| redhat-operator-index:v4.20 | opentelemetry-product | stable | 0.144.0-3 |
+| redhat-operator-index:v4.20 | netobserv-operator | stable | 1.11.1 |
+| redhat-operator-index:v4.20 | servicemeshoperator3 | stable-3.3 | 3.3.2 |
+| redhat-operator-index:v4.20 | kiali-ossm | stable | 2.22.2 |
+| redhat-operator-index:v4.20 | quay-operator | stable-3.17 | 3.17.1 |
+| redhat-operator-index:v4.20 | cluster-kube-descheduler-operator | stable | 5.3.2 |
+| redhat-operator-index:v4.20 | file-integrity-operator | stable | 1.3.8 |
+| redhat-operator-index:v4.20 | security-profiles-operator | release-alpha-rhel-8 | 0.10.0 |
+| redhat-operator-index:v4.20 | nfd | stable | 4.20.0-202604140241 |
+| redhat-operator-index:v4.20 | kubevirt-hyperconverged | stable | 4.20.11 |
+| certified-operator-index:v4.20 | cloudnative-pg | stable-v1 | 1.29.0 |
+| certified-operator-index:v4.20 | open-liberty-certified | v1.6 | 1.6.1 |
+
+Two packages are explicitly **deferred** (intentionally absent from the active mirror):
+
+- `rhods-operator` (OpenShift AI) — large RHOAI images; reintroduce only when AI workloads are scope-approved.
+- `gpu-operator-certified` (NVIDIA) — large GPU images; reintroduce only when GPU workers are scope-approved.
+
+OpenShift release itself is locked separately:
+
+| Component | Version |
+| --- | --- |
+| OpenShift cluster | 4.20.18 |
+| RHCOS | bundled with release payload |
+| `oc` / `openshift-install` | 4.20.18 |
+| `oc-mirror` | 4.20.18 |
+
+## Subscription template
+
+Every operator's Subscription follows this template. The only fields that change per operator are `name`, `channel`, `startingCSV`, and `source` (which depends on whether the operator is from the Red Hat or certified catalog).
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: <package-name>
+  namespace: <operator-namespace>
+spec:
+  channel: <channel-name>
+  installPlanApproval: Manual
+  name: <package-name>
+  source: cs-redhat-operator-index-v4-20      # or cs-certified-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: <package-name>.v<version>
+```
+
+The lab convention is to put every Subscription under platform-gitops at:
+
+```
+clusters/<cluster>/platform/operators/<package-name>/
+  operatorgroup.yaml
+  subscription.yaml
+  installplan-<version>.yaml   # only for planned upgrades, see page 05
+```
+
+## A worked example: ACM 2.16.1
+
+```yaml
+# clusters/hub-dc-v6/platform/operators/acm/operatorgroup.yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: open-cluster-management-og
+  namespace: open-cluster-management
+spec:
+  targetNamespaces:
+    - open-cluster-management
+---
+# clusters/hub-dc-v6/platform/operators/acm/subscription.yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+spec:
+  channel: release-2.16
+  installPlanApproval: Manual
+  name: advanced-cluster-management
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: advanced-cluster-management.v2.16.1
+```
+
+When this commits to platform-gitops:
+
+1. Argo CD applies the OperatorGroup, then the Subscription (sync waves handle the order; see [GitOps section](/docs/openshift-platform/gitops-operating-model)).
+2. OLM's `catalog-operator` resolves the Subscription against `cs-redhat-operator-index-v4-20`. The catalog index contains exactly one CSV `advanced-cluster-management.v2.16.1` because that's what's mirrored.
+3. An InstallPlan named `install-<xxxx>` is created with `spec.approved: false`.
+4. The platform operator opens a second MR that commits an `installplan-2.16.1.yaml` file flipping `spec.approved: true`. Argo applies it. OLM continues.
+5. CSV `advanced-cluster-management.v2.16.1` is created; the ACM Deployment starts.
+
+The two MRs are intentional — the second one is a per-CSV approval event with a name and a date, which is the artifact ADR 0025 wants.
+
+## Why not `installPlanApproval: Automatic`?
+
+`Automatic` is the OLM default. It's the right answer for connected dev clusters that should always run the latest patch. It is the **wrong** answer for the dc-lab fleet because:
+
+- Patch versions of major operators (ACM 2.16.1 → 2.16.2) frequently include CRD schema changes. Auto-apply means no test window.
+- The dc-lab fleet runs disconnected; a new CSV only becomes available after a re-mirror. The mirror is a deliberate event; the apply should be too.
+- PCI-DSS audit evidence wants a record of "who approved version X on date Y." Manual approval via GitOps MR is that record.
+
+## What changes when we add an operator
+
+The full procedure to add `foo-operator` v1.2.3 to the fleet:
+
+1. Open a tracking issue (per ADR 0016 — workspace execution governance).
+2. Edit `operator-version-lock.md` to add the new row.
+3. Edit `imageset-config.yaml` to add the package with `minVersion: 1.2.3, maxVersion: 1.2.3`.
+4. Re-run `oc mirror` (a small incremental run, not a full re-mirror).
+5. Commit the updated IDMS / CatalogSource if the catalog digest changed.
+6. Open the platform-gitops MR with:
+   - `clusters/<cluster>/platform/operators/foo-operator/operatorgroup.yaml`
+   - `clusters/<cluster>/platform/operators/foo-operator/subscription.yaml`
+7. Merge, wait for Argo sync, observe the InstallPlan, approve via second MR.
+8. Verify the CSV reaches `Succeeded`.
+9. Close the issue with a closeout per ADR 0016: files changed, validation, residual risks.
+
+The point of the long list is that adding an operator is not a one-line change. It's a tracked event with a paper trail.
+
+## What changes when we upgrade
+
+Upgrading from `1.2.3` to `1.2.4` follows the same procedure with one nuance: the `Subscription`'s `startingCSV` is **updated**, not the version, because OLM's upgrade graph reads from the CSV's `spec.replaces` chain.
+
+Two patterns:
+
+| Pattern | Subscription change | Notes |
+| --- | --- | --- |
+| Minor patch upgrade in the same channel | bump `startingCSV` to the new version | InstallPlan covers only the new CSV |
+| Channel change (e.g. `release-2.16` → `release-2.17`) | bump both `channel` and `startingCSV` | InstallPlan likely covers multiple CSVs; review the dependency graph carefully |
+
+Detailed upgrade procedure is on page 05.
+
+## Drift detection
+
+A weekly compliance report — produced by the platform automation — diffs:
+
+- The current `operator-version-lock.md` table.
+- The committed `ImageSetConfiguration` versions.
+- The live `oc get subscription -A -o ...` for each cluster.
+- The live `oc get csv -A -o ...` for each cluster.
+
+Any disagreement is drift. The expected output is **identical** values across all four for every operator. The script that produces this report lives under `codex-opp-agent/scripts/` (internal; not in this public site).
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| Subscription `UpgradePending` immediately after creation | `startingCSV` not present in catalog | confirm `oc mirror` actually mirrored that version; re-run if needed |
+| Two CSVs in same namespace (`Succeeded` + `Replacing`) | someone changed `installPlanApproval` to `Automatic` | revert to `Manual`; delete the unwanted CSV; re-resolve |
+| `operator-version-lock.md` says X.Y.Z but cluster runs X.Y.W | manual `oc patch` on the Subscription, or stale ImageSet | revert subscription via GitOps; re-mirror against the correct ImageSet |
+| New operator install never starts | Subscription was committed but `startingCSV` typo means OLM can't find the CSV | inspect Subscription status; fix the CSV name and re-MR |
+| Cluster shows two Subscriptions for the same package | accidental duplicate created in a different namespace | remove the duplicate via GitOps; OperatorHub allows at most one Subscription per operator per OperatorGroup scope |
+
+## References
+
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — canonical table.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml` — pinned input.
+- ADR 0019 — Nexus-only image supply chain (operator pinning context).
+- ADR 0025 — GitOps-only operations (approval-as-record).
+- ADR 0016 — Workspace execution governance (issue + ADR before implementation).
+- [01-olm-overview](/docs/openshift-platform/operator-lifecycle/olm-overview) — the CR model behind this page.
+- [05-upgrade-and-channel-management](/docs/openshift-platform/operator-lifecycle/upgrade-and-channel-management) — what to do at upgrade time.

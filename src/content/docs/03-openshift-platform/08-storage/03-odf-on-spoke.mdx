@@ -1,8 +1,232 @@
 ---
-title: "ODF on Spoke"
-description: "Section 03-openshift-platform/08-storage: ODF on Spoke (placeholder)."
-sidebar_label: "ODF on Spoke"
+title: "ODF on spoke-dc-v6"
+description: "OpenShift Data Foundation on the workload cluster: StorageCluster topology, Ceph backend, NooBaa MCG, encryption baseline, and the operand dependency graph."
+sidebar_label: "ODF on spoke"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+OpenShift Data Foundation (ODF) is the storage platform on `spoke-dc-v6`. It packages the Rook Ceph operator (RBD + CephFS) and the NooBaa Multi-Cloud Gateway (S3) under a single OLM operator with a single user-visible CR — `StorageCluster`.
+
+This page covers the dc-lab ODF setup specifically: version lock, the dependency operator subgraph, the StorageCluster shape, encryption baseline, the three storage classes it produces, and lessons from the 2026-05-10 ODF rollout.
+
+## Versions
+
+| Package | Channel | Version | Source |
+| --- | --- | --- | --- |
+| `odf-operator` | `stable-4.20` | `4.20.10-rhodf` | `cs-redhat-operator-index-v4-20` |
+
+`odf-operator` is the user-visible package. Its CSV declares dependencies on a long subgraph of operands, each of which must be mirrored, pinned, and installed separately. ADR 0019 §Consequences notes this explicitly: oc-mirror v2 does **not** auto-expand bundle dependencies.
+
+The full pinned ODF dependency set (all at `4.20.10-rhodf`):
+
+- `cephcsi-operator` — Ceph CSI driver
+- `mcg-operator` — NooBaa Multi-Cloud Gateway
+- `ocs-client-operator` — ODF client (external-cluster client mode)
+- `ocs-operator` — the orchestrator
+- `odf-csi-addons-operator` — CSI add-ons (volume snapshots, network fence)
+- `odf-dependencies` — bundle of shared deps
+- `odf-external-snapshotter-operator` — external snapshotter
+- `odf-prometheus-operator` — Prometheus for ODF metrics
+- `recipe` — backup/restore recipes
+- `rook-ceph-operator` — Ceph orchestrator
+
+All ten are listed in `imageset-config.yaml`. The 2026-05-10 ODF dependency refresh moved this set from 4.20.9-rhodf to 4.20.10-rhodf and recorded the result in `mirror-manifest.md`: **193 release images + 425 operator images + 4 additional images mirrored successfully.**
+
+## Why all dependencies must be in the mirror
+
+The original ODF rollout on `spoke-dc-v6` taught the lesson recorded in ADR 0019 §Context:
+
+> "ODF CSI operands attempted direct `registry.redhat.io` pulls because the release image mirror existed but the operator and operand mirror configuration was incomplete. The missing exact digests had to be copied into Nexus before CSI could settle."
+
+Translation: mirroring `odf-operator` alone is not enough. The CSV references operand images (Ceph CSI driver, Rook, NooBaa core) by digest. Those digests must be in the mirror **and** must be covered by the cluster's IDMS. If either fails, the CSI driver pods land in `ImagePullBackOff`, and the failure mode propagates: no CSI driver means no PVC binding means no operand reconciliation means the OLM CSV reports `InstallSucceeded` but the data plane is down.
+
+The fix is the explicit pin-every-operand approach we now use. The prevention is the image-supply check (`scripts/openshift-image-supply-check.sh`) which catches missing IDMS coverage before workloads notice.
+
+## StorageCluster — the single user-visible CR
+
+ODF's main CR is `StorageCluster`. The dc-lab shape:
+
+```yaml
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  encryption:
+    clusterWide: true                     # ADR 0020 mandate; at-cluster-init only
+    storageClass: false                   # per-PVC encryption (separate from cluster-wide)
+    kms: {}                               # no external KMS in dc-lab; uses ODF-managed keys
+  monPVCTemplate:
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 50Gi
+      storageClassName: localblock
+      volumeMode: Filesystem
+  storageDeviceSets:
+    - count: 1                            # devices per replica
+      dataPVCTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 1
+          storageClassName: localblock
+          volumeMode: Block
+      name: ocs-deviceset-localblock
+      portable: false                     # OSD pinned to its PV's node
+      replica: 3                          # 3 OSDs total, one per labelled node
+      resources:
+        limits:
+          cpu: 2
+          memory: 5Gi
+  multiCloudGateway:
+    reconcileStrategy: standalone         # NooBaa runs as its own component
+  managedResources:
+    cephConfig:
+      reconcileStrategy: manage
+    cephFilesystems:
+      reconcileStrategy: manage           # creates ocs-storagecluster-cephfs SC
+    cephObjectStores:
+      reconcileStrategy: manage
+    cephBlockPools:
+      reconcileStrategy: manage           # creates ocs-storagecluster-ceph-rbd SC
+```
+
+### Why `encryption.clusterWide: true` cannot be added later
+
+ODF cluster-wide encryption is set at `StorageCluster` creation. Adding it after the cluster is operational would require re-encrypting every OSD's data, which ODF does not support live. The procedure to "turn it on later" is: drain, destroy, recreate the cluster with encryption from initialization.
+
+This is why ADR 0020 §Decision 8 lists it as a **day-zero prerequisite** — non-negotiable, set at install, never retrofitted.
+
+## The three operand storage classes
+
+After `StorageCluster` reconciles, three `StorageClass` objects appear:
+
+| Name | Provisioner | Backend | Access modes |
+| --- | --- | --- | --- |
+| `ocs-storagecluster-ceph-rbd` | `openshift-storage.rbd.csi.ceph.com` | Ceph RBD block pool | `ReadWriteOnce`, `ReadWriteOncePod` |
+| `ocs-storagecluster-cephfs` | `openshift-storage.cephfs.csi.ceph.com` | CephFS filesystem | `ReadWriteMany`, `ReadWriteOnce` |
+| `openshift-storage.noobaa.io` | `openshift-storage.noobaa.io/obc` | NooBaa MCG (S3) | n/a — used via OBC |
+
+The first is the default. See [06-storage-class-defaults](/docs/openshift-platform/storage/storage-class-defaults).
+
+## Component layout
+
+A healthy ODF deployment on `spoke-dc-v6` runs these pod sets in `openshift-storage`:
+
+| Component | Replicas | Where | Notes |
+| --- | --- | --- | --- |
+| `rook-ceph-operator` | 1 | one of the storage workers | the orchestrator |
+| `csi-rbdplugin-provisioner` | 2 | storage workers | external-provisioner for RBD volumes |
+| `csi-cephfsplugin-provisioner` | 2 | storage workers | external-provisioner for CephFS volumes |
+| `csi-rbdplugin` | DaemonSet (3) | every storage worker | per-node RBD mount agent |
+| `csi-cephfsplugin` | DaemonSet (3) | every storage worker | per-node CephFS mount agent |
+| `rook-ceph-mon-*` | 3 | one per storage worker | Ceph quorum |
+| `rook-ceph-mgr-*` | 1 | one of the storage workers | Ceph manager |
+| `rook-ceph-osd-*` | 3 | pinned per OSD PV | one OSD per data disk |
+| `rook-ceph-mds-*` | 2 | storage workers | CephFS metadata servers |
+| `rook-ceph-rgw-*` | 2 | storage workers | RADOS gateway (object store) |
+| `noobaa-operator` | 1 | one of the storage workers | NooBaa orchestrator |
+| `noobaa-core-0` | 1 | one storage worker | NooBaa state + MongoDB |
+| `noobaa-db-pg-0` | 1 | one storage worker | NooBaa Postgres backend |
+| `noobaa-endpoint-*` | 1+ | storage worker | S3 endpoint pods (scales with load) |
+
+## Validation after install
+
+```bash
+K=/path/to/spoke-dc-v6.kubeconfig
+
+# CSV ready
+oc --kubeconfig "$K" -n openshift-storage get csv | grep odf-operator
+# expected: odf-operator.v4.20.10-rhodf ... Succeeded
+
+# StorageCluster health
+oc --kubeconfig "$K" -n openshift-storage get storagecluster ocs-storagecluster \
+  -o jsonpath='{.status.phase}{"\n"}'
+# expected: Ready
+
+# Ceph cluster health (via the rook-ceph-tools pod if present, or the CR)
+oc --kubeconfig "$K" -n openshift-storage get cephcluster ocs-storagecluster-cephcluster \
+  -o jsonpath='{.status.ceph.health}{"\n"}'
+# expected: HEALTH_OK (sometimes HEALTH_WARN during rebuild — investigate per warning)
+
+# Storage classes exist
+oc --kubeconfig "$K" get storageclass | grep ocs-storagecluster
+
+# Test PVC binds
+cat <<EOF | oc --kubeconfig "$K" apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: odf-smoke-test
+  namespace: openshift-storage
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ocs-storagecluster-ceph-rbd
+EOF
+oc --kubeconfig "$K" -n openshift-storage get pvc odf-smoke-test
+# expected: Bound within ~10 seconds
+```
+
+## ODF routes
+
+ODF exposes an S3 endpoint via two Routes — a secure one for production traffic and (often inadvertently) an unsecured one ODF reconciles itself. ADR 0020 carried-forward lessons:
+
+> "ODF reconciles one of its object-store routes back to `Allow`, while production S3 access uses the secure route. The PCI suite must be tailored to acknowledge this reality rather than fight ODF."
+
+In practice, two Routes exist in `openshift-storage`:
+
+| Route | TLS termination | Status |
+| --- | --- | --- |
+| `s3` (the in-cluster Service `s3.openshift-storage.svc`) | n/a — Service, not Route | the in-cluster object endpoint, used by OBC bridge |
+| `s3-rgw` (Route exposed by Rook RGW) | reedge/passthrough — production path | secured |
+| `s3-public` (route auto-reconciled by ODF) | `Allow` (unencrypted) | accept-as-is per the PCI tailored profile |
+
+The route TLS rule failure on the PCI suite is closed via a TailoredProfile rule exclusion, citing ADR 0020.
+
+## Encryption operating notes
+
+| Encryption layer | Where | Notes |
+| --- | --- | --- |
+| **OSD at-rest** (cluster-wide) | every Ceph OSD | enabled at `StorageCluster` creation; uses ODF-managed encryption keys stored in cluster Secrets |
+| **PVC-level encryption** (per-volume) | optional, opt-in via StorageClass | dc-lab does not use this; `encryption.storageClass: false` |
+| **LUKS on worker root disks** | physical disk layer | independent of ODF; ADR 0020 §Decision 8 |
+| **Network in-flight** | between RBD client and OSD | TLS via cephx authentication; not separately configurable |
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| CSI driver pods `ImagePullBackOff` for `odf4/...` | mirror gap; IDMS doesn't cover the operand digest | mirror the operand explicitly via `imageset-config.yaml`; regenerate IDMS |
+| `StorageCluster` stuck `Progressing` | one or more OSD PVs not yet bound | check LSO; check labels; bump `storageDeviceSets[].count` only if device count actually changed |
+| `cephcluster` reports `HEALTH_WARN` after node reboot | OSD on rebooted node temporarily down | wait for OSD to rejoin (~minutes); persistent → investigate `oc -n openshift-storage logs rook-ceph-osd-X` |
+| PVC `Pending` with no events | wrong StorageClass requested or no default | check pvc `spec.storageClassName`; see page 06 |
+| Noobaa `endpoint` pods CrashLoopBackOff | NooBaa db Postgres unhealthy or OBC misconfiguration | check `noobaa-db-pg-0` logs; usually resolved on retry |
+| LokiStack `Warning Degraded` | OBC secret has the wrong key shape | this is the OBC bridge issue — see page 04 |
+| Cluster expands but new OSD never starts | `LocalVolumeSet` did not pick up the new disk | see page 02 — likely root-disk filter mismatch or partition table |
+| ODF route reverts to `Allow` after `oc patch` | ODF actively reconciles its own routes | accept and tailor PCI profile per ADR 0020 |
+
+## ADR 0020 specifics that touch ODF
+
+- ODF cluster-wide encryption at init: `storagecluster.spec.encryption.clusterWide: true`.
+- Workers-storage ScanSetting for Compliance Operator (default puts scan results on master nodes, which causes RBD attach failures — see ADR 0020 §Decision 4).
+- ODF route tailoring via TailoredProfile (see Route discussion above).
+- Raw PCI scan results stored on Ceph RBD; sanitized evidence exported to MinIO under a `pci-dss/` prefix.
+
+## References
+
+- ADR 0019 — Nexus-only image supply chain (dependency-mirror lesson).
+- ADR 0020 — PCI baseline (encryption, ScanSetting, route tailoring).
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` — version table.
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — 2026-05-10 dependency refresh evidence.
+- `codex-opp-agent/connection-details/openshift-spoke-dc-v6.md` — spoke topology.
+- [02-lso-and-local-volumes](/docs/openshift-platform/storage/lso-and-local-volumes) — the underlying PV layer.
+- [04-noobaa-and-object-bucket-claims](/docs/openshift-platform/storage/noobaa-and-object-bucket-claims) — the object side.
+- Memory: *project_obc_to_operand_secret_bridge.md*.

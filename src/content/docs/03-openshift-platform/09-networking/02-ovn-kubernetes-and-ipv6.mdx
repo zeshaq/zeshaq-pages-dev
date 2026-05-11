@@ -1,0 +1,201 @@
+---
+title: "OVN-Kubernetes and the IPv6 baseline"
+description: "OVN-K topology on dc-lab clusters, the four verifiable IPv6 invariants from ADR 0026, and the forbidden-actions list."
+sidebar_label: "OVN-K & IPv6"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+OVN-Kubernetes is the cluster CNI on every dc-lab v6 cluster. This page covers the topology, the pod / Service / overlay networks, and — most importantly — the **IPv6 baseline** that ADR 0026 establishes after the 2026-05-10 #135 incident. The IPv6 section is the one many fleets get wrong.
+
+## OVN-K is the only CNI on OCP 4.20+
+
+OpenShift-SDN is end-of-life as of OCP 4.15 and not supported as a default CNI on 4.20+. Every cluster in the fleet uses OVN-Kubernetes; the rules on this page assume that.
+
+## Pod, Service, and overlay networks
+
+| Network | CIDR | Where it lives |
+| --- | --- | --- |
+| `clusterNetwork` (Pod CIDR) | `10.128.0.0/14` | Pod IPs |
+| `serviceNetwork` (Service CIDR) | `172.30.0.0/16` | ClusterIPs and Endpoints |
+| Geneve overlay | host-local, IPv6 link-local `fe80::/10` on geneve interface | inter-node tunneling, **internal to OVN-K** |
+| Node addressing | lab `/16` (IPv4) | physical / VM NIC addresses |
+
+The geneve overlay uses IPv6 link-local addresses (`fe80::/10`) on its tunnel interface as a transport mechanism, even though all workload traffic on the cluster is IPv4. This is the detail that makes "disable IPv6" infeasible on OVN-K.
+
+## OVN-K components
+
+| Component | Where | Purpose |
+| --- | --- | --- |
+| `ovnkube-master` (3 replicas) | masters | the OVN northbound / southbound DB pair; election among the 3 |
+| `ovnkube-node` (DaemonSet) | every node | per-node ovn-controller + per-node iptables/conntrack |
+| `ovn-control-plane` controllers | masters | watch K8s API, translate to OVN logical flows |
+| `multus-admission-controller` | masters | admission for additional networks (Multus) |
+| `network-check-source` / `-target` | scattered | cluster network self-tests |
+
+A healthy spoke-dc-v6 reports:
+
+```
+ovnkube-master-*       3/3 Running
+ovnkube-node-*         8/8 Running (DaemonSet, one per node, multiple containers)
+```
+
+If `ovnkube-node` is not at 8/8 ready, *something is wrong with networking on that node*. The most common cause in the dc-lab is the IPv6 mistake described below.
+
+## Why "just disable IPv6" doesn't work
+
+ADR 0026 was written after two attempts to apply ADR 0005's IPv6 disable rule on OVN-K clusters. Both broke the cluster.
+
+### Attempt 1: `ipv6.disable=1` kernel argument (MR `!2`)
+
+A MachineConfig added `ipv6.disable=1` to the kernel command line. The IPv6 kernel module was unloaded. The geneve interface could not bring up its `fe80::/10` link-local — which OVN-K uses for inter-node tunneling even on IPv4-only `clusterNetwork`. Affected nodes reported `Ready=False` indefinitely. Reverted via MR `!3`.
+
+### Attempt 2: `disable_ipv6` sysctl drop-in (MR `!4`)
+
+A MachineConfig dropped a `/etc/sysctl.d/*.conf` setting `net.ipv6.conf.all.disable_ipv6 = 1`. The IPv6 module remained loaded, but `/proc/sys/net/ipv6/conf/all/forwarding` became unwritable. The `ovnkube-controller` container's startup script unconditionally runs `sysctl -w net.ipv6.conf.all.forwarding=0` and exits 1 on failure. The kubelet restarted the container; the node entered `CrashLoopBackOff` on the `ovnkube-node` DaemonSet. Workloads on the affected nodes lost reachability to the kube-apiserver service IP. Reverted via MR `!7`.
+
+The OVN-K startup behaviour is built into the Red Hat OpenShift release image and is not configurable. **No third mechanism can satisfy the literal text of ADR 0005 on an OVN-K cluster.**
+
+## The amended operative requirement
+
+ADR 0026 supersedes the host-kernel-disable language of ADR 0005 §IPv6 for OVN-K clusters. The new operative requirement is **"IPv6 is not used for cluster traffic,"** defined by **four verifiable invariants**.
+
+### Invariant 1 — `clusterNetwork` and `serviceNetwork` are IPv4-only
+
+```bash
+K=/path/to/cluster.kubeconfig
+oc --kubeconfig "$K" get networks.config.openshift.io cluster \
+  -o jsonpath='{.spec.clusterNetwork[*].cidr}{"\n"}{.spec.serviceNetwork[*]}{"\n"}'
+```
+
+Expected output:
+
+```
+10.128.0.0/14
+172.30.0.0/16
+```
+
+No IPv6 CIDR anywhere in `networks.config.openshift.io/cluster`.
+
+### Invariant 2 — no admin-managed IPv6 addresses or routes on physical interfaces
+
+Geneve-internal `fe80::/10` link-local is permitted (it's the CNI's tunnel transport). Loopback `::1/128 scope host` on `lo` is permitted and required for the kernel IPv6 stack to function.
+
+Per-node verification:
+
+```bash
+oc --kubeconfig "$K" debug node/<node> -- chroot /host bash -c '
+  ip -6 addr show \
+    | awk "/inet6/ && \$2 !~ /^fe80::/ && \$2 != \"::1/128\" {print FILENAME, \$0}"
+  ip -6 route show \
+    | grep -v "^fe80::/64 dev " \
+    | grep -v "^::1 dev lo proto kernel"
+'
+```
+
+Expected: no output (the loopback carve-out from ADR 0026 §Decision 4 is embedded in the awk filter).
+
+### Invariant 3 — no upstream DHCPv6 / Router-Advertisement listeners
+
+This is an **infrastructure-side check** on the upstream switching fabric, not a node-side check. The network team confirms no DHCPv6 server and no Router-Advertisement source reachable from the OpenShift node interfaces.
+
+As of 2026-05-11 this is recorded as `PENDING-INFRA-V3` for spoke-dc-v6 — does not block ADR acceptance but is tracked as a residual evidence item.
+
+### Invariant 4 — no application workload binds to an IPv6 podIP
+
+```bash
+oc --kubeconfig "$K" get pods -A -o wide \
+  | awk 'NR>1 && $7 ~ /:/ {print}'
+```
+
+Expected: no output (no `podIP` containing an IPv6 colon-separated address).
+
+## The forbidden-actions list (ADR 0026 §5)
+
+The following are **forbidden** on any OVN-K cluster in the fleet:
+
+1. Adding `ipv6.disable=1` (or any synonym) to `kernelArguments` in any `MachineConfig`.
+2. Writing `net.ipv6.conf.all.disable_ipv6 = 1`, `net.ipv6.conf.default.disable_ipv6 = 1`, `net.ipv6.conf.lo.disable_ipv6 = 1`, or any sysctl that makes `/proc/sys/net/ipv6/conf/all/forwarding` unwritable, into a `MachineConfig` file.
+3. Proposing the disablement of the OVN-K geneve tunnel as a workaround.
+4. Shipping a third `MachineConfig` variant of "disable IPv6" in any form.
+
+A future violation of this list is a break-glass-class incident and triggers ADR 0025 §3 controls.
+
+## Verification evidence (2026-05-11 spoke-dc-v6)
+
+Captured live against `spoke-dc-v6` and recorded in ADR 0026:
+
+- **OCP version:** 4.20.18.
+- **Default network:** `OVNKubernetes`.
+- **`ovnkube-node` pods:** 6/6 in `Running` state with 8/8 containers ready; uptime 8h-33h; no crashloops.
+
+**Invariant 1:** PASS — `clusterNetwork = 10.128.0.0/14`, `serviceNetwork = 172.30.0.0/16`, no IPv6 CIDR anywhere.
+
+**Invariant 2:** PASS — per-node `ip -6 addr` shows only `::1/128 scope host` on `lo`; per-node `ip -6 route` shows only `::1 dev lo proto kernel`. All 6 nodes identical.
+
+**Invariant 3:** PENDING-INFRA-V3.
+
+**Invariant 4:** PASS — 446 pods across all namespaces; every `podIP` is IPv4.
+
+## How the PCI-DSS profile interacts with this
+
+The PCI-DSS Compliance Operator profile checks `net.ipv6.conf.all.disable_ipv6 = 1` as a node-level rule. By construction, that rule **fails** on any functioning OVN-K cluster. ADR 0026 closes the gap via a **TailoredProfile rule exclusion** in PCI-3 (#111), citing ADR 0026 in the exclusion `description`.
+
+This is intentional auditor-visible:
+
+| Approach | Visibility | Acceptable? |
+| --- | --- | --- |
+| Operator-level rule suppression | opaque to evidence review | no |
+| TailoredProfile rule exclusion citing ADR | auditor sees the rule, the exclusion, and the ADR | yes |
+| Live cluster failing the rule | failure-mode audit finding | no |
+
+## Inspecting OVN-K live
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+# Components healthy
+oc --kubeconfig "$K" -n openshift-ovn-kubernetes get pod
+# expected: ovnkube-master * 3, ovnkube-node DaemonSet 1/node (8/8 ready)
+
+# Default network type
+oc --kubeconfig "$K" get network.config cluster -o jsonpath='{.spec.networkType}{"\n"}'
+# expected: OVNKubernetes
+
+# Cluster network CIDRs
+oc --kubeconfig "$K" get network.config cluster -o jsonpath='{.spec.clusterNetwork[*]}{"\n"}{.spec.serviceNetwork[*]}{"\n"}'
+
+# Geneve interface on a node (debug pod)
+oc --kubeconfig "$K" debug node/<node> -- chroot /host bash -c 'ip link show genev_sys_6081'
+# expected: link exists, state UP
+```
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Node `Ready=False` after MachineConfig change | likely an IPv6-disable attempt | revert the MachineConfig via `mco-stuck-node-recovery.md`; do not retry |
+| `ovnkube-node` pod CrashLoopBackOff | sysctl `disable_ipv6` interfering with forwarding write | revert; see ADR 0026 forbidden actions |
+| Pods can't talk cross-node | geneve tunnel down; check `genev_sys_6081` | restart `ovnkube-node` daemon; investigate IPv6 link-local on geneve |
+| Service IPs unreachable | `kube-proxy` (now part of OVN-K) misconfigured | very rare on OCP 4.20; check OVN northbound DB consistency |
+| Cluster boots a 7th node and OVN doesn't notice | rare race; restart ovnkube-master leader | escalate; this should not happen |
+| Compliance scan reports IPv6 rule FAIL | expected; ADR 0026 + PCI-3 TailoredProfile exclusion is the documented response | confirm exclusion is in place |
+| MachineConfig with `ipv6.disable=1` reaches main | reviewer let it through | revert; this is a break-glass incident under ADR 0025 |
+
+## What this page does not cover
+
+- Multus secondary networks (not in scope for v6 fleet).
+- Egress IP (not used; pods egress via node SNAT).
+- Network observability operator (separate page in this section's TOC plan).
+
+## References
+
+- ADR 0026 — IPv6 baseline for OVN-Kubernetes (the controlling decision).
+- ADR 0005 — OpenShift rebuild network (amended by 0026).
+- ADR 0020 — PCI baseline (rule exclusion citation).
+- ADR 0025 — GitOps-only operations (forbidden-action enforcement boundary).
+- `codex-opp-agent/runbooks/openshift-ipv6-disable-correct-approach.md` — controlling architectural-lesson reference.
+- `codex-opp-agent/runbooks/mco-stuck-node-recovery.md` — recovery procedure used twice during the #135 incident.
+- GitHub issue #135 (PCI-1.13) — the failure-mode incident record.
+- GitHub issue #245 — ADR 0026 review issue.
+- GitHub issue #111 (PCI-3) — owns the TailoredProfile rule exclusion.

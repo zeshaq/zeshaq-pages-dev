@@ -1,0 +1,307 @@
+---
+title: "NetworkPolicy baseline"
+description: "The default-deny + explicit-allow east-west networking model on dc-lab clusters: per-namespace baselines, common allow patterns, and operator-namespace exceptions."
+sidebar_label: "NetworkPolicy baseline"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+`NetworkPolicy` is the Kubernetes-native primitive for filtering east-west traffic between pods. The dc-lab v6 fleet's posture is **default-deny per namespace** with explicit allow rules for the specific traffic each workload needs. This page covers the baseline, the common patterns, and the exception classes that need separate handling.
+
+## The baseline rule
+
+Every workload namespace in the fleet has a default-deny NetworkPolicy applied first, before any allow rules:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: tenant-platform-app-prod
+spec:
+  podSelector: {}                       # all pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+Empty `podSelector` matches every pod; the absence of `ingress:` / `egress:` rules means no traffic is allowed. NetworkPolicy semantics are **additive** — adding allow rules opens specific paths but the default-deny remains in force for anything not explicitly allowed.
+
+## Why default-deny
+
+Two reasons:
+
+1. **Failure of imagination is fail-open.** Without default-deny, a pod can reach any other pod by default; if you forgot to write a policy excluding malicious traffic, the malicious traffic flows. With default-deny, forgetting an allow rule fails-closed: the legitimate traffic breaks, you notice, you fix.
+2. **Audit story.** Default-deny + explicit allow is what PCI-DSS / NIST / FedRAMP audits expect. Reviewing the namespace's NetworkPolicy set tells you exactly who can talk to what.
+
+The trade-off is that every workload now has to **declare its peers**. For most app teams that's actually a useful design discipline; for operator namespaces it's a one-time setup cost.
+
+## Common allow patterns
+
+### Allow Pod A → Pod B in same namespace
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-postgres
+  namespace: tenant-platform-app-prod
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: app-postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: app-frontend
+      ports:
+        - port: 5432
+          protocol: TCP
+```
+
+This allows pods labelled `app: app-frontend` to reach the CNPG primary on port 5432. Nothing else can reach Postgres.
+
+### Allow IngressController → backend pods
+
+The OpenShift router lives in `openshift-ingress`. Routes work, but pods often can't actually receive traffic from the router until you allow it:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-router
+  namespace: tenant-platform-app-prod
+spec:
+  podSelector:
+    matchLabels:
+      app: app-frontend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+      ports:
+        - port: 8080
+          protocol: TCP
+```
+
+`network.openshift.io/policy-group: ingress` is the well-known label OpenShift puts on `openshift-ingress`. Match against it rather than hard-coding namespace names.
+
+### Allow monitoring scrape
+
+The cluster Prometheus scrapes metrics from `openshift-monitoring`. To let it reach a tenant pod:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: tenant-platform-app-prod
+spec:
+  podSelector:
+    matchLabels:
+      app: app-frontend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: monitoring
+      ports:
+        - port: 9090                    # metrics endpoint
+          protocol: TCP
+```
+
+`network.openshift.io/policy-group: monitoring` is the OpenShift-applied label for the monitoring stack.
+
+### Allow DNS from any pod in the namespace
+
+DNS is the most common allow rule everyone forgets:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: tenant-platform-app-prod
+spec:
+  podSelector: {}                       # every pod
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - port: 5353
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+        - port: 53
+          protocol: UDP
+```
+
+`openshift-dns` runs the cluster DNS service. Without this rule, pods can't resolve any name — including their own ClusterIP Services, which fail open in some clients and closed in others.
+
+### Allow kube-apiserver
+
+Services that talk to the kube-apiserver (e.g. controllers, operators) need:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kube-apiserver
+  namespace: external-secrets
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 172.30.0.0/16          # serviceNetwork — covers kubernetes.default.svc
+      ports:
+        - port: 443
+          protocol: TCP
+```
+
+The kube-apiserver Service IP is in `serviceNetwork`; the `ipBlock` rule covers it.
+
+## A complete tenant baseline (composed)
+
+A new tenant namespace gets this set of policies on day one:
+
+1. `default-deny-all` (the baseline).
+2. `allow-dns` (egress to openshift-dns).
+3. `allow-kube-apiserver` (egress to kube-apiserver service IP).
+4. `allow-from-router` (ingress from `openshift-ingress`, on the application's port).
+5. `allow-prometheus-scrape` (ingress from monitoring, on the metrics port).
+6. App-specific allow rules (frontend → backend → Postgres, etc.).
+
+These six (plus per-pair allow rules) is the entire NetworkPolicy footprint for most tenant namespaces.
+
+## Operator namespace exceptions
+
+Operator namespaces (`openshift-*`, `open-cluster-management-*`) generally come with OpenShift-managed NetworkPolicies. The dc-lab v6 baseline doesn't override these; it relies on OpenShift's posture.
+
+Two operator namespaces in the lab need additional rules:
+
+### `external-secrets`
+
+The Red Hat ESO 1.1.0 default-deny in `external-secrets` ns must be relaxed enough that the reconciler can reach the Vault VM. This is the *project_eso_egress_to_vault.md* fix:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-vault
+  namespace: external-secrets
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: external-secrets
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: <vault-vm>/32         # internal-only; kept in connection-details/
+      ports:
+        - port: 8200
+          protocol: TCP
+```
+
+### `openshift-marketplace`
+
+CatalogSource pods need to reach the Nexus mirror-registry to pull the gRPC index image. The default-deny means we explicitly allow:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-nexus
+  namespace: openshift-marketplace
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: <nexus-vm>/32          # internal-only
+      ports:
+        - port: 443
+          protocol: TCP
+```
+
+## NetworkPolicy + EgressFirewall together
+
+NetworkPolicy egress and EgressFirewall **intersect**, not union. A packet must be allowed by both to pass.
+
+| Rule | Where | Granularity |
+| --- | --- | --- |
+| EgressFirewall | namespace-level, OpenShift-specific | per-CIDR / per-DNS-name |
+| NetworkPolicy egress | pod-selector level, Kubernetes-standard | per-pod-selector / per-namespace-selector / per-CIDR |
+
+For a pod to reach Vault, *both* must allow:
+
+- EgressFirewall in the namespace must have an `Allow` rule for Vault.
+- NetworkPolicy on the pod (or namespace's default-deny + allow) must allow egress to Vault.
+
+If one denies, the packet drops. This is the dc-lab convention; some clusters disable one or the other for simplicity. We keep both because they catch different mistakes (namespace-level oversight vs pod-level oversight).
+
+## Validation
+
+```bash
+K=/path/to/cluster.kubeconfig
+
+# Default-deny present
+oc --kubeconfig "$K" -n <ns> get networkpolicy default-deny-all
+
+# Live test from a pod
+oc --kubeconfig "$K" -n <ns> run nptest --image=registry.redhat.io/ubi9/ubi:latest \
+  --rm -it -- bash -c '
+  curl -m 5 -sSI http://app-frontend:8080/
+  echo "exit: $?"
+'
+# expected: 200 if the calling pod has the right label; timeout if not
+```
+
+A common pattern is to keep a "policy-tester" pod in a dedicated namespace and run smoke checks after policy changes.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Pod can't resolve any DNS | `allow-dns` missing | add the openshift-dns egress rule |
+| Pod can't reach in-cluster Service | NetworkPolicy on target pod doesn't allow source label | add allow ingress rule |
+| Backend gets traffic from outside but not from frontend | only one of frontend or backend is labelled correctly | check label match between `podSelector` and `from.podSelector` |
+| Route returns 503 | router (openshift-ingress) blocked by backend's NetworkPolicy | add `allow-from-router` (namespaceSelector match on `network.openshift.io/policy-group: ingress`) |
+| Operator pod can't reach kube-apiserver | egress to `serviceNetwork` denied | add `allow-kube-apiserver` |
+| Prometheus metrics scraping fails | monitoring not allowed to scrape | add `allow-prometheus-scrape` |
+| New pod inherits old NetworkPolicy unexpectedly | wrong namespace, or policy applies to all pods (empty `podSelector`) | inspect `podSelector` carefully |
+| Tenant gets full internet access despite EgressFirewall | NetworkPolicy egress permits 0.0.0.0/0 | tighten NetworkPolicy egress to in-cluster only |
+
+## Anti-patterns
+
+| Anti-pattern | Why it's bad |
+| --- | --- |
+| `podSelector: {}` + `from: [{}]` allow-all | nullifies the default-deny; equivalent to no NetworkPolicy |
+| Allowing entire `kubernetes.io/metadata.name: openshift-*` to ingress to tenant pods | grants too much; operator namespaces shouldn't have ad-hoc tenant access |
+| Hard-coding pod IPs in `ipBlock` rules | pod IPs change; use pod-selector / namespace-selector / Service CIDR |
+| One giant policy with 50 ingress rules | impossible to review; split per-pair |
+| NetworkPolicy without monitoring | you can't tell what's getting denied without OVN-K logs or trace |
+
+## What this page does not cover
+
+- The mTLS / service-mesh story (Service Mesh 3 / OSSM) — separate operand layer; complements NetworkPolicy but doesn't replace it.
+- Cilium / Calico-specific policy CRDs — OVN-K is the only CNI; we use stock NetworkPolicy.
+
+## References
+
+- Kubernetes docs: *NetworkPolicy*.
+- OpenShift docs (Red Hat): *About network policy* + *Default network policies*.
+- Memory: *project_eso_egress_to_vault.md* — the canonical example.
+- [04-egress-firewall-and-allowlist](/docs/openshift-platform/networking/egress-firewall-and-allowlist) — the OVN-K-specific outbound layer.
+- ADR 0020 — PCI baseline (NetworkPolicy posture is one of the day-zero prerequisites).
