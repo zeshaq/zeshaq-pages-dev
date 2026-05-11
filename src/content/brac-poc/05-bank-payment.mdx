@@ -1,37 +1,64 @@
 ---
 title: "Brac POC — bank-payment Open Liberty app"
 sidebar_label: "Bank Payment app"
-description: "Open Liberty payment app for the Payment division — two backend microservices (client + approver), two React SPAs (customer + admin), WSO2 IS for OIDC. Deployed via GitOps onto spoke-dc-v6 with a Let's Encrypt wildcard cert."
+description: "Executive overview: a two-microservice payment app with two React SPAs, gated by WSO2 IS, delivered onto OpenShift via GitOps in a single afternoon."
 last_reviewed: 2026-05-11
 draft: false
 ---
 
 import Whiteboard from "../../components/Whiteboard.tsx";
 
-> Built 2026-05-11 as part of the BRAC engagement scope-narrowing
-> exercise. The [demo scope email](/brac-poc/demo-scope-email) asked
-> for an end-to-end story across API exposure, IAM, mTLS, and a
-> service-mesh-style canary. This app stands up the IAM leg with two
-> domain microservices and two SPAs behind WSO2 IS — the API gateway
-> and mesh-mode mTLS are the next sprint.
+> Built 2026-05-11 for the BRAC engagement. The [scope email](/brac-poc/demo-scope-email)
+> asks for an end-to-end story across IAM, API exposure, mTLS and
+> canary. This app delivers the IAM leg with two domain services,
+> two SPAs, and a Let's Encrypt cert — all the runtime config flows
+> through GitOps.
 
-## What it is
+## What got built
 
-Four apps in one tenant namespace (`bank-payment`) on **spoke-dc-v6**:
+A payment workflow with split duty between **customers** (initiate
+transfers) and an **approver** (settles them):
 
-| App | Tech | Purpose | Users |
-| --- | --- | --- | --- |
-| `payment-client-svc` | Open Liberty 26 / JAX-RS / MP-JWT 2.1 | Customer-facing payment API. System of record for accounts + transfers. | `zahid`, `shaikat` |
-| `payment-approver-svc` | Open Liberty 26 / MP REST Client | Admin-only API. Pending queue, approve / decline, audit. Calls the client svc's internal endpoints with the admin's own token forwarded. | `admin` |
-| `client-frontend` | React 18 + Vite + Tailwind + `react-oidc-context` | Customer SPA. Balance, send-payment form, transfer history. | `zahid`, `shaikat` |
-| `approver-frontend` | React 18 SPA | Admin SPA. Pending queue with inline Approve / Decline; audit log. | `admin` |
+| App | Role |
+| --- | --- |
+| `payment-client-svc` | Customer API + system of record for accounts and transfers (Open Liberty 26, MP-JWT 2.1). |
+| `payment-approver-svc` | Admin-only API. Forwards the admin's bearer down to client-svc, so the audit trail captures the actual deciding human. |
+| `client-frontend` | React SPA for `zahid` / `shaikat` — balance, send-payment, history. |
+| `approver-frontend` | React SPA for `admin` — pending queue, approve / decline, audit. |
 
-Tenant: `bank-payment` on `is.apps.sub.comptech-lab.com`. Three users
-(`zahid` / `shaikat` / `admin`) with one shared password
-(`Hkj38djf&&&`) — `zahid` and `shaikat` carry an `accountNumber` plus
-a seed balance; `admin` doesn't own an account, only the approver
-role (which the backends derive from `username == "admin"` when the
-JWT has no `groups` claim).
+Identity is one WSO2 IS tenant (`bank-payment`) with three users
+sharing one password. The two SPAs are separate OIDC service
+providers; tokens are issued via authorization-code + PKCE and
+consumed by the backends as id_tokens.
+
+## How it was built
+
+Top-to-bottom on **spoke-dc-v6** in one afternoon, in this order:
+
+1. **Tenant scaffolded via platform-gitops** — Namespace, RBAC,
+   LimitRange, ResourceQuota, default-deny NetworkPolicy, Argo
+   `Application` pointed at the new app repo's `manifests/base/`.
+2. **WSO2 IS tenant bootstrapped by REST API** — `bank-payment`
+   tenant, three users, two OIDC SPs with redirect-URI regex for
+   prod and localhost, all from JSON specs checked into the repo.
+3. **Two Liberty services + two SPAs** — JAX-RS resources, the
+   `<mpJwt>` block tuned to WSO2's claim shape, CORS configured per
+   SPA origin, role derivation that grants `admin` to the username
+   `admin` since WSO2's tokens carry no `groups` claim by default.
+4. **GitOps reconciles** — every commit lands on the cluster
+   through Argo with `selfHeal=true`. No `oc apply` against the
+   cluster during the build; even the wildcard cert flows through
+   cert-manager + the platform-gitops repo.
+5. **Browser-trusted TLS** — cert-manager issues a Let's Encrypt
+   wildcard for `*.apps.spoke-dc-v6.sub.comptech-lab.com` via DNS-01
+   over RFC2136 against the lab PowerDNS. The spoke
+   IngressController's `defaultCertificate` consumes the Secret,
+   so every Route is trusted in browsers automatically.
+
+The image supply chain is the only out-of-GitOps step: `buildah`
+builds four images locally and pushes to Nexus
+(`app-registry.apps.sub.comptech-lab.com/bank-payment/<name>:latest`);
+Argo's reconcile loop then rolls out the workloads.
 
 ## Request flow
 
@@ -72,157 +99,32 @@ export const flowEdges = [
   { id: "admin-aspa", source: "admin", target: "aspa", style: { stroke: "#1f2937" } },
   { id: "cspa-wso2",  source: "cspa",  target: "wso2is", label: "OIDC code+PKCE", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
   { id: "aspa-wso2",  source: "aspa",  target: "wso2is", label: "OIDC code+PKCE", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "cspa-csvc",  source: "cspa",  target: "csvc",   label: "fetch /v1/*\nBearer id_token", style: { stroke: "#1f2937" } },
-  { id: "aspa-asvc",  source: "aspa",  target: "asvc",   label: "fetch /v1/*\nBearer id_token", style: { stroke: "#1f2937" } },
-  { id: "asvc-csvc",  source: "asvc",  target: "csvc",   label: "internal\n/v1/internal/transfers/*\n(admin's token forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
+  { id: "cspa-csvc",  source: "cspa",  target: "csvc",   label: "Bearer id_token", style: { stroke: "#1f2937" } },
+  { id: "aspa-asvc",  source: "aspa",  target: "asvc",   label: "Bearer id_token", style: { stroke: "#1f2937" } },
+  { id: "asvc-csvc",  source: "asvc",  target: "csvc",   label: "internal\n(admin token forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
   { id: "csvc-ledger", source: "csvc", target: "ledger", style: { stroke: "#1f2937" } },
 ];
 
 <Whiteboard nodes={flowNodes} edges={flowEdges} height={620} client:only="react" />
 
-**Reading the diagram:**
+## Status
 
-- **WSO2 IS** issues a JWT to either SPA via OIDC authorization-code +
-  PKCE (dashed grey). The two SPAs are registered as separate service
-  providers — `bank-payment-client-spa` and `bank-payment-approver-spa`
-  — so a customer token's audience doesn't match a call to the admin
-  API by accident. (Liberty trusts either audience because the
-  approver service forwards admin tokens down to client-svc.)
-- **No API Gateway in front of the backends in this build.** Each SPA
-  calls its matching Liberty service directly over CORS; the
-  `<cors>` block in `server.xml` lets the SPA origin call `/v1/*` with
-  `Authorization: Bearer <id_token>`. WSO2 IS issues opaque access
-  tokens for public clients, so the JWT-validating backends consume
-  the **id_token** as the bearer.
-- **The approver service does not own a ledger.** It calls
-  `payment-client-svc`'s `/v1/internal/transfers/*` endpoints with the
-  admin's own `Authorization` header forwarded (dashed green), so the
-  audit record on the client side captures the actual deciding human,
-  not a service account.
-- **In-memory ledger** for the demo: `zahid` 5005-0001-23 (50,000 BDT)
-  and `shaikat` 5005-0004-56 (75,000 BDT). Reserve-on-create +
-  complete-on-approve semantics so the visible balance never shows
-  "spent twice" during pending review.
-
-## How a payment moves
-
-1. `zahid` opens `payments.apps.spoke-dc-v6.sub.comptech-lab.com`,
-   gets bounced to WSO2 IS, logs in, lands back on the SPA with an
-   id_token + refresh_token persisted in `localStorage`.
-2. He picks `shaikat` from the recipient dropdown (the SPA fetches
-   the account directory from `/v1/accounts` with balances redacted
-   for non-admins), enters an amount, hits **Send**.
-3. SPA `POST /v1/transfers` to `client-api.*` with the Bearer.
-   Liberty's mpJwt validates the JWT against the WSO2 JWKS, calls
-   `Ledger.createTransfer` — funds are reserved out of `zahid`'s
-   visible balance, transfer goes to `PENDING`.
-4. `admin` opens `approver.apps.spoke-dc-v6.sub.comptech-lab.com`,
-   does the same OIDC dance against the approver SPA. The dashboard
-   polls `approver-api.*/v1/pending` every 5 seconds; approver-svc
-   forwards the admin's Bearer to `client-api.*/v1/internal/transfers/pending`
-   and shows the queue.
-5. Admin clicks **Approve**. Approver-svc forwards to
-   `client-svc /v1/internal/transfers/{id}/approve`, which moves the
-   reserved funds into `shaikat`'s balance and marks the transfer
-   `APPROVED` with the admin's username + timestamp on the audit
-   trail.
-
-`Decline` is the same path but refunds the reserved amount to the
-sender. Either decision is one-shot — the API rejects with `409` if
-the transfer is already settled.
-
-## JWT plumbing
-
-A few non-obvious things in the Liberty config worth flagging:
-
-- **Audiences** must be hardcoded in `server.xml` as
-  `audiences="bank-payment-client-spa,bank-payment-approver-spa"`. Using
-  `${WSO2_JWT_AUDIENCE}` with a comma-separated env value gets parsed
-  as a single literal string instead of two trusted audiences, and the
-  admin's token (issued for the approver SPA) gets rejected by
-  client-svc.
-- **`userNameAttribute="email"`** maps `JsonWebToken.getName()` to the
-  `email` claim. The `CurrentUser` helper then strips the `@domain`
-  part so the in-memory `Ledger` lookup by short username works
-  (`zahid@bank-payment.local` → `zahid`).
-- **`**` role binding.** `web.xml`'s `<auth-constraint><role-name>**</role-name></auth-constraint>`
-  on `/v1/*` does **not** work out of the box under Liberty
-  `appSecurity-5.0` — `**` is treated as a literal role name and no
-  JWT user is mapped to it, so every request 403s. The fix is an
-  `<application-bnd>` block in `server.xml`:
-
-  ```xml
-  <application-bnd>
-      <security-role name="**">
-          <special-subject type="ALL_AUTHENTICATED_USERS"/>
-      </security-role>
-  </application-bnd>
-  ```
-
-- **OPTIONS exemption.** The `<security-constraint>` carries
-  `<http-method-omission>OPTIONS</http-method-omission>` so CORS
-  preflight requests aren't 401'd before the `<cors>` handler can
-  respond.
-
-## TLS
-
-- **Let's Encrypt wildcard** for `*.apps.spoke-dc-v6.sub.comptech-lab.com`
-  via cert-manager + the DNS-01 (RFC2136) solver, with TSIG updates
-  against the lab's PowerDNS. The spoke IngressController's
-  `defaultCertificate` points at the issued Secret, so every Route
-  under the spoke ingress gets a browser-trusted cert with no
-  per-Route change.
-- **Lab CA** is keytool-imported into each Liberty pod's `cacerts` so
-  mpJwt's outbound JWKS fetch to `is.apps.sub.comptech-lab.com`
-  validates the chain. Liberty's `<ssl>` block points
-  `trustStoreRef` at `$JAVA_HOME/lib/security/cacerts` rather than
-  Liberty's own empty `key.p12`.
-
-## URLs
-
-| Component | URL |
+| | |
 | --- | --- |
-| Repo | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
-| Customer SPA | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com` |
-| Customer API | `https://client-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
-| Approver SPA | `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` |
-| Approver API | `https://approver-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
-| WSO2 IS console | `https://is.apps.sub.comptech-lab.com/t/bank-payment/console` |
+| **Live** | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com` (customer) · `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` (approver) |
+| **Cert** | Let's Encrypt wildcard, trusted in browsers without lab-CA install |
+| **State** | In-memory; client-svc pinned to a single replica until persistence lands |
+| **Repo** | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
 
-## Repo layout
+## What's next
 
-```
-divisions/payment/bank-payment/
-├── apps/
-│   ├── payment-client-svc/     ← Open Liberty (JAX-RS + MP 6.1 + JWT)
-│   ├── payment-approver-svc/   ← Open Liberty admin API
-│   ├── client-frontend/        ← React 18 + Vite + Tailwind
-│   └── approver-frontend/      ← React 18 SPA (admin only)
-├── docker/                     ← 4 Containerfiles
-├── manifests/base/             ← kustomize base — Deployments + Services + Routes
-└── wso2/                       ← tenant + SP bootstrap (REST API)
-```
-
-`bank-payment` is its own Argo Application on the spoke; auto-sync +
-self-heal point at `manifests/base/`. Images are pushed to
-`app-registry.apps.sub.comptech-lab.com/bank-payment/<name>:latest`
-on Nexus.
-
-## What's intentionally not built yet
-
-- **Persistence.** The ledger is in-memory. Restarts wipe history, and
-  client-svc runs at `replicas: 1` to avoid split-brain reads. JDBC +
-  PostgreSQL (or just a PVC-backed JSON snapshot) is the obvious next
-  step; the model is already split into `Account` and `Transfer` so
-  the swap is mechanical.
-- **API Gateway.** The SPAs call backends directly. Putting WSO2 APIM
-  in front is the next sprint — the OpenAPI specs in `wso2/api-definitions/`
-  already carry the `x-wso2-*` annotations APIM expects.
-- **mTLS via Service Mesh.** The [scope email](/brac-poc/demo-scope-email)
-  asks for ambient-mode mTLS and a service-mesh-driven canary. Adding
-  the namespace to the mesh + a VirtualService is mechanical — the
-  apps don't need code changes to participate.
-- **Audit pipeline.** Today the approver svc's decisions land in the
-  in-memory ledger only. Real-world: emit a Kafka event per decision
-  for downstream reconciliation. That's the `Observability + Kafka
-  — High Priority` line in the scope email.
+- **Persistence** — JDBC + PostgreSQL or a PVC-backed JSON snapshot;
+  the model is already split `Account` / `Transfer`, the swap is
+  mechanical.
+- **API Gateway** — put WSO2 APIM in front of both backends; the
+  OpenAPI specs in `wso2/api-definitions/` already carry the
+  `x-wso2-*` annotations APIM expects.
+- **Service Mesh + mTLS** — add the namespace to the mesh and a
+  VirtualService for the canary story; no app code changes.
+- **Audit pipeline** — emit a Kafka event per approver decision for
+  downstream reconciliation.
