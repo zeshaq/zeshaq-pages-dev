@@ -1,0 +1,309 @@
+---
+title: "Sample: Mesh + Tempo trace"
+description: "Two-service app (front → backend → CNPG) labelled for ambient service mesh, OTel-instrumented, with traces visible in Tempo and Kiali topology rendering the edge."
+sidebar_label: "Mesh + Tempo trace"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const tenantBox = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const ctrlBox   = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600 };
+export const dataBox   = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+
+export const reqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const spanEdge = { animated: true, style: { stroke: "#a855f7", strokeDasharray: "4,4", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#a855f7" }, labelStyle: { fill: "#7c3aed", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" } };
+
+export const meshNodes = [
+  { id: "user",    position: { x: 0,   y: 80  }, data: { label: "External client\n(curl)" }, style: dataBox },
+  { id: "route",   position: { x: 180, y: 80  }, data: { label: "OpenShift Route\nfront.apps.spoke..." }, style: dataBox },
+  { id: "front",   position: { x: 360, y: 80  }, data: { label: "front Pod\n(node + OTel SDK)" }, style: tenantBox },
+  { id: "backend", position: { x: 540, y: 80  }, data: { label: "backend Pod\n(node + OTel SDK)" }, style: tenantBox },
+  { id: "pg",      position: { x: 720, y: 80  }, data: { label: "CNPG pg-rw Service\n(Postgres 15)" }, style: dataBox },
+  { id: "otelcol", position: { x: 360, y: 240 }, data: { label: "OTel Collector\n(daemonset, ambient mesh-emitted)" }, style: ctrlBox },
+  { id: "tempo",   position: { x: 540, y: 240 }, data: { label: "TempoStack\n(NooBaa OBC-backed)" }, style: ctrlBox },
+  { id: "kiali",   position: { x: 720, y: 240 }, data: { label: "Kiali\n(topology view)" }, style: ctrlBox },
+];
+
+export const meshEdges = [
+  { id: "e1", source: "user",    target: "route",   label: "https", ...reqEdge },
+  { id: "e2", source: "route",   target: "front",   label: "edge TLS", ...reqEdge },
+  { id: "e3", source: "front",   target: "backend", label: "POST /items", ...reqEdge },
+  { id: "e4", source: "backend", target: "pg",      label: "INSERT", ...reqEdge },
+  { id: "e5", source: "front",   target: "otelcol", label: "spans", ...spanEdge },
+  { id: "e6", source: "backend", target: "otelcol", label: "spans", ...spanEdge },
+  { id: "e7", source: "otelcol", target: "tempo",   label: "OTLP", ...spanEdge },
+  { id: "e8", source: "tempo",   target: "kiali",   label: "TraceQL", ...muted },
+];
+
+## Deploy in 5 commands
+
+Prerequisites: tenant onboarding complete for `apps-platform-mesh-trace-dev`; the platform's Istio ambient mesh + the Tempo operator + Kiali are installed; the tenant namespace is labelled `istio.io/dataplane-mode=ambient` for ambient mode participation; CNPG operator is installed (the backend writes to a Postgres Cluster as in [sample 03](./03-cnpg-backed-app)).
+
+```bash
+# 1. Clone the platform app monorepo and confirm the sample is present.
+git clone http://gitlab.sub.comptech-lab.com/divisions/platform/platform-apps-monorepo.git
+ls platform-apps-monorepo/apps/team-platform/mesh-trace-sample
+
+# 2. Wait for Argo to roll out both Deployments + the CNPG Cluster (~ 3 min).
+oc -n apps-platform-mesh-trace-dev rollout status deploy/front --timeout=180s
+oc -n apps-platform-mesh-trace-dev rollout status deploy/backend --timeout=180s
+oc -n apps-platform-mesh-trace-dev wait cluster/mt-pg --for=condition=Ready --timeout=300s
+
+# 3. Generate trace traffic.
+ROUTE=$(oc -n apps-platform-mesh-trace-dev get route front -o jsonpath='{.spec.host}')
+for i in $(seq 1 20); do curl -fsS -X POST "https://${ROUTE}/items" \
+  -H 'Content-Type: application/json' -d "{\"name\":\"item-$i\"}"; done
+
+# 4. Open Kiali topology — expect an edge `front → backend → mt-pg`.
+oc -n istio-system get route kiali -o jsonpath='https://{.spec.host}/console/graph/namespaces/?namespaces=apps-platform-mesh-trace-dev&duration=300{"\n"}'
+
+# 5. Open Tempo — search by service name `front` and confirm a trace with three spans.
+oc -n openshift-tempo-operator get route tempo -o jsonpath='https://{.spec.host}/{"\n"}'
+```
+
+Expected: in Kiali, a graph showing `unknown → front → backend → mt-pg` with throughput numbers. In Tempo, a trace with three spans (`front: POST /items` → `backend: POST /items` → `backend: INSERT items`).
+
+## What this sample demonstrates
+
+The whole observability triangle — service mesh + traces + topology — in one tenant deployment.
+
+Per [issue #204 (DEV-OCP-5.5)](https://github.com/zeshaq/codex-opp-agent/issues/204).
+
+It exercises:
+
+- **Ambient mode service mesh** (Istio ambient, no sidecar injection). The namespace label `istio.io/dataplane-mode=ambient` opts in.
+- **OTel instrumentation** — the front and backend containers ship with the `@opentelemetry/sdk-node` SDK (Node) configured to send OTLP/gRPC to `http://otel-collector.istio-system:4317`.
+- **The OTel Collector** running as a DaemonSet (part of the platform's observability stack), forwarding OTLP to the TempoStack.
+- **TempoStack** backed by a NooBaa OBC (S3-compatible storage on ODF). The ESO bridge translates OBC-emitted Secret keys into the lowercase keys TempoStack expects — see [platform memory `project_obc_to_operand_secret_bridge.md`](../05-tenant-onboarding/04-eso-secret-and-pullsecret).
+- **Kiali topology** — reads from Prometheus (service mesh metrics) and Tempo (trace edges) to render the per-namespace graph.
+- **CNPG Cluster `mt-pg`** — backend writes go to Postgres; trace spans the DB call.
+
+## Whiteboard — request and trace flow
+
+<Whiteboard client:load data={{ nodes: meshNodes, edges: meshEdges }} height={420} />
+
+Solid black lines = request path. Dashed purple lines = OTel span emission. The `front` and `backend` Pods emit spans to the OTel Collector, which forwards via OTLP to TempoStack. Kiali reads Tempo + Prometheus to render the topology.
+
+## Repo layout
+
+```
+apps/team-platform/mesh-trace-sample/
+  base/
+    kustomization.yaml
+    deployment-front.yaml
+    deployment-backend.yaml
+    service-front.yaml
+    service-backend.yaml
+    route.yaml                           # only on `front`
+    cluster.yaml                         # CNPG Cluster mt-pg
+    backup-schedule.yaml
+    configmap-front.yaml                 # has BACKEND_URL=http://backend.<ns>.svc:8080
+    configmap-backend.yaml               # has PGHOST=mt-pg-rw, PGDATABASE=mesh_trace
+    externalsecret-minio-backup.yaml
+  overlays/
+    dev/
+      kustomization.yaml                 # adds istio.io/dataplane-mode=ambient label via patchTransformer
+    stg/
+      kustomization.yaml
+    prd/
+      kustomization.yaml
+```
+
+## Manifest highlights
+
+### Ambient mesh participation
+
+In the overlay (per-env so dev/stg can have different mesh policies than prd):
+
+```yaml
+# apps/team-platform/mesh-trace-sample/overlays/dev/kustomization.yaml
+namespace: apps-platform-mesh-trace-dev
+
+commonLabels:
+  apps.platform/env: dev
+  apps.platform/division: platform
+  app.kubernetes.io/instance: mesh-trace-sample-dev
+  app.kubernetes.io/version: "REPLACED_BY_CI"
+
+  # Ambient mesh participation — the only addition vs. a non-mesh app.
+  istio.io/dataplane-mode: ambient
+
+resources:
+  - ../../base
+
+images:
+  - name: app-registry.apps.sub.comptech-lab.com/team-platform/mesh-trace-sample-front
+    newName: app-registry.apps.sub.comptech-lab.com/team-platform/mesh-trace-sample-front
+    digest: sha256:REPLACED_BY_CI_FRONT
+  - name: app-registry.apps.sub.comptech-lab.com/team-platform/mesh-trace-sample-backend
+    newName: app-registry.apps.sub.comptech-lab.com/team-platform/mesh-trace-sample-backend
+    digest: sha256:REPLACED_BY_CI_BACKEND
+```
+
+The label `istio.io/dataplane-mode=ambient` on the namespace is what opts every Pod in the namespace into the ambient mesh. No sidecar injection; the ztunnel DaemonSet on each node handles L4 mTLS for Pods in this namespace.
+
+The label is set via a `Namespace` patch in the tenant template (not in the overlay; namespaces are platform-owned). Tenants who want ambient mesh ask in the onboarding MR; the platform admin adds the label.
+
+### OTel instrumentation (front, Node.js excerpt)
+
+```js
+// server.js (front)
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-grpc');
+
+const sdk = new NodeSDK({
+  serviceName: 'front',
+  traceExporter: new OTLPTraceExporter({
+    url: 'http://otel-collector.istio-system.svc:4317'
+  }),
+  instrumentations: [
+    require('@opentelemetry/instrumentation-http').HttpInstrumentation(),
+    require('@opentelemetry/instrumentation-express').ExpressInstrumentation(),
+  ],
+});
+sdk.start();
+
+const app = require('express')();
+app.post('/items', async (req, res) => {
+  const r = await fetch(process.env.BACKEND_URL + '/items', { method: 'POST', body: JSON.stringify(req.body), headers: { 'content-type': 'application/json' } });
+  res.status(r.status).send(await r.text());
+});
+app.listen(8080);
+```
+
+The SDK auto-injects W3C trace context headers (`traceparent`, `tracestate`) on outbound HTTP, so when `front` calls `backend`, the spans share a `trace_id`.
+
+### Backend Postgres span instrumentation
+
+The backend uses `@opentelemetry/instrumentation-pg` to add a span around every Postgres query, so the trace shows the DB call as a child span of the `backend: POST /items` span.
+
+```js
+// server.js (backend)
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-grpc');
+
+const sdk = new NodeSDK({
+  serviceName: 'backend',
+  traceExporter: new OTLPTraceExporter({ url: 'http://otel-collector.istio-system.svc:4317' }),
+  instrumentations: [
+    require('@opentelemetry/instrumentation-http').HttpInstrumentation(),
+    require('@opentelemetry/instrumentation-pg').PgInstrumentation(),
+  ],
+});
+sdk.start();
+```
+
+## Verifying mesh + traces
+
+### Ambient mesh: confirm ztunnel handles the traffic
+
+```bash
+NS=apps-platform-mesh-trace-dev
+
+# 1. Confirm the namespace is in ambient mode.
+oc get ns $NS -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}{"\n"}'
+# Expected: ambient
+
+# 2. Pods should NOT have a sidecar container.
+oc -n $NS get pod -l app.kubernetes.io/name=front -o jsonpath='{.items[0].spec.containers[*].name}{"\n"}'
+# Expected: app   (NOT app istio-proxy)
+
+# 3. ztunnel sees the Pods.
+oc -n istio-system get pod -l app=ztunnel -o wide
+
+# 4. Verify L4 mTLS by checking ztunnel's logs after sending a request.
+oc -n istio-system logs -l app=ztunnel --tail=50 | grep mesh-trace
+```
+
+### Traces: open Tempo and find the trace
+
+```bash
+# Generate traffic.
+for i in $(seq 1 5); do curl -fsS -X POST "https://${ROUTE}/items" -H 'Content-Type: application/json' -d "{\"name\":\"trace-$i\"}"; done
+
+# Open Tempo UI via the OCP Console (Observe → Traces) or directly:
+oc -n openshift-tempo-operator get route tempo \
+  -o jsonpath='https://{.spec.host}/search?spanName=POST+%2Fitems{"\n"}'
+```
+
+In Tempo:
+
+- Service `front` shows `POST /items` spans.
+- Each span has a child `backend: POST /items` (linked via `traceparent` headers).
+- Each `backend` span has a child `pg.query` span showing the Postgres `INSERT INTO items`.
+
+### Kiali topology
+
+```bash
+# Kiali Route.
+oc -n istio-system get route kiali \
+  -o jsonpath='https://{.spec.host}/console/graph/namespaces/?namespaces='$NS'&duration=300{"\n"}'
+```
+
+In Kiali:
+
+- Open the namespace graph for `apps-platform-mesh-trace-dev`.
+- See the edge from `front` → `backend` with request throughput.
+- The `mt-pg-rw` Service is shown as a sink edge from `backend`.
+
+## Smoke validation
+
+```bash
+NS=apps-platform-mesh-trace-dev
+
+# 1. Argo Application Synced/Healthy.
+oc -n openshift-gitops get app team-platform-mesh-trace-sample-dev \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+# 2. Both Deployments rolled out.
+oc -n $NS get deploy
+
+# 3. CNPG Cluster Ready.
+oc -n $NS get cluster mt-pg
+
+# 4. Pods do NOT have sidecars (ambient mode).
+oc -n $NS get pod -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[*].name}{"\n"}{end}'
+
+# 5. Send a request and confirm the row exists.
+ROUTE=$(oc -n $NS get route front -o jsonpath='{.spec.host}')
+curl -fsS -X POST "https://${ROUTE}/items" -H 'Content-Type: application/json' -d '{"name":"smoke"}'
+curl -fsS "https://${ROUTE}/items"
+```
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Tempo shows no traces despite traffic | OTel Collector cannot reach the TempoStack ingester (NetworkPolicy or wrong endpoint). | `oc -n istio-system logs deploy/otel-collector \| grep -i tempo`. | Verify the OTel exporter URL points at `tempo-distributor.openshift-tempo-operator.svc:4317`. |
+| TempoStack pods log "AccessDenied" on S3 | The OBC-emitted Secret keys don't match what TempoStack expects (OBC emits `AWS_ACCESS_KEY_ID`; TempoStack wants `access_key_id`). | Apply the platform ESO bridge that templates the lowercase keys. See platform memory `project_obc_to_operand_secret_bridge.md`. | Bridge is part of the platform install; verify at platform onboarding. |
+| Kiali graph shows the namespace but no edges | Prometheus is not scraping the mesh metrics for the namespace; PodMonitor missing. | Verify `oc -n openshift-monitoring get podmonitor istio-mesh` includes the namespace selector. | Ambient mesh ships a default PodMonitor; verify per cluster install. |
+| Spans land but the `pg.query` span is missing | The backend's `pg` instrumentation isn't registered, or the `pg` client is wrapped in a non-instrumented connection pool. | Confirm `PgInstrumentation` is in the SDK instrumentations list and the client uses the auto-patched `pg` module. | Document the OTel instrumentation list in the sample's README. |
+| Pods stuck `Init:0/1` with `istio-init` container | Namespace label is `istio-injection=enabled` (sidecar mode), not `istio.io/dataplane-mode=ambient`. Ambient does not need init. | Remove the `istio-injection` label; set `istio.io/dataplane-mode=ambient` instead. | Tenant onboarding for mesh-participating namespaces sets only the ambient label. |
+| Trace `traceparent` not propagated from `front` to `backend` | Auto-instrumentation does not patch the HTTP client (e.g., bare `node-fetch`). | Use a patched library (`@opentelemetry/instrumentation-http` patches `http`/`https`; for `node-fetch`, use the dedicated instrumentation). | Document the patched libraries in the sample. |
+| `mt-pg` Cluster fails with `image not allowed by policy` | The CNPG image prefix `ghcr.io/cloudnative-pg` was removed from the cluster-wide allowlist. | Restore the prefix per [image-registry-allowlist](../03-build-paths/01-overview). | Allowlist is desired state in `platform-gitops`; reverts to right state on Argo sync. |
+| Kiali UI shows "no metrics" | The `openshift-monitoring` Prometheus does not have `enableUserWorkload` set, or the tenant's PodMonitor is missing. | Enable user workload monitoring; verify the tenant namespace has `openshift.io/cluster-monitoring=true`. | Tenant template sets the label. |
+
+## Adapting for your own app
+
+| Slot | Substitute |
+| --- | --- |
+| `team-platform/mesh-trace-sample-front` and `-backend` images | `<your-team>/<your-app>-<service>` |
+| `apps-platform-mesh-trace-dev` namespace | `apps-<division>-<app>-<env>` |
+| OTel SDK service name `front` / `backend` | `<your-service-name>` |
+| `BACKEND_URL=http://backend.<ns>.svc:8080` | Service-local DNS for the downstream service. |
+| `istio.io/dataplane-mode=ambient` namespace label | Keep — and request the label in onboarding MR. |
+| OTel collector endpoint `http://otel-collector.istio-system.svc:4317` | Keep — platform-shared. |
+| CNPG Cluster `mt-pg` | Same pattern as [sample 03](./03-cnpg-backed-app); rename per app. |
+
+## References
+
+- Issue #204 (DEV-OCP-5.5) — sample closure.
+- Istio ambient mesh docs — `istio.io/dataplane-mode=ambient`.
+- TempoStack operator docs — `tempo.grafana.com/v1alpha1/TempoStack`.
+- Kiali docs — namespace graph + TraceQL integration.
+- OpenTelemetry Node SDK docs — `@opentelemetry/sdk-node`, `@opentelemetry/instrumentation-pg`.
+- Platform memory `project_obc_to_operand_secret_bridge.md` — ESO key-name bridge for Tempo storage.
+- ADR 0014 — developer-readiness-platform-contract.

@@ -1,0 +1,310 @@
+---
+title: "Sample: Path-B end-to-end (Tekton → Argo)"
+description: "Quay-only sample app configured for Path B: GitLab push → Tekton EventListener → Pipeline → Quay → overlay patch → Argo → OCP. Demonstrates the cluster-side Quay pullSecret path."
+sidebar_label: "Path-B end-to-end"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Mermaid from "../../../../components/Mermaid";
+
+## Deploy in 5 commands
+
+Prerequisites: tenant onboarding complete for `apps-platform-quay-only-sample-dev`; cluster Quay (`quay.apps.sub.comptech-lab.com`) is up; the tenant has a Quay Organization `team-platform` + Robot Account `platform+ci` whose token is in Vault at `secret/apps/platform/quay-only-sample/ci/quay-robot`; the ExternalSecret in `openshift-pipelines` has materialised `quay-robot-team-platform` (see [memory: Quay robot token convention](../05-tenant-onboarding/04-eso-secret-and-pullsecret#per-tenant-quay-robot-token-for-ci-push-not-runtime-pull)); the `tenant-apps-allowed=true` label is on the spoke cluster.
+
+```bash
+# 1. Clone the tenant app source.
+git clone http://gitlab.sub.comptech-lab.com/divisions/platform/quay-only-sample.git
+cd quay-only-sample
+
+# 2. Make a trivial change and push.
+echo "// $(date)" >> server.js
+git commit -am "trigger build $(date +%s)" && git push origin main
+
+# 3. Watch the Tekton EventListener fire and the PipelineRun start.
+oc -n openshift-pipelines get pipelinerun -l app=quay-only-sample --sort-by=.metadata.creationTimestamp | tail -3
+
+# 4. After the PipelineRun completes, watch the auto-MR on the app monorepo.
+gh -R divisions/platform/platform-apps-monorepo pr list --search 'bump quay-only-sample'
+
+# 5. Once merged + Argo syncs (~ 3 min), curl the Route.
+ROUTE=$(oc -n apps-platform-quay-only-sample-dev get route quay-only-sample -o jsonpath='{.spec.host}')
+sleep 30 && curl -fsS "https://${ROUTE}/health"
+```
+
+Expected total elapsed time: **~4-5 minutes**. Slightly faster than Path A on this lab because the Tekton pod runs near the registry it pushes to.
+
+## What this sample demonstrates
+
+Path B's full chain on real infrastructure. Importantly, this sample's image lives **only** in Quay (not Nexus app-registry), which exercises the cluster-side Quay pullSecret path end-to-end.
+
+Per [issue #203 (DEV-OCP-5.4)](https://github.com/zeshaq/codex-opp-agent/issues/203) and [issue #205 (DEV-OCP-5.6)](https://github.com/zeshaq/codex-opp-agent/issues/205), combined into one sample.
+
+It exercises:
+
+- GitLab webhook → Tekton `EventListener` on a Route.
+- `TriggerBinding` + `TriggerTemplate` produce a `PipelineRun` per push.
+- Shared Tekton `Tasks`: `git-clone`, `buildah`, `trivy-scan`, `mc-upload`, `push-image-quay`, `update-overlay-digest`.
+- The `push-image-quay` Task uses the per-tenant `quay-robot-team-platform` Secret materialised from Vault.
+- Image lands in `quay.apps.sub.comptech-lab.com/team-platform/quay-only-sample:<git-sha>`.
+- Same evidence shape as Path A (same MinIO bucket, same key names).
+- Same overlay-patch convention (same `update-overlay-digest.sh` script).
+- The spoke's `quay-pull` cluster-wide pull Secret (separate from `app-registry-pull`) lets the Pod pull from Quay.
+- **Negative test:** removing the `quay-pull` Secret causes `ImagePullBackOff`; restoring fixes — explicit validation that the Quay pullSecret path works.
+
+## Path-B timing breakdown
+
+<Mermaid client:load chart={`sequenceDiagram
+    participant Dev as Developer
+    participant GL as GitLab
+    participant EL as EventListener
+    participant PR as PipelineRun
+    participant Bld as buildah Task
+    participant Trv as trivy-scan Task
+    participant Qy as Quay
+    participant Mn as MinIO
+    participant Mr as overlay MR
+    participant Argo as Argo
+    participant K as Kubelet
+    Dev->>GL: git push main (t=0s)
+    GL->>EL: webhook (t+2s)
+    EL->>PR: create PipelineRun (t+3s)
+    PR->>PR: git-clone (t+3s..t+10s)
+    PR->>Bld: buildah build (t+10s..t+70s)
+    PR->>Trv: trivy image --severity CRITICAL (t+70s..t+100s)
+    PR->>Qy: push image (t+100s..t+115s)
+    PR->>Mn: evidence upload (t+115s..t+120s)
+    PR->>Mr: open MR via GitLab API (t+120s..t+125s)
+    Mr->>Mr: auto-merge (t+150s)
+    Mr->>Argo: refresh detects new main (t+150s..t+330s)
+    Argo->>K: apply Deployment
+    K->>Qy: pull image via quay-pull Secret
+    K->>K: roll out (t+330s..t+360s)
+    Dev->>Dev: curl /health (t+360s, 200 OK)
+`} />
+
+## Repo layout (tenant source + tenant overlay)
+
+```
+quay-only-sample/                              # tenant source repo
+  Containerfile
+  package.json
+  server.js
+  .tekton/                                     # OPTIONAL: tenant-side trigger definitions
+    eventlistener.yaml                         # but normally these live in openshift-pipelines
+
+platform-apps-monorepo/                        # tenant overlay repo
+  apps/team-platform/quay-only-sample/
+    base/
+      kustomization.yaml
+      deployment.yaml
+      service.yaml
+      route.yaml
+    overlays/
+      dev/
+        kustomization.yaml
+      stg/
+        kustomization.yaml
+      prd/
+        kustomization.yaml
+```
+
+## Manifest highlights — overlay
+
+```yaml
+# apps/team-platform/quay-only-sample/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: apps-platform-quay-only-sample-dev
+
+commonLabels:
+  apps.platform/env: dev
+  apps.platform/division: platform
+  app.kubernetes.io/instance: quay-only-sample-dev
+  app.kubernetes.io/version: "REPLACED_BY_CI"
+
+resources:
+  - ../../base
+
+images:
+  - name: quay.apps.sub.comptech-lab.com/team-platform/quay-only-sample
+    newName: quay.apps.sub.comptech-lab.com/team-platform/quay-only-sample
+    digest: sha256:REPLACED_BY_CI
+```
+
+The only difference from a Path A overlay is the image registry — `quay.apps.sub.comptech-lab.com` instead of `app-registry.apps.sub.comptech-lab.com`. Both prefixes are in the cluster-wide VAP allowlist and the RHACS allowlist.
+
+## Pipeline structure
+
+The Pipeline lives in `openshift-pipelines` namespace (platform-shared). Tenants do not write Pipeline YAML — they parameterise the shared Pipeline via the `TriggerTemplate`.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-scan-push-overlay
+  namespace: openshift-pipelines
+spec:
+  params:
+    - { name: app-repo-url,        type: string }
+    - { name: app-revision,        type: string, default: main }
+    - { name: image-registry,      type: string, default: "quay.apps.sub.comptech-lab.com" }
+    - { name: image-repo,          type: string }                # e.g. team-platform/quay-only-sample
+    - { name: quay-secret-name,    type: string }                # e.g. quay-robot-team-platform
+    - { name: overlay-repo-url,    type: string }
+    - { name: team,                type: string }
+    - { name: app,                 type: string }
+    - { name: env,                 type: string, default: dev }
+  workspaces:
+    - name: shared-data
+    - name: quay-creds                                           # NOT mounted under /tekton (reserved)
+  tasks:
+    - { name: git-clone,            taskRef: { name: git-clone },             workspaces: [{name: output, workspace: shared-data}], params: [{name: url, value: $(params.app-repo-url)}] }
+    - { name: build,                taskRef: { name: buildah },               runAfter: [git-clone], workspaces: [{name: source, workspace: shared-data}] }
+    - { name: trivy-scan,           taskRef: { name: trivy-scan },            runAfter: [build] }
+    - { name: push-quay,            taskRef: { name: push-image-quay },       runAfter: [trivy-scan], workspaces: [{name: creds, workspace: quay-creds}], params: [{name: quay-secret-name, value: $(params.quay-secret-name)}] }
+    - { name: mc-upload,            taskRef: { name: mc-upload },             runAfter: [trivy-scan] }
+    - { name: update-overlay,       taskRef: { name: update-overlay-digest }, runAfter: [push-quay] }
+```
+
+The `push-image-quay` Task takes the Quay Secret name as a parameter, so the Task is reused unchanged across all tenants — tenant isolation is enforced at the Quay org/robot level, not at the Task level.
+
+## EventListener + TriggerTemplate
+
+One `EventListener` per tenant project (handful of YAML):
+
+```yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: quay-only-sample-listener
+  namespace: openshift-pipelines
+spec:
+  serviceAccountName: pipelines-trigger
+  triggers:
+    - name: gitlab-push
+      interceptors:
+        - { ref: { name: gitlab }, params: [{ name: secretRef, value: { secretName: gitlab-quay-only-sample-webhook, secretKey: secretToken }}, { name: eventTypes, value: ["Push Hook"] }] }
+        - { ref: { name: cel }, params: [{ name: filter, value: "body.ref == 'refs/heads/main'" }] }
+      bindings:
+        - { ref: gitlab-push-binding }
+      template:
+        ref: build-scan-push-overlay-template
+```
+
+The matching `TriggerTemplate` fills in the Pipeline's params from the GitLab webhook payload (`body.project.git_http_url`, `body.checkout_sha`, ...).
+
+The EventListener exposes a Route at `https://el-quay-only-sample-listener-openshift-pipelines.apps.spoke-dc-v6.sub.comptech-lab.com/` that the tenant's GitLab project webhook calls.
+
+## The Quay-only validation (negative test)
+
+The `quay.apps.sub.comptech-lab.com/team-platform/quay-only-sample` image lives only in Quay. The spoke pulls it via the cluster-wide `quay-pull` Secret (ESO-materialised from Vault at `secret/ocp/spoke-dc-v6/registries/quay-pull`). To prove the pull-secret path works:
+
+```bash
+NS=apps-platform-quay-only-sample-dev
+
+# Baseline: Pod is running.
+oc -n $NS get pod -l app.kubernetes.io/name=quay-only-sample
+# Expected: STATUS=Running
+
+# Negative test: remove the quay-pull entry from the default SA.
+oc -n $NS patch sa default --type=json \
+  -p '[{"op":"remove","path":"/imagePullSecrets"}]'
+
+# Trigger a rollout to force a re-pull.
+oc -n $NS rollout restart deploy/quay-only-sample
+sleep 30
+oc -n $NS get pod -l app.kubernetes.io/name=quay-only-sample
+# Expected: STATUS=ImagePullBackOff (confirms image was only pullable with the Secret)
+
+# Restore: re-add the imagePullSecrets and confirm recovery.
+oc -n $NS patch sa default \
+  -p '{"imagePullSecrets":[{"name":"app-registry-pull"},{"name":"quay-pull"}]}'
+oc -n $NS rollout restart deploy/quay-only-sample
+sleep 30
+oc -n $NS get pod -l app.kubernetes.io/name=quay-only-sample
+# Expected: STATUS=Running
+```
+
+This negative test is the explicit proof that the Quay pull-secret path is wired correctly, not just that the Pod happens to be running by accident.
+
+## Smoke validation
+
+```bash
+NS=apps-platform-quay-only-sample-dev
+
+# 1. Latest PipelineRun completed.
+oc -n openshift-pipelines get pipelinerun \
+  -l app=quay-only-sample --sort-by=.metadata.creationTimestamp \
+  -o jsonpath='{.items[-1].status.conditions[?(@.type=="Succeeded")].status}{"\n"}'
+# Expected: True
+
+# 2. Image is in Quay.
+skopeo inspect docker://quay.apps.sub.comptech-lab.com/team-platform/quay-only-sample:<git-sha>
+
+# 3. Evidence is in MinIO (same shape as Path A).
+mc ls minio/developer-ci-evidence/team-platform/quay-only-sample/
+
+# 4. Overlay MR was opened.
+gh -R divisions/platform/platform-apps-monorepo pr list --search 'bump quay-only-sample' -L 1
+
+# 5. Argo Synced/Healthy.
+oc -n openshift-gitops get app team-platform-quay-only-sample-dev \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+# 6. Pod is running the new digest.
+oc -n $NS get deploy quay-only-sample \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+## Path-B failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| EventListener Route returns 404 for the GitLab webhook | The EventListener has not finished creating its Route, or the Route hostname does not match the webhook URL. | `oc -n openshift-pipelines get route el-<listener-name>`; update the webhook URL. | Document the exact Route hostname at onboarding; smoke-test the webhook once. |
+| `PipelineRun` is created but fails at `git-clone` | The `gitlab-deploy-token-<project>` Secret is missing or wrong. | Mount the deploy token via the `git-clone` Task's workspace. | One-time platform setup: create the deploy token, materialise via ESO. |
+| `buildah` Task fails with `permission denied` | The Tekton SA has the wrong SCC. | The Pipeline-trigger SA must use the `pipelines-scc` SCC. Confirm with `oc get scc pipelines-scc -o yaml`. | Platform install ships the SCC. |
+| `push-image-quay` fails with `unauthorized` | The `quay-robot-team-<team>` Secret has not materialised, or the Quay robot's repo scope doesn't include the target repo. | Verify ExternalSecret `Ready=True`; in Quay UI, check Robot Account's repo permissions include `team-<team>/<app>:write`. | Quay robot scope is set at Org creation; one-time platform action. |
+| `mc-upload` Task succeeds but no evidence in MinIO | The `minio-developer-ci-evidence` Secret is in the wrong namespace, or the bucket name is misspelled. | Confirm the Secret is in `openshift-pipelines`; bucket name is `developer-ci-evidence`. | Use the shared mc-upload Task, which encodes the bucket name. |
+| Overlay MR opens but the digest in the patch is wrong | The `image-digest` Task result was read from the wrong PipelineRun step. | `tkn pipelinerun describe <name>` and inspect the `image-digest` result. | The `push-image-quay` Task emits the digest as a `results` field; only one step should read it. |
+| Pod ImagePullBackOff on `quay.apps.sub...` | The cluster-wide `quay-pull` Secret is missing or not attached to the SA. | `oc -n <ns> get secret quay-pull` then patch SA. | Tenant onboarding attaches both `app-registry-pull` and `quay-pull` when the tenant onboards a Path B app. |
+| Two PipelineRuns from rapid pushes interleave and patch the wrong digest | Concurrent `update-overlay-digest.sh` runs both push to the same branch. | Add `serializeDir` or queue logic in the EventListener. | Tekton has a built-in `concurrency` setting on PipelineRun; tune to 1 per app. |
+| Tekton's validation webhook rejects the Pipeline with `mountPath /tekton/ reserved` | The push-image-quay Task mounted the robot Secret under `/tekton/...`. | Move the mount to `/workspace/quay-creds`. | Memory `reference_quay_robot_token_convention.md` documents this gotcha. |
+
+## Adapting for your own app
+
+| Slot | Substitute |
+| --- | --- |
+| `team-platform/quay-only-sample` | `<your-team>/<your-app>` |
+| `quay-robot-team-platform` Secret | `quay-robot-team-<your-team>` (your tenant's own robot Secret materialised in `openshift-pipelines`). |
+| EventListener name `quay-only-sample-listener` | `<your-app>-listener`. |
+| GitLab webhook URL | The EventListener's Route URL, captured at onboarding. |
+| `quay.apps.sub.comptech-lab.com/team-platform/quay-only-sample` | `quay.apps.sub.comptech-lab.com/<your-team>/<your-app>`. |
+| Pipeline params `team`, `app`, `env` | Set per-app in your `TriggerTemplate`. |
+
+## When to choose Path B (and when not)
+
+Path B fits when:
+
+- The app is greenfield or has no Jenkinsfile yet.
+- The team wants OCP-native trigger surface (Tekton EventListener gives you ConfigMap-watcher, Image-push, etc., not just `git push`).
+- The image should live in in-cluster Quay (more secure pull path; tenant-specific robot tokens enforce isolation).
+- The team wants horizontal scale (each PipelineRun a fresh pod across the cluster, not a single warm Jenkins agent).
+
+Path B does NOT fit when:
+
+- The team has an existing mature Jenkinsfile with regulated audit trail (lose continuity if rewriting).
+- The build needs a long-running warm Maven cache (Path A's agent has one; Path B's pods are cold each run).
+- The build must work while OpenShift is down (e.g., change-window builds on a half-broken cluster). Path A's Jenkins survives an OCP outage.
+
+Migration A → B is supported; B → A is not (see the [build-path matrix](../03-build-paths/03-path-b-tekton)).
+
+## References
+
+- Issues #203 (DEV-OCP-5.4) and #205 (DEV-OCP-5.6) — sample closures.
+- `codex-opp-agent/connection-details/build-path-matrix.md` — Path A vs Path B decision.
+- `codex-opp-agent/connection-details/ci-evidence-schema.md` — cross-path evidence parity.
+- Memory `reference_quay_robot_token_convention.md` — per-tenant Quay robot token pattern.
+- Tekton Triggers docs — `EventListener`, `TriggerBinding`, `TriggerTemplate`.
+- OpenShift Pipelines operator docs — `tekton.dev/v1/Pipeline`, `Task`, `PipelineRun`.

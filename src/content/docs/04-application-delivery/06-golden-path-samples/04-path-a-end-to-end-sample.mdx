@@ -1,0 +1,252 @@
+---
+title: "Sample: Path-A end-to-end (Jenkins → Argo)"
+description: "Liberty hello-world configured for Path A: GitLab push → Jenkins → Trivy → Nexus → overlay digest patch → Argo → OCP. End-to-end timing and evidence shown."
+sidebar_label: "Path-A end-to-end"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Mermaid from "../../../../components/Mermaid";
+
+## Deploy in 5 commands
+
+Prerequisites: tenant onboarding complete for `apps-platform-liberty-hello-dev`; Jenkins job `liberty-hello-image-build` is configured against the GitLab `liberty-hello` project (one-time platform setup, ~5 min, [Path-A operator reference](../03-build-paths/02-path-a-jenkins)); the GitLab project has a webhook that calls Jenkins `notifyCommit` on `main` push.
+
+```bash
+# 1. Clone the tenant app source.
+git clone http://gitlab.sub.comptech-lab.com/divisions/platform/liberty-hello.git
+cd liberty-hello
+
+# 2. Make a small change and push to main.
+echo "// trivial change $(date)" >> src/main/java/Hello.java
+git add . && git commit -m "trivial: $(date +%s)"
+git push origin main
+
+# 3. Wait for Jenkins build (~ 4 min) and watch the auto-opened MR on the app monorepo.
+gh -R divisions/platform/platform-apps-monorepo pr list --state open --search 'bump liberty-hello'
+
+# 4. Merge the auto-MR (or watch CODEOWNERS auto-merge if enabled).
+gh -R divisions/platform/platform-apps-monorepo pr merge <PR-number> --squash
+
+# 5. Wait for Argo to roll out (~ 30 sec) and curl the Route.
+ROUTE=$(oc -n apps-platform-liberty-hello-dev get route liberty-hello -o jsonpath='{.spec.host}')
+sleep 30 && curl -fsS "https://${ROUTE}/health"
+```
+
+Expected total elapsed time from `git push` to first request served: **~5 minutes**. Most of that is Jenkins build (~3 min) + Trivy scan (~30 s) + MR merge + Argo sync (~30 s).
+
+## What this sample demonstrates
+
+The full Path A chain on real infrastructure, end to end. It is the same Liberty hello-world app from sample 02, but with a working Jenkins job behind it.
+
+It exercises:
+
+- GitLab webhook → Jenkins `notifyCommit` trigger.
+- Jenkins on `jenkins-0.sub` with build agent `jenkins-agent-0` (label `developer-build`).
+- `podman build` pulling base from `docker-group.apps.sub.comptech-lab.com` (Nexus pull-through cache).
+- Trivy scan with fail-on-CRITICAL gate.
+- `podman push` to `app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello:<build-tag>`.
+- `skopeo inspect` to capture the post-push digest.
+- `mc cp` to upload evidence to MinIO bucket `developer-ci-evidence` per the [CI evidence schema](../03-build-paths/05-ci-evidence-schema).
+- `update-overlay-digest.sh` to patch the `apps/team-platform/liberty-hello/overlays/dev/kustomization.yaml` digest field, commit, push to a branch, and open an MR via the GitLab API.
+- The platform `ApplicationSet` picks up the merged MR; hub Argo wraps a `ManifestWork`; spoke Argo pulls and reconciles.
+
+Per [issue #202 (DEV-OCP-5.3)](https://github.com/zeshaq/codex-opp-agent/issues/202).
+
+## Timing breakdown
+
+<Mermaid client:load chart={`sequenceDiagram
+    participant Dev as Developer
+    participant GL as GitLab
+    participant Jen as Jenkins
+    participant Agt as jenkins-agent-0
+    participant Trv as Trivy server
+    participant Nx as Nexus app-registry
+    participant Mn as MinIO
+    participant Mr as overlay MR
+    participant Argo as Hub Argo
+    participant Sp as Spoke Argo
+    participant K as Kubelet
+    Dev->>GL: git push main (t=0s)
+    GL->>Jen: notifyCommit webhook (t+5s)
+    Jen->>Agt: schedule build on developer-build agent
+    Agt->>Nx: podman pull base (cached: ~5s)
+    Agt->>Agt: podman build (t+30s..t+90s)
+    Agt->>Trv: trivy image --severity CRITICAL (t+90s..t+120s)
+    Agt->>Nx: podman push (t+120s..t+150s)
+    Agt->>Mn: mc cp build.log + sbom + scan (t+150s..t+160s)
+    Agt->>Mr: gitlab API: open MR with overlay patch (t+165s)
+    Mr->>Mr: CODEOWNERS auto-merge / reviewer merges (t+200s)
+    Mr->>Argo: AppSet refresh detects new main (t+200s..t+380s)
+    Argo->>Sp: ManifestWork (t+380s..t+400s)
+    Sp->>K: apply Deployment with new digest
+    K->>K: pull image + roll out (t+400s..t+430s)
+    Dev->>Dev: curl /health (t+430s, 200 OK)
+`} />
+
+Typical full-cycle: **6-7 minutes**. The longest leg is the AppSet refresh window (3 min default); shortenable with `argocd appset get --refresh` if you need a faster demo.
+
+## Repo layout (tenant source + tenant overlay)
+
+```
+liberty-hello/                            # tenant source repo
+  Containerfile
+  Jenkinsfile                             # from templates/jenkinsfiles/liberty-app.Jenkinsfile
+  src/
+    main/java/Hello.java
+  pom.xml
+
+platform-apps-monorepo/                   # tenant overlay repo
+  apps/team-platform/liberty-hello/
+    base/
+      kustomization.yaml
+      openlibertyapplication.yaml
+      service.yaml
+      route.yaml
+      externalsecret-db-creds.yaml
+    overlays/
+      dev/
+        kustomization.yaml                # CI rewrites images[].digest here
+      stg/
+        kustomization.yaml
+      prd/
+        kustomization.yaml
+```
+
+## Jenkinsfile shape
+
+The tenant's `Jenkinsfile` derives from `templates/jenkinsfiles/liberty-app.Jenkinsfile`. Stages:
+
+1. **Prepare Workspace** — verifies podman, skopeo, trivy, mc, and `claude-agent` scripts are present.
+2. **Checkout App Source** — `checkout scm` on the GitLab project.
+3. **Registry Login** — `podman login` to `docker-group.*` (pull) and `app-registry.*` (push), using `nexus-jenkinsbot` credential.
+4. **Build Image** — `podman build` with `BASE_IMAGE_REGISTRY=docker-group.apps.sub.comptech-lab.com`.
+5. **Trivy Scan Gate** — `trivy image --server $TRIVY_SERVER_URL --severity CRITICAL --exit-code 1`. Build fails on any CRITICAL; HIGH is warning only.
+6. **Push to Nexus** — `podman push $APP_IMAGE_REGISTRY/$TEAM/$APP:build-$BUILD_NUMBER` and capture digest with `skopeo inspect`.
+7. **Upload Evidence** — `mc cp build.log sbom.spdx.json trivy-scan.json image-digest.txt minio/developer-ci-evidence/$TEAM/$APP/$GIT_SHA/`.
+8. **Patch Overlay** — clone `platform-apps-monorepo`, run `/opt/claude-agent/scripts/update-overlay-digest.sh team-platform liberty-hello dev <digest>`, commit, push to branch `ci/dev/<short-sha>`, open MR via GitLab API.
+
+Full Jenkinsfile lives at `developer-handbook/examples/jenkins/Jenkinsfile.nexus-app` and is the starting template tenants adapt.
+
+## Manifest highlights
+
+The tenant overlay is the same as the [Liberty hello-world](./02-liberty-hello-world) sample. The interesting bit is the **diff CI produces**:
+
+```diff
+ # apps/team-platform/liberty-hello/overlays/dev/kustomization.yaml
+ images:
+   - name: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+     newName: app-registry.apps.sub.comptech-lab.com/team-platform/liberty-hello
+-    digest: sha256:REPLACED_BY_CI
++    digest: sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890
+```
+
+Plus a `commonLabels` update setting `app.kubernetes.io/version` to the git short SHA:
+
+```diff
+ commonLabels:
+   apps.platform/env: dev
+   apps.platform/division: platform
+   app.kubernetes.io/instance: liberty-hello-dev
+-  app.kubernetes.io/version: "REPLACED_BY_CI"
++  app.kubernetes.io/version: "abc123de"
+```
+
+That single MR is the entire delivery artefact for one build.
+
+## Evidence layout in MinIO
+
+For build `git-sha = abc123def4567890abc123def4567890abc123def40`:
+
+```
+developer-ci-evidence/
+  team-platform/liberty-hello/abc123def4567890abc123def4567890abc123def40/
+    build.log                            # full Jenkins console output
+    sbom.spdx.json                       # SPDX SBOM from syft
+    trivy-scan.json                      # full Trivy JSON (all severities)
+    image-digest.txt                     # one line: sha256:<64hex>
+    promotion.log                        # log of the overlay-patch MR creation
+```
+
+Reproduce a build's evidence:
+
+```bash
+mc alias set ci http://minio.sub.comptech-lab.local:9000 <reader-key> <reader-secret>
+mc cp --recursive ci/developer-ci-evidence/team-platform/liberty-hello/<git-sha>/ ./local-evidence/
+cat ./local-evidence/image-digest.txt
+jq '.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")' ./local-evidence/trivy-scan.json
+```
+
+## Smoke validation
+
+```bash
+NS=apps-platform-liberty-hello-dev
+
+# 1. Jenkins build #N succeeded.
+gh -R divisions/platform/liberty-hello run list -L 1 | head -3
+
+# 2. Image landed in Nexus with the expected tag.
+curl -fsSk "https://nexus.apps.sub.comptech-lab.com/service/rest/v1/components?repository=app-registry-hosted" \
+  | jq '.items[] | select(.name=="team-platform/liberty-hello") | .version' | head -3
+
+# 3. Evidence is in MinIO.
+mc ls minio/developer-ci-evidence/team-platform/liberty-hello/
+
+# 4. Overlay MR was opened (and possibly auto-merged).
+gh -R divisions/platform/platform-apps-monorepo pr list --search 'bump liberty-hello dev' --state all -L 1
+
+# 5. Argo Application is Synced/Healthy with the new digest.
+oc -n openshift-gitops get app team-platform-liberty-hello-dev \
+  -o jsonpath='{.status.sync.revision}{" "}{.status.health.status}{"\n"}'
+
+# 6. Pod is running the new digest.
+oc -n $NS get deploy liberty-hello \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+## Path-A failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| Jenkins build never starts despite `git push` | GitLab webhook not configured on the project, OR the `git-notifycommit-<project>-token` is wrong. | Confirm webhook URL is `https://jenkins.apps.sub.comptech-lab.com/git/notifyCommit?url=<repo-url>`. | One-time platform setup per project; document the token rotation cadence. |
+| Trivy gate fails on a clean base image | Trivy DB stale (> 24h). | Trigger nightly Trivy DB refresh job; or `oc -n openshift-pipelines patch ...` to update the mirror. | Nightly refresh job is part of the platform install. |
+| `podman push` fails with `unauthorized` | The `nexus-jenkinsbot` credential is expired / wrong. | Rotate the Jenkins credential. | Rotate quarterly via `jenkins-secrets-rotate.sh`. |
+| MR opened but not auto-merged | CODEOWNERS file in `platform-apps-monorepo` does not allow `apps-overlay-bot` to auto-merge bump-only MRs. | Either add the bot to CODEOWNERS or merge manually. | Document the auto-merge bot in the platform handoff. |
+| Argo shows `OutOfSync` indefinitely after MR merge | Spoke can't pull from Nexus (`app-registry-pull` Secret missing in the namespace). | Confirm `apps.platform/tenant=true` label on the namespace; check ESO. | Tenant onboarding includes the label. |
+| Argo shows `Synced / Healthy` but no rollout | Image digest unchanged in the rendered manifest. | `oc -n <ns> get deploy <app> -o yaml \| grep image:`. If digest matches but Pods are old, `oc rollout restart deploy/<app>`. | Should not happen if AppSet auto-renders; investigate Argo if it does. |
+| Argo silent — neither hub nor spoke reconciling | gitops-addon CRD collision (platform memory `project_acm_gitops_addon_routes_crd.md`, incident #153). | `oc delete crd routes.route.openshift.io` on the spoke. | Document in the onboarding handoff. |
+| Evidence in MinIO is missing the SBOM | `syft` not installed on the build agent, or the SBOM step was skipped on a transient failure. | Confirm `syft` is on `jenkins-agent-0`; re-run the SBOM step. | Stage 7 of the Jenkinsfile is `set -euo pipefail`; any failure surfaces. |
+
+## Adapting for your own app
+
+| Slot | Substitute |
+| --- | --- |
+| `team-platform/liberty-hello` (path everywhere) | `<your-team>/<your-app>` |
+| `nexus-jenkinsbot` Jenkins credential | Keep — platform credential, shared across tenants. |
+| `gitlab-mavenbot-pat` Jenkins credential | Keep — same shared bot for the monorepo MR. |
+| `MINIO_BUCKET=developer-ci-evidence` | Keep — bucket is platform-shared. |
+| Jenkinsfile `pollSCM('H/5 * * * *')` | Set to `pollSCM('H/2 * * * *')` for tighter integration, or rely on the webhook (preferred). |
+| `Trivy --severity CRITICAL` gate | Keep — Trivy gate is per-platform policy. Loosening requires an ADR. |
+| `BASE_IMAGE_REGISTRY=docker-group.apps.sub.comptech-lab.com` | Keep — pull-through cache is platform-shared. |
+| `APP_IMAGE_REGISTRY=app-registry.apps.sub.comptech-lab.com` | Keep — destination for Path A. (Path B uses Quay.) |
+
+## When to switch to Path B
+
+Path A's edge cases (the matrix in [build-path-matrix](../03-build-paths/03-path-b-tekton)):
+
+- Need OpenShift-native event triggers (ConfigMap change, image push) → Path B.
+- Want each build to run in a fresh pod (no warm-cache concerns) → Path B.
+- Image should live in in-cluster Quay (more secure pull path) → Path B.
+- Air-gapped or change-window builds while OCP is down → **stay** on Path A.
+- Existing mature Jenkinsfile → stay on Path A.
+
+The cross-path parity (evidence schema, Trivy policy, overlay-patch convention) is enforced by the platform so a Path-A→Path-B migration is a CI rewrite, not a manifest rewrite.
+
+## References
+
+- Issue #202 (DEV-OCP-5.3) — sample closure.
+- `codex-opp-agent/connection-details/jenkins-ocp-path.md` — Path-A operator reference.
+- `codex-opp-agent/connection-details/build-path-matrix.md` — Path A vs Path B decision matrix.
+- `codex-opp-agent/connection-details/ci-evidence-schema.md` — cross-path evidence parity.
+- `codex-opp-agent/connection-details/promotion-model.md` — build-once / promote-by-digest.
+- `developer-handbook/examples/jenkins/Jenkinsfile.nexus-app` — starting Jenkinsfile.
