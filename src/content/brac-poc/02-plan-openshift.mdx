@@ -30,7 +30,7 @@ The union of both documents, deduplicated, priority-ordered for the live demo. L
 | 3 | **Service Mesh + mTLS** ("Comply MTLS" — strict mTLS between services) | v2 PDF only — NEW | Demo |
 | 4 | **Canary deployment via service mesh** (replaces the original email's NGINX header-canary) | v2 PDF (replaces email §8) | Demo |
 | 5 | **Observability + Kafka (HIGH PRIORITY)** — OTel SDK + non-SDK, OTel→Kafka→SigNoz, trace sampling + log filtering + metrics routing, ClickHouse hot/cold, 4 dashboards (app perf, .NET runtime, system, tracing) | both | Demo (HIGH) |
-| 6 | **Redis HA** (Sentinel topology, hard-kill failover with mock client reconnect — email says "on OpenShift Platform") | both | Demo |
+| 6 | **Redis HA** (Sentinel topology, hard-kill failover with mock client reconnect — reused from the existing dc-lab VM Sentinel cluster; mock client runs on OCP) | both | Demo |
 | 7 | **SigNoz** (the existing observability backend; explicitly named in v2) | both | Demo |
 | 8 | **Nexus OSS** (multi-format repos — Maven, PyPI, npm, Docker — three-endpoint split with HA + Backup) | both | Demo |
 | 9 | **MFE Router + BFF Router + layered TLS** (per the v2 architecture diagram: User → MFE Router → WSO2 API GW → BFF Router → Mesh → Identity → Product, with two TLS-terminate hops) | v2 PDF only — NEW | Demo (architectural) |
@@ -102,7 +102,6 @@ New tenant namespaces created for the POC, on `spoke-dc-v6`:
 - `brac-demo-frontend` — MFE Router, BFF Router, optional demo SPA.
 - `brac-demo-services` — in-mesh Open Liberty demo services (Identity, Product), OSSM ambient.
 - `brac-demo-otel` — OTel Collector (Gateway).
-- `brac-demo-redis-ocp` — small Redis HA on OCP (decision-pending; see open questions).
 - `brac-demo-jboss` — JBoss EAP managed-domain demo (separate from mesh services).
 - `brac-demo-evidence` — scratch / artifacts during the live demo.
 
@@ -115,7 +114,7 @@ New tenant namespaces created for the POC, on `spoke-dc-v6`:
 | **Service Mesh + mTLS** | OSSM 3 ambient mode already installed on spoke-dc-v6 (DEV-OCP-1.4 #178) | Scope to `brac-demo-services`; `PeerAuthentication.mtls.mode=STRICT`; Kiali dashboard scoped view |
 | **Mesh canary** | None — new pattern (replaces NGINX header-canary from email §8) | `VirtualService` + `DestinationRule` with header-based override (`x-canary: beta` → v2) + 90/10 default split |
 | **Observability + Kafka** | Kafka KRaft VMs (kafka-0/1/2, ADR 0007), SigNoz VM (signoz-0) + ClickHouse, NooBaa OBC pattern for cold archive | OTel Collector (Gateway) on `brac-demo-otel` with `tail_sampling` + `filter` + `routing` processors; sample microservice (.NET preferred) with + without SDK; 4 dashboards (app perf, .NET runtime, system, tracing) authored in SigNoz |
-| **Redis HA** | Redis Sentinel VMs (ADR 0006) — work today | OCP-side small Redis HA in `brac-demo-redis-ocp` via `redis-operator` (decision dependent — see Q1); mock-client reconnect demo |
+| **Redis HA** | Redis Sentinel VMs (ADR 0006) — used as-is for the demo | OCP-side mock client only — a small `Deployment` in `brac-demo-evidence` that uses `redis-py` `Sentinel` to connect to the lab Sentinel pool; demonstrates client reconnect after a VM-side hard-kill. No new Redis on OCP. |
 | **SigNoz** | SigNoz VM with ClickHouse + retention | None — the four BRAC dashboards are authored against the existing SigNoz |
 | **Nexus OSS** | Existing Nexus three-endpoint split (`mirror-registry` / `docker-group` / `app-registry`, ADR 0019) | None — demo the existing setup |
 | **MFE Router + BFF Router** | None | NGINX `Deployment` for MFE; Liberty/Node `Deployment` for BFF, both in `brac-demo-frontend`; cert-manager Route at the edge |
@@ -139,7 +138,7 @@ Block A items are reuse-walkthroughs (no new code; just narration + screencasts)
 | **P1: Observability + Kafka pipeline** *(HIGH PRIORITY)* | Day 3-5 | OTel Collector deployed; sample microservice w/+w/o SDK; pipeline OTel→Kafka→SigNoz wired; 4 dashboards authored | End-to-end trace appears in SigNoz; sampling/filter/routing visible |
 | **P2: Service Mesh + mTLS + canary** *(v2 priority)* | Day 5-7 | OSSM scoped to `brac-demo-services`; STRICT mTLS; VirtualService canary on identity-svc v1/v2; Istio→OTel trace export | Kiali shows mTLS green; canary curl demo passes |
 | **P3: MFE + BFF + WSO2 wiring** | Day 7-10 | MFE Router (NGINX edge), BFF Router, egress NetworkPolicy to WSO2 VMs, SAML + OIDC + Federation flows verified end-to-end | Full user → MFE → API GW → BFF → mesh → Identity → Product chain |
-| **P4: Redis + Trivy + CI/CD glue** | Day 10-12 | Redis HA on OCP (if Q1 = yes); SBOM pipeline extension; BRAC monorepo + conditional Jenkinsfile; hybrid CD to OCP + one VM target | Hard-kill failover; DefectDojo SBOM view; monorepo-aware build triggers only the affected app |
+| **P4: Redis client + Trivy + CI/CD glue** | Day 10-12 | OCP-side Redis mock client connecting to the existing VM Sentinel pool; SBOM pipeline extension; BRAC monorepo + conditional Jenkinsfile; hybrid CD to OCP + one VM target | Hard-kill failover demo (VM-side, with OCP client reconnect); DefectDojo SBOM view; monorepo-aware build triggers only the affected app |
 | **P5: JBoss managed domain + evidence pack** | Day 12-14 | EAP Operator + Domain/Host Controllers + 2 Server Groups; deploy + reload demo; full evidence pack written | All demo steps recorded + filed in `reports/brac-poc/<section>/` |
 
 ## Live demo flow (v2 priority order)
@@ -153,7 +152,7 @@ The live demo runs in v2 PDF order so the HIGH-PRIORITY items land first if time
 3. **Service Mesh — mTLS** (new OCP): `istioctl authn tls-check` returns MUTUAL; Kiali shows all-green mTLS edges.
 4. **Canary via mesh** (new OCP): `curl` with and without `x-canary: beta`; show traffic split + Kiali request graph.
 5. **Observability + Kafka — high priority** (new collector + existing Kafka + SigNoz): hit the demo app, watch traces traverse identity → product in SigNoz, show Kafka topic lag, expand spans.
-6. **Redis** (decision-dependent): if Q1=yes, demo OCP-side hard-kill failover; otherwise narrate existing VM Sentinel topology with mock client reconnect.
+6. **Redis** (existing VM Sentinel + OCP-side mock client): hard-kill the primary on the VM side; tail the mock client's logs (running on OCP) showing it reconnects through Sentinel to the newly-promoted primary.
 7. **SigNoz** (existing VM): tour the 4 dashboards (app perf, .NET runtime, system, tracing).
 8. **Nexus OSS** (existing VM): show three-endpoint split; demo multi-format pull (Maven + npm + Docker) from the same Nexus.
 
@@ -183,15 +182,18 @@ No secret values, no kubeconfigs, no credential bytes in the evidence pack. Vaul
 
 ## Open questions
 
-1. **Redis on OCP vs reuse VM Sentinel:** BRAC says "deploy on OpenShift Platform." Default in this plan: deploy a small Redis HA on `spoke-dc-v6` *in addition to* the existing VM Sentinel. Confirm or override.
-2. **OCP cluster choice:** use existing `spoke-dc-v6` (default — fastest) or stand up a separate POC cluster (more demonstrable for the Terraform-automation requirement but adds 2-3 days)?
-3. **OCP version pin:** confirm BRAC's evaluation tools work against the current spoke-dc-v6 minor; if they want a specific version, plan a controlled upgrade or a side cluster.
-4. **JBoss EAP image entitlement:** valid pull secret for the EAP Operator's images? Otherwise fall back to community WildFly.
-5. **WSO2 license / image entitlement:** existing WSO2 VMs run fine. Confirm no new license needed for the POC.
-6. **DC-DR scope:** default is "documented procedure + one rehearsed restore in a side namespace" rather than a second live cluster. Confirm.
-7. **Truncated requirements PDF:** original email mentions "13 Products" but PDF ends at section 9. Request sections 10-13 before P5 finalizes.
-8. **MFE / BFF stack choice:** NGINX-only for MFE, or a real micro-frontend aggregator (Module Federation / single-spa)? BFF as Liberty (Java ecosystem fit) or Node (lighter)?
-9. **"Comply MTLS" interpretation:** v2 PDF says "MTLS (Commply MTLS / Service mesh)". Likely typo for "Compliance-grade mTLS" — strict mTLS + FIPS-ish posture + audit. Confirm.
+1. **OCP cluster choice:** use existing `spoke-dc-v6` (default — fastest) or stand up a separate POC cluster (more demonstrable for the Terraform-automation requirement but adds 2-3 days)?
+2. **OCP version pin:** confirm BRAC's evaluation tools work against the current spoke-dc-v6 minor; if they want a specific version, plan a controlled upgrade or a side cluster.
+3. **JBoss EAP image entitlement:** valid pull secret for the EAP Operator's images? Otherwise fall back to community WildFly.
+4. **WSO2 license / image entitlement:** existing WSO2 VMs run fine. Confirm no new license needed for the POC.
+5. **DC-DR scope:** default is "documented procedure + one rehearsed restore in a side namespace" rather than a second live cluster. Confirm.
+6. **Truncated requirements PDF:** original email mentions "13 Products" but PDF ends at section 9. Request sections 10-13 before P5 finalizes.
+7. **MFE / BFF stack choice:** NGINX-only for MFE, or a real micro-frontend aggregator (Module Federation / single-spa)? BFF as Liberty (Java ecosystem fit) or Node (lighter)?
+8. **"Comply MTLS" interpretation:** v2 PDF says "MTLS (Commply MTLS / Service mesh)". Likely typo for "Compliance-grade mTLS" — strict mTLS + FIPS-ish posture + audit. Confirm.
+
+**Resolved:**
+
+- *(2026-05-11)* **Redis HA stays on existing VM Sentinel** — no OCP-side Redis deployment. OCP carries only a small mock client to demonstrate Sentinel reconnect.
 
 ## What's intentionally not in this plan
 
