@@ -1,0 +1,237 @@
+---
+title: "ValidatingAdmissionPolicy (VAP) — Image Registry Allowlist"
+description: "The cluster-wide allowed-image-registries VAP: shape, allowedPrefixes, messageExpression, why per-tenant override VAPs do not work, the two governance paths (mirror to Nexus / extend the cluster-wide allowlist), and the relationship with RHACS exclusions."
+sidebar_label: "VAP image allowlist"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+`ValidatingAdmissionPolicy` (VAP) is the Kubernetes-native, CEL-based admission gate. The fleet ships exactly one cluster-wide VAP — `allowed-image-registries` — which is the primary registry allowlist enforcement. This page covers the VAP shape, the per-tenant exclusion problem (and why there isn't a clean answer), and the two governance paths.
+
+## The CR pair
+
+Two Kubernetes objects make a VAP enforceable:
+
+| Object | Role |
+| --- | --- |
+| `ValidatingAdmissionPolicy/allowed-image-registries` | the policy logic (CEL expressions, allowed prefixes) |
+| `ValidatingAdmissionPolicyBinding/allowed-image-registries` | the binding: which resources, which action (`Deny` / `Audit`) |
+
+Both live in `platform-gitops`:
+
+```text
+clusters/<cluster>/platform/admission-policies/allowed-image-registries.yaml
+```
+
+Identical on `hub-dc-v6` and `spoke-dc-v6`.
+
+## The policy shape
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: allowed-image-registries
+  annotations:
+    description: |
+      Deny pods whose containers do not pull from one of the approved registries:
+        - mirror-registry.apps.sub.comptech-lab.com
+        - registry.redhat.io
+        - quay.io/openshift-release-dev
+        - image-registry.openshift-image-registry.svc:5000
+        - app-registry.apps.sub.comptech-lab.com
+        - quay.apps.sub.comptech-lab.com
+        - ghcr.io/cloudnative-pg
+        - icr.io/appcafe
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:    [""]
+        apiVersions:  ["v1"]
+        operations:   ["CREATE","UPDATE"]
+        resources:    ["pods"]
+  matchConditions:
+    - name: skip-system-namespaces
+      expression: |
+        !(object.metadata.namespace.matches('^(openshift-.*|kube-.*|open-cluster-management.*|default|openshift)$'))
+  variables:
+    - name: allowedPrefixes
+      expression: |
+        [
+          'mirror-registry.apps.sub.comptech-lab.com/',
+          'registry.redhat.io/',
+          'quay.io/openshift-release-dev/',
+          'image-registry.openshift-image-registry.svc:5000/',
+          'app-registry.apps.sub.comptech-lab.com/',
+          'quay.apps.sub.comptech-lab.com/',
+          'ghcr.io/cloudnative-pg/',
+          'icr.io/appcafe/',
+        ]
+  validations:
+    - expression: |
+        (
+          (object.spec.containers          .all(c, variables.allowedPrefixes.exists(p, c.image.startsWith(p))))
+          && (object.spec.?initContainers       .orValue([]).all(c, variables.allowedPrefixes.exists(p, c.image.startsWith(p))))
+          && (object.spec.?ephemeralContainers  .orValue([]).all(c, variables.allowedPrefixes.exists(p, c.image.startsWith(p))))
+        )
+      messageExpression: |
+        'image is not in the allowed-image-registries set; allowed prefixes are: ' +
+        variables.allowedPrefixes.join(', ')
+```
+
+And the binding:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: allowed-image-registries
+spec:
+  policyName: allowed-image-registries
+  validationActions: [Deny]
+```
+
+Key fields and patterns:
+
+| Field | Why |
+| --- | --- |
+| `failurePolicy: Fail` | If the policy's CEL fails to evaluate (rare; bug in expression), deny rather than admit-silently |
+| `resources: ["pods"]` | VAP fires on Pod admission. Indirectly catches Deployments/StatefulSets because they all create Pods. |
+| `matchConditions` skip-system-namespaces | Operator namespaces (openshift-*, kube-*, ACM, default) get a free pass — those pull from registries that aren't allow-listed (oc-mirror reroutes them via IDMS). |
+| `variables.allowedPrefixes` | Centralized so the validation and message expression share one source of truth |
+| three-container check | Pods can have `containers`, `initContainers`, `ephemeralContainers`. All three must satisfy. |
+| `messageExpression` | When a Pod is denied, the message lists the allowed prefixes inline — debugging path is "read the error." |
+| `validationActions: [Deny]` | Hard deny. Other options: `Audit` (log without blocking), `Warn` (return as warning). |
+
+## Where it sits in the admission chain
+
+The kube-apiserver admission pipeline runs in a defined order: built-in admission plugins → MutatingWebhookConfigurations → ValidatingAdmissionPolicies → ValidatingWebhookConfigurations.
+
+For a Pod create:
+
+1. Built-in `PodSecurity` runs first (PSS namespace label / pod-security.kubernetes.io).
+2. RHACS MutatingWebhookConfiguration (not enabled on this fleet) — would run here.
+3. **VAP `allowed-image-registries` runs** — denies if any container image isn't in `allowedPrefixes`.
+4. RHACS ValidatingWebhookConfiguration runs — evaluates the five DEV-OCP-4.3 policies.
+
+So VAP is *before* RHACS. If the VAP denies, the Pod never reaches RHACS. The CEL evaluation is cheap (microseconds) and synchronous; there's no separate "RHACS may admit but VAP later denies" race.
+
+## Why per-tenant override VAPs do not work
+
+A tenant wants to deploy a vendor sidecar at `gcr.io/<vendor>/sidecar:tag`. First instinct: add a narrower VAP that allows this image in this one namespace. **That does not work.**
+
+Kubernetes admission for VAP aggregates by **AND, not OR**:
+
+- Each VAP whose `matchConstraints` and `matchConditions` select a request is evaluated independently.
+- If **any** matching policy fails its `validations:` (and the binding's `validationActions` includes `Deny`), the request is denied.
+- A second VAP that "allows" `gcr.io` in one namespace does not override the cluster-wide VAP. The cluster-wide one still matches Pods in that namespace, still sees `gcr.io` as out-of-allowlist, still denies.
+
+There is no `Allow` action. There is no priority field. There is no namespace-level escape hatch built into the VAP API. The model is intentionally "every policy must pass."
+
+> Corollary: any image that a tenant Pod references must satisfy the cluster-wide VAP. Per-tenant flexibility is expressed somewhere other than VAP, or by changing the cluster-wide VAP itself.
+
+## Governance Path A — mirror to `app-registry` (preferred)
+
+For a vendor sidecar `gcr.io/<vendor>/<sidecar>:<tag>`:
+
+1. Tenant opens an issue against `codex-opp-agent` describing the image, vendor licensing terms, consuming app.
+2. Platform admin pulls the image once, re-tags as `app-registry.apps.sub.comptech-lab.com/<vendor>/<sidecar>:<tag>`, pushes. Trivy scans on push gate this; results land in DefectDojo per ADR 0013.
+3. Tenant's GitOps overlay references the `app-registry` path and pins by digest per `image-digest-overlay.md`.
+4. **No VAP change required** — `app-registry.apps.sub.comptech-lab.com/` is already in the cluster-wide allowlist.
+
+This is the default answer to "we need an image from outside the allowlist." It scales — any number of vendor sidecars can be mirrored without touching admission policy. It also keeps the air-gap-rebuild story intact: the image lives in our registry rather than depending on `gcr.io` being reachable.
+
+## Governance Path B — extend the cluster-wide allowlist (rare)
+
+If mirroring is infeasible (vendor licensing forbids re-hosting, image is rebuilt nightly with a content-addressed pull that Nexus cannot proxy), the only option is to add the upstream prefix to the cluster-wide allowlist.
+
+This is a **governance change, not a tenant change**:
+
+1. Open a `type/decision` issue against `codex-opp-agent` proposing the prefix, the consuming team, the supply-chain compensating controls (Trivy policy, RHACS image policy, signing if available), and a sunset criterion ("when vendor publishes to Red Hat Container Catalog, we revert").
+2. Platform admin reviews. If accepted, the change is made in `platform-gitops` at the cluster-wide VAP manifests (both `hub-dc-v6` and `spoke-dc-v6`) by adding the prefix to the `allowedPrefixes` variable, the `description:` annotation, and the `messageExpression`.
+3. The issue records the decision; on merge, the prefix is in the audit trail.
+4. RHACS image policy is updated in parallel via `scripts/rhacs-update-img-allowlist.sh` (Central API) so RHACS doesn't flag the newly-allowed prefix.
+
+Path B should be a single-digit-count event over the lifetime of the platform. Each addition broadens the supply-chain surface for every tenant, not just the requester — that's exactly why Path A is preferred.
+
+## RHACS — where per-tenant scoping does work
+
+RHACS deploy-time policies support a `scope` selector that restricts a policy to a cluster, namespace, or label set. That *is* the right place to express "this namespace is allowed to use this specific image (or image prefix) even though the platform default would warn."
+
+But: **an RHACS exclusion only suppresses RHACS's own alert / enforcement.** The cluster-wide VAP is independent and still denies admission at the Kubernetes API layer. RHACS exclusion + VAP `Deny` mode = the Pod is still admission-blocked. RHACS exclusion is only useful here as a *narrower compensating control* while Path A (mirror) is being executed; it is not a substitute for Path A or Path B.
+
+The current production posture is `validationActions: [Deny]` on the cluster-wide VAP. So RHACS exclusions buy nothing for the admission-blocked Pod. They become meaningful only if the platform ever runs the VAP in `Warn`/`Audit` mode (it does not, today).
+
+## What this means in practice
+
+When a tenant asks for a VAP exception:
+
+- **Default response:** mirror the image to `app-registry` (Path A). Point at `image-digest-overlay.md` and at the tenant's Jenkinsfile / Tekton pipeline.
+- **Only if mirroring is impossible:** open a decision issue and consider Path B.
+- **Never:** add a second VAP intending to "override" the first one. It does not override — it just adds another AND-clause; the request is still denied by the cluster-wide policy.
+- **If short-term tolerance is needed before Path A completes:** an RHACS scoped exclusion, understanding it doesn't unblock admission while VAP is `Deny`.
+
+## Adding a new registry — combined checklist
+
+The VAP and the RHACS IMG-SUPPLY-3 policy must be kept in sync. The flow:
+
+1. Edit BOTH cluster VAP files (`clusters/hub-dc-v6/...` and `clusters/spoke-dc-v6/...`).
+2. Update three places per file:
+   - the header comment (`Allowed prefixes:` list);
+   - the `allowedPrefixes` variable;
+   - the `messageExpression` string.
+3. Commit + push to GitLab `platform-gitops` `main`. Argo reconciles within ~3 minutes.
+4. Verify with the live test pattern below.
+5. Edit `DESIRED_REGISTRIES` in `scripts/rhacs-update-img-allowlist.sh`.
+6. Run the script; confirm the verify block.
+7. Update the "Current allowlist" table in `connection-details/image-registry-allowlist.md`.
+
+## Live test pattern
+
+```bash
+KCFG=<kubeconfig>
+
+# Should be ALLOWED — returns "pod/<name>":
+KUBECONFIG=$KCFG oc run vap-test-ok \
+  --image=app-registry.apps.sub.comptech-lab.com/test/foo:latest \
+  --dry-run=server --image-pull-policy=Never \
+  -n external-secrets-operator -o name
+
+# Should be DENIED — returns "ValidatingAdmissionPolicy ... denied request":
+KUBECONFIG=$KCFG oc run vap-test-deny \
+  --image=evil.example.com/test/foo:latest \
+  --dry-run=server --image-pull-policy=Never \
+  -n external-secrets-operator -o name
+```
+
+`--dry-run=server` runs the request through the kube-apiserver admission chain (so VAP fires) without creating the Pod. The target namespace must be a non-system one (system namespaces are exempted by `matchConditions`).
+
+If you must apply pre-merge to validate the change, temporarily disable Argo auto-sync, apply, test, then re-enable. Argo selfHeal is `true` on these apps, so any manual `oc apply` is reverted within seconds otherwise.
+
+## Why no manifest in `platform-gitops` for per-tenant VAP overrides
+
+There is no working per-tenant override VAP to ship. The framework is the documented constraint plus the two governance paths above. Any future tenant-specific change lands either as:
+
+- a new mirror entry in Nexus (Path A — no GitOps change needed for the VAP), or
+- an edit to the existing `allowed-image-registries.yaml` (Path B — governance-issue-driven).
+
+This is why `vap-tenant-exclusions.md` (#199) is a doc-only deliverable, not a manifest.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Pod denied with "image is not in the allowed-image-registries set..." | image not allow-listed | Path A (mirror) or Path B (allowlist extension) |
+| VAP error "CEL evaluation failure" | `failurePolicy: Fail` + bug in expression | revert the VAP change; rebuild the CEL |
+| VAP allows an image that RHACS denies | granularity mismatch (VAP path vs RHACS host) | update both layers in step |
+| Tenant claims they added an override VAP and it works | the override matches a different `matchConstraints` (different resource, different op) than the cluster-wide one, so they don't both fire on the same request | re-verify with `oc run --dry-run=server`; document the (rare) case |
+| System namespace Pod denied | namespace not in the `matchConditions` skip list | add to the regex (review if the namespace really should be exempt) |
+
+## References
+
+- `connection-details/image-registry-allowlist.md` (IMG-SUPPLY-3).
+- `connection-details/vap-tenant-exclusions.md` (DEV-OCP-4.4 / #199).
+- `connection-details/image-digest-overlay.md` (Path A pinning).
+- Kubernetes ValidatingAdmissionPolicy semantics: `admissionregistration.k8s.io/v1` reference.
+- ADRs: 0019 (image supply), 0020 (PCI baseline).

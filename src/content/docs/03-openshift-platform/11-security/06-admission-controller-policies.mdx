@@ -1,0 +1,190 @@
+---
+title: "RHACS Admission Controller and Deploy-Time Policies"
+description: "How the RHACS Admission controller webhook intercepts Pod admission, what the enforcement actions mean (SCALE_TO_ZERO vs FAIL_BUILD), failurePolicy semantics, break-glass annotation, timeouts, and the policy lifecycle stages."
+sidebar_label: "Admission controller"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+The RHACS Admission controller is the per-cluster webhook that turns RHACS Central policies into deploy-time gates. This page covers how it plugs into the kube-apiserver, what the enforcement actions mean, how to do break-glass admission, and the failure semantics.
+
+## Where it fits
+
+The Admission controller is a Deployment in `stackrox` (3 replicas by default) running behind a Service. The RHACS operator registers a `ValidatingWebhookConfiguration` (and optionally a `MutatingWebhookConfiguration`) with the kube-apiserver. When a Pod, Deployment, or DaemonSet is `CREATE`d or `UPDATE`d, the apiserver synchronously calls the webhook.
+
+| Webhook | Resources | Operations | What it gates |
+| --- | --- | --- | --- |
+| ValidatingWebhookConfiguration | Pod, Deployment, ReplicaSet, DaemonSet, StatefulSet, Job, CronJob | CREATE, UPDATE | RHACS deploy-time policy evaluation |
+| MutatingWebhookConfiguration | (off by default; not used) | n/a | image-tag-to-digest pinning (we use IDMS for this) |
+
+Three policies-on-the-cluster things to keep in mind:
+
+1. **Pod admission ≠ Deployment admission.** The kube-apiserver's admission chain runs on the Pod object. RHACS evaluates the Deployment/StatefulSet object (with the Pod template inside it). The webhook configuration intercepts both — the Deployment is evaluated at the controller level, and the Pod is intercepted to apply enforcement.
+2. **Pull-side policies require the Pod to exist.** RHACS evaluates image-related policies after Scanner V4 has scanned (or skipped) the image. `admissionControl.contactImageScanners: ScanIfMissing` makes this synchronous.
+3. **The webhook talks to the local Sensor**, not directly to Central. Sensor has the cached policy snapshot. So a brief Central outage doesn't kill admission — Sensor keeps evaluating with the last-known snapshot.
+
+## Configuration block in SecuredCluster
+
+```yaml
+spec:
+  admissionControl:
+    listenOnCreates: true
+    listenOnEvents: true
+    listenOnUpdates: true
+    contactImageScanners: ScanIfMissing
+    timeoutSeconds: 10
+    bypass: BreakGlassAnnotation
+```
+
+| Field | What it does |
+| --- | --- |
+| `listenOnCreates` | webhook fires on `CREATE` admission events |
+| `listenOnUpdates` | webhook fires on `UPDATE` admission events |
+| `listenOnEvents` | webhook fires on Kubernetes event resources (used for image-scan-on-event flows) |
+| `contactImageScanners` | `ScanIfMissing` triggers a synchronous Scanner V4 scan if no scan exists; `Never` skips |
+| `timeoutSeconds` | webhook timeout. After this, the apiserver's `failurePolicy` decides |
+| `bypass` | `BreakGlassAnnotation` allows annotation-based bypass; `Disabled` prevents bypass |
+
+The webhook `failurePolicy` defaults to `Fail` (i.e., if the webhook doesn't respond in 10s, the request is denied). Operators can switch it to `Ignore` as break-glass — but this is a cluster-wide change with a clear cost: every admission goes uninspected. Use only during incident response.
+
+## Policy lifecycle stages
+
+| Lifecycle | When evaluated | What enforcement actions are available |
+| --- | --- | --- |
+| `BUILD` | image push / scan | (alert only; no admission enforcement) |
+| `DEPLOY` | admission of Deployment / Pod | `UNSET_ENFORCEMENT`, `SCALE_TO_ZERO_ENFORCEMENT`, `UNSATISFIABLE_NODE_CONSTRAINT_ENFORCEMENT`, `DEPLOYMENT_TIME_FAIL_BUILD` |
+| `RUNTIME` | Collector runtime events | `KILL_POD_ENFORCEMENT`, `FAIL_KUBE_REQUEST_ENFORCEMENT` |
+
+The fleet uses `DEPLOY` lifecycle for the app-team policy set (next page), with `SCALE_TO_ZERO_ENFORCEMENT`. Build-time policies (vulnerability gating) are intentionally **not** enforced via RHACS — Trivy on the build path handles them, with the trade-offs documented in [05-scanner-v4-and-image-policies](./05-scanner-v4-and-image-policies).
+
+## Enforcement actions in plain English
+
+| Action | What actually happens |
+| --- | --- |
+| `UNSET_ENFORCEMENT` | RHACS alerts; admission proceeds. Used for advisory / "warn" policies. |
+| `SCALE_TO_ZERO_ENFORCEMENT` | Pod is admitted, then RHACS scales the owning Deployment's `replicas` to 0. The Pod is killed. The Deployment shows `replicas: 0` and the alert in Central explains why. |
+| `UNSATISFIABLE_NODE_CONSTRAINT_ENFORCEMENT` | RHACS patches the Pod spec with a nodeSelector that no node matches; the Pod stays `Pending`. Less common than scale-to-zero. |
+| `DEPLOYMENT_TIME_FAIL_BUILD` | The webhook returns Deny at admission — the apiserver rejects the request. Used when you want hard denial vs visible-but-stopped. |
+| `KILL_POD_ENFORCEMENT` | runtime; RHACS kills the Pod when a runtime policy fires |
+| `FAIL_KUBE_REQUEST_ENFORCEMENT` | runtime; rejects the kube-API request that triggered the runtime alert |
+
+The fleet's app-team policies use **`SCALE_TO_ZERO_ENFORCEMENT`** rather than hard-deny because:
+
+1. The Deployment object remains visible — easier for the tenant to see "RHACS scaled me to zero" than "kubectl apply returned 403."
+2. The alert in Central is unambiguous: Deployment scaled, policy named, violation described.
+3. The Pod's events show the RHACS reason — a developer reading `oc describe deploy/myapp` sees the explanation without going to Central.
+
+Hard deny is reserved for cluster-wide policies like IMG-SUPPLY-3 where the violation is fundamentally not the tenant's call to override.
+
+## Break-glass annotation
+
+`admissionControl.bypass: BreakGlassAnnotation` lets operators annotate a Pod (or its owning Deployment) to bypass RHACS admission:
+
+```yaml
+metadata:
+  annotations:
+    admission.stackrox.io/break-glass: "incident-2026-05-11 — resolving CrashLoop, exception expires in 1h"
+```
+
+Once annotated, the webhook will admit without running policy evaluation. Two important properties:
+
+- **The bypass is logged.** Sensor reports a `bypass` event to Central with the annotation value. Auditable trail.
+- **The bypass is local to the annotated Pod.** Removing the annotation re-engages RHACS evaluation on the next admission.
+
+Break-glass usage is governed by the `break-glass-procedure.md` runbook. Use of this annotation outside an open incident issue is itself a policy violation.
+
+## Timeouts and failurePolicy
+
+The webhook timeout is `timeoutSeconds: 10`. If the webhook doesn't respond:
+
+- `failurePolicy: Fail` (default) — the apiserver denies the request. Pods can't be scheduled.
+- `failurePolicy: Ignore` — the apiserver admits the request without RHACS evaluation. Use only as break-glass.
+
+If RHACS Sensor goes down on a cluster, every admission times out, and `failurePolicy: Fail` means the cluster stops accepting new Pods. The recovery path:
+
+1. Confirm Sensor is unhealthy (`oc -n stackrox get pods -l app=sensor`).
+2. If unrecoverable in minutes, patch the `ValidatingWebhookConfiguration` `failurePolicy: Ignore` temporarily:
+   ```bash
+   oc patch validatingwebhookconfiguration stackrox \
+     --type=json \
+     -p='[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]'
+   ```
+3. Restore Sensor.
+4. Revert `failurePolicy: Fail`.
+
+Argo's selfHeal will revert step 2 unless the auto-sync is paused; for break-glass, you accept that and document it.
+
+## What the webhook actually looks like
+
+```bash
+oc get validatingwebhookconfiguration stackrox -o yaml | head -40
+```
+
+A typical entry:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: stackrox
+webhooks:
+  - name: policyeval.stackrox.io
+    clientConfig:
+      service:
+        name: admission-control
+        namespace: stackrox
+        path: /admit
+      caBundle: <base64 of admission-control-tls CA>
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments","daemonsets","statefulsets","replicasets"]
+    failurePolicy: Fail
+    timeoutSeconds: 10
+    namespaceSelector:
+      matchExpressions:
+        - key: stackrox.io/admission-control
+          operator: NotIn
+          values: ["disabled"]
+    sideEffects: None
+    admissionReviewVersions: ["v1","v1beta1"]
+```
+
+Three patterns are worth noting:
+
+1. **`namespaceSelector` with NotIn label** — a namespace labelled `stackrox.io/admission-control=disabled` is excluded. This is a per-namespace opt-out for namespaces where admission interference is dangerous (e.g., bootstrap namespaces during install).
+2. **`sideEffects: None`** — important. RHACS doesn't mutate the Pod (it scales the owner externally), so the webhook is idempotent and the apiserver can re-invoke it safely.
+3. **`admissionReviewVersions: ["v1","v1beta1"]`** — backwards-compatible. OCP 4.20 uses v1.
+
+## Per-namespace admission opt-out (rare)
+
+Label a namespace to bypass RHACS admission for everything in it:
+
+```bash
+oc label ns <ns> stackrox.io/admission-control=disabled
+```
+
+This is used during install to avoid race conditions when the operator namespace itself is bootstrapping. **Don't use it on tenant namespaces** — RHACS evaluation is the whole point.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Pod admission times out (10s) | Sensor down or slow | check Sensor health; temporary break-glass: `failurePolicy: Ignore` |
+| Admission denies everything | Sensor down + `failurePolicy: Fail` | as above |
+| `SCALE_TO_ZERO_ENFORCEMENT` does nothing | policy in `UNSET_ENFORCEMENT` | check policy config in Central; or `--reconcile` via `scripts/rhacs-enable-app-policies.sh` |
+| Webhook not invoked | namespace labelled `stackrox.io/admission-control=disabled` | unlabel |
+| Specific Pod admitted despite policy violation | break-glass annotation set | inspect for `admission.stackrox.io/break-glass`, follow up with tenant |
+| `MutatingWebhookConfiguration` interfering with IDMS | mutating webhook somehow enabled | verify `admissionControl.bypass` and webhook configurations |
+
+## References
+
+- `connection-details/rhacs-app-policy.md` (DEV-OCP-4.3).
+- `runbooks/break-glass-procedure.md`.
+- RHACS 4.10 admission webhook configuration docs.
+- `scripts/rhacs-enable-app-policies.sh` (claude-agent/scripts).

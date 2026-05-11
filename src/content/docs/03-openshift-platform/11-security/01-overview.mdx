@@ -1,0 +1,153 @@
+---
+title: "Security Overview (RHACS, VAP, NetworkPolicy)"
+description: "The OpenShift security plane on the v6 fleet: Red Hat Advanced Cluster Security (Central on hub, SecuredCluster on each spoke), Scanner V4, admission controller, app-team policy set, ValidatingAdmissionPolicies for image allowlist, and per-tenant NetworkPolicy defaults."
+sidebar_label: "Overview"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 220, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 190, textAlign: "center" };
+export const agentBox = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 180, textAlign: "center" };
+export const tenantBox = { background: "#dbeafe", border: "1px solid #2563eb", borderRadius: 8, padding: 8, color: "#1e3a8a", width: 190, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nodes = [
+  // hub cluster
+  { id: "central",   position: { x: 0,   y: 0   }, data: { label: "RHACS Central\n(hub-dc-v6)" },                style: ctrlBox },
+  { id: "scanner",   position: { x: 280, y: 0   }, data: { label: "Scanner V4\n(matcher + indexer)" },           style: dataBox },
+  { id: "centralDb", position: { x: 560, y: 0   }, data: { label: "Central DB\n(Postgres)" },                    style: dataBox },
+
+  // hub-side secured cluster bits (self-managed)
+  { id: "sensorHub", position: { x: 0,   y: 150 }, data: { label: "Sensor (hub-dc-v6)" },                        style: agentBox },
+  { id: "admHub",    position: { x: 220, y: 150 }, data: { label: "Admission ctlr (hub)" },                      style: agentBox },
+
+  // spoke
+  { id: "sensorSpk", position: { x: 0,   y: 330 }, data: { label: "Sensor (spoke-dc-v6)" },                      style: agentBox },
+  { id: "admSpk",    position: { x: 220, y: 330 }, data: { label: "Admission ctlr (spoke)" },                    style: agentBox },
+  { id: "collSpk",   position: { x: 440, y: 330 }, data: { label: "Collector DS\n(per node, kernel-mode)" },     style: agentBox },
+
+  // platform Kubernetes-native admission
+  { id: "vap",       position: { x: 760, y: 150 }, data: { label: "VAP allowed-image-registries\n(per cluster)" }, style: tenantBox },
+  { id: "kubeapi",   position: { x: 760, y: 0   }, data: { label: "kube-apiserver\n(admission chain)" },         style: ctrlBox },
+
+  // network policy
+  { id: "np",        position: { x: 760, y: 330 }, data: { label: "Tenant default-deny\nNetworkPolicies" },       style: tenantBox },
+
+  // vault
+  { id: "vault",     position: { x: 280, y: 480 }, data: { label: "Vault\n(RHACS init-bundle Secrets)" },         style: extBox },
+];
+
+export const edges = [
+  { id: "a", source: "scanner",   target: "central",  label: "image scan API", ...muted },
+  { id: "b", source: "central",   target: "centralDb", label: "policies, alerts", ...muted },
+  { id: "c", source: "sensorHub", target: "central",  label: "TLS, mTLS",       ...pullEdge },
+  { id: "d", source: "sensorSpk", target: "central",  label: "TLS, mTLS",       ...pullEdge },
+  { id: "e", source: "admHub",    target: "sensorHub", label: "evals via",      ...muted },
+  { id: "f", source: "admSpk",    target: "sensorSpk", label: "evals via",      ...muted },
+  { id: "g", source: "collSpk",   target: "sensorSpk", label: "runtime events", ...muted },
+  { id: "h", source: "kubeapi",   target: "vap",       label: "admit",          ...reqEdge },
+  { id: "i", source: "kubeapi",   target: "admSpk",    label: "admit",          ...reqEdge },
+  { id: "j", source: "kubeapi",   target: "np",        label: "admit",          ...muted },
+  { id: "k", source: "vault",     target: "sensorSpk", label: "init-bundle via ESO", ...pullEdge },
+];
+
+The security plane stacks four independent control layers — RHACS, VAP, NetworkPolicy, Pod Security — over the same workloads. Each catches a different class of risk, and they're designed so the failure of one still leaves a meaningful check standing. This page is the topology; subpages drill into each component.
+
+## What's in the security plane
+
+| Layer | Tool | What it gates | Failure leaves still standing |
+| --- | --- | --- | --- |
+| Build-time image vulnerability | Trivy → DefectDojo (out of scope here; see §6 supply-chain docs) | known CVEs at build | RHACS deploy-time policy will still flag if a known-bad lands |
+| Deploy-time policy (CR-level) | RHACS Central deploy policies | latest tag, missing limits, privileged, CAP_SYS_ADMIN, required labels | VAP allowed-image-registries still denies disallowed registries |
+| Admission-time registry allowlist | `ValidatingAdmissionPolicy/allowed-image-registries` | any image not from an allow-listed prefix | RHACS deploy-time policy alerts; runtime collector observes |
+| Admission-time RHACS gate | RHACS admission controller (per cluster) | RHACS-policy-violating Pods | Kubernetes-native VAP still denies registry violations |
+| Pod Security Standards | OpenShift built-in (per-namespace) | SCC-equivalents (`restricted`, `restricted-v2`, etc.) | RHACS Privileged Container policy alerts |
+| Runtime detection | RHACS Collector (DaemonSet) | unexpected processes, cryptomining, lateral movement | none — last line of defense; relies on alerting |
+| Network egress/ingress | per-tenant default-deny NetworkPolicy set | east-west traffic, lab-perimeter egress | RHACS network-flow detection still surfaces anomalies |
+
+The doctrine: **don't rely on a single layer**. If a Trivy fail-gate is bypassed via a build-side exception, RHACS will still alert at deploy. If RHACS Sensor goes degraded, the VAP still denies non-allow-listed registries at the apiserver. Defense in depth is non-negotiable on a PCI-target cluster.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes, edges }} height={600} />
+
+Reading the diagram:
+
+- **Central + Scanner V4 + Postgres** all run on `hub-dc-v6` in `stackrox` ns. Central is the policy engine and UI; Scanner V4 is the image-scanning service (replaced the older `Scanner` + `Scanner-DB`); Postgres holds policies, alerts, and history.
+- **Sensor + Admission controller** run on each cluster (hub manages itself in addition to the spoke). The Sensor is the long-lived pull-mode agent that maintains an mTLS connection to Central; the Admission controller webhook is registered with the local kube-apiserver and consults the Sensor for policy evaluation.
+- **Collector** runs as a DaemonSet on the spoke. It's the kernel-mode (or eBPF) probe that produces runtime events (process, network, file) and feeds them to the Sensor.
+- **VAP** is Kubernetes-native admission — independent of RHACS. The cluster-wide allowed-image-registries policy lives in `platform-gitops` per cluster.
+- **NetworkPolicy** defaults live in every tenant overlay (the W1.C template, DEV-OCP-4.2 / #197). Default-deny + named allows.
+- **Vault** stores the per-Sensor init-bundle (per `reference_rhacs_init_bundle_via_api.md`); ESO materializes the three TLS Secrets (`collector-tls`, `sensor-tls`, `admission-control-tls`) into `stackrox` on each cluster.
+
+## Where things deploy
+
+| Component | Cluster | Namespace | Replicas | Storage |
+| --- | --- | --- | --- | --- |
+| Central | `hub-dc-v6` | `stackrox` | 1 | RWO PVC (`central-db-backup` PV) |
+| Central DB (Postgres) | `hub-dc-v6` | `stackrox` | 1 | RWO PVC |
+| Scanner V4 (matcher + indexer) | `hub-dc-v6` | `stackrox` | 1+1 | shared cache PVC |
+| Sensor | both | `stackrox` | 1 | none |
+| Admission controller | both | `stackrox` | 3 (per RHACS default) | none |
+| Collector | spoke (and hub) | `stackrox` | DaemonSet (1 per node) | hostPath access |
+
+## RHACS at a glance
+
+RHACS is structured as five distinct pods/Deployments that talk over a hub-spoke pull model identical in spirit to RHACM's klusterlet:
+
+1. **Central** — the brain. Stores policies, alerts, images. UI lives here.
+2. **Sensor** (per cluster) — the on-cluster controller. Long-lived mTLS connection back to Central. Reads Kubernetes resources, evaluates policy locally, sends events upstream.
+3. **Admission controller** (per cluster) — registers a webhook with the kube-apiserver. Evaluates Pods on `CREATE` / `UPDATE` against deploy-time policies. Talks to Sensor for current policy snapshot.
+4. **Collector** (DaemonSet) — host-level agent producing runtime events (eBPF or kernel-mode driver).
+5. **Scanner V4** — pulls images from registries (using the secured cluster's pull credentials), runs Clair-derived static analysis, attaches vulnerability/CVE data to image objects in Central.
+
+The hub-spoke split makes RHACS work across air-gapped, NAT-ed, and disconnected configurations — the Sensor initiates the TLS connection; Central never reaches *into* a managed cluster.
+
+## What this section covers (subpage map)
+
+| Page | Topic |
+| --- | --- |
+| 02 `rhacs-central-on-hub` | Central + DB + Scanner V4 install pattern, route, admin password, storage |
+| 03 `sensor-on-spoke` | Sensor + Admission + Collector install on the spoke, secured-cluster CR shape, Central endpoint |
+| 04 `init-bundle-via-eso` | Generating init-bundles via Central API, pushing to Vault, ESO delivery to `stackrox` |
+| 05 `scanner-v4-and-image-policies` | Scanner V4 (matcher + indexer), CVE feed model, image policies (IMG-SUPPLY-3 allowlist) |
+| 06 `admission-controller-policies` | The deploy-time policies enforced by RHACS admission controller, enforcement actions |
+| 07 `app-team-policy-set` | The 5 RHACS built-in policies scoped to `apps-.*`, the exception process, audit trail |
+| 08 `validating-admission-policies-vap` | The cluster-wide allowed-image-registries VAP, why per-tenant overrides don't work, governance paths |
+| 09 `network-policy-egress-defaults` | Per-tenant default-deny + allow set, the egress-to-Vault NP, app-specific add-ons |
+
+## Versions and where they're pinned
+
+| Component | Version | Pinned in |
+| --- | --- | --- |
+| `rhacs-operator` | `4.10.2` | `platform-admin-handoff.md` rebuild operator-version-lock |
+| Scanner V4 | bundled with `4.10.2` | same |
+| Compliance Operator (companion in §12) | `1.9.0` | same |
+| Container Security Operator | `3.16.3` | same (informational; not in scope for §11 details) |
+| Gatekeeper | `3.21.0` | same (informational; not in scope) |
+
+The fleet runs RHACS 4.10.2 in disconnected mode against mirrored images. The catalog source is the same `cs-redhat-operator-index-v4-20` index used for ESO and the other platform operators (see §6 image supply).
+
+## Where RHACS *isn't* the enforcement layer
+
+A few categories are explicitly **not** RHACS-enforced even though Central can:
+
+- **Image vulnerability gating** — Trivy + DefectDojo on the build path. RHACS sees the CVE landscape but the build gate is what fails a deploy of a known-bad image. Doing both creates double-blocking that slows incident triage. RHACS still *alerts* on deploy-time CVE policy if one slips past.
+- **NetworkPolicy enforcement** — RHACS observes network flows and can suggest NetworkPolicies, but the actual enforcement is the per-tenant NetworkPolicy set from DEV-OCP-4.2.
+- **Allowed-registry admission** — RHACS *also* runs a deploy-time `IMG-SUPPLY-3` policy, but the **primary** registry gate is the Kubernetes-native VAP. The RHACS policy is the corroborating layer (lower granularity on the registry path) and the source of audit-friendly alerts in the Central UI.
+
+## References
+
+- `connection-details/platform-admin-handoff.md` (operator inventory + install lock).
+- `connection-details/rhacs-app-policy.md` (DEV-OCP-4.3 / #198).
+- `connection-details/image-registry-allowlist.md` (IMG-SUPPLY-3).
+- `connection-details/vap-tenant-exclusions.md` (DEV-OCP-4.4 / #199).
+- `reference_rhacs_init_bundle_via_api.md` (memory).
+- ADRs: 0019 (image supply), 0020 (PCI baseline).
