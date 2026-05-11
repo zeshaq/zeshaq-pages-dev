@@ -1,8 +1,88 @@
 ---
-title: "MinIO Buckets Table"
-description: "Section 07-references: MinIO Buckets Table (placeholder)."
-sidebar_label: "MinIO Buckets Table"
+title: "Object Storage Buckets"
+description: "Bucket-level inventory across MinIO (VM-side) and NooBaa OBC (in-cluster) — owner, purpose, lifecycle, readers, writers."
+sidebar_label: "Object Storage Buckets"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The lab uses two object-storage planes:
+
+- **MinIO VM** — standalone S3 endpoint outside any OpenShift cluster, used
+  for CI evidence and backups that need to survive cluster reinstalls.
+- **NooBaa MCG (in-cluster on `spoke-dc-v6`)** — OBC-managed buckets
+  provisioned through ODF for in-cluster operands (Loki, Tempo, Quay).
+
+This page lists the **named** buckets / OBCs in use. Where a credential
+custody location is given it is a logical reference, not a usable token.
+
+## MinIO VM buckets
+
+| Bucket | Owner | Purpose | Lifecycle | Read by | Written by |
+| --- | --- | --- | --- | --- | --- |
+| `developer-ci-evidence` | platform-admin | Per-build evidence (Trivy reports, SBOM, release records) | `smoke/` 30d, `builds/` 90d, `trivy/` 180d, `sbom/` 365d, `releases/` 365d | DefectDojo importer (deferred), human auditor (read-only key) | Jenkins (`nexus-jenkinsbot` parent), Jenkins build `openliberty-readiness-probe-image-build` |
+| `oadp-hub-dc-v6` | platform-admin | OADP Velero backups for hub cluster | OADP retention policy | OADP restore | OADP backup controller on `hub-dc-v6` |
+| `oadp-spoke-dc-v6` | platform-admin | OADP Velero backups for spoke cluster | OADP retention policy | OADP restore | OADP backup controller on `spoke-dc-v6` |
+| `acm-dpa-hub-dc-v6` | platform-admin | ACM DataProtectionApplication target | OADP retention policy | ACM restore | ACM DPA |
+| `vault-snapshots` | platform-admin | Vault Raft snapshots | Vault snapshot retention | Vault restore | Vault VM snapshot job |
+
+### CI evidence prefix layout (`developer-ci-evidence`)
+
+| Prefix | Content |
+| --- | --- |
+| `builds/` | Build manifests + image-digest records (90d) |
+| `trivy/` | Trivy vulnerability reports per build (180d) |
+| `sbom/` | SBOM artifacts (CycloneDX/SPDX) per build (365d) |
+| `releases/` | Release evidence (manifest + signatures) (365d) |
+| `smoke/` | Smoke-test artifacts (30d) |
+
+## NooBaa MCG OBCs (in-cluster, `spoke-dc-v6`)
+
+NooBaa OBCs are provisioned through `ObjectBucketClaim` CRs. NooBaa writes
+an `AWS_*` Secret + a `BUCKET_*` ConfigMap; an ESO bridge transforms those
+into the operand-shaped Secret (LokiStack/TempoStack expect lowercase keys).
+
+| OBC / Bucket | Owner | Purpose | Lifecycle | Read by | Written by |
+| --- | --- | --- | --- | --- | --- |
+| `loki-storage` (bucket `loki-chunks`) | observability platform team | LokiStack chunk store | LokiStack retention | LokiStack queriers | LokiStack distributors / ingesters |
+| `tempo-traces` (bucket `tempo-traces`) | observability platform team | TempoStack trace blocks | TempoStack retention | TempoStack querier | TempoStack ingester |
+| `quay-storage` (bucket `quay-registry`) | platform-admin | Quay image blobs | Operator-managed | Quay registry pull | Quay registry push |
+
+### OBC -> operand Secret bridge
+
+The bridge ExternalSecret (one per operand) lives in the operand's GitOps
+overlay:
+
+| Operand | ExternalSecret manifest |
+| --- | --- |
+| TempoStack | `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml` |
+| LokiStack | `clusters/spoke-dc-v6/platform-services/logging/externalsecret-loki-storage.yaml` (tracked under #233) |
+| Quay | uses `quay-config-bundle-secret` populated from Vault path `secret/ocp/spoke-dc-v6/quay/config-bundle` |
+
+## Credential custody (logical reference)
+
+| Credential | Custody | Reference |
+| --- | --- | --- |
+| `developer-ci-evidence` writer | local file at `/home/ze/codex-opp-agent/secrets/minio-developer-ci-evidence.env` | `connection-details/minio.md` |
+| `developer-ci-evidence` reader | local file at `/home/ze/codex-opp-agent/secrets/minio-developer-ci-evidence-reader.env` | `connection-details/minio.md` |
+| OADP `aws` profile per cluster | OADP `DataProtectionApplication` -> Secret in `openshift-adp` namespace | OADP install runbook |
+| NooBaa OBC creds | NooBaa-generated Secret in operand namespace, bridged via ESO | `project_obc_to_operand_secret_bridge.md` |
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| LokiStack `Warning Degraded`, "missing endpoint key" | OBC Secret has `AWS_*` keys but LokiStack wants lowercase `endpoint`/`bucketnames`/... | Apply the ESO bridge ExternalSecret (Tempo pattern, tracked under #233 for Loki). |
+| QuayRegistry stalls reconciliation | Vault path `secret/ocp/spoke-dc-v6/quay/config-bundle` empty | Populate the Vault path, then restart the Quay operator. |
+| `oc mirror` rejected by MinIO | Wrong target — MinIO is not the OpenShift mirror | Use Nexus `mirror-registry.apps.sub.comptech-lab.com` for `oc mirror`; MinIO is OADP/evidence only. |
+
+## Internal only
+
+> MinIO endpoint host, access keys, secret keys, and the audit-grade
+> backup/restore status are kept in `codex-opp-agent/connection-details/`.
+
+Last regenerated from
+`connection-details/minio.md`,
+`connection-details/jenkins-ocp-path.md`,
+`project_obc_to_operand_secret_bridge.md`,
+`reference_lab_infrastructure.md`.

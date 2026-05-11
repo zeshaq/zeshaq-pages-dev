@@ -1,8 +1,131 @@
 ---
-title: "Vault Paths Table"
-description: "Section 07-references: Vault Paths Table (placeholder)."
-sidebar_label: "Vault Paths Table"
+title: "Vault Paths"
+description: "Vault KV-v2 path convention — per-tenant tree, per-cluster Kubernetes auth mounts, ESO role bindings."
+sidebar_label: "Vault Paths"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+Vault OSS does not provide Enterprise namespaces, so the lab uses **strict
+path prefixes**. The convention is one mount (KV-v2 at `secret/`), three
+top-level subtrees (`secret/ocp/`, `secret/platform/`, `secret/apps/`), and
+per-cluster Kubernetes auth mounts (`auth/kubernetes-<cluster>`). Every real
+application gets its own policy, role, namespace-scoped `SecretStore`, and
+`ExternalSecret`. No `ClusterSecretStore` is used for tenant traffic.
+
+## Path convention
+
+| Path pattern | Owner | Engine | Mounted in | Bound role | Reference |
+| --- | --- | --- | --- | --- | --- |
+| `secret/ocp/platform/*` | platform-admin | KV-v2 | shared across clusters | `ocp-<cluster>-eso` (per cluster) | `plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md` |
+| `secret/ocp/hub-dc-v6/*` | platform-admin | KV-v2 | hub cluster | `ocp-hub-dc-v6-eso` | `connection-details/openshift-hub-dc-v6.md` |
+| `secret/ocp/spoke-dc-v6/*` | platform-admin | KV-v2 | spoke cluster | `ocp-spoke-dc-v6-eso` | `connection-details/openshift-spoke-dc-v6.md` |
+| `secret/ocp/<cluster>/registries/*` | platform-admin | KV-v2 | per-cluster | platform ESO | `connection-details/app-registry-pullsecret.md` |
+| `secret/ocp/<cluster>/quay/config-bundle` | platform-admin | KV-v2 | spoke (Quay namespace) | platform ESO | `project_obc_to_operand_secret_bridge.md` |
+| `secret/ocp/platform/kafka/rke2-client` | platform-admin | KV-v2 | shared | platform ESO | `RUNBOOK.md` |
+| `secret/platform/gitlab/admin-pat` | platform-admin | KV-v2 | local automation | (no ESO; shell scripts) | `plans/disconnected-rebuild/gitlab-bootstrap-design.md` |
+| `secret/platform/gitlab/runners/<class>` | platform-admin | KV-v2 | local automation | (no ESO; bootstrap scripts) | `plans/gitlab-runner-classes-and-tags.md` |
+| `secret/platform/gitlab-runner/<class>/registration-token` | platform-admin | KV-v2 | local automation | runner bootstrap script | `plans/gitlab-runner-access-model.md` |
+| `secret/platform/gitlab-runner/<class>/minio-cache-credentials` | platform-admin | KV-v2 | local automation | runner cache | `plans/gitlab-runner-classes-and-tags.md` |
+| `secret/platform/minio/terraform-hmac` | platform-admin | KV-v2 | local automation | terraform | `plans/disconnected-rebuild/gitlab-bootstrap-design.md` |
+| `secret/apps/<division>/<app>/<env>/*` | division team | KV-v2 | tenant namespace | `apps-<cluster>-<division>` | `connection-details/vault-app-secrets.md` |
+| `secret/apps/<division>/<app>/ci/quay-robot` | division team (CI) | KV-v2 | `openshift-pipelines` (Tekton) | `apps-<cluster>-<division>` | `reference_quay_robot_token_convention.md` |
+
+## Path naming rules
+
+- All-lowercase, hyphen-separated. No underscores in `<division>` or `<app>`.
+- `<division>` is part of the namespace prefix (`apps-<division>-*`), the
+  Vault role (`apps-<cluster>-<division>`), the policy (`apps-<division>-read`),
+  and the path subtree (`secret/apps/<division>/...`).
+- `<env>` is one of `dev`, `stage`, `prod`.
+
+## Vault auth mounts (per cluster)
+
+| Mount path | Used by | Trust anchor |
+| --- | --- | --- |
+| `auth/kubernetes-hub-dc-v6` | hub-dc-v6 ESO + tenant SAs | hub-dc-v6 API CA + TokenReview reviewer SA |
+| `auth/kubernetes-spoke-dc-v6` | spoke-dc-v6 ESO + tenant SAs | spoke-dc-v6 API CA + TokenReview reviewer SA |
+
+## Policies
+
+| Policy name | Capabilities |
+| --- | --- |
+| `ocp-<cluster>-eso` | read on `secret/data/ocp/platform/*` + `secret/data/ocp/<cluster>/*`; list on the corresponding metadata paths |
+| `apps-<division>-read` | read on `secret/data/apps/<division>/*`; list on `secret/metadata/apps/<division>/*` |
+
+## Role binding example (per-division, per-cluster)
+
+```json
+{
+  "bound_service_account_names":      ["app-eso"],
+  "bound_service_account_namespaces": ["apps-<division>-*"],
+  "token_policies":                   ["apps-<division>-read"],
+  "token_ttl":                        "1h",
+  "token_max_ttl":                    "4h",
+  "audience":                         "vault"
+}
+```
+
+## ESO `SecretStore` (per-tenant)
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: vault-apps
+  namespace: apps-<DIVISION>-<APP>
+spec:
+  provider:
+    vault:
+      server: https://vault.sub.comptech-lab.com:8200
+      path: secret
+      version: v2
+      caBundle: <base64 vault CA>
+      auth:
+        kubernetes:
+          mountPath: kubernetes-<CLUSTER>
+          role: apps-<CLUSTER>-<DIVISION>
+          serviceAccountRef:
+            name: app-eso
+            audiences:
+              - vault
+```
+
+`kind: SecretStore` (namespace-scoped) — **not** `ClusterSecretStore`. The
+namespace glob refuses to issue a token outside `apps-<division>-*`.
+
+## Onboarding flow (new division)
+
+1. Pick a lowercase, hyphen-only division name (e.g. `payments`).
+2. Run `scripts/vault-apps-onboard.sh <division> <cluster>` server-side to
+   create/refresh the policy and role.
+3. Create the tenant namespace via GitOps using the
+   `tenants/_template/secretstore-vault-apps.yaml` shape.
+4. Seed the secret: `vault kv put secret/apps/<division>/<app>/<env>/<key> <field>=<value>`.
+5. Reference it from the app's `ExternalSecret` (kind `SecretStore` named
+   `vault-apps`).
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| ESO operand `SecretSyncedError`, "permission denied" | Tenant SA not in the role's `bound_service_account_namespaces` glob | Re-run the onboarding script with the correct division; confirm namespace prefix. |
+| Vault login hangs / times out from `external-secrets` ns | Default-deny NetworkPolicy in `external-secrets` blocks egress to Vault VM | Apply allow-egress NetworkPolicy targeting Vault (see `project_eso_egress_to_vault.md`). |
+| `apps-<division>-read` policy missing | Vault was re-initialized without re-running onboarding | Re-run `vault-apps-onboard.sh` per division. |
+| QuayRegistry stalls | `secret/ocp/spoke-dc-v6/quay/config-bundle` empty | Populate the Vault path; restart Quay operator. |
+
+## Internal only
+
+> Vault server URL, root token custody, unseal key custody, Raft node IPs,
+> snapshot bucket credentials, and the Kubernetes auth reviewer SA token
+> for each cluster are kept in
+> `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md`
+> and `codex-opp-agent/secrets/`. None of those values are republished.
+
+Last regenerated from
+`connection-details/vault-app-secrets.md`,
+`plans/disconnected-rebuild/environments/dc-lab/vault-oss-vm-plan.md`,
+`plans/gitlab-runner-access-model.md`,
+`plans/gitlab-runner-classes-and-tags.md`,
+`reference_quay_robot_token_convention.md`,
+`project_eso_egress_to_vault.md`.

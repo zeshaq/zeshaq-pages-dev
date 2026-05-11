@@ -1,8 +1,121 @@
 ---
-title: "HAProxy Frontends Table"
-description: "Section 07-references: HAProxy Frontends Table (placeholder)."
-sidebar_label: "HAProxy Frontends Table"
+title: "HAProxy Frontends and Backends"
+description: "Pattern-level inventory of the lab HAProxy frontends, SNI matches, and backends — public IPs and host addresses redacted."
+sidebar_label: "HAProxy Frontends"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The lab runs a single HAProxy edge VM (Ubuntu 24.04, HAProxy 2.8.16) with
+roughly 40 frontend / backend / listen blocks in `/etc/haproxy/haproxy.cfg`.
+The model is three-tier: a public Internet edge, a private lab-network edge
+(same hostnames), and a loopback SNI-passthrough plane that re-decrypts TLS
+with the `*.apps.sub.comptech-lab.com` wildcard cert before reaching VM
+backends. This table is the pattern-level surface — exact bind IPs and
+backend addresses are redacted; full custody lives in
+`codex-opp-agent/connection-details/`.
+
+> HAProxy is platform-VM-only. OpenShift cluster APIs and `*.apps.<cluster>.*`
+> routes do **not** transit this HAProxy — they bind to dedicated public IPs.
+
+## Frontends (binds)
+
+| Frontend (port) | SNI match | Backend | Notes |
+| --- | --- | --- | --- |
+| `public-apps-http` (`:80`) | host header match on `*.apps.sub.comptech-lab.com` | redirect HTTPS or `public-apps-http-be` | Primary public HTTP edge; ACME challenges and HTTPS redirect. |
+| `public-apps-https` (`:443`) | SNI on `*.apps.sub.comptech-lab.com` | branches to `vm-tls-be`, `wso2-*-vm-be`, `gitlab-vm-be`, etc. | Primary public HTTPS edge. |
+| `public-apps-dr-http` (`:80`) | host header match (DR public IP) | same backends, DR variant | Secondary public edge for failover. |
+| `public-apps-dr-https` (`:443`) | SNI on `*.apps.sub.comptech-lab.com` (DR) | same VM backends | Secondary public HTTPS edge. |
+| `public-apps-https` (lab `:443`) | same SNI rules | same VM backends | Private/lab-network edge — same hostnames resolve internally too. |
+| `vm-tls` (loopback `:8443`) | SNI passthrough decrypted with wildcard cert | host-header re-route to `vm-tls-be` | Loopback PROXY-protocol re-decrypt plane. |
+| `rke2-api` (lab `:6443`) | — | RKE2 cluster API (legacy) | Legacy RKE2 cluster control plane. |
+| `rke2-supervisor` (lab `:9345`) | — | RKE2 supervisor port (legacy) | Legacy RKE2 supervisor. |
+
+## Backends (by category)
+
+### VM-side TLS passthrough (SNI on `:443`, host-header on loopback)
+
+| SNI hostname (pattern) | Backend (logical) | Notes |
+| --- | --- | --- |
+| `gitlab.apps.sub.comptech-lab.com` | `gitlab-vm-be` | GitLab CE 18.11.1. |
+| `minio.apps.sub.comptech-lab.com` | `minio-api-vm-be` | MinIO S3 API. |
+| `minio-console.apps.sub.comptech-lab.com` | `minio-console-vm-be` | MinIO web console. |
+| `nexus-mirror.apps.sub.comptech-lab.com` | `vm-tls-be` -> Nexus VM | Nexus UI/API. |
+| `mirror-registry.apps.sub.comptech-lab.com` | `vm-tls-be` -> Nexus :5000 | OpenShift install mirror. |
+| `docker-group.apps.sub.comptech-lab.com` | `vm-tls-be` -> Nexus :5001 | Developer base-image pulls. |
+| `app-registry.apps.sub.comptech-lab.com` | `vm-tls-be` -> Nexus :5002 | App image pushes. |
+| `nexus.apps.sub.comptech-lab.com` | `vm-tls-be` -> Nexus VM | Legacy alias for Nexus UI. |
+| `nexus-docker.apps.sub.comptech-lab.com` | `nexus-docker-rke2-be` | Legacy RKE2-era Docker connector (may be decommissioned). |
+| `defectdojo.apps.sub.comptech-lab.com` | `defectdojo-vm-be` | DefectDojo SecOps UI. |
+| `jenkins.apps.sub.comptech-lab.com` | `vm-tls-be` -> Jenkins VM | Jenkins controller. |
+| `signoz.apps.sub.comptech-lab.com` | `vm-tls-be` -> SigNoz VM | SigNoz EE observability. |
+| `trivy.apps.sub.comptech-lab.com` | `vm-tls-be` -> Trivy VM | Trivy server. |
+| `monitoring.apps.sub.comptech-lab.com` | `vm-tls-be` -> monitoring-0 | Sandbox LGTM stack. |
+| `grafana.apps.sub.comptech-lab.com` | `vm-tls-be` -> monitoring-0 | Grafana UI on monitoring sandbox. |
+| `grafana.mon.sub.comptech-lab.com` | `vm-tls-be` with `wildcard-mon.pem` | `*.mon.*` exposure pattern. |
+| `haproxy.apps.sub.comptech-lab.com` | `haproxy-self-be` | HAProxy stats / self-management. |
+
+### WSO2 hostnames (separate ACL group)
+
+| SNI hostname | Backend (logical) | Notes |
+| --- | --- | --- |
+| `is.apps.sub.comptech-lab.com` | `wso2-is-vm-be` | WSO2 Identity Server. |
+| `auth.apps.sub.comptech-lab.com` | `wso2-is-vm-be` | WSO2 IS alias used for OIDC. |
+| `apim.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` | WSO2 APIM management plane. |
+| `publisher.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` | APIM publisher. |
+| `devportal.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` | APIM developer portal. |
+| `admin.apps.sub.comptech-lab.com` | `wso2-apim-mgmt-vm-be` | APIM admin. |
+| `gateway.apps.sub.comptech-lab.com` | `wso2-apim-gateway-vm-be` | APIM gateway data plane. |
+
+### Legacy RKE2-hosted services (may be partially decommissioned)
+
+| SNI hostname | Backend (logical) | Notes |
+| --- | --- | --- |
+| `vault-rke2.apps.sub.comptech-lab.com` | `vault-rke2-be` | Legacy in-cluster Vault path (Vault VM is current authoritative). |
+| `auth-legacy.apps.sub.comptech-lab.com` | `keycloak-rke2-be` | Legacy Keycloak. |
+| `terrakube-ui.apps.sub.comptech-lab.com` | `terrakube-ui-rke2-be` | Terrakube UI. |
+| `terrakube-api.apps.sub.comptech-lab.com` | `terrakube-api-rke2-be` | Terrakube API. |
+| `terrakube-reg.apps.sub.comptech-lab.com` | `terrakube-reg-rke2-be` | Terrakube registry. |
+| `awx.apps.sub.comptech-lab.com` | `awx-rke2-be` | AWX. |
+| `redisinsight-dr.apps.sub.comptech-lab.com` | `redisinsight-dr-rke2-be` | RedisInsight (DR variant). |
+| `bootstrap.kafka.apps.sub.comptech-lab.com` | `kafka-rke2-be` | Kafka bootstrap (SNI passthrough). |
+| `broker-0.kafka.apps.sub.comptech-lab.com` | `kafka-rke2-be` | Kafka broker 0. |
+| `broker-1.kafka.apps.sub.comptech-lab.com` | `kafka-rke2-be` | Kafka broker 1. |
+| `broker-2.kafka.apps.sub.comptech-lab.com` | `kafka-rke2-be` | Kafka broker 2. |
+
+### Self / utility / fallback
+
+| Frontend / backend | Purpose |
+| --- | --- |
+| `haproxy-self-be` | HAProxy stats served back to its own host. |
+| `public-apps-http-be`, `public-apps-https-be` | Default fallback path (in-cluster routes). |
+| `errors/` directory | Custom HTTP error pages. |
+| `certs/wildcard-apps.pem` | LE wildcard for `*.apps.sub.comptech-lab.com`. |
+| `certs/wildcard-mon.pem` | LE wildcard for `*.mon.sub.comptech-lab.com`. |
+
+## Add-a-new-host pattern (five spots)
+
+When adding a `<svc>.apps.sub.comptech-lab.com` host, mirror the existing
+entries in these five places:
+
+1. SNI ACL in `public-apps-https` (and DR variant).
+2. `use_backend` rule keyed on the SNI ACL.
+3. Public-apps-http redirect ACL (so HTTP -> HTTPS works).
+4. `vm-tls` deny-unless ACL (so the loopback re-decrypt only accepts known
+   hosts).
+5. New backend block targeting the VM IP and port.
+
+For `*.mon.*` hosts the cert pair on `127.0.0.1:8443` selects the right
+wildcard by SNI; the cert side is one-and-done after `wildcard-mon.pem` was
+first issued.
+
+## Internal only
+
+> Specific public IPs (primary + DR), bind addresses, backend IPs, and the
+> dated `haproxy.cfg.bak.*` change ledger are kept in
+> `codex-opp-agent/connection-details/` and on the haproxy VM.
+
+Last regenerated from
+`reference_haproxy_vm.md`,
+`reference_lab_infrastructure.md` (`*.mon.*` pattern),
+`connection-details/nexus.md` (registry split).

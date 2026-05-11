@@ -1,8 +1,100 @@
 ---
-title: "Nexus Endpoints Table"
-description: "Section 07-references: Nexus Endpoints Table (placeholder)."
-sidebar_label: "Nexus Endpoints Table"
+title: "Nexus Endpoints"
+description: "Three-endpoint split for the lab Nexus mirror — mirror-registry (install), docker-group (dev pulls), app-registry (app pushes)."
+sidebar_label: "Nexus Endpoints"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+The lab Nexus mirror exposes **three independent Docker endpoints** by
+design. They share a single Nexus instance but have distinct purposes, ACL
+surfaces, and change windows. The split exists so OpenShift install content
+never mixes with developer pull-through caching, and CI app pushes never mix
+with platform-mirror writes.
+
+| Endpoint (public HTTPS) | Purpose | Auth | Used by | Reference |
+| --- | --- | --- | --- | --- |
+| `mirror-registry.apps.sub.comptech-lab.com` | OpenShift install / platform mirror (`oc mirror --v2` output, IDMS/ITMS, release images) | Nexus user, scoped to `ocp-mirror` hosted repo | `oc mirror` from `ocp-bootstrap`; OpenShift install pulls via IDMS/ITMS | `connection-details/nexus.md` |
+| `docker-group.apps.sub.comptech-lab.com` | Developer / Jenkins base-image **pulls** (pull-through cache) | Nexus user `jenkinsbot` (read) | Jenkins build stages, developer workstations, runtime base-image pulls | `connection-details/nexus.md` |
+| `app-registry.apps.sub.comptech-lab.com` | CI / developer app-image **pushes** + runtime pull source | Nexus user `jenkinsbot` (browse/read/add/edit on `docker-dev-hosted`) | Jenkins push after Trivy scan; runtime image pull source for Docker runtime VM and OpenShift workloads | `connection-details/nexus.md` |
+
+## Backing repositories
+
+| Endpoint | Nexus repo | Type | Port (inside Nexus) |
+| --- | --- | --- | --- |
+| `mirror-registry.apps.*` | `ocp-mirror` | Docker hosted | `5000` |
+| `docker-group.apps.*` | `docker-group` | Docker group | `5001` |
+| `app-registry.apps.*` | `docker-dev-hosted` | Docker hosted | `5002` |
+
+`docker-group` members:
+
+- `docker-dev-hosted` (hosted, same content as `app-registry.*` push target)
+- `icr-proxy` (proxy to `icr.io`)
+- `redhat-proxy` (proxy to `registry.redhat.io`)
+- `dockerhub-proxy` (proxy to Docker Hub)
+
+`ocp-mirror` is **not** a member of `docker-group`. The split between
+platform-mirror and developer caching is intentional.
+
+## Cleanup policies
+
+| Repository | Cleanup policy | Notes |
+| --- | --- | --- |
+| `docker-dev-hosted` | `docker-dev-hosted-retain-30d` | Trims untagged / stale app builds. |
+| `icr-proxy` | `docker-proxy-retain-14d` | Pull-through proxy cleanup. |
+| `redhat-proxy` | `docker-proxy-retain-14d` | Pull-through proxy cleanup. |
+| `dockerhub-proxy` | `docker-proxy-retain-14d` | Pull-through proxy cleanup. |
+| `ocp-mirror` | (none, install-time only) | Pruned manually per release. |
+
+## Hard rules
+
+- App workloads must **not** write to `mirror-registry.*`.
+- Pull base images **only** from `docker-group.*`.
+- Push app images **only** to `app-registry.*`.
+- Pull approved app images for runtime from `app-registry.*` (not from
+  `docker-group`, even though the same content might transit the proxy).
+- When using a proxy repo through the group, do **not** include the upstream
+  registry hostname in the image path. Example:
+  - Correct: `docker-group.apps.sub.comptech-lab.com/appcafe/open-liberty:25.0.0.6-kernel-slim-java17-openj9-ubi-minimal`
+  - Wrong: `docker-group.apps.sub.comptech-lab.com/icr.io/appcafe/open-liberty:...`
+
+## Service accounts and roles
+
+| Account | Role | Capabilities |
+| --- | --- | --- |
+| `admin` | Built-in | Full Nexus admin. Custody local-only. |
+| `jenkinsbot` | `nexus-jenkins-ci` | Read on `docker-group`; browse + read + add + edit on `docker-dev-hosted`. Cannot access `ocp-mirror`. |
+
+The `jenkinsbot` delete right is intentionally scoped to `docker-dev-hosted`
+so Jenkins can remove tags it created if a later stage fails.
+
+## Active realm
+
+Only `NexusAuthenticatingRealm` — no LDAP, no SAML. Per-account credentials
+are local-only.
+
+## Quick validation
+
+```bash
+# DNS
+dig @<lab-recursor> nexus-mirror.apps.sub.comptech-lab.com A +short
+dig @<lab-recursor> mirror-registry.apps.sub.comptech-lab.com A +short
+dig @<lab-recursor> docker-group.apps.sub.comptech-lab.com A +short
+dig @<lab-recursor> app-registry.apps.sub.comptech-lab.com A +short
+
+# Reachability (HTTP 200 status, HTTP 401 on /v2/ unauthenticated)
+curl -sSI https://nexus-mirror.apps.sub.comptech-lab.com/service/rest/v1/status | head -1
+curl -sSI https://mirror-registry.apps.sub.comptech-lab.com/v2/ | head -1
+curl -sSI https://docker-group.apps.sub.comptech-lab.com/v2/ | head -1
+curl -sSI https://app-registry.apps.sub.comptech-lab.com/v2/ | head -1
+```
+
+## Internal only
+
+> Nexus VM IP, direct-debug HTTP ports (`8081`, `5000-5002`), and credential
+> custody filenames are kept in
+> `codex-opp-agent/connection-details/nexus.md`.
+
+Last regenerated from
+`connection-details/nexus.md`,
+`project_nexus_endpoint_split.md`.
