@@ -28,7 +28,7 @@ Before starting, confirm:
 | DNS (PowerDNS) is reachable from the operator workstation | `dig @<lab-dns> nexus-mirror.apps.sub.comptech-lab.com A +short` returns the HAProxy address |
 | HAProxy edge VM is healthy | `curl -sSI https://nexus-mirror.apps.sub.comptech-lab.com/` from a lab host |
 | Let's Encrypt wildcard certificate is valid and >30 days from expiry | inspect `/etc/haproxy/certs/wildcard-apps.pem` on the HAProxy VM |
-| Upstream pull secret is current and accessible | `jq '.auths | keys' /home/ze/secrets/openshift-pull-secret.json` lists the expected registries |
+| Upstream pull secret is current and accessible | `jq '.auths | keys' "$PULL_SECRET"  # workstation-local, git-ignored` lists the expected registries |
 | Operator workstation can reach `30.30.30.0/24` lab subnet | `ssh oc-bootstrap` from operator workstation succeeds |
 | Sufficient storage budget | Nexus VM: at least 2 TiB; oc-mirror VM: at least 1 TiB |
 | Internet egress for upstream pulls works on the bootstrap path | upstream pull-secret check succeeds against `registry.redhat.io` |
@@ -111,10 +111,10 @@ Direct HTTP endpoints are for local private-network debugging only. Production a
 Recreate the local-only credential custody on the operator workstation:
 
 ```text
-/home/ze/codex-opp-agent/secrets/nexus-admin-password
-/home/ze/codex-opp-agent/secrets/nexus-jenkinsbot-password
-/home/ze/codex-opp-agent/secrets/nexus-oauth2-cookie-secret
-/home/ze/codex-opp-agent/secrets/nexus-oidc-client.json
+"$NEXUS_ADMIN_PASSWORD"
+"$NEXUS_JENKINSBOT_PASSWORD"
+"$NEXUS_OAUTH2_COOKIE_SECRET"
+"$NEXUS_OIDC_CLIENT_JSON"
 ```
 
 The Git-ignored, mode-restricted layout is intentional. Never commit these files; never paste their values into chat or issue trackers.
@@ -176,7 +176,7 @@ mkdir -p /home/ze/ocp-mirror-workspaces/dc-lab
 cd /home/ze/ocp-mirror-workspaces/dc-lab
 
 # Start from the upstream pull-secret already on this host
-cp /home/ze/secrets/openshift-pull-secret.json pull-secret.merged.json
+cp "$PULL_SECRET"  # workstation-local, git-ignored pull-secret.merged.json
 chmod 0600 pull-secret.merged.json
 
 # Add the local mirror credential via podman login (writes into --authfile)

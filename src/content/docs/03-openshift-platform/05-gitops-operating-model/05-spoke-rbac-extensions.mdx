@@ -109,7 +109,7 @@ kubectl kustomize clusters/spoke-dc-v6 > /tmp/spoke.yaml
 git diff --check
 ```
 
-5. Commit, push, open MR via the GitLab API (PAT at `/home/ze/codex-opp-agent/secrets/gitlab-zahid-pat`):
+5. Commit, push, open MR via the GitLab API (PAT at `"$LOCAL_GITLAB_PAT_FILE"  # operator PAT, local-only`):
 
 ```bash
 git add clusters/spoke-dc-v6/platform/argocd-extensions/clusterrole.yaml CHANGELOG.md
@@ -120,7 +120,7 @@ curl --request POST \
   --header "PRIVATE-TOKEN: <PAT>" \
   --header "Content-Type: application/json" \
   --data '{"source_branch":"<branch>","target_branch":"main","title":"<issue-key>: argocd extension for <operator>"}' \
-  http://30.30.30.5/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops/merge_requests
+  http://<gitlab-vm>/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops/merge_requests
 ```
 
 6. Wait for Argo sync. The new rule is sync-wave 0 so it lands ahead of the operator's CR (which is at sync-wave 20 or higher).

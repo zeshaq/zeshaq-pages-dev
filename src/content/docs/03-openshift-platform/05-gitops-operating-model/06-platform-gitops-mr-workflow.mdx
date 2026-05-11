@@ -13,7 +13,7 @@ draft: false
 | Path | Purpose |
 | --- | --- |
 | `comptech-platform/openshift-ops/openshift-platform-gitops` (GitLab project) | Source of truth |
-| `http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git` | LAN endpoint — used by Argo CD, automation, CI, and the GitLab API |
+| `http://<gitlab-vm>/comptech-platform/openshift-ops/openshift-platform-gitops.git` | LAN endpoint — used by Argo CD, automation, CI, and the GitLab API. Internal hostname is in `codex-opp-agent/connection-details/`. |
 | `https://gitlab.apps.sub.comptech-lab.com/comptech-platform/openshift-ops/openshift-platform-gitops` | Public browser/API route — human dashboard only, not for automation |
 | `/home/ze/platform-gitops/` | Operator-workstation clone (the user's hands-on copy) |
 | `/home/ze/claude-agent/clones/platform-gitops/` | Agent-staging clone (workspace-boundary compliant working copy) |
@@ -178,14 +178,14 @@ The clone is configured with author `Zahid Platform Admin <zahid@comptech-lab.co
 
 ### MR creation via GitLab API
 
-`gh` does not target GitLab. Use the GitLab API directly with the PAT at `/home/ze/codex-opp-agent/secrets/gitlab-zahid-pat`:
+`gh` does not target GitLab. Use the GitLab API directly with the PAT at `"$LOCAL_GITLAB_PAT_FILE"  # operator PAT, local-only`:
 
 ```bash
 curl --request POST \
-  --header "PRIVATE-TOKEN: $(cat /home/ze/codex-opp-agent/secrets/gitlab-zahid-pat)" \
+  --header "PRIVATE-TOKEN: $GITLAB_PAT" \
   --header "Content-Type: application/json" \
   --data @- \
-  http://30.30.30.5/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops/merge_requests <<EOF
+  http://<gitlab-vm>/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops/merge_requests <<EOF
 {
   "source_branch": "<issue-key>/<short-slug>",
   "target_branch": "main",

@@ -13,11 +13,11 @@ The lab has one IP plan and one MAC plan, and both fit in a single markdown file
 Two rules cover almost every VM in the fleet:
 
 1. **IP allocation follows role + last octet.** Platform VMs live in a single platform `/24` inside the lab `/16`. OpenShift nodes and VIPs live in a separate `/24` inside the same `/16`. Inside each `/24` the last octet is assigned roughly chronologically and recorded in `allocation-table.md`.
-2. **MAC follows IP.** Each platform VM gets a MAC of the form `52:54:00:30:30:<HH>` where `<HH>` is the last octet of the platform-`/24` IP. A VM with last-octet `.32` gets MAC `52:54:00:30:30:32`. The byte is written in the same base on both sides — easy to grep, easy to verify.
+2. **MAC follows IP.** Each platform VM gets a MAC of the form `52:54:00:XX:XX:<HH>` where `<HH>` is the last octet of the platform-`/24` IP. The byte is written in the same base on both sides — easy to grep, easy to verify. The exact middle bytes are part of the internal lab convention recorded in `codex-opp-agent/connection-details/`.
 
 That MAC convention has one purpose: when you `virsh domiflist | grep <mac>` you can see at a glance which VM a stray MAC belongs to. It also means the seed ISO and the libvirt XML can be machine-generated from the IP alone.
 
-OpenShift master VMs follow the same convention with a different middle segment: `52:54:00:75:10:<HH>` for hub masters and `52:54:00:75:30:<HH>` for spoke masters. Physical workers' MACs come from iLO Redfish, not from a deterministic formula.
+OpenShift master VMs follow the same convention with a different middle segment per cluster — exact MAC patterns are in `codex-opp-agent/connection-details/`. Physical workers' MACs come from iLO Redfish, not from a deterministic formula.
 
 ## Canonical allocation table layout
 

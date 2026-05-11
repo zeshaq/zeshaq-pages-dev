@@ -37,7 +37,7 @@ It is a *generic* cloud-image qcow2 — no lab-specific provisioning is baked in
 
 For any new VM (`<vm>`):
 
-1. **Allocate** an IP and MAC by editing `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`. The deterministic MAC convention is `52:54:00:30:30:<last-octet-of-IP-in-hex>` — e.g., a `.32` IP gets MAC `52:54:00:30:30:32`. This makes the allocation table greppable.
+1. **Allocate** an IP and MAC by editing `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`. The deterministic MAC convention is `52:54:00:XX:XX:<last-octet-of-IP-in-hex>`; the exact middle bytes are part of the internal lab convention recorded in `codex-opp-agent/connection-details/`. This makes the allocation table greppable.
 2. **Clone the base qcow2** onto the chosen hypervisor: `cp /var/lib/libvirt/images/ubuntu-24.04-base.qcow2 /var/lib/libvirt/images/<vm>.qcow2`, then `qemu-img resize` it to the per-VM OS disk size (typically `100G`).
 3. **Create a data disk** if the role needs one (Jenkins home, Docker data dir, Vault raft path, MinIO buckets, ClickHouse storage, Loki/Tempo storage…). Mount it at the service's expected path during cloud-init.
 4. **Render cloud-init** for the VM — `user-data`, `meta-data`, `network-config` — and seed an ISO with `cloud-localds` or attach a `noCloud` datasource via libvirt.
@@ -120,7 +120,7 @@ A typical libvirt domain XML excerpt:
 
 ```xml
 <interface type='bridge'>
-  <mac address='52:54:00:30:30:32'/>
+  <mac address='52:54:00:XX:XX:XX'/>
   <source bridge='br30'/>
   <model type='virtio'/>
 </interface>

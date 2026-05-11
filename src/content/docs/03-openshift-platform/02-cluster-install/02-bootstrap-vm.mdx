@@ -70,8 +70,7 @@ The render helpers stage:
 ~/ocp-clusters/hub-dc-v6/agent-config.yaml
 ~/ocp-clusters/hub-dc-v6/openshift/99-master-tpm2-encryption.yaml
 ~/ocp-clusters/hub-dc-v6/hub-dc-v6-agent.iso
-~/ocp-clusters/hub-dc-v6/auth/kubeconfig           # populated post-install
-~/ocp-clusters/hub-dc-v6/auth/kubeadmin-password   # populated post-install
+~/ocp-clusters/hub-dc-v6/auth/                     # kubeconfig + kubeadmin password (post-install, local-only)
 ~/ocp-clusters/hub-dc-v6/mirror-resources/         # idms/itms/cs from oc-mirror
 ```
 
@@ -151,25 +150,7 @@ openshift-install agent wait-for bootstrap-complete --dir ~/ocp-clusters/<cluste
 openshift-install agent wait-for install-complete   --dir ~/ocp-clusters/<cluster> --log-level info
 ```
 
-The `auth/kubeconfig` and `auth/kubeadmin-password` files are then written under `~/ocp-clusters/<cluster>/auth/`. They are copied to the workstation's `secrets/` and `.kube/configs/` directories under specific filenames and stay local-only.
-
-For the hub:
-
-```text
-/home/ze/.kube/config                                   # default kubeconfig
-/home/ze/.kube/configs/hub-dc-v6.kubeconfig
-/home/ze/codex-opp-agent/ocp-clusters/hub-dc-v6/auth/kubeconfig
-/home/ze/codex-opp-agent/secrets/hub-dc-v6-kubeconfig
-/home/ze/codex-opp-agent/secrets/hub-dc-v6-kubeadmin-password
-```
-
-For the spoke:
-
-```text
-/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
-/home/ze/codex-opp-agent/secrets/spoke-dc-v6-kubeconfig
-/home/ze/codex-opp-agent/secrets/spoke-dc-v6-kubeadmin-password
-```
+The kubeconfig and the kubeadmin-password file are then written under `~/ocp-clusters/<cluster>/auth/`. They are copied to the workstation's local-only `secrets/` and `.kube/configs/` directories under specific filenames and stay local-only — exact paths live in `codex-opp-agent/connection-details/platform-admin-handoff.md` and are not enumerated here.
 
 The `kubeadmin` password is never pasted in chat, Git, wiki, or session reports. For CLI work, prefer the kubeconfig paths above; `kubeadmin` is for console access and one-off bootstrap checks only.
 

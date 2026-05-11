@@ -12,7 +12,7 @@ GitLab has a sprawling token model. The lab keeps the surface deliberately small
 
 | Token type | Purpose | Custody |
 | --- | --- | --- |
-| **Operator PAT** | API access for the bootstrap operator; create groups/projects/shares; scoped fine-grained per ADR direction | `secrets/gitlab-md-pat` (Git-ignored) |
+| **Operator PAT** | API access for the bootstrap operator; create groups/projects/shares; scoped fine-grained per ADR direction | the bootstrap GitLab PAT file (local-only) (Git-ignored) |
 | **Deploy token (read-only)** | Project clone access for Jenkins / Argo CD / runners | Jenkins credential store (`gitlab-<project>-read`); per-project |
 | **Deploy token (read-write)** | Image-registry push token if GitLab Container Registry is used | Not in scope today — Nexus is the registry |
 | **Project access token** | Per-project token, scoped to one project | Per-job custody |
@@ -23,13 +23,13 @@ GitLab has a sprawling token model. The lab keeps the surface deliberately small
 
 The bootstrap admin user `zahid` is the only user with broad GitLab API access today. Move-to-named-users + deploy-tokens is a roadmap item per the operator guide.
 
-## Operator PAT (`gitlab-md-pat`)
+## Operator PAT (bootstrap-admin convention)
 
 The operator's Personal Access Token is the main bootstrap credential:
 
 ```bash
 GITLAB_URL=http://<lab-IP-for-gitlab>
-GITLAB_PAT="$(cat /home/ze/codex-opp-agent/secrets/gitlab-md-pat)"
+GITLAB_PAT=""$GITLAB_PAT"  # bootstrap-admin PAT in local secrets dir"
 curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
   "$GITLAB_URL/api/v4/version"
 unset GITLAB_PAT
@@ -37,7 +37,7 @@ unset GITLAB_PAT
 
 Custody discipline:
 
-- The PAT lives only in `secrets/gitlab-md-pat`. The directory is Git-ignored and mode-restricted (`0700`).
+- The PAT lives only in the bootstrap GitLab PAT file (local-only). The directory is Git-ignored and mode-restricted (`0700`).
 - The PAT is never printed, copied into issues, pasted into wiki, or echoed in shell history.
 - The PAT scope is operator-driven (currently `api` scope for the operator workspace). Future hardening: narrow to per-task scopes.
 
@@ -153,7 +153,7 @@ Every break-glass action must record:
 
 **Root cause.** Pasted into a chat, an issue, an MR comment, or a screenshot.
 
-**Fix.** Revoke the PAT immediately in GitLab UI. Create a new PAT. Update `secrets/gitlab-md-pat`. Audit any tools that may have cached the old value.
+**Fix.** Revoke the PAT immediately in GitLab UI. Create a new PAT. Update the bootstrap GitLab PAT file (local-only). Audit any tools that may have cached the old value.
 
 **Prevention.** Never paste tokens into anything. Use the runbook pattern: `load from custody, unset after use`.
 

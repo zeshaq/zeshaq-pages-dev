@@ -14,7 +14,7 @@ Sanitization note: all kubeadmin passwords, root tokens, robot pull-secrets, Vau
 
 1. **You have a writable workspace.** The Claude-agent workspace boundary is `/home/ze/claude-agent`, `/home/ze/secrets`, `/home/ze/codex-opp-agent`. Other `/home/ze/*` paths are off-limits unless explicitly named. If your operator account does not have read access to `codex-opp-agent/secrets/` and write access to `codex-opp-agent/`, stop and re-do onboarding.
 2. **You have a GitHub identity in `zeshaq/codex-opp-agent`.** All issues, milestones, ADR review threads, and the operations tracking record live there.
-3. **You have a GitLab identity with developer permission on `comptech-platform/openshift-ops/openshift-platform-gitops`** and a Personal Access Token stored at `codex-opp-agent/secrets/gitlab-zahid-pat`. The PAT is used by the API-driven MR flow; it does not need to be in your shell environment.
+3. **You have a GitLab identity with developer permission on `comptech-platform/openshift-ops/openshift-platform-gitops`** and a Personal Access Token stored at `codex-opp-agent/the operator GitLab PAT (local-only)`. The PAT is used by the API-driven MR flow; it does not need to be in your shell environment.
 4. **You have `oc`, `kubectl`, `git`, `curl`, `jq`, `skopeo`, and `ssh` on the workstation you operate from.** The workspace assumes these as the minimal toolset; no `oc-mirror` is needed on the operator workstation (it runs on the mirror VM).
 
 ## Hour 1: read these, in this order
@@ -51,7 +51,8 @@ Expected: each command returns the configured identity (`kubeadmin` for first-da
 Confirm GitLab reachability via PAT:
 
 ```bash
-PAT=$(tr -d '\r\n' < /home/ze/codex-opp-agent/secrets/gitlab-zahid-pat)
+PAT=$(tr -d '
+' < "$LOCAL_GITLAB_PAT_FILE")
 curl -sSf -H "PRIVATE-TOKEN: $PAT" \
   http://<gitlab-vm>/api/v4/projects/comptech-platform%2Fopenshift-ops%2Fopenshift-platform-gitops \
   | jq '.name, .default_branch'

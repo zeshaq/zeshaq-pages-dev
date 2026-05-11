@@ -47,15 +47,15 @@ The directory contains plain text and YAML files, each typically named after the
 ├── acs-central-admin-password
 ├── acs-init-bundle-fleet.yaml
 ├── argocd-admin-password
-├── argocd-gitlab-webhook-secret
-├── arif-rke2-1 / arif-rke2-2 / arif-rke2-3 / arif-rke2-token
-├── awx-admin-password
+├── argocd / argocd webhook secret
+├── arif-rke2 family (3 files + a token) — old RKE2 cluster artifacts
+├── awx admin password
 ├── cluster-logs-writer-password
-├── cloudflare-token / cloudflare-token.txt
-├── defectdojo-admin-password / defectdojo-api-token / defectdojo-secrets.env
-├── demo-orders-dc-secret / demo-orders-oidc-client.json
-├── github-pat
-├── gitlab / gitlab-md-pat / gitlab-oidc-client.json / gitlab-root-password / gitlab-root-pat
+├── cloudflare-token (two variants)
+├── defectdojo (admin password / API token / env file)
+├── demo-orders (dc-secret + OIDC client config)
+├── github PAT
+├── gitlab (folder + md-pat + OIDC client config + root password + root PAT — five variants)
 ├── ...
 ```
 
@@ -65,7 +65,7 @@ Reading the file names alone is enough to see the failure class.
 
 ### 1. Credential sprawl
 
-Every system that needed a credential dropped a file here. There is no convention for naming, location, encryption, or rotation. The same credential appears in multiple formats (`gitlab-root-pat` and `gitlab-md-pat` and `gitlab-root-password`). When two attempts at a system left two different password files, nothing told the operator which was current. **Each new rebuild created new credentials and the old ones became indistinguishable noise.**
+Every system that needed a credential dropped a file here. There is no convention for naming, location, encryption, or rotation. The same credential appears in multiple formats (different filenames for the same logical GitLab admin secret, for example). When two attempts at a system left two different password files, nothing told the operator which was current. **Each new rebuild created new credentials and the old ones became indistinguishable noise.**
 
 ### 2. No declarative state
 
@@ -88,7 +88,7 @@ The workspace boundary rule is recorded in the agent memory entry `feedback_work
 This rule has three operational implications:
 
 1. **No automation writes to `cloud-init/`.** No script, no Ansible playbook, no GitOps reconcile loop. The folder is frozen.
-2. **No new secrets land in `cloud-init/`.** New credentials are written to `/home/ze/secrets/` or to the workspace `/home/ze/codex-opp-agent/secrets/` — both of which are git-ignored. Vault is the durable backing store.
+2. **No new secrets land in `cloud-init/`.** New credentials are written to `/home/ze/secrets/` or to the workspace `codex-opp-agent/secrets/` (local-only, contents not enumerated here) — both of which are git-ignored. Vault is the durable backing store.
 3. **Values found in `cloud-init/` are flagged historical when reported.** When the user asks "what's the GitLab root password?" the answer is **not** `cat /home/ze/cloud-init/gitlab-root-password`; the answer is "Vault path `secret/infra/gitlab/admin/root`" — and if that's empty, the cloud-init value is offered as historical evidence only, with the recommendation to rotate immediately.
 
 REP-6 (issue [#150](https://github.com/zeshaq/codex-opp-agent/issues/150)) explicitly distinguished this kind of operational rule from project-knowledge memory:
@@ -102,14 +102,14 @@ REP-6 (issue [#150](https://github.com/zeshaq/codex-opp-agent/issues/150)) expli
 
 | cloud-init artifact | Replacement | Where it lives now |
 | --- | --- | --- |
-| `gitlab-root-password`, `gitlab-root-pat`, `gitlab-md-pat` | Vault KV v2 + admin custody convention | Vault `secret/infra/gitlab/admin/*`; admin steady-state credentials in `/home/ze/secrets/gitlab/` |
+| GitLab admin credentials (multiple legacy filename variants) | Vault KV v2 + admin custody convention | Vault `secret/infra/gitlab/admin/*`; admin steady-state credentials in the local-only GitLab admin secrets dir |
 | `argocd-admin-password` | OpenShift-managed Secret | `secret/openshift-gitops-cluster` in the `openshift-gitops` namespace (Argo CD generates and rotates this; never read or copy the value out) |
 | `argocd-gitlab-webhook-secret` | Sealed via Vault + ESO bridge | `secret/apps/<tenant>/ci/webhook` → ESO ExternalSecret materializes `Secret` in the target namespace |
 | `acs-central-admin-password`, `acs-init-bundle-fleet.yaml` | RHACS init-bundle via Central API (no `roxctl` needed) | `POST /v1/cluster-init/init-bundles`; admin creds from `central-htpasswd` Secret; bundle pushed to Vault for ESO delivery (memory `reference_rhacs_init_bundle_via_api.md`) |
 | `defectdojo-admin-password`, `defectdojo-api-token`, `defectdojo-secrets.env` | Per-service Vault path | `secret/infra/defectdojo/admin/*` with ESO bridge to the DefectDojo VM via cloud-init (the *current* cloud-init phase, not the scrap folder) |
 | `cluster-logs-writer-password` | Vault → MinIO STS path | `secret/infra/minio/loki-writer/*` |
 | `cloudflare-token` | Vault | `secret/infra/cloudflare/api-token` |
-| `github-pat` | `/home/ze/secrets/github/` (git-ignored, never committed) | Local custody; PAT scope minimized |
+| Legacy `github-pat` file | Local-only GitHub PAT custody (git-ignored, never committed) | Local custody; PAT scope minimized |
 | `arif-rke2-*` | **N/A — RKE2 clusters out of scope.** Memory `project_workspace_scope.md`: workspace is OpenShift-only. | Not replaced; deprecated wholesale |
 | `awx-*` | **N/A — AWX out of scope.** | Not replaced |
 | `demo-orders-*`, `demo-orders-oidc-client.json` | Per-tenant Vault path | `secret/apps/<division>/demo-orders/*` |
