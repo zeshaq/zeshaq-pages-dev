@@ -1,0 +1,265 @@
+---
+title: "Bump an operator version"
+description: "From CSV release notes to a merged MR: how to mirror the new operator/operand images, pin the startingCSV, validate the rollout, and update the operator-version-lock."
+sidebar_label: "Bump operator version"
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This task covers the canonical operator version bump on the v6 fleet: from CSV release notes to a merged platform-gitops MR, through `oc mirror --v2` for the new images, the `startingCSV` pin update, the MachineConfigPool waits (when applicable), and the operator-version-lock refresh.
+
+The procedure is the same across operators; specifics differ (channel, default CSV, MCP-touching status). The fleet's active operator queue lives in `connection-details/platform-admin-handoff.md` §"Current Installed Operator Baseline" + §"Planned Operator Install Queue", and the source-of-truth version pin file is `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`.
+
+## When this task runs
+
+- **Upstream releases a CSV with a security fix or required feature.** CVE in the operator's image, a CRD addition needed by an ADR-mandated capability, a new channel default.
+- **Compliance scan flags the current version.** PCI-DSS scan finds an operator at a version no longer covered by a vendor's support window.
+- **Operator-dependency satisfaction.** A new operator install requires an existing operator to be at version `>= X.Y.Z`.
+
+The cadence is event-driven, not calendar-driven. The fleet does *not* auto-bump operators; the explicit pin in `operator-version-lock.md` is the contract.
+
+## What is in scope
+
+- One operator at a time. Bumping two operators in the same MR makes the validation harder and the rollback more expensive.
+- The `Subscription` `startingCSV` value, the channel, the catalog source (Red Hat vs certified), the operand version compatibility.
+- Image-supply: every image the new CSV references must be mirrored to Nexus before the bump.
+- MachineConfigPool rollout windows: operators that ship MachineConfigs (Compliance Operator, File Integrity Operator, certain network operators) trigger MCP rollouts that take 30-60 minutes per pool.
+
+Out of scope:
+
+- OCP minor/patch upgrades — different procedure, ADR 0018-governed.
+- Operator *install* (vs bump). Install is the [MR mechanics operator-install pattern](/docs/05-operations/03-platform-gitops-mr-mechanics).
+- Reverting a bump that proved bad — that is an incident, not a routine task; see the [break-glass procedure](/docs/05-operations/06-on-call-and-escalation).
+
+## Pre-checks
+
+Before mutating anything:
+
+1. **Read the upstream CSV release notes.** Note any breaking changes, new RBAC requirements (which may require an `argocd-platform-extensions` ClusterRole extension), changed CRD versions, new operand dependencies.
+
+2. **Identify all images the new CSV references.** The Subscription resolves to an InstallPlan, which resolves to a CSV YAML, which lists `relatedImages`. Capture the set:
+
+   ```bash
+   # Inspect the new CSV before installing it (if available in the local catalog
+   # source after a fresh oc mirror):
+   K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+   oc --kubeconfig "$K" -n openshift-marketplace get packagemanifest <package> \
+     -o jsonpath='{.status.channels[?(@.name=="<channel>")].currentCSV}{"\n"}'
+   ```
+
+3. **Confirm catalog coverage.** The new CSV must be present in the mirrored CatalogSource. If `oc get packagemanifest` does not show the new version, run an `oc mirror --v2` cycle from the mirror VM first (see [What To Do If An Operator Package Is Missing](https://github.com/zeshaq/codex-opp-agent/blob/main/connection-details/platform-admin-handoff.md) — recipe in `connection-details/platform-admin-handoff.md`).
+
+4. **Confirm operand image coverage.** Spot-check that the operand images in the new CSV's `relatedImages` are mirrored. The image-supply drift script catches this after rollout, but the cheap check beforehand is:
+
+   ```bash
+   skopeo inspect \
+     --authfile /home/ze/ocp-mirror-workspaces/dc-lab/pull-secret.merged.json \
+     docker://mirror-registry.apps.sub.comptech-lab.com/<path>@sha256:<digest>
+   ```
+
+5. **Check ADR / governance.** If the bump is non-trivial (major version, new CRDs, changed defaults), the issue should cite the governing ADR set.
+
+6. **Open the GitHub issue.** Branch prefix `op-bump/<operator>-<from>-to-<to>`.
+
+## The change
+
+### Step 1 — Mirror the new images (if needed)
+
+If the new CSV is not in the local catalog yet, refresh the mirror:
+
+```bash
+# On the mirror VM:
+ssh ze@oc-mirror.sub.comptech-lab.com
+cd /home/ze/ocp-mirror-workspaces/dc-lab
+
+# Edit imageset-config.yaml to add or bump the operator entry.
+# Bump the version under operators.packages.<name>.versions.
+
+# Dry-run first:
+RUN_ID="$(date -u +%Y%m%dT%H%M%S)"
+oc mirror \
+  --config imageset-config.yaml \
+  --workspace "file:///home/ze/ocp-mirror-workspaces/dc-lab/dryrun-$RUN_ID" \
+  --dry-run \
+  docker://mirror-registry.apps.sub.comptech-lab.com \
+  2>&1 | tee "logs/oc-mirror-dryrun-$RUN_ID.log"
+wc -l "dryrun-$RUN_ID/working-dir/dry-run/mapping.txt"
+
+# Review the mapping count, then run for real:
+tmux new -s oc-mirror-op-bump
+./tools/run-oc-mirror-fast.sh
+```
+
+After the run completes, capture the refreshed catalog image digests from the generated resources:
+
+```bash
+ls /home/ze/ocp-mirror-workspaces/dc-lab/full-workspace/working-dir/cluster-resources/ \
+  | grep -E "cs-redhat-operator-index-v4-20|cs-certified-operator-index-v4-20"
+```
+
+### Step 2 — Update GitOps
+
+Branch and edit in the working copy:
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+git checkout main
+git pull --ff-only origin main
+git checkout -b op-bump/<operator>-<from>-to-<to>
+```
+
+Edit `clusters/<cluster>/operators/<name>/subscription.yaml`:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: <subscription-name>
+  namespace: <operator-namespace>
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  channel: <channel>           # may also change with the bump
+  installPlanApproval: Automatic
+  name: <package-name>
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: <package>.v<new-version>     # the pinned new CSV
+```
+
+If the catalog image digest changed (step 1 above), also update `clusters/<cluster>/platform/catalogs/catalogsource-redhat-operator-index-v4-20.yaml` (and the certified equivalent) to pin the refreshed digest:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: cs-redhat-operator-index-v4-20
+  namespace: openshift-marketplace
+spec:
+  sourceType: grpc
+  image: mirror-registry.apps.sub.comptech-lab.com/<path>@sha256:<new-digest>
+  displayName: Red Hat Operators (mirror v4.20)
+  publisher: Red Hat (mirror)
+```
+
+If the new CSV needs an RBAC group not currently in `argocd-platform-extensions`, extend the ClusterRole at sync-wave 0 in the same MR or in a sequenced preceding MR. See [Spoke RBAC extension memory](/docs/05-operations/07-known-gotchas).
+
+Update `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` with the new pin (in a separate hunk inside the same MR for the version-lock file lives in `codex-opp-agent`, not `platform-gitops` — this is a cross-repo update; sequence the MRs).
+
+### Step 3 — Validate the build
+
+```bash
+cd /home/ze/claude-agent/clones/platform-gitops
+kubectl kustomize clusters/hub-dc-v6   > /dev/null
+kubectl kustomize clusters/spoke-dc-v6 > /dev/null
+```
+
+If kustomize errors, stop and fix before committing.
+
+Optional but recommended: server-side dry-run on a kubeconfig:
+
+```bash
+oc --kubeconfig "$K" apply --server-side --dry-run=server \
+  -k clusters/spoke-dc-v6
+```
+
+### Step 4 — Commit + open MR
+
+Commit with the tracking-header block (per [MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics)):
+
+```text
+op-bump: bump <operator> <from> -> <to> on <cluster> (#<n>)
+
+Issue:     #<n> op-bump
+Milestone: <milestone> (#<m>)
+Phase:     <phase>
+ADRs:      0018, 0019
+
+<rationale: why this version, what CVE/feature/dep>
+
+<files changed>
+
+Validation:
+- Subscription resolves to InstallPlan; InstallPlan moves to Complete
+- CSV phase Succeeded
+- Operand pods Ready
+- oc get co clean
+- No new external image refs (image-supply drift script clean)
+
+Rollback:
+- Revert this MR; let Argo re-sync to the previous Subscription pin
+- If operands rolled (MCP-touching), wait for MCP rollback before validating
+```
+
+Push and open the MR via the GitLab API (per MR mechanics).
+
+### Step 5 — Watch Argo apply
+
+```bash
+oc --kubeconfig "$K" -n openshift-gitops get app spoke-dc-v6-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+```
+
+Expected: `Synced Healthy <merge-sha>`.
+
+### Step 6 — Watch the operator bump itself
+
+```bash
+oc --kubeconfig "$K" -n <operator-ns> get sub,installplan,csv -o wide
+```
+
+Expected progression:
+
+- `Subscription` shows `state=AtLatestKnown`, `currentCSV=<new>`.
+- A new `InstallPlan` for `<new>` is created and moves to `Complete`.
+- The new `CSV` moves from `Installing` to `Succeeded`.
+- The operator pod restarts on the new image; new operand pods (if applicable) come up.
+
+If the operator ships MachineConfigs, MCP rollout begins:
+
+```bash
+oc --kubeconfig "$K" get mcp -w
+```
+
+Wait for `UPDATED=True / UPDATING=False / DEGRADED=False / readyMachineCount==machineCount` on every affected pool. This is usually 30 minutes per pool on a 3-node spoke; canary with `master` first if the pool selector includes both.
+
+## Validation
+
+A bump is complete when **all** of the following are true:
+
+1. Argo `Application` shows `Synced / Healthy` at the merge SHA.
+2. `Subscription` is `AtLatestKnown` with `currentCSV=<new>`.
+3. `CSV` for the new version is `Succeeded`.
+4. Operand pods are `Running` with no recent restarts.
+5. `oc get co | awk 'NR==1 || $3 != "True" || $4 != "False" || $5 != "False"'` is clean.
+6. `oc get mcp` shows every pool `UPDATED=True / UPDATING=False / DEGRADED=False` (where MCP-touching).
+7. The image-supply drift script reports zero uncovered external runtime references.
+8. The CHANGELOG entry on `platform-gitops` describes the bump.
+9. `operator-version-lock.md` on `codex-opp-agent` reflects the new pin.
+10. The session report under `reports/sessions/` captures the bump's evidence.
+
+Skipping step 7 is how the image-supply silently drifts — every bump must re-validate the drift posture.
+
+## Prevention
+
+- **Use the operator-version-lock.md as the source of truth.** Never rely on `installPlanApproval: Manual` and a human reviewer to gate auto-upgrades; gate via the explicit `startingCSV` pin in GitOps.
+- **Sequence catalog-digest-pin changes ahead of CSV bumps when both are needed.** The catalog pin must be in effect before the Subscription resolves to the new CSV.
+- **Canary on one cluster first when multiple clusters run the same operator.** The fleet has two clusters; bumping on `spoke-dc-v6` first and waiting a session before bumping on `hub-dc-v6` (or vice versa) catches operator-version regressions cheaply.
+- **For SigNoz, re-discover the API contract before bumping past the v0.122 baseline.** The v0.121 -> v0.122 break (see [SigNoz auth runbook](/docs/05-operations/04-incidents-and-runbooks/06-signoz-v0122-auth)) is precedent. SigNoz is not an OpenShift operator but the same pattern applies for VM-hosted services.
+
+## Forbidden actions
+
+- Re-enabling default external OperatorHub CatalogSources to "see" a new CSV. The mirror is the source.
+- Bumping two operators in the same MR.
+- Bumping without updating `operator-version-lock.md`.
+- Using `installPlanApproval: Manual` as a gate. Use explicit `startingCSV` pins.
+- Bumping during an active MCP rollout window for another change.
+
+## References
+
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"Operator Install Workflow" + §"Catalog Refresh Workflow"
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`
+- `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md`, `0019-nexus-only-image-supply-chain.md`
+- Memory: `reference_platform_gitops_mr_path`, `reference_spoke_argo_extension_rbac`
+- Issues: #137 (hub catalog capture), #229 (this section)

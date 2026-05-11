@@ -1,8 +1,159 @@
 ---
-title: "On-Call and Escalation"
-description: "Section 05-operations: On-Call and Escalation (placeholder)."
-sidebar_label: "On-Call and Escalation"
+title: "On-call and escalation"
+description: "How the lab's small-team on-call rotation works: the paging path, the escalation matrix, who owns hub vs spoke vs supporting VMs, and the break-glass triggers."
+sidebar_label: "On-call and escalation"
+last_reviewed: 2026-05-11
 draft: false
 ---
 
-> **Coming soon.** This page is part of the [Full Platform Docs](https://github.com/zeshaq/codex-opp-agent/milestone/33). The leaf will be filled in as the section's tracking issue progresses.
+This page documents how on-call works on the lab. The lab is operated by a small team (currently solo with Claude-agent assistance per `user_role`), so "on-call" reads more as "the convention you follow when something is on fire" rather than a multi-tier PagerDuty rota. The conventions still matter — they keep recovery deterministic when the operator is tired, paged at 3 AM, or context-switching from another task.
+
+The paging path, the escalation matrix, and the break-glass triggers are documented here. Per [section tracker #229](https://github.com/zeshaq/codex-opp-agent/issues/229), this page does not expose pager numbers, on-call phone numbers, or the rotation calendar — those live in the operator's local notes and the team-internal channels.
+
+## The on-call posture
+
+| Item | Value |
+|---|---|
+| Active rotation | Solo operator (workspace owner) + Claude-agent assistance |
+| Off-hours | Best-effort; the lab has no 24x7 SLO |
+| Paging surface | GitHub issue with `incident` label + workspace owner notification |
+| Escalation | Workspace owner -> infrastructure team -> network team (external) |
+| Acceptable response window | Ninety minutes for `incident` label; same-business-day for `bug` label |
+
+The lab does **not** carry a customer-facing SLA. The on-call posture is appropriate for an internal platform: fast enough that incidents do not compound, deliberate enough that recovery has an audit record.
+
+## The paging path
+
+What triggers a page (and who/what does the paging):
+
+| Trigger | Source | Page target | Severity |
+|---|---|---|---|
+| OCP `Critical` alert fires on the hub or spoke (`Watchdog` excepted) | Prometheus alertmanager -> on-call channel | On-call operator | High |
+| Argo CD `Application` becomes `OutOfSync` or `Degraded` | Cluster controller -> alert -> on-call channel | On-call operator | High |
+| ClusterOperator goes `Available=False` or `Degraded=True` | Prometheus -> alertmanager | On-call operator | High |
+| MachineConfigPool `Updating=True` outside a known rollout window | Periodic check; not an alertmanager rule today | On-call operator (read-only sweep catches it) | Medium |
+| MinIO bucket inaccessible | Periodic probe from operator workstation | On-call operator | Medium |
+| Vault `sealed=true` | Periodic probe; alertmanager rule recommended | On-call operator | Critical |
+| RHACS Central reports `centralStatus.administered=false` | Central API probe | On-call operator | Medium |
+
+The "page" itself is currently:
+
+1. An issue is opened on `zeshaq/codex-opp-agent` with the `incident` label (manually if the operator notices first; automatically as the alerting integrations mature).
+2. The workspace owner is notified (channel TBD per local convention).
+3. The operator picks up the issue, follows the relevant [runbook](/docs/05-operations/04-incidents-and-runbooks/01-overview), and updates the issue with progress.
+
+The convention is "one issue per incident". Sub-tasks are comments; spinoff issues are linked.
+
+## The escalation matrix
+
+Who owns what, in escalation order:
+
+| Surface | Owner | Backup |
+|---|---|---|
+| `hub-dc-v6` cluster lifecycle | Workspace owner | (none — solo) |
+| `spoke-dc-v6` cluster lifecycle | Workspace owner | (none — solo) |
+| Hub OpenShift GitOps (Argo CD on hub) | Workspace owner | (none — solo) |
+| Spoke OpenShift GitOps (Argo CD on spoke) | Workspace owner | (none — solo) |
+| Nexus VM (`nexus-mirror.sub.comptech-lab.com`) | Workspace owner | Infrastructure team |
+| Vault VM (`vault.sub.comptech-lab.com`) | Workspace owner | Infrastructure team |
+| MinIO VM (`minio.sub.comptech-lab.com`) | Workspace owner | Infrastructure team |
+| GitLab VM (`gitlab.sub.comptech-lab.com`) | Workspace owner | Infrastructure team |
+| SigNoz VM (`signoz.sub.comptech-lab.com`) | Workspace owner | Infrastructure team |
+| Jenkins VM (`jenkins.sub.comptech-lab.com`) | Workspace owner | Infrastructure team |
+| HAProxy edge VM | Infrastructure team | Network team |
+| PowerDNS auth + recursor VM | Infrastructure team | Network team |
+| Cluster network (CNI, OVN-K, NetworkPolicy) | Workspace owner | Network team for upstream |
+| Cluster storage (ODF, LSO) | Workspace owner | (none — solo) |
+| Compliance auditor / implementor split | See `compliance-implementor-handbook.md` | n/a |
+
+The lab's "infrastructure team" and "network team" are external teams (not the OpenShift admin). When escalating to them:
+
+- Capture the symptom and the diagnostic evidence in the GitHub issue first.
+- Translate cluster-side observations into infrastructure-side terms (e.g., "spoke node X cannot resolve `vault.sub.comptech-lab.com`" rather than "ESO is failing").
+- Avoid asking external teams to log into the cluster. They do not have OpenShift access.
+
+## Break-glass triggers
+
+Break-glass is the explicit policy in ADR 0025 governing live changes that bypass the [GitOps MR flow](/docs/05-operations/03-platform-gitops-mr-mechanics). The full procedure is in `codex-opp-agent/runbooks/break-glass-procedure.md`; this page is the operator-facing summary.
+
+All four of these conditions MUST be true at the moment you decide to act:
+
+1. There is a declared production incident or imminent production impact.
+2. Argo CD on the owning cluster cannot recover the state on its own within the time budget.
+3. A corrective action is needed in under fifteen minutes.
+4. No GitOps PR path can complete inside that window.
+
+If any of those is false, this is not break-glass. Open an MR.
+
+### Acceptable break-glass examples
+
+- Emergency node cordon + drain because of kernel errors threatening pods.
+- `oc delete crd routes.route.openshift.io` to recover `/openapi/v2` (the [Routes CRD incident](/docs/05-operations/04-incidents-and-runbooks/02-acm-gitops-addon-routes-crd)).
+- `oc annotate node ... desiredConfig=...` to unstick an MCP after a failed rollout (the [MCO stuck-node procedure](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn)).
+- A stale finalizer is blocking an operator-managed deletion that GitOps cannot resolve.
+
+### Forbidden break-glass actions
+
+Per ADR 0025 §4 — these need code-owner review even mid-incident:
+
+- Bypassing or disabling an RHACS image, deployment, runtime, or admission policy.
+- Disabling, deleting, or modifying security operators directly (RHACS, compliance, cert-manager, External Secrets, oauth).
+- Granting `cluster-admin` or expanded AppProject destinations to a user or service account.
+- Direct edits to `rendered-*` MachineConfig objects.
+- Direct edits to etcd, etcd Secrets, or `kube-system` cluster signing keys.
+- Silent rotation of Vault / Nexus / GitLab credentials without updating Vault and the local mirror in the same change window.
+
+If one of these forbidden actions IS the incident remediation, a second platform admin must be named in the audit record per ADR 0025 §4.
+
+### The audit record
+
+Every break-glass action produces a record under `codex-opp-agent/reports/break-glass/YYYY-MM-DD-<incident-slug>.md`. The template lives in `runbooks/break-glass-procedure.md`. The record captures:
+
+- Incident issue, cluster, namespace, resource(s), owning Argo CD Application.
+- Actor, start / end / expiry timestamps (UTC).
+- Trigger (one paragraph: why GitOps could not recover).
+- Conditions verified (the four conditions above).
+- Prohibited-action exception (yes/no + second reviewer if yes).
+- Commands executed (verbatim — paste from `/tmp/break-glass-*/commands.log`).
+- Before/after state captures (redacted for secrets).
+- SSH session log if SSH was used.
+- Validation: immediate symptom cleared, Argo CD post-backport status, backport PR link.
+- Follow-up: issues opened, pattern to promote.
+
+The audit record is the FG-6 evidence per `plans/federated-gitops-readiness-gates.md`. Its existence is what makes the live change accountable.
+
+### The clock
+
+Twenty-four hours after the live change, **one** of the following must be true:
+
+1. A backport MR has merged into the owning GitOps repo and Argo CD is `Synced / Healthy` on the merge SHA. The live change is durable desired state.
+2. The live change has been reverted (the captured `before-...yaml` re-applied) and the cluster has returned to the pre-incident state.
+
+The twenty-four-hour clock is absolute. Drifting past it without backport or revert is the FG-6 audit failure mode.
+
+## What every operator should keep on the desk
+
+- The kubeconfigs for both clusters (`K_HUB`, `K_SPOKE`) in shell env vars.
+- The GitLab PAT (`/home/ze/codex-opp-agent/secrets/gitlab-zahid-pat`) loaded into the curl wrapper.
+- A scratch directory for `/tmp/break-glass-$(date -u +%Y%m%dT%H%M%SZ)` captures.
+- The [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff) and [break-glass procedure runbook](https://github.com/zeshaq/codex-opp-agent/blob/main/runbooks/break-glass-procedure.md) (the runbook lives in the workspace; this site has the operator-facing summary).
+- An open browser tab to the hub OpenShift console -> Observe -> Alerts.
+
+## Postmortem cadence
+
+After every incident with the `incident` label:
+
+1. Write a dated session report under `codex-opp-agent/reports/sessions/`.
+2. Close the incident issue with: timeline, root cause, fix, validation evidence, follow-up issues opened.
+3. If the lesson is durable: update the relevant runbook in `codex-opp-agent/runbooks/`, the relevant published page in this section, the relevant memory entry under `~/.claude/projects/-home-ze-claude-agent/memory/`.
+4. If the lesson is architectural: open an ADR amendment review issue (the pattern that produced ADR 0026 from ADR 0005 — see [IPv6 incident](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn)).
+
+The postmortem is *not* a separate scheduled meeting in the lab's solo posture; it is the close-out of the incident issue. The deliverables are the same.
+
+## References
+
+- `codex-opp-agent/adr/0025-gitops-only-operations-break-glass.md`
+- `codex-opp-agent/runbooks/break-glass-procedure.md`
+- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"Break-Glass Rules"
+- `codex-opp-agent/plans/federated-gitops-readiness-gates.md` (FG-6)
+- Memory: `user_role`, `feedback_subagent_first`, `feedback_github_first_tracking`
