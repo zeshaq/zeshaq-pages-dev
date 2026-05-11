@@ -1,0 +1,357 @@
+---
+title: "Brac POC — SPA + BFF repo architecture"
+sidebar_label: "SPA architecture"
+description: "Repo layout, component breakdown, BFF endpoint shapes, container strategy, manifest layout, and tech-stack picks for the BRAC POC Demo Dashboard."
+last_reviewed: 2026-05-11
+draft: false
+---
+
+This page sketches the repo, the component breakdown for the SPA, the BFF Router's `/demo/*` endpoints, the container strategy, and the OpenShift manifest tree. It's the technical companion to the [demo plan](./plan-openshift).
+
+## Repo strategy
+
+**Single monorepo** at `comptech-platform/brac-demo/brac-poc-demo` (GitLab). Houses everything the POC needs: SPA, BFF, the two Liberty services, the MFE Router (NGINX config), OpenShift manifests, and the demo scripts.
+
+Why monorepo: 8 panels share one BFF; the BFF and SPA evolve together; OCP manifests reference all of them; one Jenkinsfile drives the whole demo build. Splitting per service would be 4-5 repos to coordinate during a 2-week build.
+
+## Top-level layout
+
+```
+brac-poc-demo/
+├── README.md
+├── Jenkinsfile                       # Path-A build (per dc-lab convention)
+├── .gitlab-ci.yml                    # GitLab CI: lint + build + image push
+├── docker/
+│   ├── frontend.Containerfile        # multi-stage: node → nginx static serve
+│   ├── bff-router.Containerfile      # node runtime (UBI Node 18)
+│   └── mfe-router.Containerfile      # nginx (UBI) with the SPA bundle copied in
+├── apps/
+│   ├── frontend/                     # React SPA (Vite + TypeScript)
+│   ├── mfe-router/                   # NGINX config + entrypoint
+│   ├── bff-router/                   # Fastify BFF (TypeScript)
+│   ├── identity-svc/                 # Open Liberty (Maven + microprofile)
+│   └── product-svc/                  # Open Liberty (Maven + microprofile)
+├── manifests/                        # Kustomize
+│   ├── base/
+│   └── overlays/poc/
+├── scripts/
+│   ├── deploy-all.sh
+│   ├── validate-demo.sh
+│   ├── reset-canary.sh
+│   ├── reset-redis.sh
+│   ├── seed-iam-clients.sh
+│   ├── seed-apim-key.sh
+│   └── snap-evidence.sh
+└── reports/                          # evidence pack lives here per POC convention
+```
+
+## Frontend SPA (`apps/frontend/`)
+
+**Stack:** React 18 + Vite + TypeScript + Tailwind v4. `@xyflow/react` for the mesh graph, Recharts for live counters, Server-Sent Events for live primary-swap and request streams.
+
+```
+apps/frontend/
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+├── index.html
+├── public/
+│   └── favicon.svg
+└── src/
+    ├── main.tsx                       # React root + router
+    ├── App.tsx                        # Tab shell
+    ├── api/
+    │   ├── client.ts                  # fetch wrapper: auth headers, traceparent, error envelope
+    │   ├── apiGateway.ts              # GET /demo/api-gateway/info, POST .../call
+    │   ├── iam.ts                     # GET /demo/iam/me, POST /logout, GET /auth/{oidc,saml}, POST /switch-idp
+    │   ├── mesh.ts                    # GET /demo/mesh/verify-mtls, SSE /demo/mesh/graph
+    │   ├── canary.ts                  # POST /demo/canary/send, PUT /split
+    │   ├── observability.ts           # POST /demo/observability/trigger
+    │   ├── redis.ts                   # SSE /demo/redis/status, POST /kill-primary
+    │   ├── nexus.ts                   # GET /demo/nexus/artifacts, POST /pull
+    │   ├── kafka.ts                   # POST /demo/kafka/produce (valid|invalid)
+    │   └── tender.ts                  # GET /demo/tender/links
+    ├── components/
+    │   ├── Shell.tsx                  # header (BRAC POC Demo), tab strip, footer
+    │   ├── HealthPip.tsx              # green/yellow/red dot per backend dep
+    │   ├── ResponseViewer.tsx         # request + response + latency block
+    │   ├── MeshGraph.tsx              # React Flow node/edge renderer
+    │   ├── CanarySlider.tsx           # 0-100% range with live preview
+    │   ├── LiveBarChart.tsx           # Recharts horizontal bars
+    │   ├── TraceTrigger.tsx           # button + ratio sliders
+    │   ├── PrimaryStatus.tsx          # current primary host + uptime
+    │   ├── KillButton.tsx             # red destructive button with confirm
+    │   ├── ArtifactList.tsx           # Nexus row component
+    │   ├── TenderCard.tsx             # grid card linking out to native UI
+    │   └── ToastHost.tsx              # transient notifications
+    ├── panels/
+    │   ├── ApiGatewayPanel.tsx
+    │   ├── IamPanel.tsx
+    │   ├── MeshPanel.tsx
+    │   ├── CanaryPanel.tsx
+    │   ├── ObservabilityPanel.tsx
+    │   ├── RedisPanel.tsx
+    │   ├── SignozPanel.tsx
+    │   ├── NexusPanel.tsx
+    │   └── TenderTour.tsx
+    ├── hooks/
+    │   ├── useSse.ts                  # generic SSE consumer with reconnect
+    │   ├── useHealth.ts               # polls /healthz every 10s
+    │   ├── useOidcSession.ts          # current user + claims from cookie/JWT
+    │   └── useToast.ts
+    ├── styles/
+    │   └── globals.css                # Tailwind import + theme tokens
+    └── utils/
+        ├── formatLatency.ts
+        ├── formatBytes.ts
+        └── auth.ts                    # token reading helpers
+```
+
+**Routing:** tab-based at the URL fragment (`/#api-gateway`, `/#iam`, …) so deep-linking works and the back button is sane.
+
+**Theme:** match the zahid blog tokens — light off-white background, dark ink, dashed-green for mesh agents, animated green pull-edges. Consistency with the rest of `zeshaq.pages.dev`.
+
+## BFF Router (`apps/bff-router/`)
+
+**Stack:** Fastify 4 + TypeScript, lighter than Express, native plugin typing, OTel auto-instrumented via `@opentelemetry/auto-instrumentations-node`.
+
+```
+apps/bff-router/
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── server.ts                       # Fastify bootstrap, plugin registration
+│   ├── config.ts                       # env vars with zod validation
+│   ├── otel.ts                         # OTel SDK init (must be first import)
+│   ├── auth.ts                         # @fastify/passport + OIDC + SAML strategies
+│   ├── audit.ts                        # audit log for destructive endpoints
+│   ├── routes/
+│   │   ├── healthz.ts
+│   │   ├── apiGateway.ts               # /demo/api-gateway/{info,call}
+│   │   ├── iam.ts                      # /demo/iam/me, /auth/{oidc,saml,callback}, /switch-idp, /logout
+│   │   ├── mesh.ts                     # /demo/mesh/{verify-mtls,graph}
+│   │   ├── canary.ts                   # /demo/canary/{send,split}
+│   │   ├── observability.ts            # /demo/observability/trigger
+│   │   ├── redis.ts                    # /demo/redis/{status,kill-primary}
+│   │   ├── nexus.ts                    # /demo/nexus/{artifacts,pull}
+│   │   ├── kafka.ts                    # /demo/kafka/produce
+│   │   └── tender.ts                   # /demo/tender/links
+│   ├── clients/
+│   │   ├── istiod.ts                   # Reads PeerAuthentication + AuthorizationPolicy via Istio API
+│   │   ├── identityService.ts          # HTTP client to identity-svc (in-mesh)
+│   │   ├── productService.ts           # HTTP client to product-svc
+│   │   ├── redisSentinel.ts            # ioredis Sentinel mode → lab VMs
+│   │   ├── nexus.ts                    # Nexus REST API (artifacts, search, pull)
+│   │   ├── wso2Apim.ts                 # WSO2 APIM REST (publish, key gen, token)
+│   │   ├── wso2Is.ts                   # WSO2 IS REST (claims, introspection, IdP list)
+│   │   ├── kafkaProducer.ts            # KafkaJS client to lab Kafka
+│   │   ├── schemaRegistry.ts           # Apicurio REST (schemas, validate)
+│   │   └── kubeApi.ts                  # @kubernetes/client-node for Istio VirtualService updates
+│   └── lib/
+│       ├── traceContext.ts             # OTel trace propagation helpers
+│       ├── sse.ts                      # SSE stream builder (heartbeat, reconnect IDs)
+│       └── errorEnvelope.ts            # consistent JSON error shape
+```
+
+**Auth model:** the SPA's session is an HTTP-only cookie set by the BFF after OIDC callback. The BFF holds the access + refresh tokens server-side; the SPA only sees the cookie and a thin `me` claims object. Destructive endpoints (`/redis/kill-primary`, `/canary/split`) require a role claim (`brac-poc-operator`) and write an audit row to a Loki stream `brac-poc-audit`.
+
+## BFF `/demo/*` endpoints
+
+Concrete shapes. Every endpoint is OTel-instrumented; every response includes a `traceparent` header so the SPA can deep-link to the trace in SigNoz.
+
+### 1. API Gateway panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/demo/api-gateway/info` | — | `{ gatewayUrl, publishedApis: [{name, version, basePath}], policy, iamKeyManager: "WSO2 IS" }` |
+| `POST` | `/demo/api-gateway/call` | `{ api, method, path, body? }` | `{ request: {...}, response: { status, headers, body }, latencyMs, traceparent }` |
+
+### 2. IAM panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/demo/iam/me` | — | `{ sub, name, email, roles, claims, federatedSource, tokenExpiresAt }` |
+| `GET` | `/demo/iam/auth/oidc` | — | 302 → IS authorization endpoint |
+| `GET` | `/demo/iam/auth/saml` | — | 302 → IS SAML SSO endpoint |
+| `GET` | `/demo/iam/auth/callback` | (code/state) | 302 → SPA with session cookie |
+| `POST` | `/demo/iam/switch-idp` | `{ idp }` | 302 → IS IdP-discovery endpoint |
+| `POST` | `/demo/iam/logout` | — | 204, session cookie cleared, IS logout redirect chained |
+
+### 3. Service Mesh + mTLS panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/demo/mesh/verify-mtls` | (optional `?ns`) | `{ edges: [{from, to, mode: MUTUAL\|PERMISSIVE\|NONE, policy}] }` |
+| `GET` | `/demo/mesh/graph` (SSE) | — | stream: `{nodes, edges, requestCounts, mtlsByEdge}` every 2s |
+
+### 4. Canary panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `POST` | `/demo/canary/send` | `{ count, headerOverride? }` | `{ v1Hits, v2Hits, errors, perRequest: [{version, latencyMs, traceId}] }` |
+| `PUT` | `/demo/canary/split` (operator role) | `{ v1Weight, v2Weight }` | 204; updates VirtualService via Kube API; emits audit row |
+
+### 5. Observability panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `POST` | `/demo/observability/trigger` | `{ count, errorRatio, slowRatio }` | `{ triggered, traceLinks: [signozUrl], summary: {ok, error, slow} }` |
+
+### 6. Redis HA panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/demo/redis/status` (SSE) | — | stream: `{ primary, replicas, readsPerSec, writesPerSec, lastSwitch }` every 1s |
+| `POST` | `/demo/redis/kill-primary` (operator role) | — | `{ killed, switchExpected: true, auditId }`. BFF runs `redis-cli -h <primary> DEBUG SEGFAULT` via the lab Sentinel client. |
+
+### 7. Nexus panel
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/demo/nexus/artifacts` | — | `[{ id, format: maven\|npm\|pypi\|docker, repo, path, size, sha256 }]` |
+| `POST` | `/demo/nexus/pull` | `{ artifactId }` | `{ digest, size, contentType, pullCommand, durationMs }` |
+
+### 8. Kafka Schema Registry panel (tender tour)
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `POST` | `/demo/kafka/produce` | `{ topic, payload, valid }` | `{ status: accepted\|rejected, offset?, reason?, registryUrl }` |
+
+### Health + tender links
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `GET` | `/healthz` | — | `{ ok, dependencies: { wso2Apim, wso2Is, istiod, redisSentinel, nexus, sigNoz, kafka, schemaRegistry } }` |
+| `GET` | `/demo/tender/links` | — | `{ compliance, rhacs, defectdojo, gitlab, jenkins, jbossAdmin, ocpConsole }` |
+
+## Container strategy
+
+| Image | Base | What it has |
+|---|---|---|
+| `brac-poc-frontend` | `registry.access.redhat.com/ubi9/nginx-122` | The SPA static bundle at `/usr/share/nginx/html`, NGINX config that serves `/` and proxies `/api/` to BFF. |
+| `brac-poc-mfe-router` | same as above | Same as frontend image — the MFE Router is the NGINX that fronts the SPA. Single image for both roles; minimizes pull-secret + RHACS surface. |
+| `brac-poc-bff-router` | `registry.access.redhat.com/ubi9/nodejs-18` | Fastify server + clients + OTel. ~80MB. |
+| `brac-poc-identity-svc` | `icr.io/appcafe/open-liberty:full-java17-openj9-ubi` | Liberty hello-world extended with MicroProfile health + metrics; two image tags (`:v1`, `:v2`) for canary. |
+| `brac-poc-product-svc` | same | Liberty downstream service. |
+
+All images get a final `LABEL` set with the build SHA + a Trivy SBOM produced as a build artifact (extends today's #64-#66 pipeline).
+
+Pull target: `app-registry.apps.sub.comptech-lab.com/brac-poc/<image>:<tag>` (dc-lab Nexus three-endpoint split, ADR 0019).
+
+## OpenShift manifest tree
+
+```
+manifests/
+├── base/
+│   ├── kustomization.yaml
+│   ├── namespaces/
+│   │   ├── brac-demo-frontend.yaml          # labels: istio-injection=disabled
+│   │   ├── brac-demo-services.yaml          # labels: istio.io/dataplane-mode=ambient
+│   │   ├── brac-demo-otel.yaml
+│   │   ├── brac-demo-jboss.yaml
+│   │   └── brac-demo-evidence.yaml
+│   ├── mfe-router/
+│   │   ├── deployment.yaml                  # 2 replicas, anti-affinity per node
+│   │   ├── service.yaml
+│   │   ├── route.yaml                       # cert-manager-issued cert from lab CA
+│   │   └── configmap-nginx.yaml             # SPA static serve + /api reverse-proxy
+│   ├── bff-router/
+│   │   ├── deployment.yaml
+│   │   ├── service.yaml
+│   │   ├── serviceaccount.yaml              # used by Istio CR update path
+│   │   ├── role.yaml                        # get/list/patch VirtualService, get PeerAuthentication
+│   │   ├── rolebinding.yaml
+│   │   ├── clusterrole-istio-reader.yaml    # cluster-wide read on Istio APIs
+│   │   ├── clusterrolebinding-istio-reader.yaml
+│   │   ├── externalsecret-vault.yaml        # WSO2 + Nexus + Kafka creds from Vault
+│   │   ├── networkpolicy-allow-frontend.yaml
+│   │   └── networkpolicy-allow-egress-lab.yaml
+│   ├── identity-svc/
+│   │   ├── openlibertyapplication-v1.yaml
+│   │   ├── openlibertyapplication-v2.yaml
+│   │   ├── service.yaml
+│   │   ├── peerauthentication.yaml          # STRICT mTLS
+│   │   ├── virtualservice.yaml              # canary 90/10 default + header override
+│   │   ├── destinationrule.yaml             # subsets v1, v2
+│   │   └── authorizationpolicy.yaml         # allow from bff-router SA only
+│   ├── product-svc/
+│   │   ├── openlibertyapplication.yaml
+│   │   ├── service.yaml
+│   │   ├── peerauthentication.yaml
+│   │   └── authorizationpolicy.yaml         # allow from identity-svc SA only
+│   ├── otel-collector/
+│   │   ├── opentelemetrycollector.yaml      # OpenTelemetry Operator CR
+│   │   └── configmap-otel-config.yaml       # receivers, processors (sampling/filter/routing), kafka exporter
+│   └── rbac/
+│       └── operator-role.yaml               # the brac-poc-operator ClusterRole for destructive endpoints
+└── overlays/
+    └── poc/
+        ├── kustomization.yaml
+        ├── route-hostname-patch.yaml        # brac-poc.apps.sub.comptech-lab.com
+        ├── image-digest-patch.yaml          # populated by update-overlay-digest.sh post-build
+        └── replica-patch.yaml               # bump replicas for the demo session
+```
+
+The `manifests/` tree mirrors the existing `platform-gitops/clusters/spoke-dc-v6/` shape so the same Argo ApplicationSet + sync-wave conventions apply (operators wave 10, operands wave 20, networking wave 30).
+
+## Scripts
+
+| Script | Purpose | When to run |
+|---|---|---|
+| `deploy-all.sh` | Apply Kustomize overlay, wait for all Deployments Ready, wait for ApplicationSet sync | After every Jenkins build merge to main |
+| `validate-demo.sh` | Pre-demo dependency check: hits `/healthz` on BFF, verifies all native UIs (Kiali, SigNoz, WSO2, DefectDojo) return 200, runs a synthetic walk-through (curl through all 8 panels) | Morning-of demo |
+| `reset-canary.sh` | Reset VirtualService to 90/10 default | Before each rehearsal |
+| `reset-redis.sh` | If a previous demo's hard-kill left a primary down, restart the failed VM via SSH | If `validate-demo.sh` flags Redis |
+| `seed-iam-clients.sh` | Ensure SAML SP + OIDC client exist in WSO2 IS; ensure Federation IdP source registered | Idempotent; safe to run repeatedly |
+| `seed-apim-key.sh` | Ensure the demo API published + key issued | Idempotent |
+| `snap-evidence.sh` | Headless-Chrome screencap each panel + dump logs for the last hour to `reports/brac-poc/<date>/` | After demo |
+
+## Build + deploy flow
+
+Reuses today's Path-A pipeline (per dc-lab ADR 0019 + today's `update-overlay-digest.sh` work from #234):
+
+```
+GitLab push
+  ↓
+Jenkins build (parallel matrix: frontend, bff-router, identity-svc, product-svc)
+  ↓
+Trivy scan + SBOM + DefectDojo import (today's b84037c pipeline)
+  ↓
+Push to app-registry.apps.sub.comptech-lab.com/brac-poc/* @sha256
+  ↓
+update-overlay-digest.sh patches manifests/overlays/poc/image-digest-patch.yaml
+  ↓
+Push manifest commit to platform-gitops (under clusters/spoke-dc-v6/brac-demo/)
+  ↓
+Argo CD on spoke-dc-v6 reconciles → demo namespaces refresh
+  ↓
+Post-merge smoke: scripts/smoke/operator-install-smoke.sh (from #141)
+```
+
+## Tech stack picks (Q9 resolution)
+
+| Choice | Default | Why |
+|---|---|---|
+| SPA framework | **React 18 + Vite** | Library ecosystem (React Flow, Recharts), interactive feel, OIDC libs mature. Astro static considered but the SPA is interaction-heavy; React island in Astro = same React with extra hosting layer. |
+| State | React Context + Zustand for canary state | No Redux needed. Zustand handles the SSE-fed live counters cleanly. |
+| Styling | **Tailwind v4** | Matches the zahid blog stack. Theme tokens reusable. |
+| Diagrams | **`@xyflow/react`** | Already in the zahid stack; mesh request graph + canary visualization. |
+| Charts | **Recharts** | Lightweight, declarative, fits Tailwind. |
+| Live updates | **SSE** | Simpler than WebSocket for one-way server → client; reconnects free; no protocol upgrade. |
+| BFF framework | **Fastify 4** | Lighter than Express, native plugin types, OTel auto-instrumented. |
+| OIDC | **`@fastify/passport` + `passport-openidconnect`** | Standard chain; works with WSO2 IS as the OIDC provider. |
+| SAML | **`@node-saml/passport-saml`** | For the SAML SP demo flow. |
+| Redis client | **`ioredis`** with Sentinel mode | Reconnect logic built in; matches the Sentinel topology. |
+| Kafka client | **KafkaJS** | TypeScript-friendly; Schema Registry integration via `@kafkajs/confluent-schema-registry`. |
+| Kubernetes client | **`@kubernetes/client-node`** | For VirtualService patch on canary slider changes. |
+| OTel | **`@opentelemetry/sdk-node` + `@opentelemetry/auto-instrumentations-node`** | Auto-instruments Fastify, fetch, ioredis, KafkaJS. |
+
+Reconsider Astro+islands only if the customer asks for zero-runtime-JS as a discriminator. The Demo Dashboard is a working app, not a content site — interactivity is the point.
+
+## Open items for the SPA scope
+
+1. **Polish vs production:** the SPA is a demo cockpit, not a customer-facing product. Aim for visually clean but don't gold-plate (e.g., no dark mode, no i18n unless BRAC asks).
+2. **Pagefind search:** the existing zahid blog ships Pagefind; not needed in the SPA (8 tabs, no search surface).
+3. **Mobile / tablet:** target desktop ≥1280px wide; a few panels (React Flow graph, live charts) won't fit on mobile. Note in the SPA footer.
+4. **i18n:** English-only; if BRAC asks for Bangla, scope is a single-pass translation of static strings + RTL audit. Out of scope by default.
+5. **Per-attendee read-only mode:** if multiple BRAC stakeholders want to click around themselves post-session, ship a read-only token. Defer until requested.
