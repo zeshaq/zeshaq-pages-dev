@@ -28,7 +28,7 @@ import InteractiveDiagram from "../../components/InteractiveDiagram.tsx";
 | **Login** | WSO2 Identity Server, tenant `bank-payment` |
 | **Browser-trusted TLS** | Public Let's Encrypt wildcard, auto-renewed |
 | **Internal TLS** | mTLS between the in-cluster proxy and the backends, certs issued by the lab CA |
-| **Observability** | Traces in Tempo · Metrics in user-workload Prometheus · Logs in LokiStack · curated **Perses** dashboard under console **Observe → Dashboards** |
+| **Observability** | Two parallel surfaces — OpenShift native (Tempo + user-workload Prometheus + LokiStack + Perses dashboard) **and** SigNoz on the lab VM (traces, metrics, logs, APM, alerts, SLO) |
 | **Delivery** | One Git repo → Jenkins → Nexus → Argo CD → OpenShift |
 
 ## What got built
@@ -77,6 +77,7 @@ vendor relationship to support.
 | Metrics | **OpenShift user-workload Prometheus** | Scrapes Liberty's `/metrics` directly via a `ServiceMonitor`. |
 | Logs | **OpenShift Logging + LokiStack** | Vector collects pod stdout; Loki stores and indexes it. |
 | Dashboards | **Cluster Observability Operator + Perses** | Dashboards declared as YAML, rendered inside the console at **Observe → Dashboards**. |
+| APM / parallel observability | **SigNoz** (on a lab VM) | Receives the same spans / metrics / logs via OTLP from an in-cluster fan-out collector. Adds APM (service map, RED metrics, exceptions), trace ↔ log correlation, alerts, SLO tracking. Used side-by-side with the OpenShift native surface — same data, richer querying. |
 
 ## How the app was designed
 
@@ -211,6 +212,13 @@ export const archNodes = [
   { id: "trivy",  data: { label: "Trivy\nblocks HIGH / CRITICAL CVEs" }, position: { x: 1100, y: 330 }, style: sCi },
   { id: "nexus",  data: { label: "Nexus app-registry\nimage tags :latest + :sha" }, position: { x: 1100, y: 440 }, style: sCi },
   { id: "pgops",  data: { label: "platform-gitops\ntenant scaffold + Argo Application" }, position: { x: 1100, y: 560 }, style: sCi },
+
+  /* Observability fan-out -------------------------------------------- */
+  { id: "fanout", data: { label: "fan-out OTel collector\nin bank-payment ns" }, position: { x: 480, y: 470 }, style: sCi },
+  { id: "tempo",  data: { label: "Tempo (Observe → Traces)" },                  position: { x: 760, y: 410 }, style: sExt },
+  { id: "promws", data: { label: "User-workload Prometheus\n(Observe → Metrics)" }, position: { x: 760, y: 510 }, style: sExt },
+  { id: "loki",   data: { label: "LokiStack (Observe → Logs)" },                position: { x: 760, y: 610 }, style: sExt },
+  { id: "signoz", data: { label: "SigNoz (lab VM)\nAPM · alerts · SLO · dashboards" }, position: { x: 480, y: 760 }, style: sCi },
 ];
 
 export const archEdges = [
@@ -273,6 +281,14 @@ export const archEdges = [
   { id: "arg-csvc",source: "argo",   target: "csvc",   label: "reconcile",       style: { stroke: "#15803d", strokeDasharray: "5,5" } },
   { id: "arg-ngx", source: "argo",   target: "ngx",    label: "reconcile",       style: { stroke: "#15803d", strokeDasharray: "5,5" } },
   { id: "nx-csvc", source: "nexus",  target: "csvc",   label: "image pull",      style: { stroke: "#15803d", strokeDasharray: "5,5" } },
+
+  /* Observability OTLP push + fan-out -------------------------------- */
+  { id: "csvc-fan",  source: "csvc",   target: "fanout", label: "OTLP (traces · metrics · logs)", style: { stroke: "#a21caf", strokeDasharray: "5,5" }, animated: true },
+  { id: "asvc-fan",  source: "asvc",   target: "fanout", label: "OTLP",                            style: { stroke: "#a21caf", strokeDasharray: "5,5" }, animated: true },
+  { id: "fan-tempo", source: "fanout", target: "tempo",  label: "tail-sampled traces",             style: { stroke: "#a21caf" } },
+  { id: "fan-prom",  source: "fanout", target: "promws", label: "(scrape via SM)",                 style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "fan-loki",  source: "fanout", target: "loki",   label: "(stdout via Vector)",             style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "fan-signoz",source: "fanout", target: "signoz", label: "all 3 signals (OTLP)",            style: { stroke: "#a21caf", strokeWidth: 2 }, animated: true },
 ];
 
 <InteractiveDiagram nodes={archNodes} edges={archEdges} height={1000} client:only="react" />
@@ -376,33 +392,85 @@ The full set of NetworkPolicies for this tenant lives in the platform
 GitOps repository — adding a new outbound destination is a small Git
 commit, reviewed and audited like everything else.
 
-## Observability — three signals
+## Observability — two parallel surfaces
 
-Every request the app handles emits **three observability signals**.
-Each lands in a separate Red Hat OpenShift backend already operated
-by the bank's platform team. The bank's ops staff can see, query and
-alert on all three from the same OpenShift web console — no extra
-tool to learn.
+Every signal the app emits (**traces, metrics, logs**) is shipped to
+**two independent observability backends in parallel** — the
+OpenShift-native stack (in the cluster console, owned by the
+platform team) and **SigNoz** running on a lab VM (a full
+observability platform with APM, alerts, SLO tracking).
 
-| Signal | What it tells you | Where it lands | How the app produces it |
-| --- | --- | --- | --- |
-| **Traces** | The full lifecycle of one request across services — useful when "the payment is slow", to pinpoint which hop slowed down. | Tempo (`tracing` namespace) | Liberty's built-in MicroProfile Telemetry pushes spans via OTLP to the platform OpenTelemetry collector. Auto-instruments every API call and cross-service call. |
-| **Metrics** | Numbers over time — heap, threads, request rate, latency. Useful for dashboards and alerts. | OpenShift user-workload Prometheus | Liberty's MicroProfile Metrics exposes `/metrics`. A `ServiceMonitor` tells Prometheus to scrape it every 30 seconds. |
-| **Logs** | Every line of stdout/stderr from every pod. Useful for digging into a specific failure. | LokiStack (`openshift-logging`) | Pods write to stdout. OpenShift Logging's Vector collector ships the lines to Loki — no app-side change. |
+The split is intentional. The platform team uses OpenShift's native
+view because it lives in the same console they already operate the
+cluster from. App developers and the on-call rotation use SigNoz
+because it has richer per-endpoint analytics and a side-by-side
+trace / log / metric view. Both surfaces show the same data — the
+app pushes once, an in-cluster collector fans out.
 
-### Where to view each in the OpenShift console
+### Where each signal lands
 
-| Signal | Console path | Example query |
+| Signal | OpenShift native | SigNoz (lab VM) |
 | --- | --- | --- |
-| Traces | **Observe → Traces** | service name = `payment-client-svc` or `payment-approver-svc`. Each customer payment shows up as one trace, 4-6 spans deep. |
-| Metrics | **Observe → Metrics** | `thread_count{namespace="bank-payment"}`, `histogram_quantile(0.95, sum by (le)(rate(http_server_request_duration_seconds_bucket[5m])))` |
-| Logs | **Observe → Logs** | namespace = `bank-payment`, optional pod filter |
+| **Traces** | OpenTelemetry collector → **Tempo** in the `tracing` namespace. View at console **Observe → Traces**. | Same span stream is also shipped over OTLP to SigNoz, which stores it in ClickHouse for richer querying. |
+| **Metrics** | User-workload **Prometheus** scrapes Liberty's `/metrics` every 30s. View at console **Observe → Metrics**. | Liberty also pushes the same metric set over OTLP; SigNoz stores it in ClickHouse and exposes it for dashboards / alerts. |
+| **Logs** | OpenShift Logging's **Vector** ships pod stdout to **LokiStack**. View at console **Observe → Logs**. | Liberty's MicroProfile Telemetry log handler pushes every message via OTLP **with the trace_id / span_id stamped on each line**, so SigNoz can jump straight from a trace to the matching log lines. |
 
-### Curated dashboard (Perses)
+### Tail sampling — kept the interesting traces, dropped the noise
+
+The in-cluster fan-out collector applies **tail-based sampling** to
+traces before forwarding to SigNoz. Sampling decisions are made on
+the complete trace:
+
+| Trace shape | Kept? |
+| --- | --- |
+| Contains any errored span | **Always kept** |
+| Total duration > 500 ms | **Always kept** |
+| All-healthy under 500 ms | **10% kept** (probabilistic) |
+
+Net effect: anomalies survive at full fidelity, normal traffic is
+ten-times-cheaper to store, and the trace storage bill scales with
+*meaningful* traffic instead of raw volume.
+
+### Business-aware traces
+
+Spans on the transfer and approve / decline endpoints carry the
+**business context** as searchable attributes — not just generic
+HTTP metadata:
+
+| Attribute | Example |
+| --- | --- |
+| `transfer.id` | `1a2b-3c4d-…` |
+| `transfer.from` · `transfer.to` | `zahid` · `shaikat` |
+| `transfer.amount` · `transfer.status` | `2500.00` · `PENDING` |
+| `decision` (on approver path) | `approve` / `decline` |
+| `bank.user` · `bank.user.role` | `admin` · `admin` |
+
+In SigNoz, you can paste a transfer ID into the trace search and
+**find that exact customer payment** — including the cross-service
+hop to the approver, the ledger write, every Liberty handler — in
+one waterfall.
+
+### What SigNoz gives you on top of the data
+
+The OTLP plumbing is the same as for Tempo, but SigNoz adds an APM
+layer that needs no extra wiring:
+
+| SigNoz feature | What it gives the demo |
+| --- | --- |
+| **Service Map** | Auto-drawn graph of every service-to-service call, arrow thickness = traffic volume. Visually proves the approver → client cross-call is happening. |
+| **APM / RED metrics per endpoint** | Auto-derived from spans — request **R**ate, **E**rror rate, **D**uration (p50/p95/p99) for every API path. No code change. |
+| **Slowest endpoints leaderboard** | Sorted list of the slowest operations across both backends. |
+| **Exception view** | When Liberty throws, the exception + Java stack lands directly on the span — visible in one click. |
+| **Trace → log jump** | Click any span → SigNoz pulls the matching log lines automatically via trace_id. Single pane of glass. |
+| **Alerts** (UI-driven) | Pre-staged: p99 on `/v1/transfers` > 500 ms · backend down (`up < 1`) · heap utilization > 80 %. |
+| **SLO panels** (UI-driven) | "99.5% of `/v1/transfers` < 500 ms over 30 days" — burn-rate tracker baked in. |
+| **Saved views** | A pre-built "find a transfer by ID" view that filters across both services. |
+
+### Curated dashboard (Perses, in the OpenShift console)
 
 A pre-built **Perses dashboard** ships alongside the app and renders
-under **Observe → Dashboards → Bank Payment Overview** in the console.
-Three collapsible grids:
+under **Observe → Dashboards → Bank Payment Overview** in the
+console. Three collapsible grids:
 
 | Grid | Panels |
 | --- | --- |
@@ -410,17 +478,16 @@ Three collapsible grids:
 | **JVM resources** | Heap used (MB) per pod · Thread count per pod · Process CPU load (%) per pod · GC time rate |
 | **HTTP traffic** | Request rate by route × status code · p95 latency by route |
 
-The dashboard is delivered through the same GitOps pipeline as the
-app — its YAML manifest sits in the repo, the Cluster Observability
-Operator's Perses operator reconciles it into the console.
+The dashboard YAML lives in the same repo as the app; the
+Cluster Observability Operator's Perses operator reconciles it into
+the console.
 
 ### Quick-glance in-app status page
 
-Independent of the platform tooling, the app also serves a tiny
-status page at `/obs/` directly on the customer hostname. Two cards,
-one per backend, refreshed every five seconds. Convenient when
-you're on the customer page and want a one-click health check
-without leaving for the console.
+Independent of the platform tooling and SigNoz, the app also serves
+a tiny status page at `/obs/` directly on the customer hostname.
+Two cards, one per backend, refreshed every five seconds. Convenient
+when you want a one-click health check without leaving the app.
 
 | Metric on `/obs/` | What it tells you |
 | --- | --- |
@@ -431,8 +498,8 @@ without leaving for the console.
 | **CPU (recent %)** | Live CPU usage. |
 
 This in-app page goes through the **mTLS hop** described above; the
-console-side observability (Tempo / Prometheus / Loki) goes through
-the platform's own collectors which run in their own namespaces.
+console-side observability and SigNoz go through their own
+collectors which run in their own namespaces / on the lab VM.
 
 ## Web hardening at the edge
 
@@ -458,6 +525,7 @@ in their referrer logs).
 | Approver page | `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | In-app health view | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com/obs/` |
 | Console dashboard | OpenShift console → **Observe → Dashboards → Bank Payment Overview** |
+| SigNoz UI | `https://signoz.apps.sub.comptech-lab.com` — Services / Traces / Logs / Metrics / Alerts / Dashboards |
 | Customer API | `https://client-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | Approver API | `https://approver-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | WSO2 IS console | `https://is.apps.sub.comptech-lab.com/t/bank-payment/console` |
