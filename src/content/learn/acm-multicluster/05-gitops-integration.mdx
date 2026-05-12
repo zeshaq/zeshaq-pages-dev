@@ -1,0 +1,308 @@
+---
+title: "GitOps integration: push, pull, and the Routes CRD trap"
+sidebar_label: "05 — GitOps integration"
+description: "The two ways to integrate Argo CD with ACM — push from the hub vs pull on the spoke — and how to choose. The gitops-addon, the ApplicationSet fan-out, and the Routes CRD incident that silently stalls every sync."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const modelNodes = [
+  { id: "pushLabel", position: { x: 60,  y: 0   }, data: { label: "PUSH MODEL (legacy)" }, style: { background: "transparent", border: "none", color: "#b91c1c", width: 240, textAlign: "center", fontWeight: 700, fontSize: 14 } },
+  { id: "pullLabel", position: { x: 540, y: 0   }, data: { label: "PULL MODEL (preferred)" }, style: { background: "transparent", border: "none", color: "#15803d", width: 240, textAlign: "center", fontWeight: 700, fontSize: 14 } },
+
+  { id: "git1",   position: { x: 60,  y: 70  }, data: { label: "Git repository" }, style: ext },
+  { id: "git2",   position: { x: 540, y: 70  }, data: { label: "Git repository" }, style: ext },
+
+  { id: "hubA",   position: { x: 60,  y: 200 }, data: { label: "Hub Argo CD\nholds kubeconfig\nfor every spoke" }, style: ctrl },
+  { id: "hubB",   position: { x: 540, y: 200 }, data: { label: "Hub Argo CD\n+ ApplicationSet\n(generates Applications)" }, style: ctrl },
+
+  { id: "mw",     position: { x: 540, y: 330 }, data: { label: "ManifestWork\n(via ACM)" },                    style: stage },
+
+  { id: "spoke1", position: { x: 60,  y: 330 }, data: { label: "Spoke 1\n(no local Argo)" }, style: stage },
+  { id: "spoke2", position: { x: 160, y: 460 }, data: { label: "Spoke 2\n(no local Argo)" }, style: stage },
+  { id: "spoke3", position: { x: 0,   y: 460 }, data: { label: "Spoke 3\n(no local Argo)" }, style: stage },
+
+  { id: "spokeArgo", position: { x: 540, y: 460 }, data: { label: "Spoke Argo CD\n(gitops-addon)\nowns local reconcile" }, style: agent },
+];
+
+export const modelEdges = [
+  { id: "m1", source: "hubA", target: "git1", label: "pulls", ...pullEdge },
+  { id: "m2", source: "hubA", target: "spoke1", label: "applies", ...reqEdge },
+  { id: "m3", source: "hubA", target: "spoke2", label: "applies", ...reqEdge },
+  { id: "m4", source: "hubA", target: "spoke3", label: "applies", ...reqEdge },
+
+  { id: "m5", source: "hubB", target: "git2", label: "pulls (hub state)", ...pullEdge },
+  { id: "m6", source: "hubB", target: "mw", label: "wraps Application", ...reqEdge },
+  { id: "m7", source: "mw", target: "spokeArgo", label: "ManifestWork dispatch", ...reqEdge },
+  { id: "m8", source: "spokeArgo", target: "git2", label: "pulls (spoke state)", ...pullEdge },
+];
+
+ACM and Argo CD are independent tools. ACM does cluster lifecycle, placement, governance, observability. Argo CD does GitOps reconcile. Integrating them is a question of *who owns the kubeconfig that talks to the spoke API server* — the hub Argo (push) or a spoke-local Argo (pull). This module is about that one question, the trap that comes with the pull-model addon on real OpenShift, and the ApplicationSet shape that fans out one hub Application into N spoke Applications.
+
+The mistake to avoid is choosing push because it's simpler. It is — and it works fine for three clusters all on one LAN. Past that the operational cost compounds and you eventually rebuild on pull. Better to start there.
+
+## Push model — what it was
+
+In the original Argo CD multi-cluster pattern, the hub Argo CD holds a long-lived kubeconfig (Secret of type `argoproj.io/cluster`) for every managed cluster. AppProjects and Applications on the hub specify `spec.destination.server: https://api.<spoke>.<domain>:6443` and the hub Argo reaches across the network to apply manifests. The model worked, was simple, and is still appropriate for tiny fleets.
+
+The pain shows up at scale:
+
+- **Credential blast radius.** One bad token on the hub means an attacker who compromised the hub has reach into every spoke. Every kubeconfig is a separately-leaking secret.
+- **Hub→spoke network requirement.** The hub must be able to open TCP/6443 to every spoke's API server. NAT, firewalls, air-gapped sites, intermittent WAN — every one of these breaks the push model.
+- **Hub Argo controller scale.** Every Application's reconcile happens on the hub Argo. At 500 clusters × 10 apps each, the hub Argo is doing 5,000 simultaneous reconciles. The application controller is single-process and has limits.
+- **No spoke autonomy.** A spoke can't continue to reconcile from Git when the hub is offline; it has no Argo of its own.
+
+For a homelab with three clusters in one rack, none of this matters. For a real fleet, all of it does.
+
+## Pull model — what it is
+
+<Whiteboard client:load data={{ nodes: modelNodes, edges: modelEdges }} height={560} />
+
+The diagram shows both models side by side. On the left (push), one hub Argo applies directly to each spoke — solid black arrows from hub to spoke. On the right (pull), the hub Argo writes a *description* of what each spoke should do (an `Application` resource), ACM wraps it as ManifestWork, the spoke pulls it, and a **spoke-local Argo CD** does the actual reconcile. Every dashed-green arrow is initiated from the spoke outbound.
+
+The key inversion: the hub no longer reaches the spoke. The hub only writes to *itself* (and to the spoke's hub-side namespace, which is also on the hub). ACM ships the ManifestWork; the klusterlet on the spoke pulls it; the spoke Argo CD owns the reconcile loop against the spoke API server. The hub has no kubeconfig for the spoke, doesn't need TCP/6443 to the spoke, and doesn't need to be online during the spoke's reconcile.
+
+For the lab's `hub-dc-v6` + `spoke-dc-v6` pair this is the chosen design — see [ADR 0018](/docs/architecture-decisions/adr-0018-acm-gitops-pull) and the [pull-model overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview) for the manifested decision.
+
+## Which to pick
+
+The decision in one sentence: **pull if any spoke is sometimes offline, in a different security zone, or behind NAT; push only if all clusters are on one network and the count is small enough that you'll never want fleet-wide ApplicationSet generation**.
+
+A table:
+
+| Decision factor | Push | Pull |
+| --- | --- | --- |
+| Spoke API reachable from hub | required | not required |
+| Hub→spoke kubeconfigs on the hub | yes (long-lived) | no |
+| Spoke can continue to reconcile when hub is offline | no | yes |
+| Spoke can be air-gapped, behind NAT | no | yes |
+| Operationally simpler at &lt;5 clusters | yes | no |
+| Operationally simpler at &gt;20 clusters | no | yes |
+| Red Hat reference architecture (since 2024) | no | yes |
+
+Red Hat now ships pull as the reference for OpenShift GitOps + ACM. The lab's two-cluster fleet uses pull not because it has scale, but because it sets up the shape for any future expansion.
+
+## The `gitops-addon` mechanics
+
+`gitops-addon` is ACM's mechanism for shipping a small Argo CD instance to each managed cluster. It runs on the hub (as part of the multicluster engine) and emits ManifestWork that installs the spoke-side Argo. The shape on the spoke:
+
+- **A Deployment** (not OLM CSV) of `openshift-gitops-operator-controller-manager` in the `openshift-gitops` namespace. ACM uses Deployment because the operator's lifecycle is driven by ACM, not the local OLM catalog.
+- **A least-privilege ClusterRole** named `argocd-platform-extensions` granting the spoke Argo CD's application controller the API groups it needs. This is where Module 06's RBAC discussion picks up.
+- **An ArgoCD CR** in `openshift-gitops` namespace that configures the spoke Argo CD itself.
+
+You enable the addon on a managed cluster via the `GitOpsCluster` CR on the hub:
+
+```yaml
+apiVersion: apps.open-cluster-management.io/v1beta1
+kind: GitOpsCluster
+metadata:
+  name: gitops-managed
+  namespace: openshift-gitops
+spec:
+  argoServer:
+    cluster: local-cluster
+    argoNamespace: openshift-gitops
+  placementRef:
+    apiVersion: cluster.open-cluster-management.io/v1beta1
+    kind: Placement
+    name: gitops-managed
+  gitopsAddon:
+    enabled: true
+```
+
+`GitOpsCluster` is the bridge between ACM Placement and Argo CD. It tells Argo CD to read the Placement's `PlacementDecision` and synthesize a cluster Secret for each matched managed cluster. `gitopsAddon.enabled: true` tells ACM to also ship the spoke-side Argo CD to those clusters. Without `gitopsAddon.enabled: true`, the spoke has no Argo of its own and pull-model reconcile can't happen.
+
+The spoke registers its `Application` resources *back to the hub* for visibility — when you open *Applications* in the ACM console, you see the spoke's Applications listed even though they live and reconcile on the spoke. This is what `application-manager` (one of the `KlusterletAddonConfig` add-ons enabled in Module 03) does: it propagates Application status from spoke to hub.
+
+## The Routes CRD trap
+
+This is the single highest-cost incident in the lab's GitOps history. Every operator running pull-model ACM on OpenShift will hit it. It looks like every Argo CD sync silently stalling, on every cluster, with a cryptic `ComparisonError` while the cluster itself is otherwise healthy.
+
+The root cause: `gitops-addon` is designed to work on non-OpenShift Kubernetes too. Argo CD on a vanilla Kubernetes cluster has no native `Route` resource (Routes are OpenShift-only), so the addon installs a `routes.route.openshift.io` CRD on every managed cluster to give Argo CD a CRD to reconcile against. On an *actual OpenShift cluster*, this CRD duplicates the aggregated `Route` APIService served by `openshift-apiserver`.
+
+Two API surfaces now declare `/apis/route.openshift.io/v1/routes` — one as a CRD, one as an aggregated APIService. The kube-apiserver's `/openapi/v2` handler tries to merge them and fails with `unable to merge: duplicated path …`. That endpoint returns 503. `/openapi/v3` still works (it serves per-group documents instead of a merged spec), so the cluster looks healthy from every other angle.
+
+Argo CD uses `/openapi/v2`. Every sync attempt fails with:
+
+```text
+failed to load open api schema while syncing cluster cache:
+error getting openapi resources:
+the server is currently unable to handle the request
+```
+
+The fix is one command:
+
+```bash
+oc delete crd routes.route.openshift.io
+```
+
+Routes themselves survive — they live behind the aggregated APIService, not the CRD. `oc get routes -A` works throughout. Within seconds `/openapi/v2` recovers and Argo CD picks up on the next sync. The lab's [runbook for this incident](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd) tracks the permanent fix under issue #153.
+
+Two paths to permanent prevention:
+
+- **Deploy `gitops-addon` with the no-CRD flag on OpenShift spokes.** The addon supports a configuration that detects an existing `v1.route.openshift.io` APIService and skips the CRD install. Set it; verify on the spoke that the CRD is gone.
+- **Apply a `ValidatingAdmissionPolicy`** on the spoke that denies creation of `routes.route.openshift.io` as a CRD. This catches the addon if it tries to recreate the CRD on a reconcile.
+
+The teaching moment: the convenience of a unified addon design has a real cost when one of the target environments has a native API the addon assumed wouldn't exist. Always check what the addon installs *as a CRD* against what your cluster already provides *as an APIService*. The lab's [gitops-operating-model docs](/docs/openshift-platform/gitops-operating-model) cover the VAP guardrail in detail.
+
+## ApplicationSet from the hub
+
+With pull model, you typically write **one** `ApplicationSet` on the hub that fans out to N spokes. The shape uses the `clusterDecisionResource` generator, which reads ACM's `PlacementDecision` to enumerate target clusters:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: spoke-cluster-config-pull
+  namespace: openshift-gitops
+spec:
+  generators:
+    - clusterDecisionResource:
+        configMapRef: acm-placement
+        labelSelector:
+          matchLabels:
+            cluster.open-cluster-management.io/placement: gitops-managed
+        requeueAfterSeconds: 180
+  template:
+    metadata:
+      name: '{{name}}-cluster-config'
+      labels:
+        apps.open-cluster-management.io/pull-to-ocm-managed-cluster: "true"
+      annotations:
+        argocd.argoproj.io/skip-reconcile: "true"
+        apps.open-cluster-management.io/ocm-managed-cluster: '{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: http://<gitlab-vm>/comptech-platform/openshift-ops/openshift-platform-gitops.git
+        targetRevision: main
+        path: 'clusters/{{name}}'
+      destination:
+        server: https://kubernetes.default.svc
+```
+
+The load-bearing fields on the generated Application:
+
+- `labels.apps.open-cluster-management.io/pull-to-ocm-managed-cluster: "true"` — tells ACM *"wrap this Application as ManifestWork and ship it to the spoke."* Without this label, the Application stays on the hub and the hub Argo tries to reconcile it (failing, because the destination is `kubernetes.default.svc` which on the hub is the hub).
+- `annotations.argocd.argoproj.io/skip-reconcile: "true"` — tells the hub Argo *"don't reconcile this; ACM is going to ship it."* You'd think the label would be enough; it isn't. The hub Argo races ACM otherwise.
+- `annotations.apps.open-cluster-management.io/ocm-managed-cluster: '{{name}}'` — tells ACM *which* spoke to target. The `{{name}}` is filled by the generator with each `PlacementDecision`'s cluster name.
+- `spec.project: default` — when the Application lands on the spoke, it lives in a namespace where the hub's AppProjects don't exist. `default` does. Use `default` here.
+- `spec.destination.server: https://kubernetes.default.svc` — points at the *spoke's* in-cluster API once the Application has been delivered there.
+
+You also need an `acm-placement` ConfigMap on the hub that teaches the generator how to read `PlacementDecision`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acm-placement
+  namespace: openshift-gitops
+data:
+  apiVersion: cluster.open-cluster-management.io/v1beta1
+  kind: placementdecisions
+  statusListKey: decisions
+  matchKey: clusterName
+```
+
+This is plumbing; you write it once and forget it.
+
+## Subscription model — the older path
+
+Before Argo CD integration was the reference, ACM shipped its own GitOps via `Subscription` + `Channel` + `PlacementRule`. The shape: a Subscription on the hub pointed at a Git path; a Channel defined the repo; a PlacementRule selected clusters; ACM's `application-manager` reconciled the manifests directly via ManifestWork.
+
+It still works. It's still supported. The thing to know: most teams should use `ApplicationSet` + pull model in 2026, not `Subscription`. The Subscription model predates ACM's Argo CD integration and lacks Argo's diffing, rollback, and sync-policy ergonomics. The exception is teams who specifically want the Subscription model's primitive (e.g., delivering Helm releases by chart URL rather than rendered manifests in Git) — that path is still valid, just niche.
+
+## The lab's setup
+
+Pull model end-to-end. The hub `openshift-platform-gitops` GitLab repo holds:
+
+- `clusters/hub-dc-v6/` — desired state for the hub itself. Reconciled by the hub Argo CD against `kubernetes.default.svc` (the hub).
+- `clusters/spoke-dc-v6/` — desired state for the spoke. Reconciled by the **spoke** Argo CD against `kubernetes.default.svc` (the spoke).
+- `clusters/hub-dc-v6/platform/fleet-registration/` — the six manifests covered in Module 03 that register `spoke-dc-v6` into `hub-dc-v6`.
+- `clusters/hub-dc-v6/gitops-control/` — the `ApplicationSet`, `AppProject`, and `acm-placement` ConfigMap that fan out per-spoke Applications.
+
+One `ApplicationSet` (`spoke-cluster-config-pull`) generates one `Application` per spoke that the `gitops-managed` Placement returns. Today that Placement returns exactly `spoke-dc-v6`, so the ApplicationSet generates one Application: `spoke-dc-v6-cluster-config`. The Application's labels mark it for pull-model wrapping; ACM ships it; the spoke Argo CD picks it up and reconciles `clusters/spoke-dc-v6/` against the spoke API.
+
+The lab's [pull-model overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview) has the full diagram and the seven manifests under `fleet-registration/`. The ADR rationale is in [ADR 0018](/docs/architecture-decisions/adr-0018-acm-gitops-pull).
+
+## Try this
+
+Three exercises that build on the lab's actual GitOps state.
+
+**1. Read the cluster-generator ApplicationSet on the hub.**
+
+```bash
+oc -n openshift-gitops get applicationset spoke-cluster-config-pull -o yaml
+oc -n openshift-gitops get placement gitops-managed -o yaml
+oc -n openshift-gitops get placementdecision \
+  -l cluster.open-cluster-management.io/placement=gitops-managed -o yaml
+```
+
+Note which clusters the PlacementDecision contains. Note which Application names the ApplicationSet generated.
+
+**2. Follow the chain from hub ApplicationSet to spoke Application.**
+
+On the hub:
+
+```bash
+oc -n openshift-gitops get application spoke-dc-v6-cluster-config -o yaml
+oc -n spoke-dc-v6 get manifestwork
+```
+
+On the spoke:
+
+```bash
+oc -n openshift-gitops get application
+oc -n openshift-gitops get application spoke-dc-v6-cluster-config -o yaml
+```
+
+Confirm the Application exists in both places — once on the hub (as the AppSet-generated, skip-reconcile-annotated source-of-truth) and once on the spoke (as the actual reconciler). The Application status on the spoke is what's authoritative; on the hub the status only reflects whether the ManifestWork was delivered.
+
+**3. Intentionally drift a Deployment on the spoke.**
+
+```bash
+oc --kubeconfig $K_SPOKE -n some-app-namespace scale deploy/some-deploy --replicas=10
+```
+
+Watch the spoke Argo CD revert it within ~30 seconds (the default reconcile interval). Then on the hub, observe that the Application status on the spoke flows back to the hub's Application status. You should see no fight — the hub Argo isn't reconciling this Application (`skip-reconcile: true`), so only the spoke is acting.
+
+## Common failure modes
+
+**ApplicationSet generates but the Application never appears on the spoke.** Two causes are common. First, `gitops-addon` isn't installed on the spoke — the spoke Argo CD doesn't exist, so there's no one to pick up the ManifestWork. Check `oc -n openshift-gitops get deploy openshift-gitops-operator-controller-manager` on the spoke; if it's missing, your `GitOpsCluster.spec.gitopsAddon.enabled` is false or the Placement doesn't match. Second, the generated Application is missing the `pull-to-ocm-managed-cluster: "true"` label — without it, ACM doesn't wrap and ship it. Re-read the ApplicationSet template.
+
+**Application appears on the spoke but is `OutOfSync` indefinitely.** The most common cause is RBAC on the spoke. Argo CD on the spoke needs `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` on the API group of the resource being reconciled. The `argocd-platform-extensions` ClusterRole shipped by `gitops-addon` covers a fixed allowlist of API groups; if your manifests touch a different group (a CRD shipped by an operator not in the allowlist), Argo can't reconcile it. Fix: add the API group to the ClusterRole via GitOps (the lab does this through `platform-gitops` MRs — see [spoke RBAC extensions](/docs/openshift-platform/gitops-operating-model/spoke-rbac-extensions)).
+
+**The Routes CRD trap.** Symptom: every Application on every spoke goes `OutOfSync` with `ComparisonError: failed to load open api schema`. Fix: `oc delete crd routes.route.openshift.io` on each affected spoke. Permanent fix: configure `gitops-addon` to skip the CRD on OpenShift, or apply a VAP that denies it. See the [runbook](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd) for the diagnostic command sequence and the permanent fix tracked under issue #153.
+
+**Spoke Application appears but the spoke Argo reports "destination cluster not found".** The Application's `spec.destination.server: https://kubernetes.default.svc` is correct on the spoke (it's the in-cluster API), but if the Application accidentally got `destination.name: spoke-dc-v6` instead, Argo CD looks up a cluster Secret by that name and fails. Use `server: https://kubernetes.default.svc`, not `name:`.
+
+**The `GitOpsCluster` is in `openshift-gitops` but the Placement is in a different namespace.** Symptom: `GitOpsCluster.status` says no decisions, even though `oc get placementdecision -A` shows decisions exist. Cause: `GitOpsCluster` is namespace-scoped and only sees PlacementDecisions in its own namespace. Fix: either move the Placement to `openshift-gitops`, or use a `GitOpsCluster` in the same namespace as the Placement. The lab keeps both in `openshift-gitops`.
+
+## Where this is heading
+
+You now have the cluster on the hub, governance flowing through Placement, and workloads delivered via pull-model GitOps fanned out by a single ApplicationSet. The remaining ACM pillars — observability, security (RHACS), and the disaster-recovery + Cluster Backup story — are next. [Module 06](/learn/acm-multicluster/observability) covers how ACM Observability collects metrics across the fleet using a hub-side Thanos and per-spoke `MetricsCollector`.
+
+**Next:** Module 06 — Observability across the fleet.
+
+## References
+
+- Open Cluster Management — App lifecycle (ApplicationSet pull): [open-cluster-management.io/concepts/applifecycle/](https://open-cluster-management.io/concepts/applifecycle/)
+- Red Hat ACM docs — Managing applications with ApplicationSet and pull model: [docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/)
+- Argo CD ApplicationSet — Cluster generator: [argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster/](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster/)
+- Argo CD ApplicationSet — Cluster Decision Resource generator: [argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster-Decision-Resource/](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster-Decision-Resource/)
+- OpenShift GitOps operator: [docs.openshift.com/gitops/](https://docs.openshift.com/gitops/)
+- Lab docs — Pull-model overview: [/docs/openshift-platform/gitops-operating-model/pull-model-overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview)
+- Lab docs — Routes CRD incident runbook: [/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd)
+- Lab docs — ADR 0018 ACM + GitOps pull: [/docs/architecture-decisions/adr-0018-acm-gitops-pull](/docs/architecture-decisions/adr-0018-acm-gitops-pull)
+- Lab docs — Spoke RBAC extensions: [/docs/openshift-platform/gitops-operating-model/spoke-rbac-extensions](/docs/openshift-platform/gitops-operating-model/spoke-rbac-extensions)

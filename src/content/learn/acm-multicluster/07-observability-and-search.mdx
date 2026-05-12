@@ -1,0 +1,163 @@
+---
+title: "Observability and Search"
+sidebar_label: "07 — Observability + Search"
+description: "Aggregate metrics, alerts, and resource queries across a fleet — Multicluster Observability Operator, the Search index, Insights, and the lab's deliberate hub/spoke split."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const dataEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const teleEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const greyEdge = { style: { stroke: "#6b7280", strokeDasharray: "4,4", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const mcoNodes = [
+  { id: "smon",   position: { x: 60,  y: 60 },  data: { label: "spoke Prometheus\n(OCP built-in)" }, style: agent },
+  { id: "addon",  position: { x: 60,  y: 180 }, data: { label: "observability-addon\n(metrics-collector)" }, style: agent },
+  { id: "smon2",  position: { x: 60,  y: 300 }, data: { label: "spoke Prometheus\n(other clusters...)" }, style: agent },
+  { id: "recv",   position: { x: 320, y: 180 }, data: { label: "Thanos receive\n(hub ingress)" }, style: ctrl },
+  { id: "s3",     position: { x: 540, y: 60 },  data: { label: "object storage\n(MinIO / NooBaa)" }, style: ext },
+  { id: "store",  position: { x: 540, y: 180 }, data: { label: "Thanos store\n+ query" }, style: ctrl },
+  { id: "graf",   position: { x: 760, y: 120 }, data: { label: "hub Grafana\n+ console" }, style: stage },
+  { id: "am",     position: { x: 760, y: 240 }, data: { label: "AlertManager\n(hub)" }, style: stage },
+];
+
+export const mcoEdges = [
+  { id: "m1", source: "smon",  target: "addon", ...greyEdge },
+  { id: "m2", source: "smon2", target: "addon", ...greyEdge },
+  { id: "m3", source: "addon", target: "recv",  label: "remote_write", ...teleEdge },
+  { id: "m4", source: "recv",  target: "s3",    label: "blocks", ...dataEdge },
+  { id: "m5", source: "store", target: "s3",    label: "read", ...dataEdge },
+  { id: "m6", source: "store", target: "graf",  ...dataEdge },
+  { id: "m7", source: "store", target: "am",    ...dataEdge },
+];
+
+The application landed on every spoke. The next problem is the inverse: how do you see all of them at once? Module 06 was about fan-out; this module is about fan-in. Metrics, alerts, and ad-hoc resource queries — one pane, many clusters.
+
+## Why a separate addon
+
+Every managed OpenShift cluster already runs the in-cluster monitoring stack — Prometheus, AlertManager, node-exporter, kube-state-metrics. That's enough for a single-cluster operator looking at one cluster's health.
+
+The multicluster *job* is different: long-retention metrics across all clusters, fleet-level dashboards, fleet-level alerts ("3 clusters have ETCD member health degraded"). For that you need an aggregator. ACM provides one: the **Multicluster Observability Operator** (MCO). It's an addon precisely because the in-cluster stack stays useful on its own.
+
+## The Multicluster Observability Operator
+
+MCO is deployed on the hub. From a single `MultiClusterObservability` CR it stands up:
+
+| Component | Role |
+| --- | --- |
+| **Thanos Receive** | Long-lived write endpoint that managed clusters push to. |
+| **Thanos Store** | Reads historical blocks from object storage. |
+| **Thanos Query / Query Frontend** | Deduplicates + merges live and historical data for queries. |
+| **Thanos Compactor** | Downsamples old blocks for cheap long-retention queries. |
+| **Grafana** | Pre-shipped dashboards plus a multi-tenant Thanos data source. |
+| **AlertManager** | Hub-level alert routing (Slack/PagerDuty/etc.). |
+
+Managed clusters get the matching half: an `observability-addon` deploys a `metrics-collector` Pod that scrapes the spoke's in-cluster Prometheus and `remote_write`s a curated subset to the hub's Thanos Receive. No hub→spoke pull; the spoke initiates the push.
+
+<Whiteboard client:load data={{ nodes: mcoNodes, edges: mcoEdges }} height={400} />
+
+Reading the diagram: spoke Prometheus is the source of truth on each cluster; the addon scrapes and forwards (dashed green = spoke-initiated push) to the hub; Thanos writes blocks to object storage; query reads back through Store; Grafana and AlertManager are the read-side surfaces.
+
+## Storage and retention
+
+MCO needs S3-compatible object storage for Thanos blocks. The lab uses MinIO (30.30.30.14:9000) for this; in cloud installs you'd point at S3 or a NooBaa OBC. Default retention is months, not days — that's the whole point of separating ingest from storage.
+
+Sizing rough numbers: at MCO's default metric set (~150 series per Pod, ~2000 Pods per medium cluster, 30-second scrape) you're looking at **~20 GiB per cluster per month** of compressed block storage. A fleet of 50 clusters over a year is single-digit TB. Compactor downsampling buys back a chunk past the first 40 hours.
+
+What kills you is not storage volume — it's Thanos Receive memory. Each receiver replica holds an in-memory tail of ~2 hours of TSDB data per tenant. Scale replicas before scale of storage.
+
+## What gets shipped vs what stays local
+
+By default MCO ships a curated allowlist — cluster, node, kube-state, ETCD, API server, ingress controller — not raw cAdvisor or per-container CPU. That curated set is what the shipped dashboards consume.
+
+You can extend the list in two ways:
+
+- The MCO `MultiClusterObservability` CR's `allowlist` ConfigMap — add specific metric names.
+- A `MetricsCustomCollector` for recording-rule output you want fanned in.
+
+App workload metrics typically stay on the spoke unless you explicitly federate them. The "right" line: SLI metrics you need fleet views of go to the hub; spoke-local debugging metrics stay on the spoke. Federating everything is how teams end up with terabyte-class hub storage bills.
+
+## Alerts
+
+Hub-level alerts evaluate against aggregated metrics in Thanos Query. Spoke-level alerts continue firing on the spoke's local Prometheus and AlertManager. Both are useful; they answer different questions.
+
+The pragmatic split:
+
+- **Hub** — fleet-shaped SLIs. "More than 2 clusters are reporting `KubeAPIErrorBudgetBurn`." "ETCD leader changes exceed threshold across the fleet."
+- **Spoke** — high-noise local alerts. "A specific Pod is CrashLooping." "Disk pressure on a specific node."
+
+Putting noisy spoke-internal alerts on the hub turns the hub AlertManager into a fire hose. Putting fleet SLI alerts on a single spoke means you don't see the fleet-wide pattern. The lab keeps Loki and Tempo local-per-spoke for the same reason — high-volume signals stay close to where they're produced (`/docs/openshift-platform/platform-services/cluster-logging-and-loki/`).
+
+## Search
+
+The second addon. Different job entirely: not metrics, but *resource state*. The Search addon runs a `search-collector` on each managed cluster that watches the etcd state via the kube-apiserver, then publishes resource lists to a hub PostgreSQL index. The ACM Search UI queries that index.
+
+Use cases that pay for it on day one:
+
+- "What version of cert-manager is installed on every cluster?"
+- "Which namespaces have a Deployment named `redis`?"
+- "Show every Pod with image containing `nginx` across the fleet."
+- "Which ManagedClusters have the `compliance=pci-dss` label?"
+
+It's `oc get` across the whole fleet without context-switching. The query language is small (key:value with simple boolean composition) but covers 80% of "where the hell is X" investigations.
+
+## Insights integration
+
+ACM ingests **Red Hat Insights** findings per managed cluster — vulnerability scans, configuration recommendations, advisories. The Insights tab on each cluster surfaces these alongside the cluster's health.
+
+The signal-to-noise is mixed. Insights catches genuinely useful things — pending CVE upgrades, misconfigured CSRs, etcd recommendations — and also catches things that don't apply to your environment ("upgrade to a SaaS feature you don't use"). Treat it as a queue of suggestions to triage, not a list of must-fix items. The remediation links are the most useful part: most findings come with a one-click rollout to apply the fix as a Policy.
+
+## Performance traps
+
+A few sharp edges that surface around fleet sizes of 25+ clusters:
+
+- **Search index scales linearly with object count.** A fleet of 50 clusters × 10k objects per cluster = 500k rows. The hub PostgreSQL underneath needs SSD storage and enough RAM that its working set fits in shared buffers. Spinning rust will time out queries.
+- **`search-collector` OOMs.** Big spokes with many Pods sometimes OOMKill the collector mid-sync. Bump its memory request before you debug a "stale index" mystery.
+- **Hub Grafana is single-tenant.** Multi-tenancy isolation happens at the Thanos data source level (cluster label filtering), not via Grafana user permissions. Don't expect Grafana folder-level RBAC to gatekeep tenants.
+- **Thanos Query timeouts.** Long time ranges against many clusters hit the default 2-minute timeout. Either narrow the range, add recording rules to pre-aggregate, or bump the query-frontend timeout and accept the latency.
+
+## The lab's deliberate hub/spoke split
+
+The lab uses MCO for metrics fan-in. But it keeps **logs and traces local per-spoke**:
+
+- **Loki** runs on each spoke via the Cluster Logging Operator (`/docs/openshift-platform/platform-services/cluster-logging-and-loki/`).
+- **Tempo** runs on each spoke under the Tempo Operator, backed by per-spoke object storage.
+- **Cluster Observability Operator (COO)** on the spoke runs Perses dashboards for the spoke-local view (`/docs/openshift-platform/platform-services/perses-dashboards/`).
+- **SigNoz** on a separate VM is the long-term observability sink for some out-of-cluster workloads (`/docs/lab-infrastructure/observability-vms/signoz-overview/`).
+
+Why split it? Metrics are aggregable and small per series; the fan-in pays off. Logs and traces are bulky and best correlated with cluster-local context (Pods, namespaces, request IDs). Federating them to the hub means moving terabytes a day and losing the per-cluster correlation you actually need when debugging.
+
+The console hides the split well — Perses tabs on the spoke, Grafana on the hub — but the data paths are different by design.
+
+## Try this
+
+1. Open the ACM Search UI on the hub. Run a query for `kind:Deployment image:nginx` — every Deployment in the fleet whose image references `nginx`. Add a `cluster:` filter to narrow to one cluster. The UI prints a count so you can spot-check vs. `oc get`.
+2. Read the `MultiClusterObservability` CR (if deployed) — `oc get mco observability -o yaml`. Identify the `allowlist` ConfigMap reference. Add a single metric name to the allowlist (a CR you know your apps emit) and watch it appear in Thanos Query within a few minutes.
+3. In the hub Grafana, write a query: `count by (cluster) (kube_pod_info)`. You should get one row per managed cluster with the Pod count on that cluster. Try the same for `node` instead of `cluster` — that's your per-node pod-density chart for free.
+
+## Common failure modes
+
+- **`observability-addon` stuck `Available=False` on a spoke.** The collector cannot reach the hub's Thanos Receive route. Check DNS resolution for the receive route from inside the spoke, then network egress. Receive routes use OpenShift Route with re-encrypt TLS; cert trust on the spoke is the second-most common cause.
+- **Search index goes stale.** The `search-collector` Pod on one or more spokes got OOMKilled. Check `oc logs -n open-cluster-management-agent-addon deployment/search-collector --previous`. Bump memory request, re-roll.
+- **Grafana dashboards empty.** Thanos Query is timing out, usually because Thanos Store can't reach object storage. From inside the `store` Pod, `wget` the bucket endpoint. The classic cause is an OBC where the AWS_*_KEY_* keys never got bridged to the operand's lowercase variants — see the lab's NooBaa OBC→operand bridge pattern.
+- **Hub AlertManager fire hose.** Spoke-internal alerts were configured to forward to the hub. Move them back to the spoke's local AlertManager and only forward the SLI-shaped fleet alerts.
+- **Insights tab empty for one cluster.** The cluster lost its `cloud.openshift.com` egress, or the Telemetry pull secret is missing on the spoke. Insights piggybacks on the same support pull-secret flow as Telemetry.
+
+## References
+
+- ACM Observability docs — `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/`
+- Thanos design — `https://thanos.io/tip/thanos/design.md/`
+- OCM Search proposal — `https://open-cluster-management.io/`
+- OpenShift Cluster Monitoring — `https://docs.openshift.com/container-platform/latest/monitoring/monitoring-overview.html`
+- Red Hat Insights — `https://docs.redhat.com/en/documentation/red_hat_insights/`
+- Lab — `/docs/openshift-platform/platform-services/cluster-logging-and-loki/`
+- Lab — `/docs/openshift-platform/platform-services/perses-dashboards/`
+- Lab — `/docs/lab-infrastructure/observability-vms/signoz-overview/`
+
+**Next:** [Module 08 — Hosted Control Planes and Cluster Pools](/learn/acm-multicluster/hosted-control-planes-and-cluster-pools) covers two ways to provision *more* clusters quickly — HyperShift's hosted control planes and ACM's warm-pool ClusterPool.

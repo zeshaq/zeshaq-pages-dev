@@ -1,0 +1,223 @@
+---
+title: "Backup and Disaster Recovery"
+sidebar_label: "10 — Backup & DR"
+description: "Back up the hub, back up the workloads, and design for a real datacenter loss — RPO, RTO, the cluster-backup operator, OADP, and the drills that actually validate the plan."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const drNodes = [
+  { id: "hub", data: { label: "Hub cluster\n(ACM, GitOps)" }, position: { x: 60, y: 60 }, style: ctrl, type: "shape" },
+  { id: "cbo", data: { label: "cluster-backup operator\n(OADP-based)" }, position: { x: 60, y: 170 }, style: ctrl, type: "shape" },
+  { id: "spoke", data: { label: "Managed cluster" }, position: { x: 460, y: 60 }, style: stage, type: "shape" },
+  { id: "oadp", data: { label: "OADP / Velero" }, position: { x: 460, y: 170 }, style: agent, type: "shape" },
+  { id: "csi", data: { label: "CSI snapshotter" }, position: { x: 460, y: 270 }, style: agent, type: "shape" },
+  { id: "minio", data: { label: "MinIO / S3 object store\n(off-cluster, ideally off-DC)" }, position: { x: 250, y: 380 }, style: ext, type: "shape" },
+  { id: "hubdr", data: { label: "hub-dr (cold)\n— restore target" }, position: { x: 60, y: 380 }, style: ext, type: "shape" },
+];
+
+export const drEdges = [
+  { id: "e1", source: "hub", target: "cbo", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "cbo", target: "minio", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "hub backup" },
+  { id: "e3", source: "spoke", target: "oadp", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "oadp", target: "csi", style: { stroke: "#1f2937" } },
+  { id: "e5", source: "oadp", target: "minio", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "workload backup" },
+  { id: "e6", source: "minio", target: "hubdr", animated: true, style: { stroke: "#6b7280", strokeDasharray: "5,5" }, label: "restore on disaster" },
+];
+
+The interview question for a multicluster platform team is "what happens when the hub goes." The polished answer talks about ApplicationSet reconciliation and a cold restore target. The honest answer is that most teams have never actually tested it, and the day they do, the restore fails because the CSI snapshotter on the destination cluster is from a different vendor.
+
+This module is the design level — what to protect, what tools to use, what RPO and RTO targets to set, and how to validate the whole thing with a drill that isn't theatre.
+
+## What you're actually protecting
+
+There are two distinct things, and they need separate stories.
+
+**(a) The hub itself.** The hub does not run customer workloads, but it owns a great deal of state. The list:
+
+- `ManagedCluster` CRs (the inventory of who is in the fleet).
+- `ManagedClusterSet`, `ManagedClusterSetBinding`, `Placement`, `PlacementDecision` (the segmentation).
+- `Policy`, `PolicyTemplate`, `PolicySet` (the governance baseline).
+- `ApplicationSet`, `Application`, `AppProject` (the GitOps fan-out).
+- `KlusterletAddonConfig` (the agent enablement).
+- The Vault custody for init-bundles, ESO ClusterSecretStore configs, the hub's own `argocd-server-tls`.
+- Argo CD's `argocd-secret` and the GitOps repo credentials.
+
+If the hub disappears, the spokes carry on running — their workloads do not care — but **drift, policy enforcement, image scanning fan-out, and observability collection** all stop. The fleet becomes a herd of unmanaged clusters until a new hub comes back.
+
+**(b) Each managed cluster's stateful workload data.** This is the per-application story: the Deployments, the StatefulSets, the ConfigMaps and Secrets, and the persistent volumes attached to databases and message queues. Most of the *config* of a managed cluster is rebuilt from GitOps. Most of the *data* is on disks that GitOps does not know about.
+
+These two stories use different tools, even though under the hood it is Velero either way.
+
+## The cluster-backup operator (ACM)
+
+ACM ships a bundled operator called **cluster-backup**. It is OADP under the hood — same Velero, same plugins — but pre-configured with the schedules and resource selectors that match the hub's CR inventory. You enable it on the hub, point it at object storage, and it produces three rolling backups:
+
+- **acm-credentials-schedule** — Secret material the hub depends on.
+- **acm-resources-schedule** — the ACM CRs and the policy and application objects.
+- **acm-managed-clusters-schedule** — the registration data needed to re-establish spoke connections after a restore.
+
+For the lab's enable/disable runbook, see [`/docs/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/acm-multicluster/acm-cluster-backup).
+
+It is **disabled** on hub-dc-v6 today. The doc explains why — the lab is single-DC and the restore target (hub-dr-v6) has not been built yet — but the operator itself is a 30-second install once the DR pair lands.
+
+## OADP — the per-cluster story
+
+**OADP** is Red Hat's productised Velero. Same APIs, same CRDs, with a small wrapper that integrates with the OpenShift operator catalogue and bundles the OpenShift plugin. It is what you put on **each managed cluster** to back up workloads.
+
+The unit of configuration is a `DataProtectionApplication` CR. It declares one or more `BackupStorageLocation` blocks (where to write — usually an S3-compatible endpoint) and one or more `VolumeSnapshotLocation` blocks (which CSI snapshotter to use for PVCs). Once that CR is reconciled, you create normal `Backup` and `Restore` CRs and Velero does the work.
+
+The two failure modes that always bite:
+
+- **You forgot the OpenShift plugin.** Vanilla Velero does not know about `Route`, `ImageStream`, `BuildConfig`, or `SecurityContextConstraints`. The `velero-plugin-for-openshift` plugin teaches it; without it, your backup is missing the OpenShift-specific surface.
+- **You forgot CSI snapshotting.** Without `EnableCSI` set and a `VolumeSnapshotLocation`, Velero falls back to file-by-file restic copies of PVs. That works but is slow and brittle on large volumes. CSI snapshots are atomic, fast, and the only reasonable choice for stateful workloads.
+
+For the lab's install recipe and the `DataProtectionApplication` pattern, see [`/docs/openshift-platform/backup-oadp/operator-install/`](/docs/openshift-platform/backup-oadp/operator-install).
+
+## The picture
+
+<Whiteboard client:load data={{ nodes: drNodes, edges: drEdges }} height={500} />
+
+Reading the diagram:
+
+- The **hub** runs `cluster-backup`, which writes ACM-specific CR dumps and registration data to the **object store**.
+- Each **managed cluster** runs **OADP**, which uses the **CSI snapshotter** for PVs and writes workload manifests (plus snapshot metadata) to the **same object store**.
+- On disaster, a **cold DR hub** is built; it reads the latest backup from object store and reconstitutes the ACM control plane. The spokes — which never went down — re-register against the new hub.
+- The dashed-green edges are the active backup streams. The dashed-grey edge is the rare-path restore.
+
+## The hub-restore process
+
+This is the part that is usually written down in a runbook and never tested. The steps:
+
+1. **Provision a new OCP cluster.** This is the long step — 30 minutes to an hour, depending on whether you have a pre-installed cold hub or are installing from scratch.
+2. **Install the ACM operator.** Subscribe; wait for the MCH (MultiClusterHub) CR; install the cluster-backup operator on top of it.
+3. **Apply the BackupStorageLocation pointing at the same object store** that the lost hub was writing to. This is what lets cluster-backup find the latest backup.
+4. **Apply a Restore CR.** `oc create -f restore.yaml`. The Restore references the latest acm-credentials, acm-resources, and acm-managed-clusters backups.
+5. **Wait.** The Restore reconciles in stages: credentials first, then resources, then managed-cluster registration data. Total time on a small fleet: ~10 minutes.
+6. **The spokes re-register.** The klusterlet agents on each managed cluster were configured with a hub URL and a bootstrap kubeconfig. They keep trying to connect. The new hub presents a different signing CA than the old one, so the agents' existing certificates are no longer trusted; the agents fall back to the bootstrap kubeconfig and resubmit a CSR; the CSR auto-approve loop on the new hub signs them; the spoke is back.
+
+**RTO budget:** 30 minutes if a cold hub is already provisioned and the restore is well-tested. 2 hours if you are building the hub from scratch. Whatever it is, write it down before the disaster, not during.
+
+## RPO and RTO targets
+
+Pick targets first, then verify the tooling supports them. Defaults that are sane for most labs:
+
+| Surface | RPO | RTO |
+| --- | --- | --- |
+| Hub state (ACM CRs, GitOps) | 1 hour | 30 min (warm DR), 4 hr (cold DR) |
+| Workload manifests | 1 hour | 30 min |
+| PV data (databases, queues) | 1 hour | 1 to several hours (volume copy time) |
+| Object storage itself | governed by storage replication | depends on cross-region setup |
+
+For a BFSI-scoped tenant the bar is higher: **RPO &lt;= 15 minutes, RTO &lt;= 4 hours**. That changes the design — hub backups have to run every 15 minutes, the DR pair has to be warm (a running OCP cluster that periodically `oc apply`s the latest backup, even if it is not the active hub), and the object store has to be cross-region replicated. See the BFSI scoring at [`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review) for the full criteria.
+
+The mistake to avoid is **declaring RPO and RTO based on what you wish the tooling could do**. Run a real drill; measure; adjust the targets to the truth.
+
+## Storage backend matters
+
+Velero writes to S3-compatible object storage. Two ways that fact becomes a quiet disaster:
+
+1. **Same fault domain.** You put the object store on the same Ceph cluster (or the same NooBaa instance, or the same DC's MinIO) as the data being backed up. The fault that takes out your workloads also takes out their backups. Backups should live somewhere genuinely independent: a different DC, a different cloud region, an off-site appliance.
+
+2. **No replication.** Even a separate object store is not enough if it itself can fail. Production-grade BFSI setups put the backup destination on a **bucket that replicates to a second region**, either via the S3 vendor's own replication or via a separate cross-region copy pipeline.
+
+The lab today uses **MinIO** on a dedicated VM (30.30.30.14). It is single-instance. That is fine for the lab; it is **not** fine for production. The work to add a replicated second-DC destination is on the roadmap.
+
+## Validating restores
+
+A backup that has never been restored is not a backup; it is a hopeful object in a bucket. The discipline that separates real DR from theatre is the **quarterly drill**:
+
+- Spin up a sandbox OCP cluster.
+- Apply the BackupStorageLocation pointing at the production object store (read-only credentials).
+- Create a Restore from last week's hub backup, into the sandbox.
+- Verify: do the ManagedCluster CRs come back? Does the Policy framework reconcile? Does a sample Application sync? Does the SecuredCluster show up under Central?
+- Write down what failed. The failures will be small at first — a missing label, a Secret that did not get backed up, a Route hostname that conflicts — and they compound if not fixed.
+
+The first drill takes a full day. The fifth drill takes an hour. The day a real disaster lands, you want to be on drill number five, not drill number one.
+
+## The lab's current state
+
+Pragmatically, where the lab is today:
+
+- **ACM cluster-backup is disabled on hub-dc-v6.** It will be enabled when the DR pair is built. The runbook in [`/docs/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/acm-multicluster/acm-cluster-backup) walks through the enable.
+- **OADP is installed on spoke-dc-v6** with a `DataProtectionApplication` CR pointing at the lab's MinIO. It is exercised periodically for the workloads that have real PVs.
+- **hub-dr-v6** is reserved in the fleet design but not yet provisioned. It is the planned restore target. See [`/docs/architecture-decisions/adr-0022-v6-fleet-purge/`](/docs/architecture-decisions/adr-0022-v6-fleet-purge) for the architectural decision.
+- **MinIO is single-instance** on a dedicated VM. Adequate for the lab; the replication work to a second DC's object store is tracked separately.
+
+The BFSI readiness review rates DR as 🔴 High — the missing DR pair is the load-bearing gap. See [`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review).
+
+## Try this
+
+1. **Read the `DataProtectionApplication` CR on spoke-dc-v6.**
+
+   ```
+   oc --context spoke-dc-v6 -n openshift-adp get dpa -o yaml
+   ```
+
+   Note the `backupLocations` (BackupStorageLocation, pointing at MinIO), the `snapshotLocations`, and the `defaultPlugins` list. The OpenShift plugin should be in there.
+
+2. **Trigger a manual backup of one namespace and restore it to a different namespace.**
+
+   ```
+   oc -n openshift-adp create -f - <<EOF
+   apiVersion: velero.io/v1
+   kind: Backup
+   metadata: { name: drill-1, namespace: openshift-adp }
+   spec:
+     includedNamespaces: [ "demo-app" ]
+   EOF
+   ```
+
+   Wait until `oc get backup drill-1` shows `Completed`. Then create a Restore with `namespaceMapping: demo-app: demo-app-restored`. The restored namespace should appear with the same workloads.
+
+3. **Sketch the runbook** for "hub-dc-v6 datacenter lost — recover on hub-dr-v6 within 4 hours." Include: who has access to the object store, who runs the restore command, how the spokes find the new hub, and what the verification checklist is. Write it down before there is a disaster.
+
+## Common failure modes
+
+**Backup succeeds but restore fails because the destination cluster's CSI is different.** CSI snapshots are tied to a specific provisioner. A snapshot taken by `csi.ovirt.org` does not restore to a cluster that only has `cephfs.csi.ceph.com`. Mitigation: keep the DR cluster's storage class line up with the source's, or use restic file-level copies for cross-storage portability (slower, but vendor-agnostic).
+
+**Velero plugin version mismatch between source and destination.** Velero serialises object-store schemas, and a Velero 1.13 plugin reading 1.11 data sometimes throws on a previously valid field. Mitigation: keep source and destination on the same OADP/Velero versions; bump them together.
+
+**PVs come back bound to old node selectors.** If a PV was provisioned with `nodeAffinity` against specific node names, restoring it to a cluster with different node names leaves it `Pending` forever. Mitigation: use storage classes that do not pin to nodes, or strip `nodeAffinity` on restore via a Velero resource modifier.
+
+**ImageStreams and BuildConfigs do not come back.** Vanilla Velero does not know about OpenShift-specific types. Mitigation: install the OpenShift plugin (`velero-plugin-for-openshift`), which is the default in OADP — but verify it is in the `defaultPlugins` list of the DPA.
+
+**Object-store quota silently fills.** Velero retention defaults are conservative; without rotation, the bucket grows unbounded. Mitigation: set TTLs on Backup CRs, and configure a lifecycle policy on the bucket itself.
+
+## BFSI cross-link
+
+The BFSI readiness review treats DR as a **🔴 High** risk so long as the reserved DR pair (hub-dr-v6) is not built. The criteria are spelled out at [`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review). Until then, the lab's posture is single-DC with rebuild-from-GitOps as the fallback — adequate for a lab, not adequate for a regulated tenant.
+
+## References
+
+- Red Hat ACM cluster-backup-and-restore documentation: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/latest/html/business_continuity/`
+- OADP project: `https://www.oadp-operator.com/`
+- Velero upstream: `https://velero.io/`
+- Velero docs (backup, restore, troubleshooting): `https://velero.io/docs/`
+- velero-plugin-for-openshift: `https://github.com/openshift/openshift-velero-plugin`
+- Open Cluster Management — backup-restore design: `https://open-cluster-management.io/`
+
+**Next:** [Module 11 — Build a project](/learn/acm-multicluster/build-a-project).

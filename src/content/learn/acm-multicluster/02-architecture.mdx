@@ -1,0 +1,195 @@
+---
+title: "Architecture: hub, managed clusters, addons"
+sidebar_label: "02 — Architecture"
+description: "The components running on the hub, the agents running on each managed cluster, how they talk, the identity model, the addon framework, sizing constraints, and where things break."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agentN = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+
+export const hubEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const telEdge = { style: { stroke: "#6b7280", strokeDasharray: "4,4", strokeWidth: 1.2 }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const archNodes = [
+  { id: "hubHdr",   position: { x: 320, y: 0 },    data: { label: "Hub cluster" },                          style: branchHeader },
+  { id: "mch",      position: { x: 60,  y: 80 },   data: { label: "multiclusterhub-operator" },             style: ctrl },
+  { id: "reg",      position: { x: 270, y: 80 },   data: { label: "registration controller\n(cluster-manager)" }, style: ctrl },
+  { id: "work",     position: { x: 480, y: 80 },   data: { label: "work controller" },                      style: ctrl },
+  { id: "obs",      position: { x: 60,  y: 170 },  data: { label: "observability controller\n+ Thanos receive" }, style: ctrl },
+  { id: "search",   position: { x: 270, y: 170 },  data: { label: "search-collector + PostgreSQL" },        style: ctrl },
+  { id: "grc",      position: { x: 480, y: 170 },  data: { label: "governance-policy-propagator" },         style: ctrl },
+  { id: "spokeHdr", position: { x: 320, y: 320 },  data: { label: "Managed cluster" },                       style: branchHeader },
+  { id: "klusterlet", position: { x: 60,  y: 400 }, data: { label: "klusterlet" },                          style: agentN },
+  { id: "workAgent",  position: { x: 270, y: 400 }, data: { label: "work-agent" },                          style: agentN },
+  { id: "regAgent",   position: { x: 480, y: 400 }, data: { label: "registration-agent" },                  style: agentN },
+  { id: "obsAddon",   position: { x: 60,  y: 500 }, data: { label: "observability-addon" },                 style: agentN },
+  { id: "appMgr",     position: { x: 270, y: 500 }, data: { label: "application-manager + policy-controllers" }, style: agentN },
+];
+
+export const archEdges = [
+  { id: "r-ra", source: "regAgent",   target: "reg",   label: "CSR / heartbeat", ...pullEdge },
+  { id: "w-wa", source: "workAgent",  target: "work",  label: "watch ManifestWork", ...pullEdge },
+  { id: "obs-flow", source: "obsAddon", target: "obs", label: "push metrics", ...telEdge },
+  { id: "search-flow", source: "appMgr", target: "search", label: "resource events", ...telEdge },
+  { id: "grc-prop", source: "grc", target: "work", label: "writes ManifestWork", ...hubEdge },
+];
+
+This module is the map. It names every component you'll see in logs and `oc get` output, says what each one does, and shows where they live. Once you can sketch this diagram from memory, ACM debugging gets a lot easier.
+
+## Component map
+
+<Whiteboard client:load data={{ nodes: archNodes, edges: archEdges }} height={620} />
+
+Reading the diagram:
+
+- **Solid black** edges are control-plane flows happening on the hub. The governance-policy-propagator, for example, takes a `Policy` and writes a `ManifestWork` for each placed cluster.
+- **Dashed green animated** edges are spoke-initiated: registration heartbeats, the `work-agent` watching for `ManifestWork`. The spoke reaches the hub; not the other way around.
+- **Dashed grey** edges are telemetry: metrics pushed to Thanos receive on the hub, resource events fed to the search index.
+
+The hub has more components than the spoke. That's by design: the hub holds desired state and the cross-cluster view; the spoke runs a thin, mostly stateless agent layer.
+
+## The Hub
+
+When you install the **Advanced Cluster Management for Kubernetes** operator from OperatorHub and create a `MultiClusterHub` CR, you get the following components, in roughly this order of importance:
+
+| Component | Role |
+| --- | --- |
+| **multiclusterhub-operator** | Watches the `MultiClusterHub` CR and reconciles every other component to it. The "operator of operators" for ACM on the hub. |
+| **cluster-manager** (registration controller) | Watches `ManagedCluster` CRs; approves the CSRs that spokes submit; tracks join state, available/unavailable, and conditions. |
+| **klusterlet-addon-controller** | Decides which addons each managed cluster gets, and writes the matching `ManagedClusterAddOn` resources. |
+| **work controller** | Owns `ManifestWork` CRs in each cluster's namespace on the hub. Spokes pull from these. |
+| **governance-policy-propagator** | Watches `Policy` CRs in policy namespaces; for each binding+placement, writes a per-cluster copy of the policy as a `ManifestWork` to be applied on the target. |
+| **search-collector + PostgreSQL** | The search index. PostgreSQL holds the indexed events; the collector consumes from the managed clusters and keeps the index fresh. The browser console's Search page queries this. |
+| **observability controller + Thanos receive** | If you enable observability, ACM installs Thanos receive on the hub plus a stock Grafana. Every managed cluster's observability-addon pushes metrics here. |
+| **console (MCH console plugin)** | A console plugin that adds the All Clusters, Search, Governance, and Applications views to the OpenShift web console. |
+| **MultiClusterEngine (MCE)** | A subset of ACM exposed as its own operator. Provides the registration + work + Hive + HyperShift bits. ACM installs MCE if it isn't already present. |
+
+In a default install, the hub namespaces you'll spend time in are `open-cluster-management`, `open-cluster-management-hub`, and a namespace **per managed cluster** named for that cluster (where its `ManifestWork` and addon-leases live).
+
+### What's optional, what isn't
+
+Some hub components only show up if you opt in. The defaults in the `MultiClusterHub` CR (`spec.overrides.components`) tell you which:
+
+- **Required-always:** multiclusterhub-operator, cluster-manager, work controller, console plugin.
+- **Default-on:** policy propagator, application-manager, search.
+- **Opt-in:** observability (needs an object store like NooBaa, ODF, or S3-compatible), submariner, gitops-addon, hypershift-addon.
+
+The lab keeps the hub storage-light deliberately and runs observability off NooBaa-backed object storage rather than full ODF. See [/docs/openshift-platform/cluster-topology/hub-dc-v6](/docs/openshift-platform/cluster-topology/hub-dc-v6).
+
+## Managed clusters
+
+Each managed cluster, after it joins the hub, runs a set of agents in the `open-cluster-management-agent` namespace plus a per-addon namespace for each enabled addon:
+
+| Component | Role |
+| --- | --- |
+| **klusterlet** | The bootstrap controller. Lives in `open-cluster-management-agent`. Creates the rest of the agent components and manages their lifecycle. |
+| **registration-agent** | Submits a CSR to the hub at join time; once approved, owns the rotating client cert that the agents use to talk to the hub. Sends heartbeats. |
+| **work-agent** | Watches `ManifestWork` resources in this cluster's namespace on the hub and applies them locally. |
+| **observability-addon** | If observability is enabled, scrapes the cluster's own Prometheus and pushes metrics to the hub's Thanos receive. |
+| **application-manager** | The "old-style" subscription-channel application lifecycle controller. Used by older ACM apps; you can disable it if you only ship via ApplicationSets. |
+| **cert-policy-controller** | Implements cert-related policies (certificate expiration, key length, etc.) for GRC. |
+| **config-policy-controller** | The big one. Implements `ConfigurationPolicy` — enforcement/inform across arbitrary Kubernetes resources. Most of GRC runs through here. |
+| **iam-policy-controller** | Implements identity-related policies. |
+| **policy-controller** | The framework that wires the policy-* controllers together. |
+| **gitops-addon** | If enabled by the hub, installs OpenShift GitOps onto the managed cluster automatically. *(This is the component that shipped the rogue Route CRD discussed in Module 01.)* |
+
+The agents are deliberately small. On a managed cluster, the total ACM footprint is on the order of half a dozen Deployments and a few hundred MiB of memory. The hub is where the volume sits.
+
+## Communication patterns
+
+Three communication patterns matter, and they're all spoke-initiated:
+
+**Spoke -> Hub: registration.** At join time, the `registration-agent` reaches out to the hub's bootstrap kubeconfig, submits a CSR, and waits for the hub's `cluster-manager` to approve it. Once approved, the agent receives a working client cert that's scoped to a single per-cluster service account on the hub. From this point forward, the spoke uses its own identity; the bootstrap kubeconfig is not used again.
+
+**Spoke -> Hub: work pull.** The `work-agent` watches `ManifestWork` resources in *its* per-cluster namespace on the hub. When the hub creates new `ManifestWork` (because, say, the policy propagator placed a `Policy` here), the agent sees it via a watch, fetches the embedded manifests, applies them locally, and writes status back into the `ManifestWork.status`. The hub then sees that status.
+
+**Spoke -> Hub: telemetry.** The `observability-addon` pushes metrics via remote-write to Thanos receive on the hub. The search-collector likewise pushes resource-event data to the hub's search index. Heartbeats from the `registration-agent` keep the spoke marked Available.
+
+**mTLS everywhere.** Every spoke-to-hub call uses mTLS. The certs are auto-rotated by the registration loop; they're cluster-scoped on the hub side via a `ManagedClusterRole` that limits each spoke's identity to its own namespace + a small set of read-only cluster-scope resources.
+
+When you debug "the spoke can't reach the hub," the layers to check are, in order: DNS, the hub API endpoint reachable from the spoke, the bootstrap secret in `open-cluster-management-agent`, and finally the renewed client cert in the same namespace.
+
+## Identity model
+
+The identity model is small but easy to get wrong if you've never written one of these:
+
+- **ManagedCluster** is a hub-scoped CRD. One per real Kubernetes cluster. The name doesn't have to match the cluster's actual name — it's whatever you registered as.
+- **ManagedClusterSet** groups `ManagedCluster`s. Sets are how you say "the prod-eu fleet" or "the dc-v6 spokes." Sets are also the **RBAC boundary** for who can `Placement`-target which clusters.
+- **ManagedClusterSetBinding** binds a set into a specific namespace. Without a binding, you cannot `Placement`-target a set from that namespace. This is the gate that stops a tenant from accidentally targeting clusters they shouldn't see.
+- **Placement** is a CR that says "select these `ManagedCluster`s from the bound sets, applying these predicates." A `Placement` produces a `PlacementDecision` (just the list of cluster names it resolved to).
+- **PlacementDecision** is the read side. Most consumers (ApplicationSet's `clusterDecisionResource` generator, the policy propagator) watch `PlacementDecision`, not `Placement`.
+
+The clean way to think about it: `ManagedClusterSet` is your *grouping*, `Placement` is your *query*, `PlacementDecision` is the *result*. Everything downstream consumes the result.
+
+## Addon framework
+
+The pluggable system that makes ACM extensible: a pair of CRDs.
+
+- **`ClusterManagementAddOn`** is hub-scoped, one per addon (e.g., one for observability, one for application-manager, one for governance-policy-framework). It describes the addon's name and where its config lives.
+- **`ManagedClusterAddOn`** is namespaced — one per (addon × managed cluster). When the hub places an addon onto a cluster, the `klusterlet-addon-controller` writes one of these into the per-cluster namespace. The spoke's `klusterlet` picks it up and installs the addon's agent locally.
+
+Most ACM features ship as addons under the covers: governance-policy-framework, application-manager, observability-controller, search-collector, work-manager, cert-policy-controller, hypershift-addon, gitops-addon, submariner. When you toggle a component in the `MultiClusterHub` CR's `overrides.components`, you're really toggling the underlying addon.
+
+Custom addons exist too: any third party (or you) can write a `ClusterManagementAddOn` and a controller that watches `ManagedClusterAddOn` resources. This is the contract ACS, OpenShift GitOps, and the lab's own internal tooling use to plug in.
+
+## Sizing and constraints
+
+Some numbers worth carrying in your head. These are rules of thumb, not contracts — read the official sizing guidance before you commit to a SKU:
+
+- A small hub managing up to ~25 clusters: 2 vCPU + 8 GiB + ~50 GiB SSD on each of three control-plane nodes is enough. Observability off, search on.
+- A medium hub managing ~100 clusters: 4-8 vCPU + 16-32 GiB + ~100 GiB SSD on each of three control-plane nodes. Observability on.
+- A large hub (~1000+ clusters): production sizing, separate infra nodes, ODF block storage, dedicated workers for Thanos. At this size, **observability metric volume** is the dominant constraint.
+
+What scales linearly: registration (each new cluster adds a CSR and a watch). Manageable up to a few hundred clusters per hub.
+
+What scales sub-linearly: work distribution. `ManifestWork` is pulled, not pushed; adding clusters adds watch overhead but the per-spoke cost is small.
+
+What scales **poorly**: the search index past a few hundred clusters. PostgreSQL with the indexed-event volume becomes the bottleneck. The official Red Hat guidance is to consider splitting fleets across hubs or accepting search degradation past that point.
+
+Storage is the most common surprise. The PostgreSQL search backend wants **SSD**; spinning disks make queries miserable. Thanos receive wants object storage — for the lab, that's NooBaa over MinIO; for cloud hubs, it's whatever S3 you have.
+
+## The lab's actual architecture
+
+The conceptual model above is portable. The lab's wiring is specific:
+
+- **hub-dc-v6** — compact 3-AIO management cluster, deliberately storage-light. NooBaa-backed observability; no full ODF on the hub. See [/docs/openshift-platform/cluster-topology/hub-dc-v6](/docs/openshift-platform/cluster-topology/hub-dc-v6).
+- **spoke-dc-v6** — workload cluster, 3 VM masters + 3 physical workers with ODF for tenant data. See [/docs/openshift-platform/cluster-topology/spoke-dc-v6](/docs/openshift-platform/cluster-topology/spoke-dc-v6).
+- **Pull-model GitOps**. The hub runs ACM and an `ApplicationSet` controller that fans out via `clusterDecisionResource`; each spoke runs OpenShift GitOps locally and reconciles from internal GitLab. The reasoning is in [ADR 0018](/docs/architecture-decisions/adr-0018-acm-gitops-pull) and [ADR 0019](/docs/architecture-decisions/adr-0019-pull-model-gitops).
+- **Storage-light hub** isn't a default — it's a sized decision for a lab where the spoke is the data plane, not the hub. If you copy this design, do the sizing math first; observability is the constraint that bites.
+
+For the lab-specific ACM component wiring, see the platform docs at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub) and [/docs/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/acm-multicluster/managedcluster-registration).
+
+## Where things go wrong, architecturally
+
+If you're going to debug this, you'll be looking at three places.
+
+**Klusterlet bootstrap secrets in the `open-cluster-management-agent` namespace on the managed cluster.** When a spoke can't join, the answer is almost always here. The bootstrap secret holds the hub kubeconfig the spoke uses for its first CSR; if it's stale, missing, or points to the wrong hub API endpoint, registration silently retries forever. Look at `bootstrap-hub-kubeconfig`, the events on the `Klusterlet` CR, and the `registration-agent` logs.
+
+**ManifestWork sync status.** Once registered, the spoke pulls `ManifestWork`. If a particular workload isn't appearing on the cluster, the chain to walk is: `Placement` resolved correctly? → `PlacementDecision` has this cluster's name? → `ManifestWork` exists in the cluster's hub namespace? → `ManifestWork.status` says it was applied? Each link tells you exactly which controller dropped the ball.
+
+The third place is the **registration-agent CSR loop**. The client cert the agents use has a lifetime; the agent rotates it automatically. If the rotation breaks (clock skew, hub unreachable for the rotation window, the spoke's identity got removed on the hub), the spoke goes Unavailable and `work-agent` stops working with no obvious crash. The hub's `csr` resources and the registration-agent's logs tell you what happened.
+
+These three are roughly half of all ACM tickets in practice. Internalising them now will save you hours later.
+
+## What's next
+
+You now have the map. The next module is **Module 03 — Cluster lifecycle**: import a managed cluster, provision one with Hive, and operate the upgrade flow.
+
+**Next:** [Module 03 — Cluster lifecycle](/learn/acm-multicluster/cluster-lifecycle).
+
+## References
+
+- [docs.redhat.com — RHACM architecture overview](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/clusters/cluster_mce_overview#mce-architecture)
+- [open-cluster-management.io — Architecture concepts](https://open-cluster-management.io/concepts/architecture/)
+- [open-cluster-management.io — ManifestWork](https://open-cluster-management.io/concepts/manifestwork/)
+- [open-cluster-management.io — Placement](https://open-cluster-management.io/concepts/placement/)
+- [open-cluster-management.io — Addons](https://open-cluster-management.io/concepts/addon/)
+- [docs.redhat.com — Sizing your cluster](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/install/installing#sizing-your-cluster)
+- [docs.openshift.com — OpenShift GitOps with ACM](https://docs.openshift.com/gitops/latest/argocd_instance/setting-up-argocd-instance.html)

@@ -1,0 +1,217 @@
+---
+title: "Cluster lifecycle: import, provision, upgrade, destroy"
+sidebar_label: "03 — Cluster lifecycle"
+description: "How clusters join the hub, what Hive does for greenfield provisioning, how ACM orchestrates upgrades it doesn't own, and the failure modes the wizard hides."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const lifecycleNodes = [
+  { id: "hub",     position: { x: 360, y: 0   }, data: { label: "Hub cluster\nACM + MCE\nRegistration controller" }, style: ctrl },
+
+  { id: "import",  position: { x: 60,  y: 160 }, data: { label: "Path A — Import\nexisting cluster" },               style: stage },
+  { id: "hive",    position: { x: 360, y: 160 }, data: { label: "Path B — Provision\nvia Hive (greenfield)" },       style: stage },
+  { id: "pull",    position: { x: 660, y: 160 }, data: { label: "Path C — Pull-mode\nimport (auto-import secret)" }, style: stage },
+
+  { id: "kl",      position: { x: 360, y: 320 }, data: { label: "klusterlet\nregistration + work agent" },           style: agent },
+  { id: "csr",     position: { x: 100, y: 320 }, data: { label: "CSR submitted\n→ hub auto-approves" },              style: stage },
+  { id: "addons",  position: { x: 620, y: 320 }, data: { label: "KlusterletAddonConfig\nships add-ons" },            style: stage },
+
+  { id: "ready",   position: { x: 360, y: 480 }, data: { label: "ManagedCluster\nAvailable=True\nready for work" },  style: ctrl },
+];
+
+export const lifecycleEdges = [
+  { id: "e1", source: "import", target: "kl", label: "apply import.yaml on target", ...reqEdge },
+  { id: "e2", source: "hive",   target: "kl", label: "Hive installs OCP, then klusterlet", ...reqEdge },
+  { id: "e3", source: "pull",   target: "kl", label: "spoke pulls bundle from hub", ...pullEdge },
+  { id: "e4", source: "kl",     target: "csr",    label: "register (outbound)",      ...pullEdge },
+  { id: "e5", source: "csr",    target: "hub",    label: "approved",                  ...reqEdge },
+  { id: "e6", source: "kl",     target: "addons", label: "addon ManifestWork",         ...pullEdge },
+  { id: "e7", source: "addons", target: "ready",  ...reqEdge },
+  { id: "e8", source: "hub",    target: "ready",  label: "status: Available",         ...reqEdge },
+];
+
+A managed cluster is just an OpenShift or Kubernetes cluster the hub *knows about*. The knowing is encoded in two CRs on the hub (`ManagedCluster` and `KlusterletAddonConfig`) and a small agent on the cluster (`klusterlet`). Once those exist and have shaken hands, ACM can target the cluster with policies, applications, and observability — everything later in this track is built on this primitive.
+
+This module is about how that handshake happens, the three ways to start it, and what to do when it doesn't.
+
+## The three ways a cluster joins the hub
+
+<Whiteboard client:load data={{ nodes: lifecycleNodes, edges: lifecycleEdges }} height={560} />
+
+The diagram has three top-row entry points and one common bottom-row outcome. ACM doesn't care which path you took to get the klusterlet running — once it's there and the CSR has been approved, the cluster is a managed cluster.
+
+The three paths:
+
+- **Import an existing cluster.** You already have a running cluster. ACM generates a YAML bundle on the hub; you `oc apply` it on the target. The klusterlet boots, registers, and the cluster appears in the ACM console.
+- **Provision a new cluster** via Hive. You give ACM the infrastructure credentials and the install config; ACM does the OpenShift install for you and then imports the result. End-to-end greenfield.
+- **Pull-mode import** (sometimes called "auto-import"). The hub writes an `auto-import-secret` into the spoke's hub-side namespace, and a small bootstrap agent on the target pulls the klusterlet manifests down. Used when you don't want to push YAML to the target manually.
+
+In the lab's v6 fleet, `spoke-dc-v6` joined via the first path — it was installed independently as a workload cluster, then imported into `hub-dc-v6` once both were stable. Cite [`/docs/openshift-platform/acm-multicluster/managedcluster-registration/`](/docs/openshift-platform/acm-multicluster/managedcluster-registration) for the worked example.
+
+## Import an existing cluster — the walkthrough
+
+The shape of a `ManagedCluster` is small. Almost everything that matters is in the labels:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: spoke-dc-v6
+  labels:
+    name: spoke-dc-v6
+    vendor: OpenShift
+    cloud: BareMetal
+    env: dc
+    role: spoke
+    gitops-managed: "true"
+    cluster.open-cluster-management.io/clusterset: default
+spec:
+  hubAcceptsClient: true
+```
+
+`hubAcceptsClient: true` is the consent flag — the hub will accept the klusterlet's incoming registration handshake. `env`, `role`, and `gitops-managed` are the lab's three Placement-driving labels (see the [Foundations module](/learn/acm-multicluster/foundations) for the labels-as-API philosophy).
+
+When you create this CR on the hub, ACM does two things. First, it expects a hub-side namespace whose name **matches the ManagedCluster name** (`spoke-dc-v6`); without that namespace, registration never completes. Second, it generates an import bundle — two YAML documents you copy to the target:
+
+- `klusterlet-crds.yaml` — the CRDs the klusterlet needs (`Klusterlet`, `KlusterletAddon`, ManifestWork CRDs).
+- `import.yaml` — the klusterlet Deployment, ServiceAccount, ClusterRole, bootstrap-hub-kubeconfig Secret, and a `Klusterlet` CR that wires everything together.
+
+You then run, on the target:
+
+```bash
+oc apply -f klusterlet-crds.yaml
+oc apply -f import.yaml
+```
+
+What happens next is the load-bearing part. The klusterlet's **registration-agent** Pod starts, reads the bootstrap-hub-kubeconfig (which has a short-lived token good only for submitting a CSR), and submits a `CertificateSigningRequest` to the hub's API server with a subject like `system:open-cluster-management:spoke-dc-v6`. The hub's registration controller sees the CSR. If `hubAcceptsClient: true` is set on the corresponding `ManagedCluster`, the controller auto-approves it. The signed certificate is materialized back into a Secret on the spoke (`hub-kubeconfig-secret`), and the klusterlet rolls out its **work-agent** Pod using the long-lived credentials. From here on, all spoke→hub traffic is outbound, mTLS, and authenticated as that ServiceAccount.
+
+The mistake to avoid is treating the bootstrap-hub-kubeconfig like a long-lived token. It's a one-shot — good only for the CSR exchange. If you re-run `import.yaml` on a different cluster, the registration controller will register that cluster under the same name and you'll lose visibility into the original.
+
+## Provision with Hive
+
+[Hive](https://github.com/openshift/hive) is an upstream operator that installs OpenShift clusters on a target infrastructure. ACM ships Hive and orchestrates it. The CR triad:
+
+- `ClusterDeployment` — *"please make me a cluster"*. Points at a `ClusterImageSet` (the OpenShift version), an `InstallConfig` secret (the install-config.yaml the OpenShift installer would normally read), and an infrastructure credentials Secret (AWS access key, vSphere credentials, baremetal BMC details).
+- `ClusterImageSet` — a named reference to an OpenShift release image. Reusable across many `ClusterDeployments`. E.g., `img-4.17.10-x86-64` → `quay.io/openshift-release-dev/ocp-release@sha256:...`.
+- `MachinePool` (optional) — describes the worker nodes; if absent, Hive uses the `InstallConfig`'s defaults.
+
+When you `oc apply` the `ClusterDeployment`, Hive runs the OpenShift installer in a Pod on the hub, watches the install to completion, and stores the new cluster's kubeconfig as a Secret. ACM then automatically imports the freshly-installed cluster — you don't run `import.yaml` separately, because Hive already has admin credentials for the target and can apply the klusterlet manifests directly.
+
+Use Hive when you want **programmatic, infrastructure-as-code cluster provisioning** — fleets of identical clusters, ephemeral CI clusters, ClusterPool-backed dev environments. Don't use Hive for clusters you've already installed by hand, or for clusters whose install was driven by an out-of-band process (assisted-installer, agent-based installer that the team operates separately, etc.). For those, import.
+
+## The ACM console import wizard
+
+Half the field will use the console first. The wizard at *Infrastructure → Clusters → Import cluster* asks for the cluster name, a few labels, a target namespace, and then generates the same `klusterlet-crds.yaml` + `import.yaml` we just walked through. It does *not* run anything on the target — it gives you a copy-pasteable `oc apply` command (or, optionally, your kubeconfig and a button to apply for you).
+
+What the wizard hides is what the CR shape underneath looks like. Two minutes after the wizard, the resulting `ManagedCluster` is in YAML you can `oc edit` like any other Kubernetes object. The wizard is convenient for the first cluster; everything after should be in Git.
+
+## Labels and ManagedClusterSets
+
+Labels on a `ManagedCluster` are not metadata — they're an API. Two things consume them:
+
+- **`Placement` selectors** — when you target a Policy, an ApplicationSet, or an ObservabilityAddon at a subset of clusters, you do it by label selector. The lab's `gitops-managed` Placement selects `env=dc, role=spoke, gitops-managed=true`, which today matches exactly `spoke-dc-v6` and tomorrow would match any new spoke that gets the same labels.
+- **`ManagedClusterSet` membership** — a `ManagedClusterSet` is a named group of managed clusters, used for RBAC. You bind a `ManagedClusterSet` into a namespace with `ManagedClusterSetBinding`, and users with RoleBindings in that namespace can target the set's clusters with applications and policies. The default set is, predictably, named `default`; new sets exist to scope team-A's policies away from team-B's clusters.
+
+If your fleet has more than a handful of clusters and more than one ops team, write the ManagedClusterSet boundaries first. Retrofitting RBAC across an established fleet is painful — you have to move clusters between sets, update PlacementBindings, and reconcile ApplicationSet ownership all at once.
+
+## Upgrades
+
+ACM **does not upgrade managed clusters itself**. Each OpenShift cluster's own Cluster Version Operator (CVO) runs the upgrade. ACM's role is to be the conductor — to tell the CVO *which* version to upgrade to and *when*.
+
+The CR is `ClusterCurator`. A minimal upgrade looks like:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: ClusterCurator
+metadata:
+  name: spoke-dc-v6
+  namespace: spoke-dc-v6
+spec:
+  desiredCuration: upgrade
+  upgrade:
+    desiredUpdate: 4.17.10
+    channel: stable-4.17
+    monitorTimeout: 120
+```
+
+ACM picks this up, patches the spoke's `ClusterVersion` resource to set the desired update, and watches the CVO complete the upgrade. You get fleet-wide upgrade visibility in the ACM console — *cluster A is at 4.16, cluster B is upgrading 4.16 → 4.17, cluster C is 4.17* — without losing the property that each cluster owns its own reconcile.
+
+The implication: you can still write to a managed cluster's `ClusterVersion` directly (break-glass) and ACM will reflect the change. ACM is the conductor, not the gatekeeper. For policy-enforced upgrade gates ("no spoke may be more than one minor behind hub"), wrap the desired state in a Policy bound to a fleet-wide Placement — covered in [Module 04](/learn/acm-multicluster/policies).
+
+## Destroying a cluster
+
+This is where the wizard betrays you most often. `oc delete managedcluster <name>` on the hub does **not** tear down the underlying cluster. It removes the hub-side state, revokes the klusterlet's credentials, and stops shipping ManifestWork — the cluster keeps running, just no longer managed. This is called "detaching."
+
+For Hive-provisioned clusters, deleting the `ClusterDeployment` is what actually destroys the cluster. Hive runs the OpenShift installer's `destroy` flow — releases cloud resources, deletes machines, cleans up DNS. The `ClusterDeployment` finalizer guarantees Hive completes that flow before the CR disappears.
+
+If you ever import a cluster, then later `oc delete managedcluster`, then later `oc delete clusterdeployment` (for example, you forgot the cluster was Hive-managed) — Hive will not destroy it, because Hive only owns clusters whose lifecycle it started. You'll need to run the OpenShift installer's `destroy` flow by hand against the install dir, or tear down infrastructure manually.
+
+ClusterPool flows complicate this further: a cluster taken from a pool via `ClusterClaim` is destroyed when the claim is deleted. Pools and claims are out of scope here; we cover them in Module 08.
+
+## The lab's actual flow
+
+`spoke-dc-v6` was imported, not provisioned. It was installed standalone (compact-3-AIO + 3 baremetal workers via agent-based installer), then once the install was stable, six manifests in `platform-gitops` landed on `hub-dc-v6` to register it — the namespace, the ManagedCluster, the KlusterletAddonConfig, a ManagedClusterSetBinding, a Placement, and a GitOpsCluster. The bootstrap import bundle was applied once on the spoke as a break-glass operation; everything after is GitOps.
+
+The Placement that activates work on `spoke-dc-v6` selects `env=dc, role=spoke, gitops-managed=true`. The naming reflects the [pre-v6 → v6 transition](/docs/history-and-replay/pre-v6-to-v6-transition): pre-v6 had four clusters (`hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr`); v6 retained the `dc` and `spoke` labels so the Placement shape stays stable when (if) a DR pair is built later. See [`/docs/openshift-platform/acm-multicluster/managedcluster-registration/`](/docs/openshift-platform/acm-multicluster/managedcluster-registration) for the full manifest set.
+
+## Try this
+
+Three exercises with rising difficulty.
+
+**1. Read the live `ManagedCluster` CR.** On a cluster with ACM, run:
+
+```bash
+oc get managedcluster -o yaml
+oc get managedcluster <name> -o jsonpath='{.metadata.labels}{"\n"}'
+oc get managedcluster <name> -o jsonpath=\
+  '{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}{"\n"}'
+```
+
+Inspect the labels. Inspect `.status.conditions`. The `ManagedClusterConditionAvailable=True` condition is the one that says "the work-agent is reaching back to the hub." Anything else means the spoke can't talk to the hub right now.
+
+**2. Write a `ManagedClusterSet` and `ManagedClusterSetBinding`.** Imagine your `ops` team needs to target every cluster labelled `tier=prod` with their internal-baseline policies. Sketch the YAML:
+
+- A `ManagedClusterSet` named `prod-fleet`.
+- A `ManagedClusterSetBinding` that exposes `prod-fleet` into the `ops-policies` namespace.
+- A RoleBinding giving the `ops` group the `open-cluster-management:managedclusterset:bind:prod-fleet` ClusterRole in `ops-policies`.
+
+Without all three pieces, the ops team's Placements in `ops-policies` will return zero decisions.
+
+**3. Sketch a compliance-narrowing Placement.** Write the Placement YAML that targets *only* managed clusters labelled `compliance=pci-dss`, tolerating the `unreachable` taint so transient network blips don't drop clusters from the decision (the lab's pattern — see the registration doc). Don't bind it to anything; just write the Placement.
+
+## Common failure modes
+
+**The CSR auto-approve loop stalls.** Symptom: `ManagedCluster.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status` stays `Unknown`. Most often the spoke's clock is more than 5 minutes off the hub's. The CSR's signed certificate has a `NotBefore` from the hub's perspective; the klusterlet rejects it as not-yet-valid. Fix: `chrony` working on both sides. Less commonly: the registration controller is misconfigured to not auto-approve (`hubAcceptsClient: false` or the CSR-approver controller crashed).
+
+**The klusterlet bootstrap fails silently.** Symptom: you ran `oc apply -f import.yaml` on the spoke, the registration-agent Pod started, then nothing. The hub-side `ManagedCluster` never flips to `Available`. Almost always a network reachability issue — the spoke can't reach `api.<hub>.<domain>:6443`. Check from the spoke: `curl -kv https://api.<hub>.<domain>:6443/version`. If that fails, fix DNS, firewall rules, or proxy config first; the klusterlet's logs will only say "context deadline exceeded" with no hint about why.
+
+**The import command succeeds but no add-ons appear.** Symptom: `ManagedCluster` is `Available=True`, the console shows the cluster green, but `Policy`, `ApplicationSet`, and observability all behave as if the cluster doesn't exist. Cause: you forgot to create the `KlusterletAddonConfig` for the cluster. Without it, ACM doesn't ship application-manager, policy-controller, or cert-policy-controller to the spoke. Fix: add the `KlusterletAddonConfig` (same name as the ManagedCluster, in the matching namespace) and watch the addons land within a minute.
+
+**You imported a cluster and now want to delete it forever.** Detach with `oc delete managedcluster`, then either (a) for Hive-provisioned, `oc delete clusterdeployment` to tear down the infrastructure, or (b) for imported clusters, run the OpenShift installer's `destroy` flow against the original install directory or decommission the underlying VMs / hardware manually. ACM doesn't track the install metadata for imported clusters — only the cluster admin who installed it does.
+
+## Where this is heading
+
+You can now make a managed cluster appear, give it labels that mean something, and watch it disappear cleanly. Everything in [Module 04](/learn/acm-multicluster/policies) is about expressing *what should be true* on every cluster the Placement selects, and [Module 05](/learn/acm-multicluster/gitops-integration) is about shipping *workloads* the same way.
+
+**Next:** [Module 04 — Policies](/learn/acm-multicluster/policies) — write a Policy, propagate it via PlacementBinding, watch compliance flow back, and flip from inform to enforce without breaking production.
+
+## References
+
+- Open Cluster Management — concepts and architecture: [open-cluster-management.io/concepts/architecture/](https://open-cluster-management.io/concepts/architecture/)
+- Open Cluster Management — registration and cluster lifecycle: [open-cluster-management.io/concepts/managedcluster/](https://open-cluster-management.io/concepts/managedcluster/)
+- Red Hat ACM docs — Importing a managed cluster: [docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/)
+- Hive operator (upstream): [github.com/openshift/hive](https://github.com/openshift/hive)
+- OpenShift docs — Cluster Version Operator and upgrades: [docs.openshift.com](https://docs.openshift.com)
+- Lab docs — ManagedCluster registration: [/docs/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/acm-multicluster/managedcluster-registration)
+- Lab docs — pre-v6 to v6 transition: [/docs/history-and-replay/pre-v6-to-v6-transition](/docs/history-and-replay/pre-v6-to-v6-transition)

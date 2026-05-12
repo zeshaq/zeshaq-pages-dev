@@ -1,0 +1,96 @@
+---
+title: "Overview"
+sidebar_label: "00 — Overview"
+description: "What this track covers, who it's for, and how to use it. The control plane for many OpenShift clusters."
+estimated_minutes: 10
+last_updated: 2026-05-12
+---
+
+This is a self-paced track on **Red Hat Advanced Cluster Management for Kubernetes** — ACM, the control plane for many OpenShift / Kubernetes clusters. By the end you'll have imported managed clusters into a hub, propagated policies to enforce baseline state, rolled applications out via GitOps, queried fleet-wide search and observability, and recovered the hub from backup.
+
+The track is opinionated. It teaches the patterns most platform teams ship in production as of 2026, not every option the operator exposes. Where ACM gives you three ways to do something, I'll tell you the one most teams pick — usually the **pull-model** path the lab itself uses — and call out the alternatives when they actually matter.
+
+## Who this is for
+
+Engineers who:
+
+- Already operate one or two OpenShift clusters and can use `oc` and a YAML editor without thinking.
+- Know what an Operator is, what an `OperatorGroup` / `Subscription` pair does, and have installed at least one from OperatorHub.
+- Have used **kustomize** or **Helm** and understand **GitOps** at the Argo CD or Flux level — even just conceptually.
+- Want to operate **ten or fifty clusters** without the ssh-tier toil that one-or-two clusters lets you get away with.
+
+If you've never touched OpenShift, do the [OpenShift 4 Introduction self-paced lab on Red Hat Learning](https://www.redhat.com/en/services/training/openshift-administration) first. Half a day; come back here.
+
+## What you'll learn
+
+After completing the track:
+
+- The **hub / managed-cluster** model — what runs where, who talks to whom, and the mTLS identity each cluster gets.
+- **Cluster lifecycle** — import an existing cluster, provision a new one with **Hive** or **Hosted Control Planes**, upgrade a fleet, retire a cluster cleanly.
+- **Governance, Risk and Compliance (GRC)** — author a `Policy`, bind it with a `PlacementBinding`, and watch it propagate; templating; remediation modes.
+- **GitOps integration** — `ApplicationSet` with the `clusterDecisionResource` generator so Argo CD fans out to whichever clusters ACM `Placement` selects.
+- **Application lifecycle** — the (older) `Subscription` model and when to skip it for ApplicationSets.
+- **Observability and Search** — Thanos receive on the hub, the search index, and how to actually query the fleet.
+- **Hosted Control Planes (HyperShift) and Cluster Pools** — provisioning patterns that scale beyond classic IPI/UPI.
+- **Security with RHACS** — pairing ACM placement with RHACS runtime policy.
+- **Backup and Disaster Recovery** — what the `cluster-backup` operator covers, what it doesn't, and what a hub rebuild looks like.
+- A **capstone project**: standing up a two-cluster fleet from scratch with policies, GitOps applications, observability, and a working DR rehearsal.
+
+## The 12-module map
+
+| # | Module | What you build/do |
+| --- | --- | --- |
+| 00 | Overview *(this page)* | — |
+| 01 | Foundations | The "why multicluster" problem and where ACM fits |
+| 02 | Architecture | Hub + managed-cluster components, communication, identity |
+| 03 | Cluster lifecycle | Import a managed cluster; provision one via Hive |
+| 04 | Policies | Author + propagate a `Policy`, with templating |
+| 05 | GitOps integration | `ApplicationSet` + `Placement` for fan-out |
+| 06 | Application lifecycle | Subscriptions vs ApplicationSets; when to use which |
+| 07 | Observability and Search | Fleet-wide metrics + the search index, with real queries |
+| 08 | Hosted Control Planes + Cluster Pools | HyperShift-hosted clusters and pooled provisioning |
+| 09 | Security with RHACS | Runtime security across a fleet |
+| 10 | Backup and DR | `cluster-backup` operator + hub rebuild rehearsal |
+| 11 | Build a project | Capstone: a two-cluster fleet, policies, GitOps, DR |
+
+Each module is self-contained but assumes the previous ones. Expect 30-90 minutes per module depending on whether you do the exercises.
+
+## How to use this track
+
+Three patterns work:
+
+- **Sequential.** Start at 01, walk through 11. Best for first-timers and for anyone who hasn't internalised the hub/spoke mental model.
+- **Reference.** Use the sidebar; jump to the module you need. Best if you already run ACM and want a specific topic — e.g. "I just want to fix my `Placement`."
+- **Project-driven.** Skip to 11, pick the capstone, walk backwards through the modules whose content you need. Best for the practically minded.
+
+If you have a lab — even one OpenShift cluster acting as both hub and a self-managed managed cluster — actually do the exercises. ACM is one of those products where reading about `ManifestWork` and doing `oc get manifestwork` are completely different experiences.
+
+## What you need
+
+- An **OpenShift hub cluster** (4.16 or later) with the **Advanced Cluster Management for Kubernetes operator** installed. A compact 3-AIO hub is plenty for the track; you do not need a 5-node production hub.
+- At least **one managed cluster**. For some modules the hub can manage itself (`local-cluster`), which is enough. For the lifecycle and GitOps modules you'll want a real second cluster.
+- `oc` 4.16+ and `kubectl`; access to the hub `kubeadmin` or an equivalent cluster-admin identity.
+- Optional but recommended: a Git repository you control (GitHub or self-hosted GitLab) for the GitOps modules.
+
+The lab this track was written against runs a **hub-dc-v6** management cluster (compact 3-AIO, storage-light) paired with a **spoke-dc-v6** workload cluster (3 VM masters + 3 physical workers with ODF). If you want a concrete reference for what a sized hub-and-spoke looks like, read [the hub-dc-v6 topology](/docs/openshift-platform/cluster-topology/hub-dc-v6) and [the spoke-dc-v6 topology](/docs/openshift-platform/cluster-topology/spoke-dc-v6). The track is portable to any hub-and-spoke pair.
+
+## Where this track lives in the bigger picture
+
+This track teaches the **concepts** — what `Placement` does, what `ManifestWork` is for, why `klusterlet` reaches *out* to the hub instead of the other way around. The track is portable: every example works on any RHACM 2.13+ hub.
+
+The lab's own implementation — names of namespaces, choice of pull model over push, the storage-light hub decision, the gitops-addon configuration — is documented separately under [/docs/openshift-platform/acm-multicluster](/docs/openshift-platform/acm-multicluster). Two of the load-bearing decisions sit in ADRs: [ADR 0018 — ACM + OpenShift GitOps pull model](/docs/architecture-decisions/adr-0018-acm-gitops-pull) and [ADR 0019 — pull-model GitOps](/docs/architecture-decisions/adr-0019-pull-model-gitops).
+
+The split is deliberate: the track teaches you ACM the product, the docs show you one lab's wire-up. Read both if you want to see how the abstract concepts get pinned to concrete YAML.
+
+## A note on what's *not* here
+
+This track doesn't cover:
+
+- **Kubernetes fundamentals.** If you don't know what a Pod is, work through the upstream Kubernetes basics first.
+- **OpenShift cluster install** end-to-end. Cluster install is a Day-0 concern; ACM is Day-1+. Module 03 covers cluster *lifecycle* in the ACM sense (import, provision via Hive, upgrade orchestration), not the installer.
+- **The MultiClusterEngine operator** in isolation. MCE is what powers a slice of ACM under the hood; you'll see it referenced where it matters, but the track is about ACM the product.
+- **Submariner** (network connectivity between managed clusters). Real but narrow; not in the 12.
+
+The goal is to make you the engineer who can stand up, secure, and operate an OpenShift fleet — not the one who can recite every CRD ACM ships.
+
+**Ready?** Continue to [Module 01 — Foundations](/learn/acm-multicluster/foundations).

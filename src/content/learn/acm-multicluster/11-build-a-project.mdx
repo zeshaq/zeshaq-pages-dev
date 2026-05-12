@@ -1,0 +1,451 @@
+---
+title: "Build a project (capstone)"
+sidebar_label: "11 — Capstone"
+description: "Import a managed cluster, govern it with policy, ship an app via ApplicationSet, wire observability and security, take a backup — the whole track in one walkthrough."
+estimated_minutes: 120
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const capstoneNodes = [
+  { id: "hub", data: { label: "Hub cluster\n(ACM + GitOps + RHACS Central)" }, position: { x: 60, y: 60 }, style: ctrl, type: "shape" },
+  { id: "mch", data: { label: "MultiClusterHub" }, position: { x: 60, y: 170 }, style: ctrl, type: "shape" },
+  { id: "appset", data: { label: "ApplicationSet\n(cluster generator)" }, position: { x: 60, y: 270 }, style: ctrl, type: "shape" },
+  { id: "policy", data: { label: "Policy: default-deny NP" }, position: { x: 60, y: 370 }, style: ctrl, type: "shape" },
+  { id: "central", data: { label: "RHACS Central" }, position: { x: 60, y: 470 }, style: ctrl, type: "shape" },
+  { id: "cbo", data: { label: "cluster-backup" }, position: { x: 60, y: 570 }, style: ctrl, type: "shape" },
+  { id: "spoke", data: { label: "Managed cluster\n(env=dc, role=workload)" }, position: { x: 500, y: 60 }, style: stage, type: "shape" },
+  { id: "klusterlet", data: { label: "klusterlet + addons" }, position: { x: 500, y: 170 }, style: agent, type: "shape" },
+  { id: "app", data: { label: "nginx Application\n(via ApplicationSet)" }, position: { x: 500, y: 270 }, style: agent, type: "shape" },
+  { id: "np", data: { label: "default-deny NetworkPolicy\n(enforced by Policy)" }, position: { x: 500, y: 370 }, style: agent, type: "shape" },
+  { id: "sc", data: { label: "SecuredCluster + sensor" }, position: { x: 500, y: 470 }, style: agent, type: "shape" },
+  { id: "obs", data: { label: "Observability addon\n(metrics back to hub)" }, position: { x: 500, y: 570 }, style: agent, type: "shape" },
+  { id: "obj", data: { label: "Object store\n(MinIO / S3)" }, position: { x: 280, y: 670 }, style: ext, type: "shape" },
+];
+
+export const capstoneEdges = [
+  { id: "e1", source: "hub", target: "mch", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "mch", target: "appset", style: { stroke: "#1f2937" } },
+  { id: "e3", source: "appset", target: "policy", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "klusterlet", target: "mch", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "register" },
+  { id: "e5", source: "appset", target: "app", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "fan out" },
+  { id: "e6", source: "policy", target: "np", style: { stroke: "#1f2937" }, label: "enforce" },
+  { id: "e7", source: "central", target: "sc", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "init-bundle, sensor mTLS" },
+  { id: "e8", source: "obs", target: "hub", animated: true, style: { stroke: "#6b7280", strokeDasharray: "5,5" }, label: "metrics" },
+  { id: "e9", source: "cbo", target: "obj", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "hub backup" },
+  { id: "e10", source: "spoke", target: "klusterlet", style: { stroke: "#1f2937" } },
+];
+
+The previous ten modules each covered one slice. This one stitches them into a single concrete project — start to finish — so you can finish the track with something you have actually run, not just read about.
+
+The project: **import a managed cluster, govern it with one policy, ship one application via ApplicationSet, wire observability, install SecuredCluster, take a backup**. By the end you will have one fleet of one spoke, with all the moving parts the previous modules introduced, all green on a single ACM dashboard.
+
+Most of this walkthrough assumes you have access to a hub OCP cluster with ACM installed, plus one OCP cluster you can import. If you do not, you can shape the steps as a thought experiment using the lab's own hub-dc-v6 + spoke-dc-v6 — the commands and CRs are real either way.
+
+## What you will build
+
+<Whiteboard client:load data={{ nodes: capstoneNodes, edges: capstoneEdges }} height={760} />
+
+Reading the diagram:
+
+- **Hub** runs the MultiClusterHub, an ApplicationSet, the Policy framework, RHACS Central, and the cluster-backup operator.
+- **Managed cluster** ends up with a klusterlet (already imported), one Application from the ApplicationSet, one NetworkPolicy enforced by the Policy, a SecuredCluster reporting to Central, and observability shipping metrics back to the hub.
+- **Dashed-green** edges are spoke-initiated pulls (register, sensor mTLS, app sync, backup push). **Solid black** edges are local intra-cluster relationships. **Dashed-grey** is telemetry.
+
+By the end, you should be able to point at every box on this picture and say what command produced it.
+
+## Prerequisites
+
+- **One hub cluster** — an OpenShift cluster with the ACM operator installed and a MultiClusterHub CR in `Running`. If you are using the lab's hub-dc-v6, you already have this.
+- **One managed cluster** — a separate OpenShift cluster that you have cluster-admin on. The lab's spoke-dc-v6 works, or any OCP 4.16+ cluster.
+- **GitOps repo with Argo CD** on the hub. The lab has `platform-gitops` configured for this.
+- **An S3-compatible object store** for backup. The lab uses MinIO.
+- **An RHACS Central** running somewhere reachable from your managed cluster (Module 09).
+- **kubectl/oc access to both clusters** with cluster-admin.
+
+Reset expectations: this is a 90 to 120 minute exercise if everything works. Budget double on a first run.
+
+## Step 1: Import the managed cluster
+
+The first thing ACM does for you is take ownership of a cluster's lifecycle. "Lifecycle" here means metadata, addons, and the lifecycle hooks for upgrades — not the kubernetes nodes themselves; the spoke is already running.
+
+On the hub, declare a ManagedCluster:
+
+```
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: dc-spoke-1
+  labels:
+    cloud: bare-metal
+    vendor: OpenShift
+spec:
+  hubAcceptsClient: true
+```
+
+`oc apply -f managedcluster.yaml`. ACM creates a corresponding namespace `dc-spoke-1` on the hub. Inside it you will find a `managedcluster-import-controller-v2-bootstrap-sa-token` Secret — that is the bootstrap kubeconfig the spoke will use.
+
+ACM also emits two manifest YAMLs: `dc-spoke-1-import.yaml` and `dc-spoke-1-import-klusterlet-crd.yaml`. You apply them to the spoke:
+
+```
+oc --context=dc-spoke-1 apply -f dc-spoke-1-import-klusterlet-crd.yaml
+oc --context=dc-spoke-1 apply -f dc-spoke-1-import.yaml
+```
+
+The first installs the klusterlet CRD on the spoke; the second installs the klusterlet itself, which will reach back to the hub using the bootstrap kubeconfig and submit a CSR. The hub auto-approves it (under the import controller). After ~2 minutes:
+
+```
+oc get managedcluster dc-spoke-1
+NAME         HUB ACCEPTED   MANAGED CLUSTER URLS               JOINED   AVAILABLE   AGE
+dc-spoke-1   true           https://api.spoke.example.com...   True     True        2m
+```
+
+**Try this:** `oc describe managedcluster dc-spoke-1` and read the conditions. There should be `HubAcceptedManagedCluster`, `ManagedClusterJoined`, and `ManagedClusterConditionAvailable`, all `True`. If `Available` is `False`, the klusterlet is having trouble reaching the hub — check the spoke's outbound network.
+
+## Step 2: Label and bind
+
+A cluster without labels is invisible to placement rules. Label it for what it is:
+
+```
+oc label managedcluster dc-spoke-1 env=dc role=workload compliance=pci-dss-inform
+```
+
+`env=dc` is the topology dimension (think "datacenter" vs "edge" vs "cloud"). `role=workload` separates tenant-running clusters from the hub. `compliance=pci-dss-inform` says this cluster is in scope for PCI policies in inform-mode (not enforce).
+
+Next, group the cluster into a ManagedClusterSet so a tenant or ops group can target it:
+
+```
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSet
+metadata:
+  name: dc-workloads
+spec: {}
+---
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSetBinding
+metadata:
+  name: dc-workloads
+  namespace: ops
+spec:
+  clusterSet: dc-workloads
+```
+
+Then move the cluster into the set:
+
+```
+oc label managedcluster dc-spoke-1 cluster.open-cluster-management.io/clusterset=dc-workloads
+```
+
+**Try this:** `oc get managedclustersetbinding -n ops` should now show `dc-workloads` bound. Any Placement created in the `ops` namespace and targeting `dc-workloads` will be able to see `dc-spoke-1`.
+
+## Step 3: Apply a policy
+
+The first thing every fleet should enforce is **default-deny ingress** in every namespace. Without it, a misconfigured Service exposes everything in the cluster by default.
+
+The clean way to express this in ACM is via the **Policy framework**. You can write a Policy by hand, but `PolicyGenerator` (a Kustomize plugin) is less verbose. Drop a config in your GitOps repo:
+
+```
+apiVersion: policy.open-cluster-management.io/v1
+kind: PolicyGenerator
+metadata:
+  name: dc-baseline
+placementBindingDefaults:
+  name: dc-baseline
+policyDefaults:
+  namespace: policies
+  remediationAction: enforce
+  severity: medium
+  placement:
+    clusterSelectors:
+      env: "dc"
+      role: "workload"
+policies:
+  - name: default-deny-ingress
+    manifests:
+      - path: networkpolicy-default-deny.yaml
+```
+
+And the NetworkPolicy it wraps:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [ "Ingress" ]
+```
+
+Kustomize-generate the Policy CR and let Argo CD on the hub sync it. After ~30 seconds:
+
+```
+oc get policy -n policies
+NAME                          REMEDIATION ACTION   COMPLIANCE STATE   AGE
+dc-baseline.default-deny-ingress   enforce              Compliant          1m
+```
+
+On the spoke, `oc get networkpolicy --all-namespaces` should now show `default-deny-ingress` in every namespace. Try removing one — ACM will recreate it within seconds because the remediation action is `enforce`.
+
+**Try this:** flip `remediationAction` to `inform`, remove one NetworkPolicy on the spoke, and watch the Policy go `NonCompliant`. Flip back to `enforce` and watch ACM reconcile.
+
+## Step 4: Deploy a sample app via ApplicationSet
+
+Policy fans out config rules; ApplicationSet fans out workloads. They are different layers and you should not blur them.
+
+A minimal ApplicationSet on the hub:
+
+```
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: demo-nginx
+  namespace: openshift-gitops
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            env: dc
+            role: workload
+  template:
+    metadata:
+      name: 'nginx-{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/example/gitops-demo
+        targetRevision: main
+        path: apps/nginx
+      destination:
+        server: '{{server}}'
+        namespace: demo-nginx
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions: [ "CreateNamespace=true" ]
+```
+
+The Argo CD cluster generator queries ACM (or its own cluster Secrets — same data) for every cluster matching `env=dc, role=workload`. It produces one Application per match. For each Application, Argo CD reconciles the manifests at `apps/nginx` in your GitOps repo into the matching cluster's `demo-nginx` namespace.
+
+The `apps/nginx` directory in the GitOps repo should be a tiny Helm chart or Kustomize overlay producing a Deployment + Service + ConfigMap. Keep it small for this exercise.
+
+```
+oc get application -n openshift-gitops
+NAME              SYNC STATUS   HEALTH STATUS
+nginx-dc-spoke-1  Synced        Healthy
+```
+
+On the spoke:
+
+```
+oc --context=dc-spoke-1 -n demo-nginx get all
+```
+
+The Deployment is running, the Service is reachable from inside the cluster, and the `default-deny-ingress` NetworkPolicy from Step 3 means external pods cannot reach it without an explicit allow. That last bit is the whole point of the baseline policy: a workload Application cannot accidentally bypass the security posture.
+
+**Try this:** change the ConfigMap in the GitOps repo, commit, push. Watch the Application sync; the new ConfigMap should appear on the spoke within 3 minutes (Argo CD's default poll interval). Then label a second cluster `env=dc, role=workload` and watch the ApplicationSet automatically produce a second Application.
+
+## Step 5: Wire up observability
+
+Observability is fan-out from the spoke, not push from the hub. The hub runs `MultiClusterObservability`; each managed cluster runs an `observability-addon` that scrapes the spoke's user-workload-monitoring Prometheus and ships metrics back to the hub's Thanos.
+
+The MultiClusterObservability CR on the hub:
+
+```
+apiVersion: observability.open-cluster-management.io/v1beta2
+kind: MultiClusterObservability
+metadata:
+  name: observability
+spec:
+  observabilityAddonSpec:
+    enableMetrics: true
+  storageConfig:
+    metricObjectStorage:
+      key: thanos.yaml
+      name: thanos-object-storage
+```
+
+You also need a Secret named `thanos-object-storage` in `open-cluster-management-observability` containing an S3-compatible config — same MinIO you used for backup is fine.
+
+Once the CR reconciles, ACM injects the observability-addon onto every managed cluster as a ManifestWork. The addon runs a `metrics-collector` Deployment on the spoke that scrapes the spoke's Prometheus and ships to the hub.
+
+On the hub, open the ACM Grafana (in the same namespace) and run a query: `up{cluster="dc-spoke-1"}`. You should see thousands of series flowing back from the spoke. The hub now has a single pane of metrics for the fleet.
+
+**Try this:** the observability addon adds a tiny CPU/memory footprint per spoke node — measure it. `oc -n open-cluster-management-addon-observability top pod` on the spoke shows what the metrics-collector and its sidecars are using.
+
+## Step 6: Install RHACS SecuredCluster
+
+If you completed Module 09, you have a Central running on the hub already. You need three things on the spoke: the init-bundle Secrets, the RHACS operator subscription, and a SecuredCluster CR.
+
+**Generate the init-bundle via the Central API**:
+
+```
+RHACS_ADMIN=$(oc -n stackrox get secret central-admin-password -o jsonpath='{.data.password}' | base64 -d)
+curl -sk -u admin:"$RHACS_ADMIN" \
+  -X POST https://central-stackrox.apps.HUB/v1/cluster-init/init-bundles \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"dc-spoke-1"}' > dc-spoke-1-bundle.json
+```
+
+The response contains three Secret YAMLs (sensor-tls, collector-tls, admission-control-tls). In a real pipeline these go to Vault and ESO materialises them; for this exercise, apply them directly:
+
+```
+jq -r '.kubectlBundle' dc-spoke-1-bundle.json | base64 -d | \
+  oc --context=dc-spoke-1 apply -n stackrox -f -
+```
+
+**Install the RHACS operator and SecuredCluster** by adding them to your GitOps repo as another Application (or `oc apply` directly if you are doing this manually):
+
+```
+apiVersion: platform.stackrox.io/v1alpha1
+kind: SecuredCluster
+metadata:
+  name: stackrox-secured-cluster-services
+  namespace: stackrox
+spec:
+  clusterName: dc-spoke-1
+  centralEndpoint: central-stackrox.apps.HUB:443
+  admissionControl: { listenOnCreates: true, listenOnUpdates: true }
+  perNode:
+    collector: { collection: EBPF }
+```
+
+After ~3 minutes:
+
+```
+oc --context=dc-spoke-1 -n stackrox get pods
+NAME                                READY   STATUS
+sensor-xxxx                         1/1     Running
+collector-xxxx                      2/2     Running (one per node)
+admission-control-xxxx              1/1     Running
+```
+
+In the Central UI, the **Clusters** page shows `dc-spoke-1` as Healthy. The first policy violations appear within minutes — most of them coming from `openshift-*` namespaces with known CVE-bearing images. That is normal; exempt those namespaces from enforce-mode policies (Module 09).
+
+**Try this:** clone the built-in "Image Age" policy to inform-mode, scope it to `dc-spoke-1`, and watch the violations roll in. Do not flip to enforce on the first day; observe for a week.
+
+## Step 7: Take a backup
+
+Enable cluster-backup on the hub. Subscription:
+
+```
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-backup
+  namespace: open-cluster-management-backup
+spec:
+  channel: release-2.13
+  name: cluster-backup
+```
+
+Once the operator is running, create a BackupSchedule:
+
+```
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: BackupSchedule
+metadata:
+  name: hub-backup
+  namespace: open-cluster-management-backup
+spec:
+  veleroSchedule: "0 */1 * * *"   # hourly
+  veleroTtl: 168h                  # 7-day retention
+```
+
+You also need a Velero `BackupStorageLocation` pointing at your object store. The cluster-backup operator's docs walk through the BSL — see [`/docs/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/acm-multicluster/acm-cluster-backup) for the lab's variant.
+
+After an hour, `oc get backup -n open-cluster-management-backup` shows three rolling backups: acm-credentials-schedule, acm-resources-schedule, and acm-managed-clusters-schedule. In your object store you can see the actual files.
+
+**Dry-run a restore.** Provision a small sandbox OCP cluster (or use an existing test one), install ACM and cluster-backup on it, point a BSL at the same object store (read-only credentials), and create:
+
+```
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Restore
+metadata:
+  name: hub-restore-drill
+  namespace: open-cluster-management-backup
+spec:
+  cleanupBeforeRestore: CleanupRestored
+  veleroManagedClustersBackupName: latest
+  veleroCredentialsBackupName: latest
+  veleroResourcesBackupName: latest
+```
+
+The ManagedCluster CRs should reappear in the sandbox hub within ~10 minutes. The actual spokes will not register (they are still pointing at the production hub), but the inventory restoration itself proves the backup is intact. This is the drill — run it quarterly.
+
+## Wrap-up: a single dashboard
+
+Open the ACM Governance UI on the hub:
+
+- **Clusters tab.** One managed cluster, `dc-spoke-1`, Available=True.
+- **Policies tab.** One Policy, `dc-baseline`, Compliant on all 1 cluster.
+- **Applications tab.** One ApplicationSet, `demo-nginx`, with one healthy Application.
+- **Observability.** Open the linked Grafana; a query for `up{cluster="dc-spoke-1"}` returns metrics.
+- **RHACS Central UI.** `dc-spoke-1` listed under Clusters, Sensor healthy.
+- **Backups.** `oc get backup -n open-cluster-management-backup` shows yesterday's hourly backups, last one Completed.
+
+Every green light on that list is a piece of fan-out the hub does for you. Adding a second managed cluster is a label change on its ManagedCluster — everything else follows.
+
+## Where to go from here
+
+You have a one-spoke fleet doing the right things. Stretch goals, in roughly increasing difficulty:
+
+- **Add a second managed cluster.** Apply the same labels. Verify the ApplicationSet produces a second Application, the Policy is `Compliant` on both, the observability addon lands, the SecuredCluster registers. This is the test of whether your fleet really is multi-cluster — if a manual step is needed for the second cluster, the fan-out is incomplete.
+- **Flip one policy to `enforce` after a week in `inform`.** Pick a policy where you have understood the existing violations. Watch ACM remediate.
+- **Add a hosted-control-plane (HCP) managed cluster.** Same import flow, different control-plane location (it runs on the hub). The fan-out works the same way.
+- **Federate the GitOps repo across tenant groups.** The lab's pattern lives at [`/docs/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership/`](/docs/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership) — each tenant team owns its own subdirectory and its own Argo CD AppProject. The hub still does fan-out, but ownership is decentralised.
+- **Run a real DR drill.** Build a sandbox cluster. Restore the latest hub backup into it. Time how long it takes. Find the steps that are not in your runbook. Update the runbook. Repeat next quarter.
+- **Tighten the RHACS posture.** Move a policy to admission-control enforce mode. Watch the first deploy that gets blocked, understand why, exempt the openshift- namespaces, repeat.
+
+## Closing
+
+Twelve modules in:
+
+- You know what ACM is and what it is not (Module 00).
+- You can name every component of the hub-and-spoke topology (Module 01).
+- You have imported a managed cluster and labelled it for placement (Modules 02, 03).
+- You understand ManagedClusterSets, placements, and placement decisions (Module 04).
+- You can write a Policy and watch it remediate (Module 05).
+- You can fan out an Application via ApplicationSet (Module 06).
+- You have observability shipping metrics back to the hub (Module 07).
+- You have done a Cluster Lifecycle install of a fresh OCP cluster from the hub (Module 08).
+- You have wired RHACS Central + SecuredCluster across the fleet (Module 09).
+- You have a backup strategy for the hub and the workloads, with an RPO and RTO target you actually believe (Module 10).
+- You have done the whole stack end-to-end on one spoke (this module).
+
+This track is the foundation. The operational depth — the on-call runbooks, the GitOps repository conventions, the per-tenant onboarding workflows — lives in the lab's own platform docs. Start at [`/docs/openshift-platform/acm-multicluster/`](/docs/openshift-platform/acm-multicluster) and work outward.
+
+The fleet you built in this capstone is a sandbox. The fleet a real platform team runs is a hundred times more nuanced — tenant isolation, change-control gates, audit trails, multi-DC failover, the long tail of policy exceptions. But the shape is the same. ACM gives you one place to see the whole fleet, one place to enforce baselines, one place to ship apps, and one place to recover from a disaster. The work after this is filling that shape with the specifics of your environment.
+
+## References
+
+- Red Hat ACM documentation: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/`
+- Red Hat ACS documentation: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/`
+- Open Cluster Management upstream: `https://open-cluster-management.io/`
+- Argo CD ApplicationSet: `https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/`
+- OADP project: `https://www.oadp-operator.com/`
+- Velero upstream: `https://velero.io/`
+
+**That is the end of the track.** If you completed the capstone, you are now operating a working multicluster control plane. Send back what you built or what blocked you — the feedback shapes future revisions of the track.
