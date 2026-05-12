@@ -1,0 +1,290 @@
+---
+title: "Policies: governance, risk, and compliance across the fleet"
+sidebar_label: "04 — Policies"
+description: "How a Policy on the hub becomes a compliance result on every selected spoke — the propagation pipeline, ConfigurationPolicy as the workhorse, inform vs enforce, PolicyGenerator, and the failure modes."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const propNodes = [
+  { id: "author",  position: { x: 40,  y: 0   }, data: { label: "Policy author\nwrites Policy YAML\n+ PlacementBinding" },         style: stage },
+  { id: "hubPol",  position: { x: 250, y: 0   }, data: { label: "Policy (hub)\nin namespace `policies`\nremediation: inform" },     style: ctrl },
+  { id: "prop",    position: { x: 480, y: 0   }, data: { label: "governance-policy-\npropagator (hub)" },                            style: ctrl },
+  { id: "plct",    position: { x: 250, y: 140 }, data: { label: "PlacementBinding\n→ Placement\n→ PlacementDecision" },              style: stage },
+  { id: "mw",      position: { x: 480, y: 140 }, data: { label: "ManifestWork\n(per spoke namespace on hub)" },                      style: stage },
+  { id: "spokeNs", position: { x: 720, y: 0   }, data: { label: "spoke namespace (hub)\nreplicated Policy" },                        style: stage },
+  { id: "klust",   position: { x: 720, y: 140 }, data: { label: "klusterlet work-agent\npulls ManifestWork" },                        style: agent },
+  { id: "spokePol",position: { x: 720, y: 280 }, data: { label: "spoke Policy + ConfigurationPolicy\ngovernance-policy-framework" }, style: agent },
+  { id: "result",  position: { x: 480, y: 280 }, data: { label: "compliance status\nflows back to hub" },                            style: stage },
+  { id: "dash",    position: { x: 250, y: 280 }, data: { label: "ACM Governance dashboard\nper-cluster compliance" },                style: ctrl },
+];
+
+export const propEdges = [
+  { id: "p1", source: "author",  target: "hubPol",   ...reqEdge },
+  { id: "p2", source: "hubPol",  target: "prop",     ...reqEdge },
+  { id: "p3", source: "hubPol",  target: "plct",     label: "bound by",   ...muted },
+  { id: "p4", source: "prop",    target: "mw",       label: "wraps as",   ...reqEdge },
+  { id: "p5", source: "mw",      target: "spokeNs",  label: "lands in",   ...reqEdge },
+  { id: "p6", source: "klust",   target: "mw",       label: "outbound pull", ...pullEdge },
+  { id: "p7", source: "klust",   target: "spokePol", label: "applies",    ...reqEdge },
+  { id: "p8", source: "spokePol",target: "result",   label: "evaluation", ...pullEdge },
+  { id: "p9", source: "result",  target: "dash",     ...muted },
+];
+
+A `Policy` on the hub is a declaration of what *must be true* on every cluster the policy targets. *"Every cluster has etcd encryption enabled."* *"Every namespace has a default-deny NetworkPolicy."* *"No Deployment runs as root."* *"The OperatorHub source list is the lab's catalog, not the default."* You write the policy once on the hub; ACM propagates it to every spoke a Placement selects, evaluates it locally on each spoke, and reports compliance back to a single dashboard.
+
+The mistake to avoid is treating Policy like an admission controller. It isn't — it doesn't block writes at API admission time. It's a reconciler. ConfigurationPolicy controllers wake up every 30 seconds (default) on each spoke, look at the world, and either report drift (`inform`) or fix it (`enforce`). If you need synchronous *deny at admission*, write a Kyverno or Gatekeeper ValidatingAdmissionPolicy; ACM Policy is the *converge-toward-state* tool.
+
+## The propagation pipeline
+
+<Whiteboard client:load data={{ nodes: propNodes, edges: propEdges }} height={420} />
+
+The path a Policy takes from authored YAML to a compliance result on the dashboard:
+
+1. **You write a `Policy` on the hub** in a namespace dedicated to governance (the lab uses `openshift-gitops`; many teams use `policies` or `open-cluster-management-policy`).
+2. **A `PlacementBinding`** ties the Policy to a `Placement`, which produces a `PlacementDecision` listing the selected ManagedClusters.
+3. **`governance-policy-propagator`** on the hub watches Policy + PlacementBinding + PlacementDecision. For each decision, it wraps the Policy as a `ManifestWork` and writes it into the matched spoke's hub-side namespace.
+4. **The klusterlet's work-agent on the spoke** pulls the ManifestWork outbound. The Policy CR is materialized in the `open-cluster-management-policies` namespace on the spoke.
+5. **`governance-policy-framework`** on the spoke expands the Policy's `policy-templates` into concrete `ConfigurationPolicy` (or `CertificatePolicy`, `IamPolicy`, `OperatorPolicy`) CRs.
+6. **`config-policy-controller`** on the spoke evaluates each `ConfigurationPolicy` every 30 seconds. It compares declared `object-templates` against live cluster state. The result is a compliance status — `Compliant` or `NonCompliant`.
+7. **The status flows back** via `governance-policy-status-sync` (spoke) → `governance-policy-status-sync` (hub) → the original Policy's `.status.status[]` list, with one entry per managed cluster.
+
+The ACM Governance dashboard reads the hub-side Policy `.status` to render compliance per cluster, per policy. The lab's [policies-and-placement doc](/docs/openshift-platform/acm-multicluster/policies-and-placement) walks through the five CR types and the spoke-side controllers in detail.
+
+## Policy templates
+
+A `Policy` is a wrapper. The work is done by one or more templates inside `spec.policy-templates`. The four template kinds:
+
+| Template | What it does |
+| --- | --- |
+| `ConfigurationPolicy` | Declare required state for arbitrary Kubernetes objects via `object-templates`. The workhorse. |
+| `CertificatePolicy` | Check certificate expiry, signer, and CA across the cluster. |
+| `OperatorPolicy` | Manage operator installs and upgrade approvals via OLM. |
+| `IamPolicy` | Audit cluster-admin role assignments and similar high-privilege bindings. |
+
+You will spend 90% of your policy time in `ConfigurationPolicy`. Its `object-templates` field lets you say things like:
+
+```yaml
+object-templates:
+  - complianceType: musthave
+    objectDefinition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: default-deny-all
+        namespace: '{{ fromConfigMap "openshift-config" "managed-namespaces" "name" }}'
+      spec:
+        podSelector: {}
+        policyTypes: [Ingress, Egress]
+```
+
+`complianceType` has three values:
+
+- `musthave` — the object must exist and its spec must match (or be a superset of) the template.
+- `mustonlyhave` — the object must exist and its spec must match exactly (no extra fields).
+- `mustnothave` — the object must *not* exist.
+
+`mustnothave` is the one people forget. It's how you write *"there is no Pod in any namespace running as `securityContext.runAsUser: 0`"* without having to enumerate every namespace.
+
+## Inform vs enforce
+
+`Policy.spec.remediationAction` (and the same field on each template) takes two values:
+
+- `inform` — measure-only. The spoke evaluates the policy and reports the result. It does not change anything.
+- `enforce` — converge. If the spoke is `NonCompliant`, the config-policy-controller patches the live state to match the template.
+
+The mistake to avoid is shipping `enforce` on day one. The lab's production convention — and Red Hat's — is **always ship as `inform`, validate, then flip**:
+
+1. Author the Policy with `remediationAction: inform`.
+2. Apply via GitOps. Wait one evaluation cycle (~30 seconds for ConfigurationPolicy).
+3. Inspect `Policy.status.status[]` on the hub. Confirm the per-cluster compliance reports match what you expected.
+4. If the report is right and the desired state is genuinely what you want, change `remediationAction: enforce` in Git and merge.
+
+This catches policy bugs before they mutate cluster state. The classic failure: a policy that says *"every namespace must have label `cost-center`"* with `enforce: true` and a typo in `complianceType: mustonlyhave` — the controller obliterates every other namespace label on every cluster in scope. *Mustonlyhave* means *"this is the entire spec; remove anything else"*. Catching that in inform mode costs nothing; catching it in enforce mode costs an outage.
+
+The corollary: keep `inform`-only policies in production indefinitely if all you want is observability. ACM's audit posture doesn't *require* enforce.
+
+## A worked example — disable default OperatorHub sources
+
+This is the lab's [policies-and-placement doc](/docs/openshift-platform/acm-multicluster/policies-and-placement) example trimmed to its essence. The goal: every spoke must have its default OperatorHub sources disabled (because the lab's [Nexus image-supply rule](/docs/openshift-platform/disconnected-image-supply) requires it).
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: disable-default-operatorhub
+  namespace: openshift-gitops
+spec:
+  remediationAction: inform
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: disable-default-operatorhub
+        spec:
+          remediationAction: inform
+          severity: high
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: config.openshift.io/v1
+                kind: OperatorHub
+                metadata:
+                  name: cluster
+                spec:
+                  disableAllDefaultSources: true
+```
+
+And the binding:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: disable-default-operatorhub
+  namespace: openshift-gitops
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: gitops-managed
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: disable-default-operatorhub
+```
+
+When merged, the propagator wraps the Policy as ManifestWork, the klusterlet pulls it, and within 30 seconds the spoke reports compliance — whether the `OperatorHub/cluster` resource has `disableAllDefaultSources: true` or not. If it doesn't, the report is `NonCompliant` and you see a line in the Governance dashboard. Flip to `enforce` once you trust the report.
+
+## `PolicyGenerator`
+
+Maintaining hundreds of policies as raw YAML is a maintenance burden. Each policy needs its own wrapper boilerplate; you copy-paste the same `spec.disabled`, `spec.policy-templates`, the same wrapping `ConfigurationPolicy`. By 50 policies the repetition has become noise.
+
+The `PolicyGenerator` is a Kustomize plugin that lets you author the **desired state** as plain Kubernetes manifests and wraps them into Policies at kustomize-build time. The input:
+
+```yaml
+# policy-generator.yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: PolicyGenerator
+metadata:
+  name: pci-baseline
+policyDefaults:
+  namespace: openshift-gitops
+  remediationAction: inform
+  severity: medium
+  placement:
+    placementName: gitops-managed
+policies:
+  - name: require-default-deny-ingress
+    manifests:
+      - path: input/default-deny-ingress-netpol.yaml
+  - name: disable-default-operatorhub
+    manifests:
+      - path: input/operatorhub-disable-defaults.yaml
+```
+
+Where `input/default-deny-ingress-netpol.yaml` is just a `NetworkPolicy` manifest. The generator runs at `kustomize build` and produces the wrapped Policy + ConfigurationPolicy + PlacementBinding YAML. Argo CD reconciles the generated output as if you'd written it by hand.
+
+Use `PolicyGenerator` once your policy count crosses ~10 and you start copy-pasting wrappers. The author-as-manifest model makes the policies grep-able by what they declare instead of by their wrapping boilerplate.
+
+## PolicySet
+
+A `PolicySet` is a named group of Policies — used to bind a coherent audit posture (PCI-DSS, NIST 800-53, internal-baseline) to a Placement with one PlacementBinding instead of N:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1beta1
+kind: PolicySet
+metadata:
+  name: pci-dss-fleet
+  namespace: openshift-gitops
+spec:
+  description: PCI-DSS-aligned fleet policies for the v6 OpenShift fleet
+  policies:
+    - disable-default-operatorhub
+    - require-default-deny-ingress-netpol
+    - require-fips-mode
+    - require-etcd-encryption
+```
+
+You then bind the PolicySet (not the individual Policies) to your Placement. The lab's [PCI-DSS profile baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline) is the right context — ACM PolicySets pair with OpenShift Compliance Operator scans to give you both *the desired state* (PolicySet) and *the audit evidence* (compliance-operator scan results) for the same controls. They're complementary, not redundant.
+
+## Evaluation cadence and performance
+
+`ConfigurationPolicy.spec.evaluationInterval` controls how often the controller re-evaluates the policy on each spoke. The default for `Compliant` policies is 10 seconds; for `NonCompliant` policies, 30 seconds. A spoke with 50 policies, each evaluating every 30s, is doing ~100 controller wake-ups per minute — not a problem on a healthy cluster, but worth thinking about at scale.
+
+Two performance traps:
+
+- **Wide `object-templates` with no namespace selector.** A template that says *"every Pod must have a `tier` label"* runs a list of every Pod on every evaluation. On a cluster with 10,000 Pods this dominates the controller's CPU. Mitigations: narrow the `namespaceSelector`, or use the `mustnothave` form (which is cheaper because it only needs to find one counterexample to fail).
+- **Templates with expensive Go-template expressions** (`{{ lookup }}` against the API). Each evaluation hits the API server. Cache where possible; mark policies as longer-interval where compliance-quality-of-life is more important than near-real-time enforcement.
+
+For policies that don't need 30-second freshness, bump `evaluationInterval.compliant: 5m` to cut the load.
+
+## Compliance dashboards
+
+The ACM Governance dashboard at *Governance → Policies* aggregates per-policy compliance across every targeted cluster. You see:
+
+- Which policies are `Compliant` vs `NonCompliant` cluster-wide.
+- For each `NonCompliant` policy, which clusters are non-compliant.
+- For each non-compliant cluster, the human-readable reason (the `ConfigurationPolicy.status.compliancyDetails[].conditions[].message`).
+
+Wire this to your alerting if you care about drift. *"PolicySet `pci-dss-fleet` has any cluster `NonCompliant` for more than 10 minutes"* is the canonical Alertmanager rule. Cross-link [`/docs/openshift-platform/compliance/`](/docs/openshift-platform/compliance) for how the lab pairs ACM governance with Compliance Operator scans.
+
+## Try this
+
+Four exercises, escalating from read to break-and-fix.
+
+**1. Write a Policy that requires every namespace to have a `cost-center` label.** Use `complianceType: musthave` with an `object-templates` entry that asserts a `metadata.labels.cost-center` on a `Namespace` object. Start with `remediationAction: inform`.
+
+**2. Bind it to a Placement.** Write a PlacementBinding that targets the Policy at a Placement selecting `role=workload`. (You'll need a Placement that selects on `role=workload` first — write that too.)
+
+**3. Flip from inform to enforce, observe the propagation.** Watch `Policy.status.status[]` on the hub change from `NonCompliant` to `Compliant` as the config-policy-controller patches namespaces on each spoke. Use `oc get policy <name> -n openshift-gitops -o yaml | yq '.status'` on the hub to inspect.
+
+**4. Break it deliberately.** On one spoke, `oc label namespace some-ns cost-center-` (the trailing `-` removes the label). Watch the Policy go `NonCompliant` for that cluster, then (since you're in `enforce`) re-converge within 30 seconds. The Governance dashboard should show the brief blip.
+
+## Common failure modes
+
+**Policy stuck `NoStatus` on the hub.** The policy was created but no cluster ever reported back. Almost always: the PlacementBinding is missing, or the Placement returns zero decisions. Check:
+
+```bash
+oc -n openshift-gitops get placement <name>
+oc -n openshift-gitops get placementdecision -l \
+  cluster.open-cluster-management.io/placement=<name> -o yaml
+```
+
+If `PlacementDecision` lists no clusters, fix the Placement selector or the ManagedCluster labels.
+
+**Policy `NonCompliant` but `enforce` doesn't act.** The most common cause: another controller owns the resource. Argo CD with `selfHeal: true`, an operator's CSV-driven reconciler, the OpenShift Cluster Version Operator. ACM patches the resource; the other controller reverts it; ACM patches again; the controller reverts again. You get an infinite reconcile fight visible as the policy oscillating between `Compliant` and `NonCompliant` in dashboards. Fix: either the policy gives up ownership and informs only, or the conflicting controller is reconfigured (Argo CD `ignoreDifferences`, a `RetainPolicy` on the operator) to not fight the policy.
+
+**Policy stuck `NonCompliant` with `enforce`, no fight.** The `ConfigurationPolicy.object-templates` references an API the spoke doesn't have — a missing CRD, a wrong apiVersion. The controller can't enforce what doesn't exist. Fix: install the prerequisite (operator that ships the CRD) earlier in the GitOps sync-wave order, or condition the policy on the CRD's existence.
+
+**Status not reporting back at all.** `KlusterletAddonConfig.spec.policyController.enabled: false` on the spoke. Without this, ACM doesn't install `governance-policy-framework` on the spoke and policies never evaluate. Fix: set `enabled: true`, wait one reconcile, and the framework lands.
+
+**Orphaned replicated Policies after PlacementBinding deletion.** When you delete a Policy or its binding, the propagator is supposed to clean up the replicated copy in each spoke's namespace. Sometimes it doesn't — finalizers stuck, controller restart mid-cleanup. You see `policy.open-cluster-management.io.replicated.<name>` objects in spoke namespaces with no owner. Fix: `oc -n <spoke-ns> delete policy <name>.replicated --grace-period=0 --force`. The garbage collector will catch up.
+
+## Where this is heading
+
+You can now write a Policy, target it at a fleet, and watch compliance flow back. The same Placement primitive you just used for Policy is what drives **GitOps fan-out** in the next module — one ApplicationSet on the hub, N spoke Applications, one Placement deciding which clusters get what. Policy answers *"is the state correct?"*; GitOps answers *"how does the state get there?"*.
+
+**Next:** [Module 05 — GitOps integration](/learn/acm-multicluster/gitops-integration) — the push vs pull model decision, the `gitops-addon` mechanics, the Routes CRD trap, and ApplicationSet fan-out from the hub.
+
+## References
+
+- Open Cluster Management — governance and policy framework: [open-cluster-management.io/concepts/policy-framework/](https://open-cluster-management.io/concepts/policy-framework/)
+- Open Cluster Management — Policy controllers (config-policy, cert-policy, iam, operator): [open-cluster-management.io/concepts/policy/](https://open-cluster-management.io/concepts/policy/)
+- Red Hat ACM docs — Governance: [docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/)
+- PolicyGenerator (open-cluster-management-io): [github.com/open-cluster-management-io/policy-generator-plugin](https://github.com/open-cluster-management-io/policy-generator-plugin)
+- ACM policy collection (community policies): [github.com/open-cluster-management-io/policy-collection](https://github.com/open-cluster-management-io/policy-collection)
+- Lab docs — Policies and Placement: [/docs/openshift-platform/acm-multicluster/policies-and-placement](/docs/openshift-platform/acm-multicluster/policies-and-placement)
+- Lab docs — Compliance overview: [/docs/openshift-platform/compliance](/docs/openshift-platform/compliance)
+- Lab docs — PCI-DSS profile baseline: [/docs/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline)
