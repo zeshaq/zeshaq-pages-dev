@@ -1,0 +1,164 @@
+---
+title: "Hosted Control Planes and Cluster Pools"
+sidebar_label: "08 — HCP + ClusterPool"
+description: "Two patterns for many-clusters-quickly — HyperShift hosted control planes share one management cluster; ClusterPool keeps warm, hibernated, ready-to-claim clusters."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const accent = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const phaseEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge  = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const hcpNodes = [
+  { id: "mgmt",    position: { x: 60,  y: 200 }, data: { label: "Management cluster\n(ACM hub or dedicated)" }, style: ctrl },
+  { id: "hc1ns",   position: { x: 280, y: 80 },  data: { label: "namespace:\nclusters-tenant-a" }, style: accent },
+  { id: "hc1kas",  position: { x: 280, y: 160 }, data: { label: "kube-apiserver\n(Pods)" }, style: stage },
+  { id: "hc1etcd", position: { x: 280, y: 240 }, data: { label: "etcd\n(StatefulSet)" }, style: stage },
+  { id: "hc1ctrl", position: { x: 280, y: 320 }, data: { label: "kcm + scheduler\n(Pods)" }, style: stage },
+  { id: "np1",     position: { x: 540, y: 160 }, data: { label: "NodePool A\n(workers)" }, style: agent },
+  { id: "np2",     position: { x: 540, y: 280 }, data: { label: "NodePool B\n(workers)" }, style: agent },
+];
+
+export const hcpEdges = [
+  { id: "h1", source: "mgmt",   target: "hc1ns",   ...phaseEdge },
+  { id: "h2", source: "hc1ns",  target: "hc1kas",  ...phaseEdge },
+  { id: "h3", source: "hc1ns",  target: "hc1etcd", ...phaseEdge },
+  { id: "h4", source: "hc1ns",  target: "hc1ctrl", ...phaseEdge },
+  { id: "h5", source: "np1",    target: "hc1kas",  label: "join", ...pullEdge },
+  { id: "h6", source: "np2",    target: "hc1kas",  label: "join", ...pullEdge },
+];
+
+Two problems sit next to each other on the multicluster roadmap. **One:** classic OpenShift install eats 3 control-plane nodes per cluster; 50 clusters is 150 control-plane VMs you don't strictly need. **Two:** provisioning a fresh cluster takes ~45 minutes, which is too slow for "give me a clean cluster for this PR" workflows.
+
+This module covers the two answers ACM ships for those problems. They solve different shapes — they're complementary, not alternatives.
+
+## Why hosted control planes (HCP)
+
+The classic OpenShift install has every cluster owning its own control plane: 3 master nodes running kube-apiserver, etcd, kube-controller-manager, scheduler. Add workers, and that's the cluster. For one or two clusters this is fine. At 50 clusters the math turns ugly: 150 master VMs, 150 etcd quorums to keep alive, 150 install pipelines to babysit.
+
+**HyperShift** (upstream) and **Hosted Control Planes** (the Red Hat-supported flavor) decouple control plane from data plane. The control planes become Pods on a single **management cluster** (which can be the ACM hub itself, or a dedicated one). The data plane is a separate set of bare workers that join those control planes over the network. A fresh cluster spins up in **~10 minutes** because there are no control-plane VMs to provision — just Pods to schedule and workers to ignition-boot.
+
+## Architecture
+
+A `HostedCluster` CR on the management cluster declares one hosted cluster. The HyperShift operator reads it and spawns:
+
+- A dedicated namespace (`clusters-<name>`) holding the control-plane workloads.
+- `kube-apiserver` Pods (HA-replicated as a Deployment).
+- `etcd` running as a StatefulSet inside the namespace.
+- `kube-controller-manager`, `scheduler`, the OpenShift controllers — all as Pods.
+- An exposed KAS endpoint (Route, LoadBalancer, or NodePort).
+
+A separate `NodePool` CR declares the data plane. The HCP operator generates ignition config; new workers boot, fetch ignition over the network, and join the cluster's kube-apiserver. Networking, ingress, storage are configured per-NodePool — so one HostedCluster can have one NodePool in AWS and another on bare metal.
+
+<Whiteboard client:load data={{ nodes: hcpNodes, edges: hcpEdges }} height={420} />
+
+Reading the diagram: the management cluster hosts the control plane as a namespaced collection of Pods; workers (the NodePools) live elsewhere and reach back over the network to join the kube-apiserver (dashed green = data-plane-initiated join).
+
+## Use cases
+
+HCP is a fit when one of these is true:
+
+- **Multi-tenant SaaS platforms.** One HCP per tenant gives each tenant their own kube-apiserver and RBAC boundary without provisioning a fleet of master VMs.
+- **Ephemeral CI environments.** Cluster up in 10 minutes, run the integration test, tear down. Cluster-life is short and frequent.
+- **Edge fleets with stable workers, dynamic control planes.** Many edge sites with the same worker pool, but the operator wants to roll new clusters of different OpenShift versions side-by-side. HCP lets you keep workers and rotate control planes independently.
+- **Resource consolidation.** When master-node CPU/RAM is the bottleneck — typical when you have many small clusters — collapsing all the control planes onto one well-provisioned management cluster recovers a real fraction of fleet cost.
+
+## The ACM angle
+
+ACM 2.x integrates HCP directly. When a `HostedCluster` reaches `Available=True`, ACM auto-registers it as a `ManagedCluster`. From that point it behaves like any other cluster in the fleet: Policies apply to it, ApplicationSets fan out to it, the Search index covers it, the observability addon attaches.
+
+This is the bit that makes HCP operationally cheap. You don't get a second cluster-management surface for hosted clusters — they ride the same fleet primitives as classic clusters.
+
+## Limitations
+
+HCP is upstream HyperShift; Red Hat ships a productized subset. As of 2026:
+
+- **AWS** and **bare-metal / AgentServiceConfig** are GA. These are the production-quality paths.
+- **vSphere**, **Azure**, **KubeVirt**, **OpenStack** are still maturing — some GA, some Tech Preview.
+- **MachineConfigOperator semantics change.** On classic clusters MCO reconciles node-level OS config via the control plane; on HCP the control plane has no nodes of its own, so MCO behaves differently. Treat that as "expect surprises if you have heavy MachineConfigPool customizations."
+- **etcd lives in the management cluster.** That means etcd's storage class, backup, and disaster-recovery strategy belong to the management cluster's operator — not the hosted cluster's. Plan accordingly.
+- **Single point of failure boundary.** Lose the management cluster, lose the control planes of every hosted cluster on it. The data planes keep running (apps don't notice) but you can't reconcile until the management cluster is back. Run the management cluster with the same care you'd give an aggregation hub.
+
+## Cluster Pools
+
+A different problem. Cluster Pools don't make control planes smaller — they make full clusters **available on demand**. A `ClusterPool` keeps a small inventory of pre-installed, **hibernated** clusters warm. When someone wants one, a `ClusterClaim` resumes one, assigns it, and (optionally) deletes it after a TTL.
+
+Use cases:
+
+- **Developer-on-demand clusters.** Engineer needs a clean cluster for an afternoon? `kubectl create -f claim.yaml`, get a fresh cluster in 30 seconds.
+- **CI integration test infrastructure.** Each PR claims a cluster, runs the suite, the cluster gets returned to the pool or destroyed.
+- **Ephemeral environments for stack testing** — when an HCP doesn't suffice because the test exercises platform components (MachineConfig, OperatorLifecycleManager, kubelet) that need real masters.
+
+## The mechanics
+
+A `ClusterPool` references:
+
+- A `ClusterImageSet` (the OCP version to install).
+- An InstallConfig template (provider, region, sizes, network).
+- A `size` (steady-state pool size) and optionally a `maxSize`.
+- Cloud credentials Secret.
+
+Hive (the install controller bundled with ACM) provisions clusters up to `size`, then hibernates each — stopping the cloud instances while keeping their state. Wake-up from hibernation is much faster than fresh install (typically under a minute on AWS, a few minutes on some other providers).
+
+A `ClusterClaim` does three things: pick a hibernated cluster from the pool, resume it, and bind it to a `ClusterDeployment` (eventually a `ManagedCluster` in ACM). Optional `lifetime` TTL on the claim auto-deletes the cluster after expiry. The pool refills behind it.
+
+```yaml
+apiVersion: hive.openshift.io/v1
+kind: ClusterClaim
+metadata:
+  name: pr-12345
+  namespace: ci-pool-ns
+spec:
+  clusterPoolName: aws-test-pool
+  lifetime: 4h
+```
+
+That's the entire user-facing object. Hive does the rest.
+
+## When you'd combine HCP and ClusterPool
+
+A development platform could reasonably use both:
+
+- **ClusterPool** for short-lived per-PR clusters where the test exercises classic-OCP-only behavior (MachineConfig changes, OperatorHub installs, kubelet flags). Full clusters needed; just need them fast.
+- **HCP** for tenant-isolated long-running environments. Each tenant gets a HostedCluster on the management cluster, with their own RBAC boundary, but you spend resources only on workers — no per-tenant control-plane VM bill.
+
+The split is on workload shape, not on time horizon: HCP is "smaller per-cluster footprint forever"; ClusterPool is "full cluster, fast, sometimes."
+
+## The lab's reality
+
+Neither HCP nor ClusterPool runs in the lab today. Both hub-dc-v6 and spoke-dc-v6 are classic full-OCP IPI installs on dl385 / dl380g10 hardware. ADR-0022 (`/docs/architecture-decisions/adr-0022-v6-fleet-purge/`) documents the v6 fleet decision, including the reserved-but-not-built DR pair — which is the canonical place HCP would shorten the build-out if/when it gets built.
+
+This module is intentionally forward-looking. The shapes here are what the lab would adopt if hosted control planes became cheaper to operate than a classic install pair, or if ClusterPool became the pattern for ephemeral CI infrastructure that the `opp-full-plat` pipeline wants. Neither is on the near-term roadmap, but both are within reach of the existing ACM install.
+
+## Try this
+
+These are thought experiments since the lab doesn't run either today:
+
+1. On a separate sandbox cluster (AWS or local KIND), install the HyperShift CLI (`hypershift install`). Provision one `HostedCluster` with two workers. Compare `kubectl get pods -n clusters-<name>` (control-plane Pods) against what a classic cluster runs on its masters (`oc get pods -n openshift-kube-apiserver` × three masters). Note CPU/RAM totals.
+2. Read the HCP `HostedCluster` reference under `https://hypershift-docs.netlify.app/`. Sketch what a 5-tenant SaaS would look like on one management cluster — namespace per tenant, Route per kube-apiserver, NodePool per tenant.
+3. Read the Hive `ClusterPool` reference. Draft a `ClusterPool` of size 5, OCP 4.18, AWS us-east-1, with 2-hour `ClusterClaim` lifetimes for CI. Estimate the AWS bill — hibernated EC2 (storage only) vs. running workers during a 2-hour claim. The cost-shape surprise here is what makes ClusterPool worth it or not.
+
+## Common failure modes
+
+- **HCP `NodePool` stuck `Ready=False, Reason=Joining`.** The worker can't reach the HCP's kube-apiserver endpoint. Check that the Route/LoadBalancer for the KAS is reachable from the worker's network, and that the ignition server is publishing config the worker can fetch.
+- **`HostedCluster` reports `EtcdAvailable=False`.** The etcd StatefulSet in the control-plane namespace lost quorum, usually because the management cluster's storage class can't keep up. etcd is unforgiving of latency; check `oc describe pvc` in the control-plane namespace.
+- **Hive `ClusterDeployment` timeout in the cloud-provider step.** Mismatched IAM permissions or missing service-linked roles. Hive surfaces the cloud-provider error on the `ClusterDeployment` status — read it before assuming a Hive bug.
+- **`ClusterClaim` resume cycle slow (minutes, not seconds).** The pool wasn't actually hibernated — the clusters are still running. Check `oc get clusterdeployment -A` and look for `powerState: Running` vs `Hibernating`. Hive's hibernation controller can fall behind on busy clusters.
+- **Hosted cluster shows up in ACM but Search index says empty.** The Search collector deploys on the hosted cluster like any other managed cluster; if it can't reach the hosted KAS from inside, it can't index. Same egress/DNS check as a classic spoke.
+
+## References
+
+- ACM Hosted Control Planes — `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/`
+- HyperShift upstream docs — `https://hypershift-docs.netlify.app/`
+- ACM Cluster Pools — `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/`
+- Hive operator — `https://github.com/openshift/hive`
+- OpenShift documentation — `https://docs.openshift.com/container-platform/latest/`
+- Lab — `/docs/architecture-decisions/adr-0022-v6-fleet-purge/`
+
+**Next:** Module 09 covers governance, compliance, and the Policy framework — how ACM enforces "every cluster must have this configuration" on the fleet you've now learned to ship apps to, observe, and grow.

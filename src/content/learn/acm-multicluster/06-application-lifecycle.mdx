@@ -1,0 +1,204 @@
+---
+title: "Application lifecycle across the fleet"
+sidebar_label: "06 — Application lifecycle"
+description: "Ship one declared workload to many clusters with a single ApplicationSet on the hub — generators, Placements, sync waves, and the lab's actual flow."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const phaseEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge  = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const fanoutNodes = [
+  { id: "git",     position: { x: 60,  y: 240 }, data: { label: "app-repo\n(kustomize overlays)" }, style: stage },
+  { id: "appset",  position: { x: 270, y: 240 }, data: { label: "ApplicationSet\n(cluster generator)" }, style: ctrl },
+  { id: "place",   position: { x: 270, y: 90 },  data: { label: "Placement\n(label predicate)" }, style: ctrl },
+  { id: "pdec",    position: { x: 480, y: 90 },  data: { label: "PlacementDecision\n(matched clusters)" }, style: ctrl },
+  { id: "app1",    position: { x: 500, y: 200 }, data: { label: "Application\nfor spoke-dc-v6" }, style: stage },
+  { id: "app2",    position: { x: 500, y: 280 }, data: { label: "Application\nfor spoke-dr-v6" }, style: stage },
+  { id: "argo1",   position: { x: 730, y: 200 }, data: { label: "spoke-dc-v6\nArgo CD" }, style: agent },
+  { id: "argo2",   position: { x: 730, y: 280 }, data: { label: "spoke-dr-v6\nArgo CD" }, style: agent },
+];
+
+export const fanoutEdges = [
+  { id: "f1", source: "git",   target: "appset", ...phaseEdge },
+  { id: "f2", source: "place", target: "pdec",   ...phaseEdge },
+  { id: "f3", source: "pdec",  target: "appset", label: "clusters", ...phaseEdge },
+  { id: "f4", source: "appset", target: "app1",  ...phaseEdge },
+  { id: "f5", source: "appset", target: "app2",  ...phaseEdge },
+  { id: "f6", source: "argo1", target: "app1",   label: "pull", ...pullEdge },
+  { id: "f7", source: "argo2", target: "app2",   label: "pull", ...pullEdge },
+];
+
+Module 05 set up GitOps and the pull model. Now we use it. The job: take one declared workload — a Helm chart, a kustomize overlay, a directory of YAML — and ship it to many clusters without copy-pasting an Argo `Application` per cluster.
+
+ACM gives you two ways. **ApplicationSet** (Argo CD-native) is what 80% of new work uses. **Subscription** (ACM's pre-Argo model) is still supported and worth a paragraph because some old manifests still wire it in. This module spends most of its time on ApplicationSet.
+
+## The two models, again
+
+| Model | Engine | When to pick |
+| --- | --- | --- |
+| **ApplicationSet** | Argo CD | Default. Git is the source, Argo is the engine, ACM provides the cluster inventory and placement. |
+| **Subscription** | ACM (pre-Argo) | Vanilla-Kubernetes managed clusters with no Argo, or maintaining legacy `application.app.k8s.io/v1beta1` Applications already wired in. |
+
+Both are "actively supported" in ACM 2.x. New work should pick ApplicationSet unless you have a concrete reason — and "we already wrote a Subscription five years ago" doesn't count.
+
+## ApplicationSet generators that matter for multicluster
+
+An `ApplicationSet` is a template plus one or more **generators**. The generator emits parameters; the template fills in those parameters and produces one `Application` per emission. The Argo CD documentation lists eight generators; four matter for multicluster work.
+
+### Cluster generator
+
+The primary fan-out tool. It emits one parameter set per registered Argo cluster, with optional filtering by a Placement (in ACM) or a label selector (vanilla Argo). One ApplicationSet, one Application per matched cluster, identical manifests applied everywhere.
+
+### List generator
+
+A fixed cartesian list of parameter sets. Useful for ad-hoc environments where the cluster list is short and human-curated — "deploy to staging-1, staging-2, perf-eu" — and you don't want a label-driven Placement.
+
+### Git generator (directory or file)
+
+Emits one parameter set per matching directory or YAML file in a Git repo. Useful when "the list of things to deploy" lives in Git as folders — for example, one folder per tenant. Combine with the cluster generator via the matrix generator to get "for every cluster, for every overlay, make an Application."
+
+### Pull-request generator
+
+Emits one parameter set per open pull request matching a filter. The review-app pattern: every PR gets a temporary deploy, every merge cleans it up. Rare in platform work, common in product engineering.
+
+### A matrix example
+
+This deploys three overlays (`dev`, `stg`, `prd`) of one Helm chart across every spoke labeled `env=dc`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: web-tenant
+  namespace: openshift-gitops
+spec:
+  generators:
+    - matrix:
+        generators:
+          - clusters:
+              selector:
+                matchLabels:
+                  env: dc
+          - git:
+              repoURL: https://gitlab.example/apps/web-tenant.git
+              directories:
+                - path: overlays/*
+  template:
+    metadata:
+      name: 'web-{{name}}-{{path.basename}}'
+    spec:
+      destination: { server: '{{server}}', namespace: 'web' }
+      source:
+        repoURL: https://gitlab.example/apps/web-tenant.git
+        path: '{{path}}'
+```
+
+For two spokes that's six Applications generated. Add a third cluster, you get nine — no edits.
+
+## Placement and labels
+
+`Placement` is ACM's cluster-selector primitive. Its job is producing a `PlacementDecision` — a list of `ManagedCluster` names that match the predicate. Argo's ApplicationSet cluster generator can consume that decision directly via the ACM integration.
+
+Predicates are label selectors. Common shapes:
+
+- `env=dc, role=spoke` — all production data-centre spokes.
+- `compliance=pci-dss` — the regulated subset.
+- `region in (eu-west, eu-central)` — geo fan-out.
+- `vendor=Red Hat, openshiftVersion>=4.18` — version-gated rollouts.
+
+ACM auto-labels managed clusters with `vendor`, `cloud`, `region`, `openshiftVersion`, and a few others. You add your own (`env`, `role`, `compliance`, `feature=experimental`) as flat-key labels on the `ManagedCluster` resource.
+
+The lab today runs one spoke, so its primary ApplicationSet has a trivial Placement that matches `cluster=spoke-dc-v6` and emits exactly one decision. See `/docs/openshift-platform/gitops-operating-model/application-and-applicationset/` for the actual definition. The shape is identical to a fleet of fifty — the predicate just gets more selective.
+
+<Whiteboard client:load data={{ nodes: fanoutNodes, edges: fanoutEdges }} height={420} />
+
+Reading the diagram: the Placement and PlacementDecision live on the hub; the ApplicationSet templates one Application per matched cluster; each spoke's local Argo (the pull-model agent) reaches up and reconciles its assigned Application against the Git repo.
+
+## The Subscription model, briefly
+
+A `Subscription` on the hub points at a Helm chart or a Git path; a `Channel` resource describes where to discover updates; a `SubscriptionAdmin` controls which subscriptions can deploy where. ACM aggregates the rolled-up deployments into an `application.app.k8s.io/v1beta1` Application for the console view.
+
+It predates ACM's Argo CD integration and still works fine. The cases where it earns its keep:
+
+- Managed clusters running plain Kubernetes (no Argo CD operator installed).
+- Existing operational habits and dashboards built around the old model.
+- Helm-chart fan-out where the chart already lives in a Helm repo and re-wrapping it in an ApplicationSet feels like overhead.
+
+If you're starting fresh on OpenShift, pick ApplicationSet. The console even surfaces ApplicationSet-generated Applications inside the same `application.app.k8s.io` view, so the UX gap is small.
+
+## The promotion problem
+
+ApplicationSet does not have promotion semantics. It fans out *the same Application* — pointed at *the same Git ref* — to every matched cluster. There is no built-in "promote from dev to staging" knob.
+
+The pattern that works: your **app-repo** holds kustomize overlays per environment, each pinned to a specific image digest. The ApplicationSet's `path` parameter changes per environment, so `env=dev` clusters get `overlays/dev`, `env=prd` clusters get `overlays/prd`. Promotion = a PR to the app repo that bumps the prd overlay to the digest currently running in stg.
+
+See `/docs/application-delivery/build-paths/build-once-promote-by-digest/` for how the lab wires this. The short version: CI builds once, tags an image digest, opens a PR to bump the next env's overlay to that digest, a human approves the PR, ArgoCD reconciles.
+
+## Sync waves and dependencies
+
+Argo's `argocd.argoproj.io/sync-wave` annotation orders manifests within a single Application sync. Lower wave numbers go first. Managed-cluster Applications inherit this — when the spoke's Argo reconciles, it respects the same waves.
+
+The lab's documented convention (`/docs/openshift-platform/gitops-operating-model/sync-wave-conventions/`) reserves:
+
+- **Wave 1** — cert-manager, namespace setup.
+- **Wave 2** — External Secrets Operator (ESO).
+- **Wave 3** — `ClusterSecretStore` and tenant `SecretStore` resources.
+- **Wave 10** — operator installs and CR roll-outs.
+- **Wave 20** — application workloads that need the operators above.
+
+You almost never see waves 4–9 used in the lab; the gap is room to wedge in new platform layers without renumbering.
+
+## Drift handling
+
+Argo's `selfHeal: true` reverts manual edits. `prune: true` removes resources that were dropped from Git. Both are typical for managed-cluster Applications, because the whole point of pull-model GitOps is that the cluster matches Git, not the operator's last hotfix.
+
+There are a few cases where you turn drift on its head with `ignoreDifferences`:
+
+- Fields that controllers default at admission time (`spec.clusterIP`, `metadata.uid`).
+- Fields a mutating webhook rewrites — for example, a service mesh injecting sidecar annotations.
+- Replica counts when a HorizontalPodAutoscaler owns them.
+
+The lab's pattern: write the `ignoreDifferences` block once in a shared base, not per Application. Drift exceptions that proliferate are a smell — usually it means a controller is fighting GitOps and you should pull that controller's config into Git instead.
+
+## The lab's actual flow
+
+On hub-dc-v6, the `openshift-gitops` instance hosts a small set of ApplicationSets in `clusters/hub-dc-v6/gitops-control/` (in the `platform-gitops` repo):
+
+- **`platform-bootstrap`** — the day-one stack for any spoke (operators, ESO, cert-manager, monitoring addons).
+- **`app-tenants`** — generates one tenant scaffolding Application per tenant directory.
+- **`placementdecision-rbac`** — issues the spoke-side ClusterRole bindings that the pull-model Argo extension needs.
+
+The spoke runs its own `openshift-gitops` (the pull-model agent). It receives Applications generated on the hub via the gitops-addon, then reconciles each one against Git directly — no manifest ever flows through the hub at runtime. ACM's job stops at "here is the Application you should be reconciling"; Argo on the spoke does the rest.
+
+## Try this
+
+1. Read the lab's ApplicationSet definitions for `app-tenants` and `placementdecision-rbac` in `clusters/hub-dc-v6/gitops-control/` of `platform-gitops`. Trace one tenant from the generator to the spoke Application it produces.
+2. Add a label `feature=experimental` to one spoke (`oc label managedcluster spoke-dc-v6 feature=experimental`). Write a Placement that selects only `feature=experimental` and watch a PlacementDecision get produced. Remove the label, see the decision empty out.
+3. Build a matrix-generator ApplicationSet that deploys three overlays of one Helm chart across two clusters. Compare the count of generated Applications to what you predicted on paper.
+
+## Common failure modes
+
+- **Generator generates, but the templated Application stays Unknown / OutOfSync.** The spoke's Argo lacks RBAC for the resource kind. See Module 05 — the `argocd-platform-extensions` ClusterRole consolidates the API groups the spoke needs. Add the missing API group, restart the spoke's Argo application-controller.
+- **PlacementDecision is empty.** Your predicate matches nothing. Run `oc get managedcluster --show-labels` and compare against the selector.
+- **An old `DeployableSubscription` shows up alongside an Application.** Pre-Argo subscription path is still wired in some old manifests. Decide: rewrite the manifest as an ApplicationSet, or leave the Subscription alone — but don't run both for the same workload, they will fight.
+- **`metadata.name` collisions in the template.** Matrix generators can produce duplicate names if you forget to interpolate every dimension into the name. Always include `{{name}}` (cluster) and `{{path.basename}}` (overlay) or you'll get one Application overwriting another.
+- **selfHeal reverts something a human needs to set live.** That's the whole point of selfHeal. Either move the setting into Git, mark the field `ignoreDifferences`, or accept that selfHeal will keep undoing the change.
+
+## References
+
+- ACM application lifecycle docs — `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/`
+- Argo CD ApplicationSet generators — `https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators/`
+- Argo CD sync waves and resource hooks — `https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/`
+- Open Cluster Management Placement API — `https://open-cluster-management.io/concepts/placement/`
+- Lab — `/docs/openshift-platform/gitops-operating-model/application-and-applicationset/`
+- Lab — `/docs/openshift-platform/gitops-operating-model/sync-wave-conventions/`
+- Lab — `/docs/application-delivery/build-paths/build-once-promote-by-digest/`
+
+**Next:** [Module 07 — Observability and Search](/learn/acm-multicluster/observability-and-search) covers what to do once Applications are landing on many clusters and you want one screen to see them all.
