@@ -166,6 +166,69 @@ The conceptual model above is portable. The lab's wiring is specific:
 
 For the lab-specific ACM component wiring, see the platform docs at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub) and [/docs/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/acm-multicluster/managedcluster-registration).
 
+## Day-1 install walkthrough
+
+Knowing the components is half the job; the other half is putting them on a cluster. Day-1 means the hour where you turn an empty OpenShift cluster into a working ACM hub. Two paths exist, the install has a few load-bearing prerequisites, and the post-install checks are short enough to memorise.
+
+### Prerequisites on the hub
+
+Before you start, the hub OpenShift cluster has to satisfy a small list:
+
+- **OpenShift version.** RHACM 2.13 supports OpenShift 4.14 and later. Older 4.x will refuse to install the operator, and the failure is usually a confusing `Subscription` event rather than an explicit version error. Check `oc get clusterversion` first.
+- **Storage class for search.** If you enable the search component, its PostgreSQL needs a default `StorageClass` that gives it SSD-class IO. Spinning disks make the index sluggish and queries time out under load. The lab disables search outright on `hub-dc-v6`, but if you keep it on, point it at NVMe-backed ODF or an equivalent.
+- **Object storage for observability.** Enabling observability requires an S3-compatible bucket — Thanos receive writes blocks there. The lab uses NooBaa over MinIO; on cloud, plain S3 or Azure Blob via the S3 gateway works. No object store, no observability.
+- **Network reachability.** Every managed cluster must be able to reach the hub's kube-apiserver on TCP 6443. The hub never connects to managed clusters; everything is spoke-initiated. DNS, firewall rules, and the hub's API endpoint (`api.<hub>.<domain>`) need to be resolvable and routable from every spoke before you import anything.
+
+Skipping the storage and reachability checks is the most common cause of an install that looks healthy on the hub but is dead the moment you try to import a cluster.
+
+### Two install paths
+
+You can install ACM through the OpenShift console or through GitOps. The two paths produce identical resources; the difference is who owns the manifests.
+
+**Path A — Operator Hub.** Open the OpenShift web console, go to *OperatorHub*, and filter for *Advanced Cluster Management for Kubernetes*. Pick the certified Red Hat tile, install cluster-scoped, choose the `release-2.16` channel (or whichever minor your fleet has standardised on), and let the Subscription land in `open-cluster-management`. After the operator install completes, go to *Installed Operators → Advanced Cluster Management → MultiClusterHub*, click *Create MultiClusterHub*, and submit the default form. This is the fastest path for a one-off hub.
+
+**Path B — GitOps (recommended for fleet ops).** Author a `Namespace`, `OperatorGroup`, `Subscription`, and `MultiClusterHub` manifest, commit them to `platform-gitops` under `clusters/<hub>/platform/acm/`, and let Argo CD apply them with sync waves so the Subscription lands before the MCH CR. This is what the lab does — the actual manifests are documented at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub). The advantage is reproducibility: tear the hub down, re-install, and the same component set comes back.
+
+Pick GitOps if you operate more than one hub or expect the install to be re-run.
+
+### MultiClusterHub CR — the shape
+
+The MCH CR is the single declaration that turns RHACM on. The minimal shape:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: MultiClusterHub
+metadata:
+  name: multiclusterhub
+  namespace: open-cluster-management
+spec:
+  availabilityConfig: High
+  disableHubSelfManagement: false
+  imagePullSecret: open-cluster-management-image-pull-credentials
+```
+
+Field by field: `availabilityConfig` is `High` (two replicas per controller) or `Basic` (single replica); pick `Basic` only for a sandbox. `disableHubSelfManagement: false` keeps the hub registered as a `ManagedCluster` named `local-cluster`, which the lab needs so the hub's `GitOpsCluster` can target the local Argo destination. `imagePullSecret` is a pull secret in `open-cluster-management` that the operator can use to fetch ACM images — usually the same one the hub's global pull secret uses. Optional fields worth knowing: `nodeSelector` and `tolerations` to pin controllers onto infra nodes, and `customCAConfigmap` to inject your private CA bundle into ACM components when the hub trusts a non-public PKI.
+
+### Watching the install
+
+Once the MCH CR exists, the operator unrolls the rest. The `oc get multiclusterhub -A` output progresses from `Installing` to `Running` in roughly five to ten minutes, depending on how many components you enabled. While it's installing, `oc get pods -n open-cluster-management` shows the cascade — roughly fifteen controllers come up across the registration, work, governance, and console pillars. The ones to watch by name are the cluster-manager (registration), the governance-policy-propagator, the console plugin (`acm-console-*`), and — if you enabled them — the search-collector and observability controller. If any one of these is stuck `ContainerCreating` for more than a couple of minutes, look at events on the pod; it's usually a missing secret or storage class.
+
+### The lab's install posture
+
+`hub-dc-v6` runs MCH with `disableHubSelfManagement: false`, the opposite of what you might expect for a control-plane-only hub. The reason is GitOps: the hub's Argo CD instance targets `local-cluster` as a destination, so the hub must be a `ManagedCluster` of itself. The hub's enabled-component set is deliberately small — registration, work, placement, app-lifecycle, GRC, console, cluster-permission, cluster-lifecycle — with search, observability, insights, and the backup operator left off until they're needed. The full component table and the actual Subscription + MCH YAML are at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub).
+
+### Post-install checks
+
+Three checks tell you the hub is genuinely ready, not just `Running`:
+
+```bash
+oc get multiclusterhub -n open-cluster-management -o jsonpath='{.items[0].status.phase}{"\n"}'
+oc get managedcluster local-cluster
+oc get crd | grep cluster.open-cluster-management.io | wc -l
+```
+
+The MCH phase should read `Running`. The `local-cluster` ManagedCluster should exist with `HUB ACCEPTED=true` (or be absent entirely if you set `disableHubSelfManagement: true`). The CRD count for `cluster.open-cluster-management.io` should be in the dozens — the install registers a couple of dozen CRDs across registration, work, placement, addon, and governance APIs. If you see fewer than fifteen, something stalled mid-install. The console plug-in is the last thing to register; reload the OpenShift web console and the *All Clusters* dropdown in the top-left header is your visual confirmation.
+
 ## Where things go wrong, architecturally
 
 If you're going to debug this, you'll be looking at three places.

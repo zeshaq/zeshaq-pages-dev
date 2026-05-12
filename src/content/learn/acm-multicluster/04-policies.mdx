@@ -230,6 +230,166 @@ Two performance traps:
 
 For policies that don't need 30-second freshness, bump `evaluationInterval.compliant: 5m` to cut the load.
 
+## Compliance Operator across the fleet
+
+ACM's native `ConfigurationPolicy` is good at *"this resource must look like this"*. It is not good at *"every node's sshd is configured per CIS"* or *"the kube-apiserver audit policy meets PCI-DSS v4.0.1 control 10"*. For those, you reach for the OpenShift Compliance Operator — and for *those, applied across a fleet*, you wrap the Compliance Operator in ACM policies.
+
+### The operator, briefly
+
+The Compliance Operator is an OpenShift-Plus operator that runs **per cluster** in `openshift-compliance`. It uses OpenSCAP to scan both the OpenShift control plane (against profiles like `ocp4-cis`, `ocp4-pci-dss-4-0`, `ocp4-nist-800-53`, `ocp4-moderate`) and the RHCOS nodes (against the matching `*-node-*` profile). For every rule the scan evaluates, it emits a `ComplianceCheckResult` CR with a PASS, FAIL, or MANUAL verdict and an optional `ComplianceRemediation` CR that, if applied, fixes the failing config. The lab's worked walkthrough is at [/docs/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline).
+
+The operator is *per cluster* because OpenSCAP needs node access to scan kernel parameters, sshd config, and file permissions. There is no fleet-wide flavour of it. What ACM contributes is the **fleet-wide installation, configuration, and result aggregation** layer on top.
+
+### How ACM wraps it
+
+ACM does not install or extend the operator. It deploys and configures it across the fleet by way of Policy CRs. The lab's pattern is a `PolicySet` named something like `compliance-operator-baseline` that contains three or four Policies:
+
+1. **Install policy.** A `ConfigurationPolicy` whose `object-templates` declare the `Namespace`, `OperatorGroup`, and `Subscription` for the Compliance Operator on every selected cluster. This is exactly the three-CR pattern from Chapter 3 of the DO432 source, but written once on the hub and fanned out.
+2. **ScanSetting policy.** A `ConfigurationPolicy` that creates a `ScanSetting` CR pinning the result-server pod onto worker nodes (avoids the RBD-on-master attach failures that bit old `spoke-dc` — see [/docs/openshift-platform/compliance/scansetting-and-bindings](/docs/openshift-platform/compliance/scansetting-and-bindings)), specifies a schedule, sets the retention policy, and reserves storage for the results.
+3. **ScanSettingBinding policy.** A `ConfigurationPolicy` whose `object-templates` declare a `ScanSettingBinding` that ties a `TailoredProfile` (PCI-DSS v4 with the lab's exclusions) to the `ScanSetting` from step 2.
+4. **(Optional) Remediation-application policy.** A `ConfigurationPolicy` setting `applyRemediations: true` on the suite when you trust the operator's auto-fixes for low-risk findings.
+
+All four bind to the same `Placement` that selects clusters needing compliance scanning — in the lab, that's `gitops-managed=true` plus a `compliance=pci-dss` label so opt-in is explicit.
+
+### Why TailoredProfile matters
+
+A stock profile ships rules written against an idealised cluster shape. Real clusters have legitimate exceptions: a rule that demands every Route use a custom signer when ODF's noobaa-mgmt route is reconciled back to the cluster-issuer; a rule that flags `kubernetes.io/cluster-service: "true"` on a namespace that the lab actually wants tagged that way; a rule that disables IPv6 at the kernel level, which would break OVN-Kubernetes ([ADR 0026](/docs/architecture-decisions/adr-0026-ipv6-baseline)).
+
+A `TailoredProfile` lets you say *"start from `ocp4-pci-dss-4-0`, disable rules X and Y, set variable Z to value W, and record why."* The disabled-rule list is small but load-bearing. The lab's PCI-DSS v4 tailored profile excludes a handful of rules with documented rationale — the `CSO` (cluster-service-objects) tagging rule and the `ingress-ciphers` rule are two of them, each tied to a specific lab decision rather than a relaxation of the standard. The full list and the rationale-per-exclusion is at [/docs/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline).
+
+Without tailoring, you either accept perpetual FAILs that aren't real findings, or you exclude rules cluster-by-cluster — both terrible. With tailoring, the exclusion is one CR per profile per fleet, written down, reviewable in Git.
+
+### A small Policy that wraps a ScanSettingBinding
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: pci-dss-scan-binding
+  namespace: openshift-gitops
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: pci-dss-scan-binding
+        spec:
+          remediationAction: enforce
+          severity: high
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: compliance.openshift.io/v1alpha1
+                kind: ScanSettingBinding
+                metadata:
+                  name: pci-dss
+                  namespace: openshift-compliance
+                profiles:
+                  - apiGroup: compliance.openshift.io/v1alpha1
+                    kind: TailoredProfile
+                    name: pci-dss-4-0-lab
+                settingsRef:
+                  apiGroup: compliance.openshift.io/v1alpha1
+                  kind: ScanSetting
+                  name: workers-storage
+```
+
+Read what's load-bearing: the `profiles` list references a `TailoredProfile` (not a stock `Profile`), and `settingsRef` references the lab's `workers-storage` ScanSetting (not `default`). Both are created by sibling Policies in the same set, ordered with sync waves so the operator's CRDs land before any binding is attempted.
+
+### The feedback loop
+
+When a `ComplianceScan` finishes, it emits one `ComplianceCheckResult` per rule. ACM's spoke-side policy controllers don't watch those directly. Instead, you write a follow-up `ConfigurationPolicy` with `complianceType: mustnothave` against `ComplianceCheckResult` objects labelled `compliance.openshift.io/check-status: FAIL`. *"There must not exist a failing PCI-DSS result"* becomes the spoke's compliance status, which the propagator's status-sync reports back to the hub. The Governance dashboard now shows PCI-DSS pass/fail per cluster, and the per-policy drilldown shows which rules failed where.
+
+This is how the same dashboard you use for `OperatorHub` and `NetworkPolicy` drift also shows you PCI control coverage. The Compliance Operator is the inspector, ACM is the foreman.
+
+### Why structurally it matters
+
+A fleet of twenty clusters without RHACM means: twenty Subscriptions, twenty OperatorGroups, twenty `ScanSettingBindings`, and twenty places to update when a `TailoredProfile` exclusion is added. With RHACM: one PolicySet, one Placement, twenty `PlacementDecisions`. The exclusion change is one MR in `platform-gitops`. The audit posture is one dashboard.
+
+This is the structural payoff. ACM doesn't make the Compliance Operator smarter; it makes the *operation* of running it across many clusters tractable.
+
+### Try this
+
+Open the lab's PolicySet for the compliance-operator baseline (under `platform-gitops/policies/compliance-operator-baseline/`). Identify:
+
+1. The Policy that installs the operator. Look at its `object-templates` — the three required objects should be there in `musthave` form.
+2. The Policy that creates the `TailoredProfile`. Find one excluded rule. Trace the rationale back to a docs page or ADR.
+3. The `Placement` that selects the target clusters. Confirm it carries `compliance=pci-dss` as a required label.
+4. The follow-up `mustnothave` `ConfigurationPolicy` that surfaces failing `ComplianceCheckResult`s as compliance status.
+
+If any one of those four is missing, you have a fleet that *installs* the operator but doesn't *use* it.
+
+## External policy engines — Gatekeeper and Kyverno wrapped in Policy CRs
+
+`ConfigurationPolicy` covers the *"this resource must exist with this shape"* case well. It does not cover everything. *"No Deployment may run as UID 0 unless its namespace has a `security-exception` label."* *"Every Pod in a tenant namespace must inherit the imagePullSecret from its ServiceAccount."* *"Block Pods whose images come from registries outside the allowed prefix list."* All of these are easier to express in OPA Rego (Gatekeeper) or Kyverno's policy DSL than in `object-templates`.
+
+### The two-engine pattern
+
+ACM does not replace Gatekeeper or Kyverno. It wraps them. The pattern is two layers deep:
+
+- **Outer ACM Policy** ensures the engine's operator is installed on each selected cluster and that a specific set of policy resources (Gatekeeper `ConstraintTemplate` and `Constraint`, or Kyverno `ClusterPolicy`) exists.
+- **Inner engine policy** is the thing that actually runs at admission time. Gatekeeper evaluates Rego per webhook call; Kyverno evaluates its DSL the same way.
+
+ACM's role is propagation and inventory. The engine does the validation. The two are complementary, not duplicate.
+
+The lab runs Red Hat's Gatekeeper Operator on `spoke-dc-v6` already — see [/docs/openshift-platform/platform-services/gatekeeper](/docs/openshift-platform/platform-services/gatekeeper). The install was hand-rolled because there was only one spoke; if a second spoke ever arrives, the install gets wrapped in an ACM Policy and fanned out via Placement.
+
+### A worked example using PolicyGenerator
+
+The cleanest way to ship a Gatekeeper template + constraint via ACM is the `PolicyGenerator`: author the underlying manifests as plain YAML, point the generator at them, and let it wrap them as Policy at kustomize-build time.
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: PolicyGenerator
+metadata:
+  name: require-cost-center-label
+policyDefaults:
+  namespace: openshift-gitops
+  remediationAction: enforce
+  severity: medium
+  placement:
+    placementName: gitops-managed
+policies:
+  - name: require-cost-center-on-namespace
+    manifests:
+      - path: input/k8srequiredlabels-template.yaml
+      - path: input/cost-center-constraint.yaml
+```
+
+`input/k8srequiredlabels-template.yaml` is the same `ConstraintTemplate` the lab already uses (`K8sRequiredLabels`); `input/cost-center-constraint.yaml` is a constraint of that kind matching `Namespace` objects with `parameters.labels: ["cost-center"]`. At build time, `PolicyGenerator` produces a `Policy` whose `policy-templates` list contains both objects wrapped in `ConfigurationPolicy` shells. The propagator fans the result out, the spoke's klusterlet pulls it, the config-policy-controller materialises the `ConstraintTemplate` and the `Constraint`, and Gatekeeper picks them up from that point on.
+
+The same pattern works for Kyverno. An ACM Policy wraps a `kyverno.io/v1` `ClusterPolicy` manifest; the spoke needs the Kyverno operator installed (also via an ACM Policy); the `ClusterPolicy` activates on the spoke as soon as the CRDs exist.
+
+### When to pick which engine
+
+| Engine | Best at | Cost |
+| --- | --- | --- |
+| ACM `ConfigurationPolicy` | Drift detection, simple state assertions, status reporting | None beyond the policy controller |
+| Gatekeeper | Hardcore allow/deny at admission, audit of violations, Rego logic | Webhook latency per admission |
+| Kyverno | Allow/deny *plus* mutation and generation (auto-inject imagePullSecret, create default NetworkPolicy on namespace creation) | Webhook latency; mutation has audit implications |
+
+If the rule is *"this should be true"*, write a `ConfigurationPolicy`. If the rule is *"this must be true at admission and we want a deny-with-reason"*, write Gatekeeper. If the rule needs to *change* the request before letting it through, write Kyverno. The lab uses all three layers: ValidatingAdmissionPolicy for the cheapest cases (CEL, in-process), Gatekeeper for Rego-driven audit and deny, and ACM `ConfigurationPolicy` for drift detection. Defense-in-depth, not replacement.
+
+### Limitations to plan around
+
+External engines run on each spoke. Their evaluation results live on each spoke. ACM's Governance dashboard knows about its own `Policy` compliance status; it does *not* natively aggregate Gatekeeper `Constraint.status.violations` or Kyverno `PolicyReport` objects across the fleet. You get fleet-wide *installation* through ACM; you do not get fleet-wide *violation reporting* for free.
+
+The workaround is to scrape constraint status into Prometheus on the spoke (Gatekeeper exposes audit metrics out of the box), federate those metrics to the hub or to a side-Grafana, and read fleet-wide constraint compliance there. The lab plans this for when the Gatekeeper deployment expands beyond one spoke; today, the spoke's own Grafana is enough.
+
+A second limitation: when ACM Policy is set to `enforce` and the wrapped Gatekeeper Constraint has `enforcementAction: deny`, you have two enforcing layers on the same rule. That's fine, but if they disagree about scope — say, the ACM Policy is bound to a Placement covering only prod, but the wrapped Constraint matches all namespaces — the Constraint will keep enforcing on dev clusters until the ACM Policy converges to remove it. Match scopes carefully.
+
+### Try this
+
+Write a small `PolicyGenerator` config locally that bundles:
+
+- A Gatekeeper `ConstraintTemplate` of kind `K8sRequiredLabels`.
+- A `K8sRequiredLabels` Constraint that matches `Namespace` resources and requires the label `team`.
+
+Run `kustomize build` against the directory, inspect the generated `Policy` YAML, and confirm that both manifests appear inside `policy-templates`. Then apply against the hub and watch the generated `Policy` propagate to the spoke; on the spoke, `oc get constrainttemplate,k8srequiredlabels` should show both resources, and any new namespace without a `team` label should now be rejected at admission.
+
 ## Compliance dashboards
 
 The ACM Governance dashboard at *Governance → Policies* aggregates per-policy compliance across every targeted cluster. You see:
