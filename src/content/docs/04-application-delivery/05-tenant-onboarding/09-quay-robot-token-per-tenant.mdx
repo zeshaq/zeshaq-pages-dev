@@ -1,0 +1,265 @@
+---
+title: "Per-tenant Quay robot token"
+description: "Path B Tekton push credential — Vault path secret/apps/<division>/<app>/ci/quay-robot, ESO into openshift-pipelines as a dockerconfigjson Secret quay-robot-team-<team>, consumed by the shared push-image-quay Task via a parameter."
+sidebar_label: "Quay robot token"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+The Path B (Tekton) build pipeline pushes images to the in-cluster Red Hat Quay registry. Each push needs a write-scoped credential, and the canonical convention is **one per-tenant Quay robot token**, stored in Vault under the tenant's `ci/` subtree and materialised into `openshift-pipelines` as a `kubernetes.io/dockerconfigjson` Secret. The shared `push-image-quay` Tekton Task accepts the Secret name as a parameter, so there's no per-task duplication.
+
+This is **not** the same credential as the runtime `app-registry-pull` (Nexus) Secret — runtime pull and CI push are different concerns with different credentials, scopes, and rotation cadences.
+
+## The shape
+
+| Resource | Where | Name | Scope |
+| --- | --- | --- | --- |
+| Vault path | `secret/apps/<division>/<app>/ci/quay-robot` | (KV-v2 path) | per (division, app); read by tenant's `vault-apps` SecretStore. |
+| Quay Robot Account | Quay Organization `team-<team>` | `<team>+ci` | `Write` permission on the team's repos, no read of other orgs. |
+| ESO `ExternalSecret` | `openshift-pipelines` namespace | `quay-robot-team-<team>` (renders a Secret of the same name) | namespace-scoped. |
+| Materialised Secret | `openshift-pipelines/quay-robot-team-<team>` | type `kubernetes.io/dockerconfigjson` | mounted by the `push-image-quay` Task per pipeline run. |
+| Tekton Task | `openshift-pipelines/push-image-quay` | shared | reads the Secret name as a parameter. |
+
+The split has three consequences:
+
+1. **Tenant isolation at the registry layer.** Tenant A's robot cannot push to Tenant B's Quay Organization because the robot is scoped at Organization-level inside Quay, not at the Kubernetes layer.
+2. **One shared Tekton Task, not one Task per tenant.** The Task parameter pattern means a new tenant adds one Vault path + one `ExternalSecret`, nothing in Tekton.
+3. **Rotation is per-tenant.** A leaked or stale robot token rotates in `secret/apps/<division>/<app>/ci/quay-robot` only — no cluster-wide blast radius.
+
+## Vault path convention
+
+```
+secret/apps/<division>/<app>/ci/quay-robot
+  ├── username        e.g. "team-payments+ci"
+  └── token           the long-lived robot token (Quay generates)
+```
+
+Examples:
+
+- `secret/apps/platform/quay-only-sample/ci/quay-robot`
+- `secret/apps/payments/checkout-api/ci/quay-robot`
+
+The `ci/` subpath signals "CI-time, not env-time" — these are not dev/stg/prd-scoped because the build pipeline pushes one image that promotes across envs by digest. See the [app-repo overlay contract](../04-gitops-consume/03-app-repo-overlay-contract) for how the digest pin works.
+
+## Step 1: create the Quay Robot Account
+
+In the Quay UI (`https://quay.apps.sub.comptech-lab.com`), under Organization `team-<team>`:
+
+1. Robot Accounts -> Create Robot Account.
+2. Name: `<team>+ci` (e.g. `payments+ci`). Quay forces the `<org>+<name>` shape.
+3. Add the robot to the team's repositories with `Write` permission. `Read` is implicit.
+4. Click the robot, copy the **`Docker Configuration`** view as JSON — that's the `dockerconfigjson` value.
+
+Alternatively, the platform ships a `scripts/quay-bootstrap-robot.sh` that does the three steps above against the Quay API and writes the result to Vault.
+
+## Step 2: seed Vault
+
+```bash
+vault kv put secret/apps/<division>/<app>/ci/quay-robot \
+  username="<team>+ci" \
+  token="<long-lived-token>"
+```
+
+The `token` is the robot's password; `username` is the full `<org>+<robot-name>` string Quay returned. Both are required for the `dockerconfigjson` template downstream.
+
+## Step 3: materialise the Secret in openshift-pipelines
+
+The tenant `vault-apps` SecretStore lives in the tenant's app namespace (e.g. `apps-payments-checkout`), not in `openshift-pipelines`. To bridge across namespaces, the platform ships a **second** narrowly-scoped Vault role + ESO `SecretStore` that lives in `openshift-pipelines` and reads only `secret/apps/*/*/ci/quay-robot` paths. Each tenant adds one `ExternalSecret` to that namespace.
+
+Or — the pattern used in practice — a single tenant-scoped `ExternalSecret` in `openshift-pipelines` per (division, app) reads via the `pipelines-vault-apps` SecretStore:
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: quay-robot-team-<team>
+  namespace: openshift-pipelines
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: pipelines-vault-apps
+  target:
+    name: quay-robot-team-<team>
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: |
+          {
+            "auths": {
+              "quay.apps.sub.comptech-lab.com": {
+                "auth": "{{ printf "%s:%s" .username .token | b64enc }}",
+                "email": "<team>+ci@comptech-lab.local"
+              }
+            }
+          }
+  data:
+    - secretKey: username
+      remoteRef:
+        key: apps/<division>/<app>/ci/quay-robot
+        property: username
+    - secretKey: token
+      remoteRef:
+        key: apps/<division>/<app>/ci/quay-robot
+        property: token
+```
+
+This produces `Secret/quay-robot-team-<team>` in `openshift-pipelines` of type `kubernetes.io/dockerconfigjson`. The ESO template composes the dockerconfig blob from `username` + `token` so neither field is stored as a JSON-encoded string in Vault.
+
+The `pipelines-vault-apps` `SecretStore` lives at `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines/secretstore-pipelines-vault-apps.yaml`. Its Vault role's `bound_service_account_namespaces` is `["openshift-pipelines"]` and `token_policies` reads only `secret/data/apps/*/*/ci/quay-robot` paths.
+
+## Step 4: reference the Secret in the Tekton PipelineRun
+
+The shared `push-image-quay` Task takes the Secret name as a parameter — no per-task duplication:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-and-push-quay
+spec:
+  params:
+    - name: dockerconfig-secret
+      type: string
+      default: quay-robot-team-platform
+  tasks:
+    - name: build
+      taskRef:
+        name: buildah
+      # ...
+    - name: push
+      runAfter: [build]
+      taskRef:
+        name: push-image-quay
+      params:
+        - name: dockerconfig-secret
+          value: $(params.dockerconfig-secret)
+        - name: image-ref
+          value: quay.apps.sub.comptech-lab.com/team-platform/liberty-hello
+```
+
+The Task's pod-spec mounts the Secret at `$HOME/.docker/config.json`:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-image-quay
+spec:
+  params:
+    - name: dockerconfig-secret
+      type: string
+    - name: image-ref
+      type: string
+  steps:
+    - name: push
+      image: registry.access.redhat.com/ubi9/podman:9.4
+      env:
+        - name: DOCKER_CONFIG
+          value: /tekton/home/.docker
+      volumeMounts:
+        - name: dockerconfig
+          mountPath: /tekton/home/.docker
+          readOnly: true
+      script: |
+        podman push --tls-verify=true $(params.image-ref):$(params.tag)
+  volumes:
+    - name: dockerconfig
+      secret:
+        secretName: $(params.dockerconfig-secret)
+        items:
+          - key: .dockerconfigjson
+            path: config.json
+```
+
+For a new tenant, the only Tekton-side change is overriding the `dockerconfig-secret` parameter in the tenant's `PipelineRun`. The Task itself is shared across all tenants.
+
+## Why parameter, not hardcoded
+
+A first design instinct is to hardcode the Secret name in the Task. That hits three problems:
+
+| Hardcode failure | Cost |
+| --- | --- |
+| One Task per tenant | O(tenants) Tasks duplicated; rebuild on every Tekton change. |
+| Or one Task with one Secret | All tenants share one robot; one leak compromises every tenant. |
+| Or runtime-mutate the Task | Argo flags it as drift; constant reconcile churn. |
+
+The parameter pattern is the right tradeoff: one shared Task, one Secret per tenant, Argo-clean reconcile.
+
+## Rotation
+
+```bash
+# 1. Regenerate the robot token in the Quay UI (Robot Accounts -> Regenerate token).
+# 2. Update Vault.
+vault kv put secret/apps/<division>/<app>/ci/quay-robot \
+  username="<team>+ci" \
+  token="<new-token>"
+
+# 3. Force ESO refresh.
+oc -n openshift-pipelines annotate externalsecret quay-robot-team-<team> \
+  force-sync=$(date +%s) --overwrite
+
+# 4. Next PipelineRun picks up the new credential automatically (Secret is mounted fresh).
+```
+
+No PipelineRun restart is needed — Tekton mounts the Secret per run, so the next run reads the rotated value.
+
+## Failure modes
+
+| Symptom | Root cause | Fix | Prevention |
+| --- | --- | --- | --- |
+| PipelineRun fails `unauthorized: access to the requested resource is not authorized` from Quay | Robot's permission on the org is `Read` not `Write`, or the robot doesn't exist on the target repo. | Add `Write` for the robot on the repo in the Quay UI. | Bootstrap script verifies permission immediately after creating the robot. |
+| `ExternalSecret Ready=False, permission denied` | The `pipelines-vault-apps` Vault role doesn't have read on this specific path, or the wrong `bound_service_account_namespaces`. | Audit the Vault role policy; confirm the namespace matches. | Tenant-onboarding script writes both the Vault path AND the ExternalSecret at the same time. |
+| Push works locally but fails in the cluster | The local `~/.docker/config.json` has a stronger credential than the robot. | Confirm the robot has `Write` on the repo; rotate if compromised. | Restrict who can read the Vault path; audit log on `secret/apps/*/ci/quay-robot`. |
+| Two tenants accidentally share a Secret | The tenant onboarding script reused `quay-robot-team-platform` for `team-payments`. | Rename to `quay-robot-team-payments` and re-create the ExternalSecret. | The Secret name convention is `quay-robot-team-<team>` — enforce in the script. |
+| Robot token leaked (gitleaks, accidental log dump) | Token was committed somewhere or printed in plaintext. | Regenerate the token in Quay; update Vault; force ESO refresh. The lab does NOT need to nuke the Org. | Treat the robot token like any other secret: `git diff` review pre-commit, secret-scanning in CI, RBAC on the Vault path. |
+
+## Validation
+
+```bash
+# Vault read works.
+vault kv get -format=json secret/apps/<division>/<app>/ci/quay-robot \
+  | jq '.data.data | keys'
+# Expected: ["token", "username"]
+
+# ESO materialised the Secret.
+oc -n openshift-pipelines get externalsecret quay-robot-team-<team> \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# Expected: True
+
+oc -n openshift-pipelines get secret quay-robot-team-<team> \
+  -o jsonpath='{.type}{"\n"}'
+# Expected: kubernetes.io/dockerconfigjson
+
+# Probe the auth value without printing it.
+oc -n openshift-pipelines get secret quay-robot-team-<team> \
+  -o jsonpath='{.data.\.dockerconfigjson}' \
+  | base64 -d \
+  | jq '.auths | keys'
+# Expected: ["quay.apps.sub.comptech-lab.com"]
+```
+
+The four checks together prove the chain — Vault has the data, ESO bridged it, the Secret is type-correct, and the dockerconfig targets the right registry host.
+
+## Why not use the runtime app-registry-pull Secret for push
+
+Three reasons the runtime pull Secret is the wrong credential to push with:
+
+| Concern | Runtime `app-registry-pull` | CI `quay-robot-team-<team>` |
+| --- | --- | --- |
+| Scope | One Nexus bot, cluster-wide, read-only on Nexus. | One per-tenant Quay robot, write-scoped on that tenant's Org. |
+| Target registry | Nexus app-registry. | In-cluster Quay. |
+| Rotation cadence | Platform-driven (rare; bot credential lifecycle). | Tenant-driven (CI rotation, leak response). |
+| Tenant isolation | None (all tenants share). | Yes (each tenant gets its own). |
+| Blast radius of leak | Cluster-wide pull-only — read access to images. | Per-tenant push — could overwrite that tenant's images. |
+
+Different concerns, different credentials. The pages [04 — ESO Secret and pullSecret](./04-eso-secret-and-pullsecret) and [08 — Cluster pull-secret fan-out](./08-app-registry-pull-secret-via-clusterexternalsecret) cover the runtime pull credential. This page covers the CI push credential.
+
+## References
+
+- [Quay on cluster](../../03-openshift-platform/14-platform-services/14-quay-on-cluster) — the QuayRegistry CR and Organization model.
+- [App-repo overlay contract](../04-gitops-consume/03-app-repo-overlay-contract) — how the pushed image's digest reaches the overlay.
+- DEV-OCP-3B.5 (#193) — Tekton image push to Quay.
+- DEV-OCP-0.4 (#174) — per-tenant Vault path + role + policy.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines/secretstore-pipelines-vault-apps.yaml` — the SecretStore the openshift-pipelines ExternalSecrets read through.

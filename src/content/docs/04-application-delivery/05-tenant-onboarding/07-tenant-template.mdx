@@ -1,0 +1,157 @@
+---
+title: "Tenant scaffolding template"
+description: "Canonical contents of platform-gitops/.../tenants/_template — Namespace, ResourceQuota, LimitRange, default-deny NetworkPolicy, ESO ServiceAccount + per-tenant SecretStore, AppProject — and the four tenants the spoke runs today."
+sidebar_label: "Tenant template"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+The platform ships a single canonical tenant scaffold under `platform-gitops/clusters/spoke-dc-v6/tenants/_template/`. Onboarding a new tenant is `cp -r _template apps-<division>-<team>` plus token substitution plus one MR — never hand-rolled YAML. This page is the contents of that scaffold, the inventory of tenants live today, and the conventions an operator MUST honour when adding a new one.
+
+Per DEV-OCP-0.3 (#173), DEV-OCP-4.1 (#196), DEV-OCP-4.2 (#197).
+
+## What every tenant gets
+
+Eight resources, all at sync-wave &lt;= 12, before any tenant workload.
+
+| File | Kind / API | Sync wave | Purpose |
+| --- | --- | --- | --- |
+| `namespace.yaml` | `v1/Namespace` | 0 | The namespace itself; carries the load-bearing `apps.platform/tenant=true` label and the PSA `restricted` profile. |
+| `serviceaccount-app-eso.yaml` | `v1/ServiceAccount` | 5 | `app-eso` — the SA the per-tenant `SecretStore` projects to Vault. No Kubernetes RBAC bound. |
+| `argocd-rbac.yaml` | `rbac.authorization.k8s.io/v1/Role` + `RoleBinding` | 5 | Grants the spoke Argo controller SA `serviceaccounts` + `secrets` write inside the namespace (the cluster default ClusterRole excludes these for security). |
+| `rolebinding-edit.yaml` | `rbac.authorization.k8s.io/v1/RoleBinding` | 5 | Grants the team's GitLab/OIDC group `edit` ClusterRole on this namespace, so developers can `oc logs` / `oc exec` for debugging. |
+| `serviceaccount-default-pull-patch.yaml` | `v1/ServiceAccount` (server-side patch) | 10 | Patches `default` SA with `imagePullSecrets: [{name: app-registry-pull}]` so Pods using the default SA can pull from Nexus app-registry. |
+| `resourcequota.yaml` | `v1/ResourceQuota` | 10 | Per-env hard cap (DEV-OCP-4.1). Defaults: dev = 4 CPU / 8 Gi; stg = 8 / 16; prd = 16 / 32. |
+| `limitrange.yaml` | `v1/LimitRange` | 10 | Per-container defaults + min/max (DEV-OCP-4.1). Catches Pods that omit `resources.requests`. |
+| `networkpolicy.yaml` | `networking.k8s.io/v1/NetworkPolicy` x 5 | 12 | Default-deny ingress+egress (DEV-OCP-4.2) plus four curated allow-list rules: from openshift-ingress, egress to kube-dns, egress to cluster monitoring, egress to Vault (30.30.30.20/30:8200). |
+| `secretstore-vault-apps.yaml` | `external-secrets.io/v1/SecretStore` | 30 | The per-tenant ESO bridge to Vault role `apps-spoke-dc-v6-<division>`. **`SecretStore`, never `ClusterSecretStore`.** |
+
+The full file list lives at `platform-gitops/clusters/spoke-dc-v6/tenants/_template/`; see [03 — Project + RoleBinding template](./03-project-rolebinding-template) for the `AppProject` it pairs with on the hub.
+
+## The load-bearing labels and annotations
+
+Three pieces of namespace metadata drive cluster-wide behaviour:
+
+| Label / annotation | Owner | Effect |
+| --- | --- | --- |
+| `apps.platform/tenant: "true"` | tenant template | `ClusterExternalSecret/app-registry-pull` fans the dockerconfigjson Secret into this ns. See [08 — Cluster pull-secret fan-out](./08-app-registry-pull-secret-via-clusterexternalsecret). |
+| `pod-security.kubernetes.io/enforce: restricted` | tenant template (ADR 0020, PCI profile) | Pods that escalate privileges, run as root, or omit `seccompProfile` are rejected at admission. |
+| `argocd.argoproj.io/managed-by: openshift-gitops` (annotation) | tenant template | Argo recognises the namespace as a sync target without `CreateNamespace=true`. |
+
+The `openshift.io/cluster-monitoring=true` label is **not** set on tenant namespaces. That label is reserved for `openshift-*` platform namespaces; user-workload Prometheus excludes anything carrying it. Tenant namespaces are scraped by `prometheus-user-workload` automatically — no opt-in label needed. (This was the `bank-payment` learning; the namespace originally shipped the wrong label and lost discovery for its `ServiceMonitor`.)
+
+## Default-deny NetworkPolicy — the baseline
+
+DEV-OCP-4.2 says **every tenant namespace ships default-deny ingress + egress**. The four allow rules cover the platform paths a tenant genuinely needs, no more:
+
+| Rule | Direction | Target |
+| --- | --- | --- |
+| `allow-from-openshift-ingress` | ingress | namespace labelled `network.openshift.io/policy-group=ingress` — i.e. OpenShift Routes terminate at tenant Services. |
+| `allow-egress-dns` | egress | `openshift-dns` ns, UDP/TCP 53 + UDP 5353. |
+| `allow-egress-cluster-monitoring` | egress | `openshift-monitoring` + `openshift-user-workload-monitoring` (Thanos querier ports 9091-9095, 10902). |
+| `allow-egress-vault` | egress | `30.30.30.20/30:8200` (Vault VMs; mirrors the platform ESO egress rule from issue #162). |
+
+Two more rules ship commented-out in the template — `allow-egress-internet-via-cluster-egress` (uncomment + edit when the tenant has a NAT / EgressIP allocation) and `allow-from-istio-ambient` (uncomment when the namespace joins the OSSM3 ambient mesh).
+
+## AppProject convention — `tenant-&lt;division&gt;-&lt;app&gt;`
+
+Argo `AppProject` is the **only** place that decides which Git repos may be a `source.repoURL`, which destinations may be a `destination`, and which resource kinds an `Application` may create. Tenant onboarding ships **one AppProject per (division, app)** on the hub, scoped to the destination namespace glob.
+
+The naming convention is `tenant-<division>-<app>`. Example AppProjects live at `clusters/hub-dc-v6/gitops-control/appproject-tenant-<division>-<app>.yaml` and were introduced by DEV-OCP-2.2 (#183).
+
+Hard rules baked into the project:
+
+| Field | Setting | Why |
+| --- | --- | --- |
+| `sourceRepos` | the tenant's app monorepo URL + the platform-gitops URL | A tenant cannot point an `Application` at an arbitrary repo. |
+| `destinations[].namespace` | glob `apps-<division>-*` | Tenant Applications can only target their own division's namespaces. |
+| `destinations[].server` | `https://kubernetes.default.svc` | Local-cluster reconcile only (ACM pull model — see [GitOps consume](../04-gitops-consume/01-overview)). |
+| `clusterResourceWhitelist` | `Namespace` only | No `ClusterRole`, `ClusterRoleBinding`, or CRDs from tenants. Cluster-scoped resources are platform team's job. |
+| `namespaceResourceWhitelist` | explicit list (Deployment, Service, Route, ConfigMap, Secret, ExternalSecret, SecretStore, OpenLibertyApplication, CNPG Cluster, NetworkPolicy, HPA, PDB, ServiceMonitor / PodMonitor / PrometheusRule) | Anything outside this list is rejected at sync. Operator CRDs the tenant uses (CNPG, OpenLiberty) are explicitly listed. |
+| `orphanedResources.warn` | `true` | Reports tenant-created resources that aren't in Git, but doesn't auto-prune. Builds the "drift" review path. |
+
+The whitelist intentionally excludes `Namespace` writes from tenants — tenants reference a namespace via the overlay's `namespace:` field; the namespace itself is platform-provisioned in `platform-gitops/.../tenants/<ns>/`.
+
+## Active tenants on spoke-dc-v6 today
+
+Four tenants are live as of 2026-05-12. Each one lives at `platform-gitops/clusters/spoke-dc-v6/tenants/<name>/`:
+
+| Tenant | Purpose | Notes |
+| --- | --- | --- |
+| `apps-platform-sample` | Reference scaffolding tenant. The canonical `apps-<division>-<team>` shape. | Use this when copy-pasting for a new tenant. |
+| `ossm3-demo` | Service mesh demo namespace (Red Hat OpenShift Service Mesh 3 ambient mode). | Has additional `ztunnel-workload-identity-rbac.yaml` for SPIFFE issuance. Hosts the `bookinfo` mesh sample. |
+| `bank-employees-jboss-chat` | BRAC engagement: JBoss EAP chat app demonstrating Path A (Nexus) and EAP runtime. | Standard scaffold, no Vault `SecretStore` (no app-side secrets yet). |
+| `bank-payment` | BRAC engagement: payment-microservice 4-service demo with SigNoz observability and ambient-mesh exploration. | Adds `argocd-workload-rbac.yaml` because it ships from a standalone Argo Application (`project=default`) rather than the tenant-apps AppSet, and needs an explicit write grant for Deployments/Services/PDBs/HPAs. Namespace is `bank-payment` (not `apps-payment-bank-payment`) — a focused-demo carve-out, kept short. The `apps.platform/tenant=true` label still wires the image-pull fanout. |
+
+`apps-platform-sample` is the template-of-templates. New apps under existing tenants don't need a new tenant directory at all — they ship as new overlays in the team's app monorepo and the `tenant-apps` `ApplicationSet` auto-discovers them.
+
+## The carve-out: `bank-payment` and project=default
+
+The general rule is "tenant apps deploy through the `tenant-apps` `ApplicationSet`, scoped by `AppProject tenant-<division>-<app>`." The carve-out is `bank-payment`, which ships from `divisions/payment/bank-payment.git` as a standalone Argo Application under `project=default`.
+
+The cost of that carve-out: the spoke Argo controller's default ClusterRole doesn't grant write on Deployments / Services / ConfigMaps / PDBs / HPAs in tenant namespaces, so the tenant needs `argocd-workload-rbac.yaml` — a namespace-scoped `Role` + `RoleBinding` granting `acm-openshift-gitops-argocd-application-controller` those verbs **for this tenant only**.
+
+Don't replicate this pattern for new tenants. Use the AppProject + AppSet flow; the carve-out is BRAC-demo-shaped, not general.
+
+## Onboarding sequence — one MR
+
+For a new tenant `apps-<division>-<team>`:
+
+```bash
+cd platform-gitops/clusters/spoke-dc-v6/tenants
+cp -r _template apps-<division>-<team>
+# replace DIVISION and TEAM tokens across all files
+sed -i "s/DIVISION/<division>/g; s/TEAM/<team>/g" apps-<division>-<team>/*.yaml
+# set the OIDC group on the RoleBinding
+sed -i "s/<OIDC-GROUP>/<group-name>/" apps-<division>-<team>/rolebinding-edit.yaml
+# add to the aggregation kustomization
+$EDITOR clusters/spoke-dc-v6/kustomization.yaml   # add `- tenants/apps-<division>-<team>`
+```
+
+Then commit the MR. Hub Argo (or the spoke-local Argo) reconciles in ~3 min and the namespace is live.
+
+The `_template/` directory carries `apiVersion`s and placeholder values that would fail server-side validation if it were itself reconciled. The aggregation `kustomization.yaml` deliberately does **not** include `_template/` — that's a copy-source only.
+
+## What is NOT in the tenant template
+
+A few things commonly conflated with tenant scaffolding but governed elsewhere:
+
+| Out of scope | Lives at | Why |
+| --- | --- | --- |
+| The AppProject CR | `clusters/hub-dc-v6/gitops-control/appproject-tenant-<division>-<app>.yaml` | Hub-side, not spoke-side. AppProjects are per (division, app) and rarely added; the tenant scaffold is per namespace. |
+| The ClusterExternalSecret for `app-registry-pull` | `clusters/spoke-dc-v6/secrets/app-registry-pull/` | Cluster-wide; one per cluster. The tenant only opts in via the `apps.platform/tenant=true` label. |
+| The Quay robot token (CI push) | Vault `secret/apps/<division>/<app>/ci/quay-robot` + ESO into `openshift-pipelines` | Different SecretStore, different namespace, different credential. See [09 — Quay robot token](./09-quay-robot-token-per-tenant). |
+| The Argo `Application` / `ApplicationSet` entry | hub `clusters/hub-dc-v6/gitops-control/` | Hub-side; the AppSet auto-discovers new overlays in already-watched monorepos. |
+
+## Validation
+
+After the MR merges and Argo syncs:
+
+```bash
+NS=apps-<division>-<team>
+oc get ns $NS -o jsonpath='{.metadata.labels}' | jq
+oc -n $NS get sa app-eso default
+oc -n $NS get rolebinding team-developers-edit argocd-tenant-manager
+oc -n $NS get resourcequota,limitrange
+oc -n $NS get networkpolicy
+oc -n $NS get secretstore vault-apps \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+# Expected: True
+
+# The fanned-in pull secret should appear within ~1 minute:
+oc -n $NS get secret app-registry-pull \
+  -o jsonpath='{.type}{"\n"}'
+# Expected: kubernetes.io/dockerconfigjson
+```
+
+Five default-deny / allow NetworkPolicies, one each of ResourceQuota and LimitRange, the `vault-apps` SecretStore `Ready=True`, and the `app-registry-pull` Secret materialised — that's the green-state for a fresh tenant.
+
+## References
+
+- DEV-OCP-0.3 (#173) — tenant Project + Role + RoleBinding template.
+- DEV-OCP-4.1 (#196) — ResourceQuota + LimitRange defaults.
+- DEV-OCP-4.2 (#197) — default-deny + curated allow-list NetworkPolicies.
+- DEV-OCP-2.2 (#183) — example tenant `AppProject` (`tenant-platform-sample`).
+- `platform-gitops/clusters/spoke-dc-v6/tenants/_template/` — the canonical scaffold.
+- `platform-gitops/clusters/hub-dc-v6/gitops-control/appproject-tenant-platform-sample.yaml` — the canonical AppProject.
+- ADR 0020 — PCI-DSS profile compliance on spoke-dc-v6.
