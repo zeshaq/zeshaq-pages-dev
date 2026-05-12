@@ -1,0 +1,484 @@
+---
+title: "Build a project (capstone)"
+sidebar_label: "12 — Capstone"
+description: "End-to-end gated deployment pipeline for a banking-style API: pre-commit hooks, SAST + SCA, image build + cosign sign + SBOM + SLSA provenance, admission verify, runtime detection, SIEM forward, continuous compliance scan."
+estimated_minutes: 120
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const capNodes = [
+  { id: "dev", data: { label: "Developer\n(local + pre-commit)" }, position: { x: 40, y: 30 }, style: stage, type: "shape" },
+  { id: "git", data: { label: "Git repo\n(branch protection)" }, position: { x: 260, y: 30 }, style: ctrl, type: "shape" },
+  { id: "ci", data: { label: "CI pipeline\n(SAST, SCA, build, scan)" }, position: { x: 480, y: 30 }, style: ctrl, type: "shape" },
+  { id: "sig", data: { label: "cosign sign +\nSBOM + SLSA attest" }, position: { x: 700, y: 30 }, style: agent, type: "shape" },
+  { id: "reg", data: { label: "Private registry\n(Quay / Nexus)" }, position: { x: 700, y: 150 }, style: ext, type: "shape" },
+  { id: "gitops", data: { label: "platform-gitops\n(digest bump)" }, position: { x: 480, y: 150 }, style: ctrl, type: "shape" },
+  { id: "argo", data: { label: "Argo CD sync" }, position: { x: 260, y: 150 }, style: ctrl, type: "shape" },
+  { id: "adm", data: { label: "Admission policy\n(verify signature)" }, position: { x: 40, y: 150 }, style: agent, type: "shape" },
+  { id: "ns", data: { label: "Namespace\n(restricted PSS + NP)" }, position: { x: 40, y: 280 }, style: agent, type: "shape" },
+  { id: "pod", data: { label: "API pod\n(mTLS, restricted SCC)" }, position: { x: 260, y: 280 }, style: agent, type: "shape" },
+  { id: "rt", data: { label: "RHACS / Falco\n(runtime detect)" }, position: { x: 480, y: 280 }, style: agent, type: "shape" },
+  { id: "siem", data: { label: "Wazuh SIEM\n(audit + RHACS webhooks)" }, position: { x: 700, y: 280 }, style: ctrl, type: "shape" },
+  { id: "comp", data: { label: "Compliance Operator\n(PCI-DSS scan)" }, position: { x: 700, y: 400 }, style: ctrl, type: "shape" },
+  { id: "ev", data: { label: "Evidence pack\n(per-control proofs)" }, position: { x: 260, y: 400 }, style: ext, type: "shape" },
+];
+
+export const capEdges = [
+  { id: "k1", source: "dev", target: "git", style: { stroke: "#1f2937" }, label: "push (signed)" },
+  { id: "k2", source: "git", target: "ci", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "trigger" },
+  { id: "k3", source: "ci", target: "sig", style: { stroke: "#1f2937" }, label: "build + scan" },
+  { id: "k4", source: "sig", target: "reg", style: { stroke: "#1f2937" }, label: "push image + sigs" },
+  { id: "k5", source: "sig", target: "gitops", style: { stroke: "#1f2937" }, label: "bump digest" },
+  { id: "k6", source: "gitops", target: "argo", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "sync" },
+  { id: "k7", source: "argo", target: "adm", style: { stroke: "#1f2937" }, label: "apply" },
+  { id: "k8", source: "adm", target: "ns", style: { stroke: "#1f2937" }, label: "verify ok" },
+  { id: "k9", source: "ns", target: "pod", style: { stroke: "#1f2937" } },
+  { id: "k10", source: "pod", target: "rt", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "runtime events" },
+  { id: "k11", source: "rt", target: "siem", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "webhook" },
+  { id: "k12", source: "pod", target: "siem", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "audit logs" },
+  { id: "k13", source: "comp", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "scan results" },
+  { id: "k14", source: "rt", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "detections" },
+  { id: "k15", source: "sig", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "signatures" },
+];
+
+The previous eleven modules each covered one slice of DevSecOps. This one stitches them into a single concrete project — a banking-style transaction-status API — so you finish the track with something you have actually built, not just read about.
+
+The project: a read-only "transaction status" REST API, written in Go, deployed through every security gate the track has introduced. By the end you will have a repository that produces signed images with SBOMs and SLSA provenance, a cluster that refuses unsigned images, runtime detection watching the pod, a SIEM that sees the events, and a Compliance Operator scan that reports the posture.
+
+This is the longest module on purpose. Budget two hours if everything works, and double on a first run. Most of the time is spent waiting on things — CI runs, image pulls, Argo CD syncs, Compliance Operator scans.
+
+## What you will build
+
+<Whiteboard client:load data={{ nodes: capNodes, edges: capEdges }} height={520} />
+
+Reading the diagram:
+
+- **Developer to git** — pre-commit hooks run locally; the push is signed and lands in a protected branch.
+- **Git to CI** — branch protection requires the CI run to pass; the dashed-green animated edge is the spoke-style trigger.
+- **CI to registry** — SAST, SCA, build, scan, sign, attest SBOM and SLSA provenance, push. The signature and SBOM live next to the image in the registry.
+- **CI to GitOps** — the same CI step bumps the digest in `platform-gitops`; Argo CD on the cluster syncs.
+- **Admission policy** — the cluster admission controller verifies the cosign signature before allowing the Deployment to apply.
+- **Namespace to pod** — restricted Pod Security Standards, NetworkPolicy default-deny, Istio mTLS, restricted SecurityContext.
+- **Runtime to SIEM** — RHACS / Falco webhooks; the pod's audit logs flow in parallel.
+- **Compliance scan + evidence pack** — Compliance Operator runs nightly; the evidence pack continuously aggregates the proofs.
+
+By the end you should be able to point at every box and say what command produced it. The mistake to avoid is treating any one box as optional; the value is in the chain.
+
+## Prerequisites
+
+- **A Kubernetes cluster.** Kind, minikube, or a single-node OpenShift install all work. The walkthrough assumes OpenShift terminology in places; substitute mentally if you use upstream Kubernetes.
+- **`kubectl` or `oc`, `helm`, `cosign`, `syft`, `trivy` installed locally.** Cosign 2.x, syft v1+, trivy 0.50+.
+- **A container registry.** A local registry (`registry:2` in a Docker container) works for development; for a more realistic exercise, point at a Quay or Harbor instance.
+- **A SIEM target.** Wazuh on a sandbox VM is the recommendation in this walkthrough; the open-source Helm chart deploys in 15 minutes.
+- **A small Go or Python REST API codebase.** The walkthrough uses Go for the snippets, but the chain is language-agnostic.
+- **`opp-full-plat` and `platform-gitops` repos are the reference for the lab's conventions.** You will mirror their structure for this exercise.
+
+## Step 1: Repo hygiene
+
+Initialise a new repo. Add `.pre-commit-config.yaml` with the four hooks that catch the most common pre-merge problems:
+
+```
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks: [{ id: gitleaks }]
+  - repo: https://github.com/returntocorp/semgrep
+    rev: v1.50.0
+    hooks: [{ id: semgrep, args: ["--config=p/security-audit","--error"] }]
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks: [{ id: hadolint }]
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.32.0
+    hooks: [{ id: yamllint }]
+```
+
+Run `pre-commit install`. Now every local commit runs the four hooks; commits that leak secrets or trip a Semgrep rule are blocked at the developer's machine, before they ever touch the remote.
+
+Enable branch protection on `main`:
+
+- Require pull-request review (at least one code-owner).
+- Require all status checks to pass (the CI pipeline below).
+- Require signed commits (GPG or SSH).
+- Restrict who can push directly (only break-glass admins).
+
+Add `CODEOWNERS`:
+
+```
+*       @your-team
+Dockerfile  @your-team @platform-team
+.github/    @your-team @platform-team
+deploy/     @your-team @platform-team
+```
+
+Drop in a PR template (`.github/pull_request_template.md`) with the audit-friendly fields from Module 10 — change description, why, linked issue, test evidence, rollback procedure. The five extra lines per PR are an annoyance for two weeks and a lifesaver at every audit.
+
+**Try this:** add a deliberately-leaked AWS access key to a file and try to commit. Gitleaks should refuse. Now run `git commit --no-verify` (do not actually push this commit anywhere) and verify that the CI pipeline in Step 2 still catches it — the local hook is a fast feedback path, not a security boundary.
+
+## Step 2: The CI pipeline
+
+A GitHub Actions or GitLab CI or Jenkins pipeline with these stages, in order. The example is GitHub Actions; translate to your tool of choice.
+
+```
+name: ci
+on: [pull_request, push]
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: go test ./...
+      - uses: returntocorp/semgrep-action@v1
+        with: { config: p/security-audit }
+      - uses: aquasecurity/trivy-action@master
+        with: { scan-type: fs, severity: CRITICAL,HIGH, exit-code: 1 }
+      - run: docker build -t $REG/$IMG:${{github.sha}} .
+      - uses: aquasecurity/trivy-action@master
+        with: { image-ref: $REG/$IMG:${{github.sha}}, severity: CRITICAL, exit-code: 1 }
+      - uses: sigstore/cosign-installer@v3
+      - run: cosign sign --yes $REG/$IMG@$(crane digest $REG/$IMG:${{github.sha}})
+      - run: syft $REG/$IMG:${{github.sha}} -o cyclonedx-json > sbom.json
+      - run: cosign attest --yes --predicate sbom.json --type cyclonedx $REG/$IMG@$DIGEST
+      - run: docker push $REG/$IMG:${{github.sha}}
+```
+
+The pipeline runs eleven gates. **Unit tests** must pass. **Semgrep `p/security-audit`** catches SAST issues — fail on Critical/High. **Trivy fs** scans the source tree for vulnerable dependencies; fail on Critical CVE. **Container build** uses a multi-stage Dockerfile that ends on a distroless base. **Trivy image** scans the built image; fail on Critical. **Cosign sign** is keyless via OIDC against Sigstore Fulcio (no static signing key to manage). **Syft** generates a CycloneDX SBOM. **Cosign attest** binds the SBOM to the image. A follow-up step does the same for a SLSA provenance attestation. The final push lands the image in the registry along with its signatures and attestations.
+
+The last step (not shown above for length) bumps the digest in `platform-gitops`:
+
+```
+git clone https://github.com/your-org/platform-gitops gitops
+cd gitops/apps/tx-status/overlays/staging
+yq -i '.images[0].digest = "'$DIGEST'"' kustomization.yaml
+git add . && git commit -m "tx-status: $DIGEST"
+git push
+```
+
+Argo CD on the cluster picks up the new digest within minutes and syncs.
+
+**Try this:** add a hardcoded `aws_access_key_id = "AKIA..."` to a Go file. Push. Watch gitleaks (in CI as a final backstop) catch it and fail the run. Remove the line; push again; observe a green build.
+
+## Step 3: The admission policy
+
+Install Sigstore Policy Controller (or Kyverno with `verify-images`). The policy requires every image in protected namespaces to be cosign-signed by your Fulcio identity:
+
+```
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: require-fulcio-signature
+spec:
+  images:
+    - glob: "registry.lab.example/**"
+  authorities:
+    - keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          - issuer: https://token.actions.githubusercontent.com
+            subjectRegExp: "https://github.com/your-org/.*"
+```
+
+Label the target namespace to enforce:
+
+```
+oc label ns tx-status policy.sigstore.dev/include=true
+```
+
+Test by attempting to apply a Deployment that references an unsigned image. The admission webhook rejects with a clear error: "image is not signed by an accepted identity." Now apply the Deployment with the CI-signed image; it admits.
+
+**Try this:** sign an image with a different identity (a personal cosign key, not the Fulcio OIDC flow). Attempt to apply. The policy rejects — the issuer + subjectRegExp combination matters, not just "any signature." This is what makes the policy meaningful.
+
+## Step 4: The Deployment manifest
+
+The Deployment lives in `platform-gitops/apps/tx-status/base/deployment.yaml`. Restricted defaults everywhere:
+
+```
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tx-status, namespace: tx-status }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: tx-status } }
+  template:
+    metadata: { labels: { app: tx-status } }
+    spec:
+      serviceAccountName: tx-status
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: registry.lab.example/tx-status@sha256:...
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+```
+
+Apply Pod Security Standards `restricted` to the namespace:
+
+```
+oc label ns tx-status \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/audit=restricted
+```
+
+A NetworkPolicy that default-denies ingress and allows only the gateway namespace:
+
+```
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-gateway-only, namespace: tx-status }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: istio-ingress }
+```
+
+The database credential comes from Vault via ESO (Module 09's pattern). Create an `ExternalSecret` that materialises a `tx-status-db` Secret in the namespace; the Deployment mounts it as env vars. No long-lived credential in git.
+
+A minimal-RBAC ServiceAccount with no cluster bindings — only the Role bindings the API actually needs (read its own Secret, list its own Pods for self-healthcheck). The trap to avoid is `cluster-admin` "just for now"; "just for now" lives forever.
+
+**Try this:** edit the Deployment to set `runAsNonRoot: false`. Apply. Pod Security Admission rejects. Revert. Apply. Admits. The PSS labels are doing exactly what the audit report claimed they do.
+
+## Step 5: Service mesh mTLS
+
+Add the namespace to the mesh:
+
+```
+oc label ns tx-status istio-injection=enabled
+```
+
+Configure PeerAuthentication to STRICT and an AuthorizationPolicy that allows only the frontend ServiceAccount to call:
+
+```
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata: { name: default, namespace: tx-status }
+spec: { mtls: { mode: STRICT } }
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: { name: allow-frontend, namespace: tx-status }
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source: { principals: ["cluster.local/ns/frontend/sa/frontend"] }
+```
+
+Re-roll the Deployment so the sidecar injects. Verify with `istioctl x describe pod tx-status-...` that mTLS is `STRICT`. Curl the Service from a pod in the `frontend` namespace — succeeds. Curl from any other namespace — denied at the sidecar.
+
+**Try this:** flip PeerAuthentication to `PERMISSIVE`. A plaintext caller now works. This is the transition mode for migrations; do not run prod here. Flip back to `STRICT`.
+
+## Step 6: Runtime detection
+
+Install RHACS SecuredCluster (per the ACM track's Module 09, or via the Operator directly). Or install Falco if you do not have an RHACS Central.
+
+Verify the workload appears in the runtime view — the `tx-status` namespace shows up in the RHACS UI, the pod is running, no policy violations.
+
+Now test the default policies. From your laptop:
+
+```
+oc exec -n tx-status deploy/tx-status -- sh
+```
+
+RHACS's "Kubernetes Exec into Pod" policy fires within seconds. The alert lands in the Central UI and (if you wired it in Step 7) in the SIEM.
+
+The lesson: even with mTLS, restricted PSS, signed images, and per-route authz, a developer with `kubectl exec` rights is still a high-privilege actor. Runtime detection catches the action; the response is RBAC and JIT (Module 09).
+
+**Try this:** clone the "Image Age" policy to inform mode, scope it to the `tx-status` namespace, and see what violations roll in. Most lab clusters surface a handful in `openshift-*` namespaces; ignore those for now and concentrate on the workload namespace.
+
+## Step 7: SIEM forwarding
+
+If you do not have a SIEM, install Wazuh on a sandbox VM — `wazuh-kubernetes` repo provides a Helm chart. Pick a small cluster; Wazuh is opinionated about resources.
+
+Forward the cluster's audit log. On OpenShift this is configured via the `APIServer` CR or a `ClusterLogForwarder`:
+
+```
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata: { name: instance, namespace: openshift-logging }
+spec:
+  outputs:
+    - name: wazuh
+      type: syslog
+      syslog: { facility: local0, severity: informational }
+      url: tcp://wazuh.sandbox.lab:514
+  pipelines:
+    - name: audit-to-wazuh
+      inputRefs: [audit]
+      outputRefs: [wazuh]
+```
+
+Configure RHACS to webhook to Wazuh on every alert: in the RHACS UI under Platform Configuration → Integrations → Generic Webhook, point at a Wazuh endpoint listening for JSON. Falco's equivalent is `falcosidekick` with the `webhook` output enabled.
+
+Write a Sigma rule for "shell-in-customer-facing-pod":
+
+```
+title: Shell spawned in customer-facing namespace
+logsource: { product: kubernetes, service: rhacs }
+detection:
+  selection:
+    policy: "Kubernetes Exec into Pod"
+    namespace|startswith: "tx-"
+  condition: selection
+level: high
+```
+
+Convert to Wazuh format with `sigma-cli convert -t wazuh shell-rule.yml`. Drop the resulting rule into Wazuh's `local_rules.xml`, restart Wazuh, and re-run the `oc exec` from Step 6. The alert should land in the Wazuh dashboard within a minute.
+
+**Try this:** measure MTTD. From the moment you run `oc exec` to the moment the Wazuh dashboard shows the alert — what is the latency? If it is more than a minute, the gap is usually in log forwarding (sampling, batching). For BFSI you want this under 30 seconds for critical-severity detections.
+
+## Step 8: Compliance scan
+
+Install the Compliance Operator (already in the cluster on the lab; for a sandbox, `oc apply -f -` the upstream Subscription). Create a `ScanSettingBinding` scoping the PCI-DSS profile to your workload namespace:
+
+```
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSettingBinding
+metadata: { name: pci-tx-status, namespace: openshift-compliance }
+profiles:
+  - name: pci-dss-v4
+    kind: Profile
+    apiGroup: compliance.openshift.io/v1alpha1
+settingsRef:
+  name: default
+  kind: ScanSetting
+  apiGroup: compliance.openshift.io/v1alpha1
+```
+
+Apply. The Compliance Operator launches a `ComplianceScan` resource per applicable profile; OpenSCAP runs on every node; results land in `ComplianceCheckResult` CRs.
+
+```
+oc get ccr -l compliance.openshift.io/scan-name=pci-dss-v4-master | head
+```
+
+Review the failing rules. For each failure, decide: remediate (fix the underlying configuration), tailor (the rule does not apply to your environment — write the `TailoredProfile` exclusion with rationale), or accept (document the residual risk).
+
+Apply at least one TailoredProfile exclusion as practice. The lab's pattern is at [`/docs/openshift-platform/operations/incidents-and-runbooks/pci-dss-remediation-and-evidence`](/docs/openshift-platform/operations/incidents-and-runbooks/pci-dss-remediation-and-evidence).
+
+**Try this:** rerun the scan after the tailoring. Confirm the rule count dropped, the documented exclusion appears in the audit trail (the `TailoredProfile` CR carries the rationale), and the remaining failures are tracked as a backlog with owners.
+
+## Step 9: End-to-end verification
+
+Test the gates by deliberately breaking each one and confirming the gate catches it.
+
+**Gate 1 — Pre-commit and CI block secrets.** Add `aws_access_key_id = "AKIA..."` to a source file. Try `git commit` — gitleaks blocks locally. Bypass with `--no-verify`, push to a branch — the CI gitleaks step blocks the merge. Revert.
+
+**Gate 2 — SCA blocks vulnerable dependencies.** Add a dependency with a known Critical CVE (an old `log4j-core` 2.14.0 or similar; check the current CVE database for one that still trips Trivy). Push. Trivy fails the build. Revert.
+
+**Gate 3 — Cosign + admission block unsigned images.** Manually push an unsigned image to the registry with the same name. Bump the digest in `platform-gitops` to the unsigned image's digest. Argo CD syncs; admission rejects; Deployment stays at the previous revision. Revert the digest.
+
+**Gate 4 — Runtime detection catches the shell.** `oc exec` into a running pod. RHACS fires; the webhook reaches Wazuh; the on-call playbook should trigger. Verify the Sigma rule from Step 7 surfaced the event.
+
+**Gate 5 — Compliance Operator surfaces the posture.** Run the scan. The result is a current snapshot of pass/fail counts. The trend matters more than the absolute number; track it month over month.
+
+Each gate is independently verifiable; the chain is what gives defense-in-depth. The attacker has to defeat all five to land malicious code in production and have it run.
+
+## Step 10: Document the evidence pack
+
+For every control you implemented, record four things:
+
+- **Control name** — the PCI-DSS sub-requirement (8.3.7, 6.4.3, 10.5.1) or the equivalent ID in your framework.
+- **Implementation evidence** — the YAML, the policy, the CI step, the configuration value that enforces the control. Link to the file in git with a commit pin.
+- **Operational evidence** — the audit log, scan result, alert, or CI run that proves the control fired. Link to the latest example.
+- **Last validated** — the date you last verified the control end-to-end, and the test you ran.
+
+Store the pack in a durable location — not a personal laptop. The lab's pattern is a small repo (`opp-full-plat/evidence-pack/`) with one Markdown file per control area, regenerated nightly from the Compliance Operator output and the SIEM's "controls dashboard" query.
+
+The auditor's question — "show me how you meet 6.4.3" — has a one-link answer. The forty-five minutes you spend building the pack the first time saves a day at every audit thereafter.
+
+**Try this:** pick the three controls you find most opaque. Write the evidence-pack entry for each one. If you find yourself writing "we sort of do this" or "this is partially covered by ...", that is your remediation backlog.
+
+## Wrap-up: the thirteen-module journey
+
+If you completed the capstone:
+
+- **Module 00** — you can articulate why "DevSecOps" is not "DevOps + a security checklist."
+- **Module 01** — you know the framework landscape and which ones apply to your work.
+- **Module 02** — secrets are in Vault, materialised via ESO; nothing is committed to git.
+- **Module 03 to 05** — your CI runs SAST, SCA, and produces SBOMs.
+- **Module 06** — your images are cosign-signed and admission-verified.
+- **Module 07** — your pods run with restricted Pod Security Standards, default-deny NetworkPolicy, and minimal RBAC.
+- **Module 08** — your runtime detection catches the actions that get past the build-time gates.
+- **Module 09** — workload identity is real, mTLS is strict, OIDC validates every human request.
+- **Module 10** — every control has a continuously-collected evidence artifact; audits are sampling, not scrambling.
+- **Module 11** — security has SLIs, detection is in git, the SOAR playbook compresses MTTD/MTTR.
+- **Module 12** — the gates compose into one pipeline you have built end-to-end.
+
+The mistake to avoid at this point is treating the gates as immutable. Every gate has a false-positive rate that needs to be tuned; every detection has a lifetime; every framework changes (PCI-DSS v4.0 phased in through 2025, the next revision will bring more changes). The work is continuous. The discipline this track teaches is how to make the continuous work compound rather than accumulate.
+
+## Where to go from here
+
+Stretch goals, in roughly increasing difficulty:
+
+- **Add DAST.** OWASP ZAP in CI against a staging deployment, scoped to the API endpoints. Catches runtime vulnerabilities — XSS, SQLi, broken auth — that SAST cannot see.
+- **Add fuzz testing.** `go-fuzz` or `cargo-fuzz` against the API handlers. Surfaces panics, off-by-ones, integer-overflow bugs that no other tool catches.
+- **Add chaos engineering for security.** Chaos Mesh or Litmus fails a node; observe how RHACS detects the workload movement, whether the audit-log pipeline keeps flowing during the failover, whether the SIEM correlation degrades.
+- **Integrate a real SIEM.** Splunk Cloud, Elastic Cloud Serverless, or Sentinel — point your forwarder at it instead of Wazuh. Map MTTD/MTTR; benchmark your false-positive rate.
+- **Add a PAM tool for break-glass.** Teleport Open Source as a JIT broker for `kubectl exec` and SSH. Eliminate the standing `cluster-admin` role.
+- **Achieve SLSA L3.** Isolated build runner (Tekton on a separate cluster, GitHub Actions with the ephemeral-runner pattern, or a dedicated builder VM). Hardened provenance generation that an external party can verify.
+- **Cross-link to the ACM track.** [Module 09 of the ACM track](/learn/acm-multicluster/security-with-rhacs) covers RHACS at fleet scale; the same gates from this capstone, fanned out to ten clusters.
+- **Cross-link to the Kubeflow track.** [Module 11 of the Kubeflow track](/learn/kubeflow/production-patterns) shows the ML-specific extensions — model artifact signing, drift monitoring, MLMD lineage as a compliance artifact. The same security spine, applied to models instead of services.
+
+## Closing
+
+The infrastructure for DevSecOps is solved. The tools exist, they are open-source-available, they compose. The differentiator is engineering discipline: do you actually run the gates, do you actually wire the logs to the SIEM, do you actually rotate the secrets, do you actually rehearse the IR runbook.
+
+The thirteen-module track has shown the shape. The work after this is filling that shape with the specifics of your environment — your industry's regulators, your tenants' privacy promises, your business's tolerance for downtime, your team's on-call capacity. The shape is the same everywhere; the specifics are what take a career to learn.
+
+Send back what you built or what blocked you. The feedback shapes future revisions of this track.
+
+## References
+
+- Sigstore cosign: `https://docs.sigstore.dev/cosign/overview/`
+- Sigstore Policy Controller: `https://docs.sigstore.dev/policy-controller/overview/`
+- Kyverno verify-images: `https://kyverno.io/docs/writing-policies/verify-images/`
+- Syft (SBOM generation): `https://github.com/anchore/syft`
+- SLSA framework: `https://slsa.dev/`
+- CycloneDX SBOM spec: `https://cyclonedx.org/`
+- Trivy: `https://aquasecurity.github.io/trivy/`
+- Semgrep: `https://semgrep.dev/docs/`
+- Gitleaks: `https://github.com/gitleaks/gitleaks`
+- Hadolint: `https://github.com/hadolint/hadolint`
+- Pod Security Standards: `https://kubernetes.io/docs/concepts/security/pod-security-standards/`
+- Istio security: `https://istio.io/latest/docs/concepts/security/`
+- OpenShift Compliance Operator: `https://docs.redhat.com/en/documentation/openshift_container_platform/latest/html/security_and_compliance/`
+- Wazuh: `https://documentation.wazuh.com/`
+- Falco: `https://falco.org/docs/`
+- RHACS documentation: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/`
+
+**That is the end of the track.** If you have completed the capstone, you are operating a pipeline that most teams in 2026 only aspire to. The work that comes after is the same shape, at greater scale, against more sophisticated threats. The shape is what stays.
