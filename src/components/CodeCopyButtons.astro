@@ -1,0 +1,73 @@
+---
+/**
+ * Injects a "Copy" button into every code block on the page.
+ *
+ * Targets `pre.astro-code` (the wrapper Astro+Shiki emits for fenced code
+ * blocks). Inline `<code>` is untouched. The button text flips to "Copied!"
+ * for 1.6s after a successful clipboard write, then resets.
+ *
+ * Styles for `.code-copy-btn` live in `src/styles/global.css`.
+ */
+---
+
+<script is:inline>
+  (() => {
+    const COPY_LABEL = "Copy";
+    const COPIED_LABEL = "Copied!";
+
+    function addCopyButton(pre) {
+      if (pre.dataset.copyButton === "1") return;
+      pre.dataset.copyButton = "1";
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "code-copy-btn";
+      btn.textContent = COPY_LABEL;
+      btn.setAttribute("aria-label", "Copy code to clipboard");
+
+      btn.addEventListener("click", async () => {
+        const code = pre.querySelector("code");
+        const text = code ? code.innerText : pre.innerText;
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          // Fallback for environments without clipboard API
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); } catch {}
+          document.body.removeChild(ta);
+        }
+        btn.textContent = COPIED_LABEL;
+        btn.dataset.copied = "true";
+        setTimeout(() => {
+          btn.textContent = COPY_LABEL;
+          delete btn.dataset.copied;
+        }, 1600);
+      });
+
+      pre.appendChild(btn);
+    }
+
+    function run() {
+      // Astro/Shiki emits <pre class="astro-code ..."> for fenced blocks.
+      // Some MDX content also produces bare <pre><code>. Cover both.
+      const blocks = document.querySelectorAll(
+        "pre.astro-code, .prose pre > code"
+      );
+      blocks.forEach((el) => {
+        const pre = el.tagName === "PRE" ? el : el.closest("pre");
+        if (pre) addCopyButton(pre);
+      });
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", run);
+    } else {
+      run();
+    }
+  })();
+</script>
