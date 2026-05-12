@@ -41,12 +41,11 @@ This file is for the **next AI agent** working on this repository. It captures t
 │   ├── favicon.svg
 │   └── robots.txt                       ← allows all + sitemap pointer
 ├── src/
-│   ├── content.config.ts                ← four collections: blog, docs, learn, brac-poc
+│   ├── content.config.ts                ← three collections: blog, docs, learn (brac-poc retired; folded under docs/brac-poc/)
 │   ├── content/
 │   │   ├── blog/*.mdx                   ← posts (flat, category in frontmatter)
-│   │   ├── docs/NN-section/NN-*.mdx     ← platform docs, numbered for sort
-│   │   ├── learn/<track>/NN-*.mdx       ← learn modules, numbered for sort
-│   │   └── brac-poc/NN-*.mdx            ← BRAC engagement POC pages, numbered for sort
+│   │   ├── docs/<module>/NN-section/... ← master docs section; sub-modules openshift-platform/ and brac-poc/
+│   │   └── learn/<track>/NN-*.mdx       ← learn modules, numbered for sort
 │   ├── components/
 │   │   ├── Whiteboard.tsx               ← ReactFlow viewer (NO minimap)
 │   │   ├── WhiteboardEditor.tsx         ← /whiteboard interactive editor
@@ -100,10 +99,11 @@ Defined in `src/content.config.ts`.
 
 - URL: `/docs/<stripped-slug>` (numeric prefixes stripped from each path segment).
 - Schema: `title`, `description?`, `sidebar_label?`, `last_reviewed?`, `draft?`.
-- Folder structure is hierarchical: `src/content/docs/06-architecture-decisions/12-blog/01-adr-0001-...`.
+- Folder structure is hierarchical and is now organized into **sub-modules** under `src/content/docs/`:
+  - `openshift-platform/` — the comptech OpenShift platform docs (foundations, lab-infrastructure, cluster-topology, ADRs, etc.).
+  - `brac-poc/` — the BRAC Bank engagement POC docs (previously a top-level `brac-poc` collection, now folded back under `/docs/brac-poc/` so all reference material shares one collection and one routing tree).
 - Numeric prefixes (`NN-`) drive sort order; they're stripped from URLs by `stripIdPrefixes` in `navTree.ts`.
-- The platform docs are for the **comptech OpenShift platform** — keep them separate from blog ADRs.
-- Blog-specific ADRs live in `src/content/docs/06-architecture-decisions/12-blog/`.
+- Blog-specific ADRs live under the openshift-platform sub-module at `src/content/docs/openshift-platform/06-architecture-decisions/12-blog/`.
 
 ### learn
 
@@ -116,16 +116,9 @@ Defined in `src/content.config.ts`.
   3. `/learn/<track>/<module>` — module content.
 - Track display titles + taglines live in `src/utils/tracks.ts` (`TRACK_TITLES`, `TRACK_TAGLINES`).
 
-### brac-poc
+### brac-poc (retired collection)
 
-- URL: `/brac-poc/<stripped-slug>` (numeric prefixes stripped from filenames).
-- Schema: same as `docs` — `title`, `description?`, `sidebar_label?`, `last_reviewed?`, `draft?`.
-- Files: flat under `src/content/brac-poc/NN-*.mdx`; numbered for sort order.
-- Two-level navigation:
-  1. `/brac-poc/` — landing page (lists pages).
-  2. `/brac-poc/<page>` — content.
-- Layout: `BracPocLayout.astro`; Sidebar: `BracPocSidebar.astro`; Tree builder: `buildBracPocTree`.
-- Promoted out of `/docs/09-brac-poc/` per [Blog ADR 0006](src/content/docs/06-architecture-decisions/12-blog/06-adr-0006-brac-poc-collection.mdx). If a second engagement lands, refactor into a generic `engagements/` collection.
+The standalone `brac-poc` content collection has been **retired**. All BRAC POC docs now live under the `docs` collection at `src/content/docs/brac-poc/`, reachable at `/docs/brac-poc/<page>`. Old `/brac-poc/*` URLs are 301-redirected via `public/_redirects`. See [Blog ADR 0007](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/07-adr-0007-docs-master-section.mdx) for the rationale; [Blog ADR 0006](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/06-adr-0006-brac-poc-collection.mdx) is marked superseded.
 
 ## 5. Voice / writing style
 
