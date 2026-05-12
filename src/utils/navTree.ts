@@ -11,8 +11,6 @@ export type NavNode = {
 type BlogItem = CollectionEntry<"blog">;
 type DocItem = CollectionEntry<"docs">;
 type LearnItem = CollectionEntry<"learn">;
-type BracPocItem = CollectionEntry<"brac-poc">;
-type AnyItem = BlogItem | DocItem | LearnItem | BracPocItem;
 
 const prettify = (s: string) =>
   s.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toLowerCase());
@@ -103,13 +101,30 @@ export function buildDocsTree(items: DocItem[], base: string): NavNode[] {
   return root.children ?? [];
 }
 
-/** Same shape as buildDocsTree, scoped to the `brac-poc` collection. */
-export function buildBracPocTree(items: BracPocItem[], base: string): NavNode[] {
+/**
+ * Build a docs tree scoped to a single module (a top-level folder under
+ * `src/content/docs/`). Strips the `<moduleId>/` prefix from each item id
+ * before building, so the resulting tree is rooted at the module — no
+ * wrapping group for the module folder itself.
+ *
+ * Use this from sidebars and module-landing pages where the surrounding
+ * UI already names the module; the tree only needs to show what's inside.
+ */
+export function buildModuleTree(
+  items: DocItem[],
+  moduleId: string,
+  base: string,
+): NavNode[] {
+  const prefix = `${moduleId}/`;
+  const scoped = items.filter((it) => it.id.startsWith(prefix));
+
   const root: NavNode = { label: "", children: [] };
-  const sorted = [...items].sort((a, b) => a.id.localeCompare(b.id));
+  const sorted = [...scoped].sort((a, b) => a.id.localeCompare(b.id));
 
   for (const item of sorted) {
-    const parts = item.id.split("/");
+    // Walk only the segments *inside* the module folder.
+    const inner = item.id.slice(prefix.length);
+    const parts = inner.split("/");
     let cursor = root;
     for (let i = 0; i < parts.length - 1; i++) {
       const dir = parts[i];
