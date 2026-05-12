@@ -1,0 +1,264 @@
+---
+title: "Multicluster Networking with Submariner"
+sidebar_label: "13 — Multicluster Networking"
+description: "Pod-to-pod and service-to-service connectivity across clusters via Submariner — when to use it, the gateway model, Globalnet for CIDR overlap, ServiceExport, and the operational realities for BFSI active-active scenarios."
+estimated_minutes: 75
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const subNodes = [
+  { id: "ca", data: { label: "Cluster A\n(pod CIDR 10.128.0.0/14)" }, position: { x: 40, y: 30 }, style: stage, type: "shape" },
+  { id: "cb", data: { label: "Cluster B\n(pod CIDR 10.132.0.0/14)" }, position: { x: 760, y: 30 }, style: stage, type: "shape" },
+  { id: "podA", data: { label: "pod payments-api\n(Service: payments)" }, position: { x: 40, y: 150 }, style: agent, type: "shape" },
+  { id: "podB", data: { label: "pod ledger-worker\n(consumer)" }, position: { x: 760, y: 150 }, style: agent, type: "shape" },
+  { id: "raA", data: { label: "Route agent\n(every node, Cluster A)" }, position: { x: 40, y: 270 }, style: ctrl, type: "shape" },
+  { id: "raB", data: { label: "Route agent\n(every node, Cluster B)" }, position: { x: 760, y: 270 }, style: ctrl, type: "shape" },
+  { id: "gwA", data: { label: "Gateway node A\n(external IP, IPsec)" }, position: { x: 40, y: 390 }, style: ctrl, type: "shape" },
+  { id: "gwB", data: { label: "Gateway node B\n(external IP, IPsec)" }, position: { x: 760, y: 390 }, style: ctrl, type: "shape" },
+  { id: "broker", data: { label: "Broker\n(hub cluster API)" }, position: { x: 400, y: 30 }, style: ctrl, type: "shape" },
+  { id: "lh", data: { label: "Lighthouse DNS\nclusterset.local" }, position: { x: 400, y: 200 }, style: ctrl, type: "shape" },
+  { id: "tunnel", data: { label: "Encrypted tunnel\n(IPsec NATT 4500/UDP)" }, position: { x: 400, y: 400 }, style: ext, type: "shape" },
+];
+
+export const subEdges = [
+  { id: "e1", source: "ca", target: "podA", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "cb", target: "podB", style: { stroke: "#1f2937" } },
+  { id: "e3", source: "podA", target: "raA", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "podB", target: "raB", style: { stroke: "#1f2937" } },
+  { id: "e5", source: "raA", target: "gwA", style: { stroke: "#1f2937" }, label: "encap" },
+  { id: "e6", source: "raB", target: "gwB", style: { stroke: "#1f2937" }, label: "encap" },
+  { id: "e7", source: "gwA", target: "tunnel", style: { stroke: "#1f2937" } },
+  { id: "e8", source: "gwB", target: "tunnel", style: { stroke: "#1f2937" } },
+  { id: "e9", source: "gwA", target: "broker", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "register" },
+  { id: "e10", source: "gwB", target: "broker", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "register" },
+  { id: "e11", source: "broker", target: "lh", style: { stroke: "#6b7280", strokeDasharray: "4,3" } },
+  { id: "e12", source: "podB", target: "lh", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "resolve" },
+];
+
+The first twelve modules of this track treat each managed cluster as an island. Pods talk to pods inside one cluster; cross-cluster traffic goes out the edge via Route or Ingress and back in via the other cluster's edge — the same wire path a public client would take. That is fine for the cases the track has covered so far: a hub managing fleet state, GitOps reconciling per-cluster, observability shipping metrics back to a Thanos receive endpoint. None of those depend on a pod in spoke-A reaching a Service in spoke-B by its in-cluster name.
+
+The moment you put a real **active-active** workload across two clusters — same Service, two homes, a load balancer fronting both — the island model stops working. A pod in spoke-A that needs to reach `payments` on spoke-B should not be hairpinning through a public Route and an external load balancer to get back into the cluster it just left. It wants **east-west** connectivity that stays inside the operator's network, that resolves Service names the same way a single-cluster pod does, and that the bank's network team has not been asked to expose to the public internet.
+
+**Submariner** is the project that closes that gap for OpenShift / Kubernetes fleets. It is the productised pull-model multicluster networking layer that RHACM ships as a `ManagedClusterAddOn`, on every cluster in a `ManagedClusterSet`, with the broker on the hub. This module covers when to reach for it, what the moving parts are, how Globalnet rescues the brownfield case where someone built two clusters with the same pod CIDR, and the operational potholes — the ones a BFSI deployment cannot afford to discover the first time the active-active rehearsal is run for an auditor.
+
+## Why cross-cluster pod and service connectivity matters
+
+Three scenarios make this concrete. None of them is hypothetical for a regional bank running on OpenShift in 2026.
+
+**Active-active across two DCs.** A payments authorisation service runs on both spoke-DC-A and spoke-DC-B. A hardware load balancer in front of both publishes a single VIP. When DC-A loses power, the LB pulls A's backends out and DC-B carries the full load — no DNS flip, no waiting for TTLs to expire, no operator paging the network team. For that to work the two service instances *cannot* depend on each other through edge ingress; if DC-A's `payments` calls a `risk-scoring` Service that happens to live only on DC-B that call has to traverse a private east-west path, not an internet hop that may be down because the partner DC is down.
+
+**Database with an app tier on a different cluster.** Postgres on Cluster A — the cluster that the DBAs operate, that the storage team backs up, that the PCI auditor signed off on — and the business app on Cluster B, where the app team has cluster-admin and ships ten times a day. The app needs to reach `postgres-primary.payments.svc` by Service name (because that is the connection string in its Helm chart and in its Vault-rendered Secret), not by an FQDN that resolves to an external Route, not by an LB IP that someone has to maintain a DNS record for. Different fault domains, different regulator scopes, one connection string that does not care about the boundary.
+
+**Data residency.** A regulator-mandated dataset can only live in Region X. An app in Region Y needs to query it — for an entitlements check, a customer-lookup, a sanction-list match. The query is small, the data must stay local, and the traffic should *not* go via the public internet because the bank's security policy says inter-DC traffic stays on the operator's MPLS and is encrypted at the network layer. That is the textbook Submariner case: an east-west tunnel between two managed clusters, encrypted, audited, no edge involved.
+
+In each of the three the wrong answer is the same: bolt up a Route or an Ingress on one side, an egress firewall rule on the other, and call it integration. It works until it doesn't — until the partner LB IP changes, until certificate rotation breaks the trust chain, until the auditor asks why customer data is leaving the controlled-network boundary, until the cluster-admin who knows the spaghetti leaves. The right answer is a real east-west fabric where the cross-cluster path is as boring as the in-cluster path.
+
+## Submariner in one diagram
+
+<Whiteboard client:load data={{ nodes: subNodes, edges: subEdges }} height={560} />
+
+Reading the diagram:
+
+- Each cluster has a **gateway node** — one designated worker (or a small group, for HA) with an external IP that the operator's network team has whitelisted for the cross-cluster traffic. The gateway is where all east-west traffic enters and exits.
+- The **Route agent** is a DaemonSet running on every node. Its job is to program iptables / OVN flows so that pod traffic destined for a remote cluster's CIDR is routed via the local gateway.
+- The **encrypted tunnel** between the two gateways carries the actual traffic. Default is IPsec with NAT traversal on 4500/UDP plus a NAT discovery port on 4490/UDP.
+- The **broker** is a small Kubernetes-API surface (typically on the hub, in a namespace named after the `ManagedClusterSet`). Each cluster's Submariner operator registers its gateway IP, its pod and service CIDRs, and its exported Services to the broker, and reads back the same information from the other clusters in the set. Solid black edges are data flow; dashed green animated edges are this control-plane registration traffic.
+- **Lighthouse DNS** is the resolver that turns `<svc>.<ns>.svc.clusterset.local` into the right remote endpoint by reading the broker's view of which Services are exported where. The dashed grey edges show that DNS query path.
+
+The mental model: Submariner is two layers. A control plane that gossips cluster identity and Service exports through the broker, and a data plane that is a private encrypted overlay between gateway nodes. The Route agent is the glue that gets pod traffic to the local gateway in the first place.
+
+## The components, in plain language
+
+| Component | Where it runs | What it does |
+| --- | --- | --- |
+| Submariner operator | Every participating cluster, in `submariner-operator` namespace | Reconciles the rest of the stack from `Submariner` CR + `SubmarinerConfig` |
+| Broker | One cluster — typically the hub — in `<clusterset-name>-broker` namespace | Tiny K8s-API surface where each cluster registers its CIDRs, gateway IP, and exported Services |
+| Gateway | One labelled worker (or HA group) per cluster | Terminates the IPsec tunnel; all cross-cluster traffic flows through it |
+| Route agent | DaemonSet on every node | Programs node-local routes so pods can reach the gateway with the correct encapsulation |
+| Lighthouse DNS | Per cluster | Resolves `*.svc.clusterset.local` queries to remote-cluster endpoints |
+| Globalnet controller | Per cluster (when enabled) | Allocates a non-overlapping virtual CIDR and NATs traffic on the gateway |
+
+The cable engine — what does the actual tunnel — has options. **Libreswan** is the default IPsec implementation. **VXLAN** is available for environments where IPsec is awkward (some hosted-control-plane setups). **OVN-IPsec** is supported on OVN-Kubernetes clusters when the cluster CNI already does IPsec at the node level. For a typical bare-metal or VM-based OpenShift install the default libreswan path is the one to pick — well-trodden, easy to debug with the standard IPsec tooling, no surprises.
+
+## Installation via RHACM
+
+The official path is the `submariner-addon`, an RHACM-shipped controller that handles the orchestration end-to-end. The flow:
+
+1. Create or pick a `ManagedClusterSet` and add the clusters you want connected. The `submariner-addon` watches for the set and automatically creates a broker namespace called `<set-name>-broker` on the hub.
+2. Apply a `Broker` CR in that namespace. The CR is small — its main knob is `globalnetEnabled: true|false` (covered below).
+3. Per cluster, apply a `SubmarinerConfig` CR in the managed cluster's namespace on the hub. This is where you set provider-specific bits — gateway count for HA, the cable driver, the NATT port, AWS / Azure / GCP credentials if the addon is going to label and prepare cloud-managed nodes, the airGappedDeployment flag for disconnected environments.
+4. Apply a `ManagedClusterAddOn` of `name: submariner` on the hub, in each managed cluster's namespace. The addon controller reconciles by pushing the operator and the per-cluster Submariner CR to the spoke via the standard manifestwork pathway.
+5. Watch the addon condition reach `Available`. The gateway node gets labelled `submariner.io/gateway=true`, the tunnel comes up, and the broker shows two clusters registered.
+
+The reason to do this through ACM rather than `subctl join` by hand: the addon handles the cert-and-PSK exchange between broker and clusters, the gateway labelling, and the firewall preparation on supported providers (AWS, Azure, GCP, OpenStack) without an engineer touching the cloud console. For a fleet of more than two clusters that pays for itself in week one.
+
+A high-level shape of the addon enable, on one cluster:
+
+```
+apiVersion: addon.open-cluster-management.io/v1alpha1
+kind: ManagedClusterAddOn
+metadata:
+  name: submariner
+  namespace: spoke-dc-v6
+spec:
+  installNamespace: submariner-operator
+```
+
+Pair that with a `SubmarinerConfig` carrying the provider knobs:
+
+```
+apiVersion: submarineraddon.open-cluster-management.io/v1alpha1
+kind: SubmarinerConfig
+metadata:
+  name: submariner
+  namespace: spoke-dc-v6
+spec:
+  gatewayConfig:
+    gateways: 1
+  IPSecNATTPort: 4500
+  airGappedDeployment: true
+```
+
+The `name` on both is fixed to `submariner` by the addon — not a customisable string. The `airGappedDeployment: true` flag is the one the lab would set because the spokes pull from the on-network Nexus mirror, not from `registry.redhat.io`.
+
+## ClusterSet integration
+
+Submariner reuses the same `ManagedClusterSet` primitive the rest of ACM uses for grouping clusters. That choice is load-bearing for two reasons.
+
+First, the RBAC story is unified. The `ManagedClusterSetAdmin` role you already use to authorise who can deploy to a group of clusters is the same role that scopes who can configure Submariner on that group. No second-class permission model for the network plane; the same `RoleBinding` that lets a tenant deploy a Helm chart to their three clusters can also let them export a Service from those clusters.
+
+Second, the boundary of a Submariner deployment is the cluster set. Every cluster in the set joins the same connectivity domain. A `Service` exported on cluster A is reachable from cluster B *if and only if* both are in the same set. That maps cleanly to a real-world segmentation: a `payments-bfsi` set with two clusters that share an active-active payments workload; a `dev-everywhere` set with three dev clusters that share nothing important; a `data-residency-region-x` set with the regulator-bound cluster pair. Cross-set traffic does not happen.
+
+The implication: design the cluster sets first, then enable Submariner per set. Do not try to retrofit a connectivity domain onto a set you assembled for some other reason — you will discover that the developers' staging cluster is in the same set as production payments and Submariner is happy to route traffic between them.
+
+## ServiceExport and ServiceImport
+
+The cross-cluster Service API is `multicluster.x-k8s.io/v1alpha1` — the same KEP that defines `ServiceExport` and `ServiceImport`. Submariner implements this with Lighthouse.
+
+The contract is asymmetric in the API but symmetric in effect. On the source cluster — the one that hosts the Service — you create a `ServiceExport`:
+
+```
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: payments
+  namespace: payments-prod
+```
+
+The name and namespace match an existing `Service`. That is all. The Lighthouse controller picks it up, registers the Service with the broker, and Lighthouse DNS on every other cluster in the set starts answering for `payments.payments-prod.svc.clusterset.local`. **There is no `ServiceImport` to write by hand** — Submariner generates the corresponding `ServiceImport` automatically on each consumer cluster, and the cluster-local Lighthouse DNS resolves the magic FQDN to either a remote ClusterIP (via the gateway tunnel) or a local one if the Service exists on the consumer too.
+
+That last detail matters for active-active. If `payments` is exported on *both* clusters and a pod on cluster A queries `payments.payments-prod.svc.clusterset.local`, Lighthouse will *prefer the local Service*. The cross-cluster path is the fallback for when the local instance is gone. That is the behaviour you want — a payments call from cluster A stays in cluster A as long as cluster A has a payments pod, and only crosses to cluster B when A has nothing to answer with. The hardware LB in front of both VIPs takes care of the inbound side; Lighthouse takes care of the east-west calls between services on the same fabric.
+
+The `subctl export service` and `subctl unexport service` commands are convenience wrappers — they apply or remove the `ServiceExport` CR. For a GitOps fleet, ship `ServiceExport` objects in the application's manifest set alongside the `Service` and let the same ApplicationSet that ships the workload also ship the export. No imperative steps.
+
+## Globalnet — when pod CIDRs overlap
+
+Greenfield CIDR planning is easy on a slide: give each cluster a non-overlapping `/14` and never let them collide. Brownfield reality is harder. Two clusters built three years apart, by different teams, both got `10.128.0.0/14` as the OpenShift default. The decision to connect them across DCs was made yesterday. Renumbering either cluster is a multi-quarter project nobody is going to fund.
+
+**Globalnet** is the workaround. Enabled cluster-set-wide at broker creation time (`globalnetEnabled: true` on the `Broker` CR), it gives each cluster a *non-overlapping virtual CIDR* — a range out of the configured Global Private Network — and lets the gateway translate between the cluster's real pod / Service IPs and the global ones on the way out and back in. Each cluster receives a chunk of the Global CIDR (default 8 global IPs per `ClusterGlobalEgressIP` resource, configurable via the `numberOfIPs` field).
+
+What that buys you: two clusters with identical pod CIDRs can talk to each other, because traffic leaving cluster A's gateway is NAT'd to a global IP from A's allocation, arrives at cluster B's gateway as a global-CIDR source, and B's gateway NATs it again to a local destination. Lighthouse DNS returns the *global* IP for exported Services so the source-cluster pod targets a non-overlapping destination.
+
+What it costs: an extra NAT hop, observability that has to translate between local and global IPs in logs and traces (a packet's source IP at the application layer is not the same as at the wire layer), and a measurably higher operational surface — there is one more controller (`globalnet`) that can be unhealthy, one more CR (`ClusterGlobalEgressIP`) to reason about, and one more reason for `subctl diagnose` to find something wrong.
+
+The recommendation is firm: **design CIDRs to be non-overlapping in greenfield**. Use Globalnet only when retrofitting a brownfield estate where renumbering is genuinely impossible. The flag is irreversible per cluster set without removing every cluster from the set and starting over.
+
+## The gateway-node trap
+
+By default the addon picks any worker as the gateway. For a development cluster that is fine. For BFSI it is not.
+
+The gateway carries every cross-cluster packet through one node's external IP. That IP has to be reachable from the partner cluster, which usually means the bank's network team has whitelisted it on the inter-DC firewall, opened 4500/UDP and 4490/UDP, possibly opened the ESP protocol if NAT is not in the path. Letting the addon pick a random worker on each reboot, and the IP changing every time the autoscaler decommissions a node, is a recipe for after-hours network-team escalations.
+
+The fix is to designate gateway nodes explicitly. Pick (for HA) two or three workers on dedicated, statically-addressed hardware. Label them `submariner.io/gateway=true` *before* you enable the addon; the operator scheduler only places the gateway pod on nodes with that label. Set `SubmarinerConfig.spec.gatewayConfig.gateways: 2` (or 3) for HA — only one is active at a time, but the others come up immediately if the active one dies. Communicate the gateway IPs to the network team once, in writing, and keep the labels sticky across cluster operations.
+
+For cloud-managed clusters (AWS, Azure, GCP) the addon can prepare the gateway nodes automatically — labelling, opening security-group rules, and on AWS attaching the load-balancer-enable annotation. For bare-metal and VM-based clusters you do the labelling by hand and you tell the addon to leave the cloud-prep step alone. The lab is the bare-metal case.
+
+## Network policy and Submariner
+
+This is the trap that catches every first-time deployment.
+
+Submariner moves packets across the wire. It does *not* override the destination cluster's `NetworkPolicy`. When a pod in cluster A reaches a Service in cluster B, the packet appears in cluster B with a source IP that is either a remote pod IP (no Globalnet) or a global-CIDR IP (Globalnet). Either way it is **not** a cluster-B-local IP, and the destination namespace's `NetworkPolicy` — if it is the common default-deny with an explicit allow for in-namespace traffic only — will drop it.
+
+The symptom: the tunnel is up (`subctl show connections` is green), DNS resolves correctly (`nslookup payments.payments-prod.svc.clusterset.local` returns an IP), the pod's connect attempt times out at the application layer. The diagnosis takes thirty minutes the first time and five seconds every time after that, because nobody documents this in the runbook the first time.
+
+The fix is an explicit allow rule on the destination namespace that permits the relevant remote-pod or global-CIDR source range. For Globalnet that is the global CIDR allocated to the source cluster, retrieved from the broker. For non-Globalnet it is the source cluster's pod CIDR. Either way the rule is concrete and writable; the trap is purely a documentation gap.
+
+A second variant of the same problem: cluster-wide `NetworkPolicy` (an admission webhook denying anything not explicitly allowed) catches Submariner traffic too. Plan the policy carefully when you bring up the addon; the easiest path is to allow ingress from the Submariner gateway pod's namespace to all destination namespaces by default and tighten from there.
+
+## Encryption and audit
+
+By default the data plane is **IPsec with libreswan**, mutually authenticated with a Pre-Shared Key the broker generates and rotates. From a network-layer audit perspective that ticks the encryption-in-transit box: an attacker with a tap on the inter-DC link sees AES-encrypted IPsec packets and nothing else. For PCI-DSS Requirement 4 — "encrypt transmission of cardholder data across open, public networks" — the IPsec layer is the answer when the inter-DC path is anything other than the bank's own dark fibre.
+
+That does **not** mean mTLS at the application layer is redundant. Network-layer encryption protects the wire; it does not protect against a compromised pod on either end. For sensitive data — card numbers, authentication tokens, anything in scope for the bank's data-classification regime — wire mTLS through Service Mesh on top of the Submariner fabric. Submariner does not care; the encrypted bytes flow through the tunnel like any other bytes. Belt and braces is the right posture, and the auditor likes seeing both.
+
+PSK rotation happens through the broker. The standard rotation cadence is documented in the upstream Submariner project and is not heavy — the addon handles it transparently when the operator's PSK source rotates. The audit record is in the operator's logs and in the broker's CR conditions.
+
+## The lab's posture
+
+**Submariner is not deployed in the lab today.** The lab runs a single spoke (spoke-dc-v6) and a single hub (hub-dc-v6); there is no second spoke to connect to. The whole conversation about east-west fabrics is academic until the reserved DR pair gets built.
+
+The reserved hub-dr-v6 and spoke-dr-v6 — see ADR-0022 ([`/docs/architecture-decisions/adr-0022-v6-fleet-purge/`](/docs/architecture-decisions/adr-0022-v6-fleet-purge)) for the v6 fleet decision and the reserved-but-not-built DR pair — are the natural target for a real Submariner deployment. Two production-ish DCs, two clusters, the kind of inter-DC link bandwidth that does not make IPsec overhead the bottleneck, a network team that already operates a controlled-network boundary. When that pair is built, the conversation shifts from "should we connect them" to "what's in the cluster set." The BFSI readiness review ([`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review)) calls out multi-DC active-active as a high-severity gap; Submariner is the mechanism for closing the network half of that gap, with the application half landing on whichever stateful tier (Postgres replication, Kafka MirrorMaker, Redis replication) the workload happens to use.
+
+The yaml examples in this module would land on hub-dc-v6 + spoke-dr-v6 + spoke-dc-v6 unchanged if the DR pair were built. The gateway nodes would be specific bare-metal workers on each spoke with statically-addressed external NICs; the broker would live on hub-dc-v6; the airGappedDeployment flag would be on; the IPsec NATT port would be the default 4500/UDP and the network team would have an entry on the firewall for it.
+
+Standing the addon up after the DR pair is built is a half-day exercise. Verifying the cross-cluster path end-to-end is closer to a week of testing — `subctl verify` against the real workload, network-policy validation, hardware-LB integration, the active-active rehearsal. The work is testing rather than configuring.
+
+## Try this
+
+These are mostly thought experiments, since the lab cannot run them today. They are still useful — Submariner has enough conceptual surface that internalising the model before touching it pays off.
+
+1. **Design the CRs for hub-dc-v6 + spoke-dc-v6.** Read the `Broker` and `SubmarinerConfig` shapes in the source documentation. Sketch what they would look like for the lab — `ManagedClusterSet` name (`bfsi-fleet` is a reasonable choice), broker namespace (`bfsi-fleet-broker`), gateway node labels per spoke, `airGappedDeployment: true`, IPSec NATT port 4500, gateway count 2 for HA. The exercise is to absorb the shape of the API; running it is for after the DR pair is built.
+
+2. **Plan the gateway-node placement strategy for a 2-DC active-active payments service.** Which physical workers on each spoke become gateways? How does the network team source-NAT or whitelist them? What happens when one of the two gateway nodes on a spoke is taken down for maintenance — does the tunnel re-establish on the second gateway without the network team having to whitelist a new IP? How do you label the workers so the addon respects your choice rather than picking arbitrarily?
+
+3. **Trace the DNS resolution path.** A pod in cluster A queries `redis.payments.svc.clusterset.local`. Walk through every component that touches that query: the pod's `/etc/resolv.conf`, the cluster's CoreDNS, the Lighthouse DNS resolver, the broker's view of which clusters export `redis.payments`, the eventual answer (a global IP under Globalnet, a remote pod IP without), and the data-plane path the subsequent TCP connection takes from pod to local gateway to remote gateway to remote pod. Knowing each hop is what lets you debug the next outage in under thirty minutes.
+
+## Common failure modes
+
+**Gateway pod never schedules.** No node carries the `submariner.io/gateway=true` label. The operator scheduler has nowhere to place the pod and reports back as `Progressing` indefinitely. The fix is to label the chosen workers explicitly. If the addon was supposed to label them automatically (on AWS / Azure / GCP), check that the cloud credentials in `SubmarinerConfig` are correct and that the addon's cloud-prep step has reached `Completed`.
+
+**Tunnel is up but traffic does not flow.** `subctl show connections` is green on both sides, the gateways report `Connected`, but pod-to-Service across the tunnel times out. Almost always `NetworkPolicy` on the destination namespace. Look at the namespace's policies, confirm none deny ingress from the Submariner gateway pod's CIDR or from the remote cluster's pod CIDR (or global CIDR under Globalnet), add an explicit allow if needed. The second-most-common cause is the destination cluster's CNI not picking up the route — `oc rsh` to the destination cluster's gateway pod and `ip route` shows whether it has a route for the source CIDR.
+
+**Globalnet enabled but Services not reachable.** The broker does not have a `GlobalCIDRRange` configured, or the per-cluster `ClusterGlobalEgressIP` did not get allocated IPs. Check the broker namespace on the hub for the `Broker` CR — `globalnetEnabled: true` should be set, and `globalnetCIDRRange` should hold a non-empty range. On each managed cluster, `oc get clusterglobalegressip` should return at least one allocated entry. If not, the globalnet controller pod logs in the source cluster usually point at the missing piece.
+
+**ServiceExport created but DNS does not resolve.** `kubectl get serviceexport -A` shows the export, `kubectl get serviceimport -A` on the consumer cluster shows the corresponding import, but `nslookup foo.bar.svc.clusterset.local` returns NXDOMAIN. The cluster's kubelet `--cluster-domain` is wrong, or the Lighthouse coreDNS plugin is not configured in the cluster's CoreDNS ConfigMap, or the consumer cluster's Lighthouse DNS Service is not in the cluster's DNS search path. `oc get configmap dns-default -n openshift-dns` and check that `clusterset.local` is in the forward zone for the Submariner Lighthouse Service.
+
+**`subctl verify` fails on the throughput test.** Usually a MTU mismatch — the IPsec overhead eats roughly 60 bytes per packet and the pod-network MTU has not been adjusted. Either lower the cluster's pod MTU (intrusive, requires a reboot) or set `Submariner.spec.tunnelMTU` on the per-cluster CR (less intrusive, takes effect immediately). The other variant is a path-MTU-discovery black hole — some inter-DC firewalls drop ICMP and the TCP path cannot negotiate down. The mitigation is `mtuProbe` on the cluster's TCP sysctl, but the real fix is to allow ICMP type 3 code 4 through the firewall.
+
+## References
+
+- Red Hat ACM networking documentation (Submariner): `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.15/html/networking/`
+- Submariner upstream project: `https://submariner.io/`
+- Submariner architecture overview: `https://submariner.io/getting-started/architecture/`
+- Globalnet controller: `https://submariner.io/getting-started/architecture/globalnet/`
+- Multicluster Services KEP (`ServiceExport` / `ServiceImport`): `https://github.com/kubernetes/enhancements/tree/master/keps/sig-multicluster/1645-multi-cluster-services-api`
+- Subctl reference: `https://submariner.io/operations/deployment/subctl/`
+
+## End of the content modules
+
+This is the final content module in the track. You have walked through foundations, architecture, cluster lifecycle, policy, GitOps, application lifecycle, observability, hosted control planes, security, backup, virtualization, and now the multicluster networking layer that makes active-active workloads real. Continue to [Module 11 — Build a project (capstone)](/learn/acm-multicluster/build-a-project) for the end-to-end walkthrough, or back to the [Overview](/learn/acm-multicluster/overview) for the full module map.
+
+A reasonable stretch goal once the lab's DR pair is built: bring up Submariner across hub-dc-v6 + spoke-dc-v6 + spoke-dr-v6, export a small Service from one spoke, consume it from the other through `*.svc.clusterset.local`, and trace the packet path end-to-end with `subctl verify`. That moment — a service name resolving across two physical DCs over an encrypted east-west fabric, with no edge in the middle — is the point of multicluster networking, and the point of this module.
