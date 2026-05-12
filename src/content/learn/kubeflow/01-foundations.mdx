@@ -1,0 +1,251 @@
+---
+title: "Foundations: ML on Kubernetes, and what Kubeflow actually is"
+sidebar_label: "01 — Foundations"
+description: "Why ML teams run on Kubernetes, what Kubeflow is (a collection, not a monolith), a short and unflinching history, the component map, and where distros and alternatives fit."
+estimated_minutes: 40
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const accent = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const flowEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const metaEdge = { style: { stroke: "#6b7280", strokeDasharray: "4,4", strokeWidth: 1.2 }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const mapNodes = [
+  { id: "dash",   position: { x: 320, y: 0 },    data: { label: "Central Dashboard" },              style: ctrl },
+  { id: "nb",     position: { x: 60,  y: 130 },  data: { label: "Notebooks\n(Jupyter on K8s)" },    style: stage },
+  { id: "kfp",    position: { x: 320, y: 130 },  data: { label: "Pipelines (KFP)\nDAG runtime" },   style: ctrl },
+  { id: "train",  position: { x: 580, y: 130 },  data: { label: "Training Operator\nPyTorchJob, TFJob, MPIJob" }, style: ctrl },
+  { id: "katib",  position: { x: 580, y: 260 },  data: { label: "Katib\nHPO + NAS" },               style: ctrl },
+  { id: "kserve", position: { x: 320, y: 260 },  data: { label: "KServe\nInferenceService" },       style: ctrl },
+  { id: "mlmd",   position: { x: 60,  y: 260 },  data: { label: "ML Metadata\n(MLMD)" },            style: accent },
+  { id: "profile",position: { x: 60,  y: 390 },  data: { label: "Profile\n(namespace per user)" },  style: accent },
+  { id: "istio",  position: { x: 320, y: 390 },  data: { label: "Istio (mesh + ingress)" },         style: ext },
+  { id: "k8s",    position: { x: 580, y: 390 },  data: { label: "Kubernetes\n+ GPU operator" },     style: ext },
+];
+
+export const mapEdges = [
+  { id: "dash-nb",    source: "dash", target: "nb",     ...flowEdge },
+  { id: "dash-kfp",   source: "dash", target: "kfp",    ...flowEdge },
+  { id: "dash-katib", source: "dash", target: "katib",  ...flowEdge },
+  { id: "dash-kserve",source: "dash", target: "kserve", ...flowEdge },
+  { id: "nb-kfp",     source: "nb",   target: "kfp",    label: "submit run",   ...flowEdge },
+  { id: "kfp-train",  source: "kfp",  target: "train",  label: "launches",     ...flowEdge },
+  { id: "kfp-katib",  source: "kfp",  target: "katib",  label: "experiments",  ...flowEdge },
+  { id: "katib-train",source: "katib",target: "train",  label: "trials",       ...flowEdge },
+  { id: "train-kserve",source: "train",target: "kserve",label: "model artifact", ...flowEdge },
+  { id: "kfp-mlmd",   source: "kfp",  target: "mlmd",   label: "lineage",      ...metaEdge },
+  { id: "katib-mlmd", source: "katib",target: "mlmd",   label: "trials",       ...metaEdge },
+  { id: "kserve-mlmd",source: "kserve",target: "mlmd",  label: "(optional)",   ...metaEdge },
+];
+
+Before you touch a CRD, it's worth being honest about what you're getting into. Kubeflow is not a product you install and forget. It's a collection of Kubernetes-native projects, glued together by a thin UI, sitting on top of a service mesh — and the case for using it is specific, not generic. This module sets the framing.
+
+## The ML-on-Kubernetes problem
+
+ML teams reach for Kubernetes for a small number of concrete reasons. None of them are *"because everyone else uses Kubernetes."*
+
+- **GPU scheduling.** A model that needs four A100s for training and one for serving is a scheduling problem long before it's an ML problem. Kubernetes' scheduler — plus the **Nvidia GPU Operator** — lets you express *"this Pod needs 4× `nvidia.com/gpu`"* and have the cluster find the right node. Doing this by hand on a fleet of bare-metal boxes is the historical baseline; it's worse than Kubernetes.
+- **Multi-tenant isolation.** A platform team running ML for ten product squads cannot give each squad its own physical GPU box. Namespaces, RBAC, and ResourceQuotas — combined with Kubeflow's `Profile` primitive — give each tenant their own logical slice without giving them root on each other's experiments.
+- **Reproducible environments.** Containers solve the *"works on my laptop, dies in prod"* problem for ML the same way they did for the web. A training job is just a container running a Python script; the cluster doesn't care whether the script trains a transformer or sorts CSVs.
+- **Hardware utilisation.** Idle A100s are expensive. A scheduler that packs short jobs onto reserved capacity, lets serving scale to zero when there's no traffic, and slices large GPUs across multiple tenants with **MIG** (Multi-Instance GPU) is the difference between a 30%-utilised fleet and a 70%-utilised one.
+- **Same Kubernetes the platform team already runs.** This is the underrated reason. If your company has a 50-person platform team running OpenShift or EKS, *not* using Kubernetes for ML means standing up a parallel infrastructure with its own on-call, its own monitoring, its own incident response. Reusing the existing platform is the cheapest path.
+
+The tradeoffs are real and worth saying out loud:
+
+- **More complexity than `python train.py`.** A data scientist who used to run a training script on a laptop now needs to understand container images, persistent volumes, service accounts, and ingress. The friction is measured in months of ramp-up.
+- **Local-dev parity is harder.** The model that trains on your laptop with conda may behave subtly differently in the cluster's container with `pip install`. The fix is to develop *inside* the same container the cluster runs — which is what Kubeflow Notebooks exists to make easy.
+- **The operator-team-vs-ML-team friction.** ML engineers want experiments fast; platform engineers want stable, audited infrastructure. Kubeflow lives at that boundary. Most failure modes are organisational, not technical.
+
+If your team is small, lives on one box with one GPU, and has no compliance pressure — **don't do this**. Train on the box. Scale up when you outgrow it.
+
+## What "Kubeflow" actually is
+
+Kubeflow is not a monolith. It is a **collection of Kubernetes-native projects** that together cover the ML workflow. Each is a separate set of CRDs and controllers, each can be deployed independently, and each has its own release cadence.
+
+The core components, in roughly the order you encounter them:
+
+| Component | What it does | Underlying primitive |
+| --- | --- | --- |
+| **Notebooks** | Jupyter / VS Code servers running as Pods, with PVCs for state and per-user identity | `Notebook` CRD |
+| **Kubeflow Pipelines (KFP)** | A DAG runtime for ML workflows — components are containers, the DAG is Python-authored, the runner is Argo or Tekton | `PipelineRun`, plus Argo `Workflow` or Tekton `PipelineRun` under it |
+| **Training Operators** | Distributed training as a Kubernetes Job — multi-Pod, multi-worker, multi-framework | `PyTorchJob`, `TFJob`, `MPIJob`, `MXJob`, `XGBoostJob`, `PaddleJob`, `JAXJob` |
+| **Katib** | Hyperparameter optimisation and neural-architecture search | `Experiment`, `Suggestion`, `Trial` |
+| **KServe** | Model serving with scale-to-zero, autoscaling, canary rollout | `InferenceService`, on Knative Serving |
+| **ML Metadata (MLMD)** | A database of artifacts and their lineage across pipeline runs | A gRPC server in front of MySQL/SQLite |
+| **Central Dashboard** | A thin frontend that lists the per-component UIs inside one shell | A web app + an Istio AuthorizationPolicy |
+| **Profiles** | The multi-tenancy primitive — one `Profile` creates a namespace plus the RBAC/SA bindings to participate in Kubeflow | `Profile` CRD |
+
+You'll notice three things about the table: there's nothing in it that *trains* a model (that's your code), nothing that *stores* data (you bring object storage), and nothing that *deploys* code outside the cluster (KServe is on-cluster). Kubeflow is a workflow platform; it doesn't try to be a data warehouse or a CI/CD system.
+
+The point worth internalising: **you can install any subset of these**. KServe is the most-installed-alone — many teams want model serving and pick up the rest later. KFP is the next most common. The Central Dashboard is essentially optional; some teams skip it and drive everything via the CLI and the per-component UIs.
+
+## A short, honest history
+
+Kubeflow started at Google in **2017** as an internal effort to port TensorFlow Extended (TFX) onto Kubernetes. It was open-sourced almost immediately and grew under Google's stewardship through 2018-2019 — when *"Kubeflow"* still informally meant *"TensorFlow training and serving on Kubernetes"*.
+
+The 2020-2022 period was governance-turbulent. Several sub-projects were deprecated. **KFServing** — the original model-serving component, named for *"Kubeflow Serving"* — was split off and renamed to **KServe**, with its own governance independent of the Kubeflow project. The training operators were consolidated: pre-v1.5 there was a separate `tf-operator`, `pytorch-operator`, `mpi-operator` and so on; v1.5 (2022) merged them into a single `training-operator` that watches all the CRDs. KFP went through a deep redesign from **v1 to v2** (2023) with a new intermediate representation; pre-2023 KFP material reads completely differently from current KFP.
+
+The project moved into the **CNCF Sandbox** in 2023 and was promoted to **Incubating** in 2024. Multiple vendors — Google, Red Hat, Canonical, HPE (via the Arrikto acquisition), AWS, Bloomberg, Apple — now contribute. The governance is healthier than it was; the project is in a stable maintenance posture with predictable releases.
+
+This isn't ancient history. It's directly relevant to operators evaluating production readiness. *"Why does my old install have seven training operator Pods?"* — pre-v1.5. *"Why does this 2021 KFP tutorial not work?"* — pre-v2 IR. *"Why is KServe in a separate GitHub org?"* — the 2021 split. Knowing the history saves you hours of *what changed*.
+
+## The component map
+
+<Whiteboard client:load data={{ nodes: mapNodes, edges: mapEdges }} height={520} />
+
+Reading the diagram:
+
+- **Solid black** edges are the **data/control flow** through a typical ML project: a user opens a Notebook, builds a Pipeline, the Pipeline launches a Training job, Katib may sweep over training runs, and the resulting model is served by KServe.
+- **Dashed grey** edges are **metadata flow**: KFP, Katib, and (optionally) KServe write artifact and lineage information to MLMD. This is what gives you *"which model came from which dataset on which run?"* for audit.
+- **Central Dashboard** sits on top — it doesn't process anything, it just routes the user to the right per-component UI.
+- **Profiles** is below — it provisions the namespace each user works in. **Istio** is the in-cluster mesh that gates ingress and adds mTLS east-west. **Kubernetes + GPU operator** is the foundation everything else runs on.
+
+The diagram is the loop you'll come back to. Every module in this track adds one of these boxes to your mental model.
+
+## What Kubeflow is NOT
+
+Be clear-eyed about the gaps. Kubeflow is **not**:
+
+- A **model registry.** You bring [MLflow](https://mlflow.org/), Weights & Biases' model registry, or a homegrown one. KFP and Katib write to MLMD, but MLMD is *lineage*, not a registry — it doesn't give you the *"promote to staging"* lifecycle a real registry does.
+- A **feature store.** You bring [Feast](https://feast.dev/), [Tecton](https://www.tecton.ai/), or roll your own on Redis + Parquet.
+- A **data labelling tool.** Label Studio, Scale, or a homegrown UI. None of this is in Kubeflow's scope.
+- A **data warehouse.** Snowflake, BigQuery, Databricks — those are upstream of Kubeflow.
+- A **CI/CD system.** You bring Argo CD, Flux, Jenkins, or GitHub Actions to push container images and update the manifests. KFP is *workflow*, not *deployment*.
+- A **notebook hosting SaaS.** Kubeflow Notebooks are Pods on your cluster. If you want a hosted experience, look at Hex, Deepnote, or Colab.
+- A **managed service.** You deploy and operate Kubeflow yourself, or you pick a distro (below). There's no *"Kubeflow Cloud."*
+
+Mapping these gaps before you start saves the conversation in month three where someone asks *"where do we store the trained models?"* and the honest answer is *"we haven't picked yet — Kubeflow doesn't do that."*
+
+## Distros and packagings
+
+Vanilla Kubeflow — the [`kubeflow/manifests`](https://github.com/kubeflow/manifests) repo, applied with kustomize — is the upstream reference, and the path this track teaches. Several productised packagings exist on top:
+
+| Distro | What it is | When it's the right pick |
+| --- | --- | --- |
+| **Vanilla Kubeflow** | The `kubeflow/manifests` repo, kustomize-driven | You want upstream, you'll run it yourself, you're OK debugging Istio |
+| **Red Hat OpenShift AI (RHOAI)** | OpenShift-bundled distribution; uses KFP, KServe, Notebooks under Red Hat productisation | You run OpenShift in production and want Red Hat support |
+| **Open Data Hub (ODH)** | The community upstream of RHOAI; same components, no Red Hat support contract | You want RHOAI shape on non-OpenShift Kubernetes, or you're an OpenShift shop without a Red Hat AI subscription |
+| **Charmed Kubeflow** | Canonical's distribution, deployed via Juju on top of Kubernetes | You're already a Canonical / MicroK8s shop |
+| **HPE / Arrikto Enterprise Kubeflow** | HPE's productised Kubeflow following the Arrikto acquisition | You're an HPE shop or need their Rok data-management add-on |
+| **Vertex AI Pipelines** | Google's managed KFP — runs your KFP v2 pipelines on GCP without managing the cluster | You're a GCP shop, want the runtime managed, accept the lock-in |
+| **SageMaker** | Not Kubeflow — AWS's own ML platform with its own SDK | If you're already deep in SageMaker; don't migrate *to* it from Kubeflow lightly |
+
+A note specifically on **RHOAI / ODH**, because the question always comes up. Both bundle Kubeflow components — KFP, KServe, Notebook controllers — and ship them under a Red Hat support model. They are **not drop-in replacements** for vanilla Kubeflow: the install path is OperatorHub, not `kubectl apply -k`; the Central Dashboard is replaced by Red Hat's own dashboard; the Notebook UX is Red Hat's *Workbenches* shell; and the supported component versions lag upstream. If you've been told *"we run Kubeflow"* by an OpenShift shop, double-check whether they mean upstream or RHOAI — the operational reality is different. This track teaches upstream; the RHOAI/ODH-specific bits are covered in Red Hat's own documentation and we won't duplicate them here.
+
+## Alternatives — when not to pick Kubeflow
+
+Be honest with yourself before committing. Kubeflow's ops burden is real and you should pick it on purpose, not by default.
+
+| Alternative | One-line description | Why pick it over Kubeflow |
+| --- | --- | --- |
+| **Vertex AI / SageMaker / Azure ML** | Cloud-managed ML platforms | You're already in one cloud, you want zero ops, and you can stomach the lock-in |
+| **MLflow + Airflow + bare K8s** | Pick-the-best-component approach | Smaller surface area, fewer CRDs, each tool is best-in-class at its job |
+| **Ray on Kubernetes** | Ray's KubeRay operator for distributed training and serving | Strong distributed-training story without Kubeflow's CRD surface area; weaker on pipeline DAGs |
+| **Metaflow** | Netflix's data-science workflow library on top of K8s + AWS Batch | Workflow-first, less infrastructure-coupled; popular with smaller data-science teams |
+| **Prefect / Dagster + KServe-only** | Use a modern Python-native orchestrator, keep KServe for serving | You want Python-native DAG authoring, not YAML and Python-DSL mix |
+
+Pick Kubeflow because you need:
+
+1. **On-prem or air-gapped.** The managed services don't exist behind your firewall; Kubeflow does.
+2. **Kubernetes-native objects everywhere.** Your platform team already runs Kubernetes; everything else is round-pegs-in-square-holes.
+3. **Open-source end-to-end.** No vendor in the critical path for training or serving.
+4. **Multi-cloud or hybrid.** One ML stack across GCP, AWS, on-prem.
+
+Don't pick Kubeflow because it's *popular*. Popularity isn't the same as fit.
+
+## Production readiness today (2026)
+
+A frank assessment of where each component stands as of this writing:
+
+- **KFP (v2)** — mature. Production-deployed at scale at Google, Bloomberg, Spotify, and a long list of enterprise users. The v2 IR is stable; the SDK is stable. Caching and artifact passing work as advertised.
+- **KServe** — mature. The most-deployed Kubeflow component, often standalone. Scale-to-zero via Knative is solid; canary and request-based autoscaling are battle-tested. Multi-model serving (`ModelMesh`) is the more experimental sibling.
+- **Training Operator** — widely used, but has rough edges. The CRDs are stable; debugging mixed-priority queues, preempted Pods, and torn-down NCCL communication groups is where you'll spend time. Plan for the operator team to learn the failure modes.
+- **Notebooks** — widely used. The Notebook Controller is fine; the multi-tenant resource-quota story (one team's quota leaking into another's, default limits being too generous, idle notebooks accumulating PVCs) is the operational tax.
+- **Katib** — solid for HPO. The algorithm catalog (random, grid, Bayesian, Hyperband, BOHB) is comprehensive. **NAS** (neural architecture search) algorithms like DARTS and ENAS work but are less polished; production NAS users are rare.
+- **Central Dashboard** — functional but visibly aging. Compared to the cloud-managed UIs (Vertex AI's, SageMaker Studio's), it feels 2019-era. Most teams use it for the namespace switcher and the Pipelines view; everything else they drive from the CLI.
+- **MLMD** — works, but the API is awkward. Most teams write a thin layer over it or skip it and rely on KFP's own run history.
+- **Profiles** — solid for the simple case (one user, one namespace). Group-based Profiles, transferring ownership, and reconciling Profiles from a Git source are where the edges show.
+
+The blunt summary: if you want notebooks → pipelines → serving, Kubeflow is production-grade today. If you want a polished UX that competes with cloud-managed offerings out of the box, you'll be doing customisation.
+
+## A quick taste — what a Kubeflow workload looks like
+
+Here is a `PyTorchJob` — a distributed PyTorch training run, expressed as a CRD:
+
+```yaml
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: imagenet-resnet50
+  namespace: ml-team-a
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: ghcr.io/my-org/resnet-train:1.4
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+    Worker:
+      replicas: 3
+      template:
+        spec:
+          containers:
+            - name: pytorch
+              image: ghcr.io/my-org/resnet-train:1.4
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+```
+
+One Master, three Workers, each on one GPU — four GPUs total. The Training Operator launches the Pods, sets up `WORLD_SIZE` and `RANK` environment variables, and watches for failures. Your container image runs `torch.distributed.init_process_group()` and trains. The whole thing is `kubectl apply -f` away.
+
+And here is the served model — a KServe `InferenceService`:
+
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: resnet50
+  namespace: ml-team-a
+spec:
+  predictor:
+    minReplicas: 0
+    maxReplicas: 10
+    pytorch:
+      storageUri: s3://my-bucket/models/resnet50/v1/
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+```
+
+`minReplicas: 0` is scale-to-zero — when no traffic arrives, no Pods run, no GPUs are reserved. `maxReplicas: 10` is the burst ceiling. The `storageUri` points at the trained model artifact. The runtime is `pytorch` — KServe picks `TorchServe` to host it. That's the production model serving story, in 12 lines of YAML.
+
+These two CRs are the bookends of an ML workflow. Everything else in this track is what goes between them.
+
+## What's next
+
+You now have the framing. The next module is the architecture deep-dive: every controller, every Pod, every CRD in a working Kubeflow install, with a diagram you should be able to sketch from memory by the end.
+
+**Next:** [Module 02 — Architecture](/learn/kubeflow/architecture).
+
+## References
+
+- [kubeflow.org — concepts overview](https://www.kubeflow.org/docs/concepts/)
+- [kubeflow.org — components reference](https://www.kubeflow.org/docs/components/)
+- [github.com/kubeflow/training-operator — the consolidated v1.5+ training operator](https://github.com/kubeflow/training-operator)
+- [github.com/kserve/kserve — KServe (formerly KFServing)](https://github.com/kserve/kserve)
+- [github.com/kubeflow/katib — hyperparameter tuning + NAS](https://github.com/kubeflow/katib)
+- [CNCF blog — Kubeflow joins the Sandbox, 2023](https://www.cncf.io/blog/2023/06/27/kubeflow-applies-to-become-a-cncf-incubating-project/)
+- [Red Hat — OpenShift AI documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai/)
+- [Open Data Hub — project home](https://opendatahub.io/)

@@ -16,6 +16,7 @@ export const TRACK_TITLES: Record<string, string> = {
   "agentic-ai": "Agentic AI",
   "cloudflare": "Cloudflare",
   "acm-multicluster": "ACM Multicluster",
+  "kubeflow": "Kubeflow",
 };
 
 export const TRACK_TAGLINES: Record<string, string> = {
@@ -25,6 +26,8 @@ export const TRACK_TAGLINES: Record<string, string> = {
     "The unified network + edge + security + AI platform. Tunnels, Zero Trust, Magic networking, Workers, Pages, and the rest.",
   "acm-multicluster":
     "Operate ten or fifty OpenShift clusters from one control plane. Red Hat Advanced Cluster Management end-to-end — registration, policies, GitOps, applications, observability, hosted control planes, and disaster recovery.",
+  "kubeflow":
+    "The platform layer for the ML workflow on Kubernetes. Upstream Kubeflow end-to-end — notebooks, KFP pipelines, distributed training, Katib HPO, KServe model serving, multi-tenancy with Profiles, and production-grade install patterns.",
 };
 
 export function trackTitle(id: string): string {

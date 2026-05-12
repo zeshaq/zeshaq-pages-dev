@@ -1,0 +1,293 @@
+---
+title: "Architecture: every controller, every CRD"
+sidebar_label: "02 — Architecture"
+description: "The full Kubeflow install — Istio, KFP, Training Operator, Katib, KServe, MLMD, Profiles, the Central Dashboard, and the storage and GPU assumptions underneath. By the end you can read a Kubeflow install."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const accent = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const branchHeader = { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 220, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" };
+
+export const flowEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const metaEdge = { style: { stroke: "#6b7280", strokeDasharray: "4,4", strokeWidth: 1.2 }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const trustEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const archNodes = [
+  { id: "foundHdr",  position: { x: 320, y: 0 },    data: { label: "Foundation (cluster-wide)" },                style: branchHeader },
+  { id: "istio",     position: { x: 60,  y: 80 },   data: { label: "Istio\n(mesh + ingress)" },                  style: ext },
+  { id: "cert",      position: { x: 240, y: 80 },   data: { label: "cert-manager" },                              style: ext },
+  { id: "knative",   position: { x: 420, y: 80 },   data: { label: "Knative Serving\n(used by KServe)" },        style: ext },
+  { id: "dex",       position: { x: 600, y: 80 },   data: { label: "Dex / OIDC" },                                style: ext },
+  { id: "platHdr",   position: { x: 320, y: 180 },  data: { label: "Kubeflow platform" },                         style: branchHeader },
+  { id: "dash",      position: { x: 60,  y: 260 },  data: { label: "Central Dashboard" },                         style: ctrl },
+  { id: "profile",   position: { x: 240, y: 260 },  data: { label: "Profile Controller" },                        style: ctrl },
+  { id: "notebook",  position: { x: 420, y: 260 },  data: { label: "Notebook Controller\n+ PVC Viewer" },         style: ctrl },
+  { id: "tboard",    position: { x: 600, y: 260 },  data: { label: "Tensorboard Controller\n+ Volumes Web App" }, style: ctrl },
+  { id: "kfpHdr",    position: { x: 320, y: 360 },  data: { label: "Kubeflow Pipelines (KFP)" },                  style: branchHeader },
+  { id: "kfpapi",    position: { x: 60,  y: 440 },  data: { label: "ml-pipeline\n(API server)" },                 style: ctrl },
+  { id: "kfpper",    position: { x: 240, y: 440 },  data: { label: "persistenceagent" },                          style: ctrl },
+  { id: "kfpui",     position: { x: 420, y: 440 },  data: { label: "ml-pipeline-ui" },                            style: ctrl },
+  { id: "kfpcache",  position: { x: 600, y: 440 },  data: { label: "cache-server" },                              style: ctrl },
+  { id: "kfpsched",  position: { x: 60,  y: 540 },  data: { label: "scheduledworkflow\n(cron pipelines)" },       style: ctrl },
+  { id: "kfpview",   position: { x: 240, y: 540 },  data: { label: "viewer-controller" },                         style: ctrl },
+  { id: "argo",      position: { x: 420, y: 540 },  data: { label: "Argo Workflows\n(DAG engine, default)" },     style: accent },
+  { id: "mlmd",      position: { x: 600, y: 540 },  data: { label: "MLMD\n(gRPC + writer)" },                     style: accent },
+  { id: "trainHdr",  position: { x: 320, y: 640 },  data: { label: "Training / HPO / Serving" },                  style: branchHeader },
+  { id: "train",     position: { x: 60,  y: 720 },  data: { label: "training-operator\n(all CRDs multiplexed)" }, style: ctrl },
+  { id: "katib",     position: { x: 240, y: 720 },  data: { label: "Katib controller\n+ DB manager + UI" },      style: ctrl },
+  { id: "kserve",    position: { x: 420, y: 720 },  data: { label: "KServe controller" },                         style: ctrl },
+  { id: "rt",        position: { x: 600, y: 720 },  data: { label: "Serving Runtimes\nTriton, MLServer, TGI" },   style: stage },
+];
+
+export const archEdges = [
+  { id: "dash-prof",  source: "dash",     target: "profile",  ...flowEdge },
+  { id: "dash-nb",    source: "dash",     target: "notebook", ...flowEdge },
+  { id: "dash-tb",    source: "dash",     target: "tboard",   ...flowEdge },
+  { id: "dash-kfp",   source: "dash",     target: "kfpui",    ...flowEdge },
+  { id: "kfpapi-per", source: "kfpapi",   target: "kfpper",   ...flowEdge },
+  { id: "kfpapi-argo",source: "kfpapi",   target: "argo",     label: "launches", ...flowEdge },
+  { id: "kfpper-mlmd",source: "kfpper",   target: "mlmd",     label: "writes lineage", ...metaEdge },
+  { id: "argo-train", source: "argo",     target: "train",    label: "PyTorchJob", ...flowEdge },
+  { id: "argo-katib", source: "argo",     target: "katib",    label: "Experiment", ...flowEdge },
+  { id: "katib-train",source: "katib",    target: "train",    label: "trials", ...flowEdge },
+  { id: "katib-mlmd", source: "katib",    target: "mlmd",     ...metaEdge },
+  { id: "train-kserve",source: "train",   target: "kserve",   label: "model artifact", ...flowEdge },
+  { id: "kserve-rt",  source: "kserve",   target: "rt",       label: "creates", ...flowEdge },
+  { id: "rt-knative", source: "rt",       target: "knative",  label: "scale-to-zero", ...trustEdge },
+];
+
+This module is the map. Once you can sketch this diagram from memory, Kubeflow debugging gets a lot easier. Every component named below is something you'll see in `kubectl get pods -A` on a working install — knowing what each one does is half of the operator job.
+
+## Component map (deep)
+
+<Whiteboard client:load data={{ nodes: archNodes, edges: archEdges }} height={840} />
+
+Reading the diagram:
+
+- **Solid black** edges are the **control-plane flow** — a Pipeline launches a `PyTorchJob`, the Training Operator runs it, the trained artifact is consumed by KServe. This is what a user-initiated run looks like, layer by layer.
+- **Dashed grey** edges are **metadata flow** — KFP and Katib emit artifact and lineage data to MLMD; serving runs can be wired in optionally.
+- **Dashed green animated** edges are **runtime contracts** — KServe leans on Knative for scale-to-zero and request-driven autoscaling.
+- The **headers in dark green** are conceptual layers: foundation services (Istio, cert-manager, Knative, identity), the Kubeflow platform itself, KFP, and the training/HPO/serving stack on top.
+
+The diagram has roughly twenty boxes. A small upstream Kubeflow install yields about thirty Pods steady-state, plus job Pods on demand; a "full" install with observability and policy add-ons can reach fifty. The boxes correspond to the load-bearing controllers — everything else is sidecars and per-job worker Pods.
+
+## The foundation layer
+
+Before Kubeflow itself, four cluster-wide pieces have to exist:
+
+- **Istio.** Kubeflow uses Istio for both **ingress** (the gateway that fronts the Central Dashboard and per-component UIs) and **east-west mTLS** (service-to-service traffic inside the mesh, with `AuthorizationPolicy` doing the per-namespace gates). The `kubeflow/manifests` repo bundles a pinned Istio version; replacing it with an existing cluster Istio install is supported but fiddly. If you already run a service mesh — **Linkerd**, **Consul**, **OSSM** — Kubeflow's opinionated dependence on Istio is the biggest single piece of friction you'll hit. Plan around it before you install.
+- **cert-manager.** Used to mint the certificates Istio's gateway serves and the certificates KServe's webhook needs. A standard cert-manager install with a `ClusterIssuer` is sufficient.
+- **Knative Serving.** Used by **KServe** for scale-to-zero and request-based autoscaling. If you don't install KServe, you can omit Knative. If you do, Knative comes with its own controller plane — `controller`, `webhook`, `activator`, `autoscaler`, `net-istio` — that you'll see in `kubectl get pods -n knative-serving`.
+- **Dex.** The default OIDC provider shipped in the manifests. It handles authentication at the Istio gateway; production deploys swap it out for an external IdP (Okta, Keycloak, Azure AD, Google Workspace).
+
+These four are the "everything below the line" — they make Kubeflow possible, but they're not Kubeflow themselves. Most production debugging starts at *"is Istio happy?"* before it touches a Kubeflow controller.
+
+## The Profile primitive
+
+A `Profile` is the multi-tenancy hinge. One `Profile` CR creates:
+
+- **A Kubernetes Namespace** named after the profile (`alice@example.com` → namespace `alice-example-com`).
+- **The RBAC and `ServiceAccount`s** that let that namespace participate in Kubeflow — bindings for `default-editor` and `default-viewer`, plus the per-component `RoleBinding`s for KFP, Notebooks, KServe.
+- **The Istio `AuthorizationPolicy`** that gates who can hit that namespace's per-component UIs through the Central Dashboard.
+- **A namespace label** (`katib-metricscollector-injection=enabled`, `serving.kserve.io/inferenceservice=enabled`, etc.) that opts the namespace into each component's webhook injection.
+- **Optionally, a default `ResourceQuota`** if the cluster admin has wired one up.
+
+The **Profile Controller** reconciles this. When you create a `Profile`, the controller writes the namespace and all the dependent objects; when you delete it, the controller tears them down. *(There's a class of bugs where the Profile is deleted but `ResourceQuota` or `NetworkPolicy` from external operators sticks around — Module 09 covers the cleanup pattern.)*
+
+This is the cleanest separation of concerns in Kubeflow: one CR per tenant, all the boilerplate generated, no manual `oc adm policy add-role-to-user` chains. Module 09 goes deep on Profiles; for now, what matters is that **every Kubeflow workload runs inside a Profile-owned namespace** — including yours.
+
+## The Central Dashboard
+
+A small frontend Deployment (`centraldashboard` in the `kubeflow` namespace) that does three things:
+
+- **Lists the namespaces a user has access to** — via a `kfam` (Kubeflow Access Management) sidecar that consults the Profile bindings. This is the namespace switcher in the top-left.
+- **Embeds the per-component UIs** in an iframe-style shell — Pipelines UI, Katib UI, Notebooks UI, Volumes UI, Tensorboards UI. Each component owns its own web app; the dashboard is just the chrome.
+- **Surfaces a configurable links menu** — documentation, custom internal tools, anything you want users to find from one place.
+
+Authentication happens at the Istio gateway, **before** the dashboard sees the request. The dashboard trusts the `kubeflow-userid` header that Istio injects after OIDC authentication. This means: if you can spoof that header *inside* the cluster, you're authenticated as anyone you want. The Istio `AuthorizationPolicy` and gateway config that prevents that header from being injected by anything except the OIDC chain is load-bearing security. Module 09 covers the failure mode where someone disables Istio sidecar injection on a tenant Pod and bypasses the whole auth flow.
+
+## Authentication and authorisation
+
+Three layers, each independent:
+
+| Layer | Where | What it gates |
+| --- | --- | --- |
+| **User identity** | Istio gateway + Dex/OIDC | Whether the request gets past the front door at all |
+| **Namespace ownership** | Profile | Which namespaces this identity can see in the dashboard |
+| **Per-resource RBAC** | Standard Kubernetes RBAC inside each namespace | What this identity can do *within* a namespace it can see |
+
+The three are independent. A user can be authenticated, be the owner of a Profile-created namespace, and still not be able to create an `InferenceService` because the `default-editor` ClusterRole doesn't grant that — they need an extra `RoleBinding`. *"I can log in but I can't create things"* is almost always a layer-3 issue; *"the dashboard is empty"* is a layer-2 issue; *"401 from Istio"* is layer-1.
+
+**KFP adds its own auth.** The KFP API server (`ml-pipeline`) has a separate authorisation layer specifically for Pipeline runs — what identity is allowed to start a run in what namespace. This is configured via `AuthorizationPolicy` in front of the API server, and it tripped up early operators who assumed Kubernetes RBAC was enough. The default Profile bindings handle the common case; custom integrations need to think about it explicitly.
+
+## The Training Operator
+
+Pre-v1.5, there was **one operator per framework**: `tf-operator` for `TFJob`, `pytorch-operator` for `PyTorchJob`, `mpi-operator` for `MPIJob`, and so on. Each was a separate Deployment, separate Pod, separate logs.
+
+Since **v1.5 (2022)**, all of these are consolidated into a **single `training-operator` Pod** that watches all the CRDs. The CRDs themselves are unchanged — `PyTorchJob`, `TFJob`, `MPIJob`, `MXJob`, `XGBoostJob`, `PaddleJob`, and `JAXJob` are all distinct resources — but the controller behind them is one process.
+
+This matters when you're debugging:
+
+```bash
+kubectl logs -n kubeflow deploy/training-operator -f | grep PyTorchJob
+```
+
+The logs are **shared across all job types**. A reconcile error on a `TFJob` and a reconcile error on a `PyTorchJob` come from the same Pod. If you remember the pre-v1.5 mental model and go looking for a `pytorch-operator` Pod, you'll be looking for a long time — it doesn't exist anymore.
+
+The operator's responsibilities are small and well-defined: it watches the CRDs, creates the corresponding Pods with the right `WORLD_SIZE` / `RANK` / `MASTER_ADDR` environment variables, watches them for completion or failure, and writes status back. Distributed training itself happens inside your container — the operator does not know what NCCL is doing; it only knows whether Pods are alive.
+
+## KFP architecture
+
+Kubeflow Pipelines is the most complex component. Eight Pods in a typical install:
+
+| Pod | Role |
+| --- | --- |
+| **`ml-pipeline`** (API server) | The Pipelines REST/gRPC API — submits runs, reads experiment history, manages recurring schedules |
+| **`ml-pipeline-persistenceagent`** | Watches `Workflow` (Argo) or `PipelineRun` (Tekton) and persists their state to the KFP database |
+| **`ml-pipeline-ui`** | The Pipelines web UI, embedded in the Central Dashboard |
+| **`ml-pipeline-scheduledworkflow`** | The cron controller — turns `ScheduledWorkflow` CRs into periodic runs |
+| **`ml-pipeline-viewer-crd`** | Manages `Viewer` CRs for output visualisations (confusion matrices, ROC curves) |
+| **`cache-server`** | Decides whether a pipeline step can be skipped because the inputs match a prior run's outputs (artifact reuse) |
+| **`metadata-grpc-deployment` / `metadata-writer`** | MLMD itself — see below |
+| **`mysql` or external Postgres** | The KFP database (runs, experiments, pipelines, recurring runs) |
+
+Under all of these sits the **DAG execution engine**. KFP v1 used **Argo Workflows** exclusively; KFP v2 supports both **Argo** and **Tekton**, with Argo as the default in the upstream manifests. Argo is the more mature choice and what this track teaches. Tekton support exists primarily because OpenShift Pipelines ship Tekton.
+
+A KFP v2 pipeline is **Python code** that compiles to an **intermediate representation (IR)** — a YAML document describing the DAG and the container images for each component. The IR is submitted to the API server, which writes an Argo `Workflow` (or Tekton `PipelineRun`) that the underlying engine runs. KFP v2's IR is incompatible with v1's; if you've read pre-2023 Kubeflow material, the SDK is different enough to be misleading. Module 04 starts you on v2 directly.
+
+## KServe architecture
+
+KServe is a standalone project — it can be installed independently of Kubeflow and frequently is. The control plane is small:
+
+- **KServe controller** — watches `InferenceService` CRs and creates the underlying Knative `Service`, Istio routing, and (optionally) Transformer/Explainer Pods.
+- **KServe webhook** — admission webhooks that validate `InferenceService` specs and inject sidecars.
+
+The data plane is more interesting. An `InferenceService` produces:
+
+- A **model server Pod**, with one of several per-framework runtimes — **TFServing** for TensorFlow, **TorchServe** for PyTorch, **Triton** for multi-framework / GPU-optimised serving, **MLServer** for scikit-learn / xgboost / arbitrary Python models, **TGI / vLLM** for LLM serving in 2026.
+- An optional **Transformer** Pod for pre-processing (tokenisation, image resize) and post-processing (de-tokenisation, threshold).
+- An optional **Explainer** Pod for LIME / SHAP / Anchor explanations.
+
+The whole thing runs on **Knative Serving**, which is what gives KServe its headline features:
+
+- **Scale-to-zero.** When no requests have arrived in N seconds (default 30), the Pod is torn down. The first request triggers a cold start (1-10 seconds for small models; longer for big ones).
+- **Request-based autoscaling.** Replicas scale on **concurrent in-flight requests**, not CPU/memory. This is much closer to what you actually want for serving — a model server with 80% idle CPU is still saturated if every request takes a second.
+- **Canary rollout.** Send 10% of traffic to v2 of the model, 90% to v1. Promote when the metrics look right.
+
+Module 08 builds all of this; Module 11 covers the production patterns (multi-model serving with ModelMesh, GPU sharing, the autoscaler tuning that matters).
+
+## Katib architecture
+
+Katib's design is unusual: it has **three controllers**, each with a different responsibility, all collaborating to run a hyperparameter sweep.
+
+- **Experiment controller** — owns the `Experiment` CR. An Experiment is the *study* — the search space, the objective metric, the algorithm, the parallelism, the budget.
+- **Suggestion controller** — owns the `Suggestion` CR. A Suggestion is *"give me the next N hyperparameter settings to try."* This is the part the algorithm runs in: a separate Pod is started per Experiment, running the chosen algorithm (Bayesian, Hyperband, random, grid, BOHB). The Suggestion Pod returns trial parameters.
+- **Trial controller** — owns the `Trial` CR. A Trial is one concrete training run — a specific set of hyperparameters being evaluated. The Trial controller launches the actual training Job (typically via a CRD template that produces a Kubernetes `Job`, a `PyTorchJob`, or a `TFJob`).
+
+The data flow is: Experiment → asks Suggestion for next trials → Suggestion returns parameters → Trial controller launches each trial as a Job → Job runs, writes metrics → metrics-collector sidecar picks them up → Experiment controller decides whether to keep going or stop.
+
+Algorithms shipped:
+
+| Family | Algorithms |
+| --- | --- |
+| **Search** | random, grid |
+| **Bayesian** | Bayesian Optimisation (Gaussian Process), TPE (Tree-of-Parzen-Estimators) |
+| **Multi-fidelity** | Hyperband, BOHB (Bayesian + Hyperband) |
+| **NAS** | DARTS, ENAS, Population-Based Training |
+
+The metric collection is its own subsystem — a sidecar in the trial Pod scrapes stdout or a metrics file, writes to the Katib DB, which the Experiment controller polls. *"Why is my Experiment stuck?"* is almost always either the metric collector failing to parse the format or the Suggestion Pod crashing — Module 07 covers both.
+
+## ML Metadata (MLMD)
+
+A separate database — **MySQL** by default in the manifests, **SQLite** for dev installs, swap in **Postgres** in production — fronted by a gRPC server. MLMD tracks three kinds of entities:
+
+- **Artifacts.** Datasets, trained models, evaluation results — anything with a URI and a type.
+- **Executions.** A run of a pipeline component, a Katib trial, a training job.
+- **Contexts.** Groupings — a pipeline run, an experiment, an environment.
+
+And the relationships between them: *this execution consumed these artifacts and produced those artifacts.*
+
+The point is **lineage**. *Which dataset version produced the model that produced this prediction?* For audit, compliance, and debugging, this is the thing that lets you walk backwards from a production failure to the data that caused it.
+
+Both **KFP** (via `persistenceagent`) and **Katib** emit MLMD events automatically. **KServe** doesn't by default — you wire it in if you want it. Most production deploys read MLMD via the Python SDK, not by hitting the gRPC API directly.
+
+In practice, MLMD is the component teams most often skip in early adoption and most often regret skipping when the compliance team shows up.
+
+## Storage assumptions
+
+Kubeflow has three storage tiers, and you need to plan all three before you install:
+
+| Tier | What for | Default in manifests | Production target |
+| --- | --- | --- | --- |
+| **Object storage** | KFP pipeline artifacts (intermediate outputs, trained models, datasets), KServe model storage | MinIO (single-replica, in-cluster) | S3, GCS, Azure Blob, or production-grade MinIO/NooBaa |
+| **PVC (block storage)** | Notebook home directories, scratch space | Default `StorageClass` (whatever your cluster has) | SSD-backed StorageClass with snapshots and quotas |
+| **Relational database** | KFP runs and metadata, Katib experiments, MLMD | MySQL (single replica, in-cluster) | External Postgres or MySQL with HA, backups, and monitoring |
+
+The defaults make for a working dev install in 20 minutes. They also make for an unrecoverable production outage the first time the in-cluster MinIO Pod loses its PVC. **Production = swap out all three.** Module 10 walks the manifest patches; Module 11 covers the operational pattern (one external service shared across many Kubeflow installs).
+
+## GPU scheduling
+
+Kubeflow **does not include a GPU scheduler**. What it does is **assume one exists** and use it via standard Kubernetes resource requests:
+
+- You install the **Nvidia GPU Operator** (or AMD's `rocm-k8s-operator`, or Intel's variant) on every node that has a GPU.
+- The operator runs a **device plugin** that exposes `nvidia.com/gpu` as a schedulable resource.
+- Your Pods request the resource: `resources.limits.nvidia.com/gpu: 1`.
+- The Kubernetes scheduler does the rest — finds a node with a free GPU, places the Pod, the device plugin makes the GPU visible to the container.
+
+This is identical to how every other Kubernetes GPU workload works. Kubeflow doesn't have its own scheduler, doesn't extend the device plugin, doesn't add a special GPU CRD. It just trusts that the cluster gives it `nvidia.com/gpu` Pods.
+
+Two production patterns worth knowing:
+
+- **MIG (Multi-Instance GPU).** An A100 or H100 can be sliced into up to seven smaller GPUs at the hardware level. The Nvidia GPU Operator exposes each slice as its own schedulable resource (`nvidia.com/mig-1g.5gb`, `nvidia.com/mig-2g.10gb`, etc.). For multi-tenant Kubeflow on big GPUs, MIG is how you avoid *"one team's notebook is hoarding the whole A100."*
+- **Time-slicing.** Cheaper than MIG, less isolated. The GPU operator can advertise N "virtual" GPUs per physical card, with the GPU's own scheduler time-multiplexing between them. Fine for inference or notebooks; bad for training (no memory isolation).
+
+Module 11 covers both in operational detail.
+
+## The Istio dependency, revisited
+
+Worth saying again because it's the single most common cause of *"why doesn't my install work?"*
+
+- **Kubeflow needs Istio.** Ingress, mTLS, the `kubeflow-userid` header, the `AuthorizationPolicy` that gates the dashboard — all of it depends on Istio. There's no `--no-istio` flag.
+- **If you already run a mesh**, you have a problem. Two meshes on one cluster is unsupportable. Most teams either (a) accept Istio for Kubeflow and accept the mesh-on-mesh awkwardness, (b) run a separate cluster for Kubeflow, or (c) commit to Istio cluster-wide and migrate other workloads.
+- **The Istio version is pinned** in `kubeflow/manifests`. Upgrading Istio independently of Kubeflow is technically possible and operationally annoying — you'll be reading the manifests' Istio overlay every release cycle.
+- **`AuthorizationPolicy` is fragile.** The policy that gates the dashboard depends on the `kubeflow-userid` header being injected correctly. Mis-configured `EnvoyFilter`s or a sidecar opt-out on a tenant Pod will silently allow unauthenticated access.
+
+If you're allergic to Istio, this is the moment to confront it. Kubeflow is not the project to fight that battle in.
+
+## A worked debugging walk
+
+Bringing the components together — a worked example of *"a user reports their pipeline run is stuck."* Here is the chain you walk, top to bottom:
+
+1. **The user's `Run` in the KFP UI shows "Running" but no progress.** Open the run's underlying Argo `Workflow`: `kubectl get workflow -n <ns> -l pipeline/runid=<run-id>`.
+2. **The Workflow's status field tells you which step is pending.** If it's a step that launches a `PyTorchJob`, check the `PyTorchJob`: `kubectl get pytorchjobs -n <ns>`.
+3. **The `PyTorchJob` status will show the Pods.** If they're `Pending`, the issue is the scheduler — usually GPU shortage. If they're `Running` but the Job isn't completing, the issue is inside the container.
+4. **If the Pods are `Pending`, look at events:** `kubectl describe pytorchjob <name> -n <ns>` and `kubectl get events -n <ns> --sort-by=.lastTimestamp`. The scheduler tells you why it can't place the Pods.
+5. **If the Pods are `Running` but the Job is hung**, it's probably NCCL or torch.distributed. Tail the Master Pod's logs.
+6. **If the underlying Workflow itself shows `WorkflowSucceeded` but the KFP UI shows `Running`**, the issue is `persistenceagent` — KFP's view of state is stale because the agent isn't keeping up. Restart the `persistenceagent` Pod and the UI catches up.
+
+Each component you've met in this module is a layer in that chain. Knowing which layer holds which kind of state — *KFP database knows the UI view, Argo knows the DAG view, training-operator knows the Pod view, the kube scheduler knows placement* — is the entire job.
+
+## What's next
+
+You have the architecture map. The next module is the front door for most data scientists — running a Jupyter Notebook on Kubeflow with persistent storage and the right identity.
+
+**Next:** [Module 03 — Notebooks](/learn/kubeflow/notebooks).
+
+## References
+
+- [kubeflow.org — architecture overview](https://www.kubeflow.org/docs/started/architecture/)
+- [kubeflow.org — Profiles and multi-tenancy](https://www.kubeflow.org/docs/components/central-dash/profiles/)
+- [github.com/kubeflow/training-operator — consolidated training operator](https://github.com/kubeflow/training-operator)
+- [github.com/kubeflow/pipelines — KFP v2 architecture](https://github.com/kubeflow/pipelines/tree/master/v2)
+- [github.com/kserve/kserve — KServe architecture](https://github.com/kserve/kserve/blob/master/docs/README.md)
+- [github.com/kubeflow/katib — controllers and algorithms](https://github.com/kubeflow/katib)
+- [google.github.io/ml-metadata — MLMD concepts](https://www.tensorflow.org/tfx/guide/mlmd)
+- [knative.dev — Knative Serving concepts](https://knative.dev/docs/serving/)
+- [istio.io — security and authorization policies](https://istio.io/latest/docs/concepts/security/)
+- [nvidia.com — GPU Operator and MIG](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/)

@@ -1,0 +1,254 @@
+---
+title: "Pipelines (basics): KFP v2, components, artifacts"
+sidebar_label: "04 — Pipelines (basics)"
+description: "Author and run a multi-step ML pipeline with the Kubeflow Pipelines SDK v2 — Python-function components, container components, typed parameters vs artifacts, caching, and the three ways to submit a run."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const pipeNodes = [
+  { id: "py",     position: { x: 60,  y: 0   }, data: { label: "Python source\n@dsl.component\n@dsl.pipeline" },     style: stage },
+  { id: "ir",     position: { x: 360, y: 0   }, data: { label: "Compiled IR\npipeline.yaml" },                       style: stage },
+  { id: "api",    position: { x: 660, y: 0   }, data: { label: "KFP API server\n(submit run)" },                     style: ctrl },
+
+  { id: "argo",   position: { x: 660, y: 160 }, data: { label: "Argo Workflows\n(or Tekton)" },                      style: ctrl },
+  { id: "ml",     position: { x: 360, y: 160 }, data: { label: "ML Metadata\n(MLMD) DB" },                           style: stage },
+
+  { id: "s1",     position: { x: 60,  y: 320 }, data: { label: "Step 1: prepare\n(container)" },                     style: agent },
+  { id: "s2",     position: { x: 360, y: 320 }, data: { label: "Step 2: train\n(container)" },                       style: agent },
+  { id: "s3",     position: { x: 660, y: 320 }, data: { label: "Step 3: eval\n(container)" },                        style: agent },
+
+  { id: "s3o",    position: { x: 360, y: 460 }, data: { label: "MinIO / S3\nartifacts + lineage" },                  style: ext },
+];
+
+export const pipeEdges = [
+  { id: "p1", source: "py",   target: "ir",   label: "compile",            ...reqEdge },
+  { id: "p2", source: "ir",   target: "api",  label: "upload / submit",    ...reqEdge },
+  { id: "p3", source: "api",  target: "argo", label: "dispatch",           ...reqEdge },
+  { id: "p4", source: "argo", target: "s1",   ...reqEdge },
+  { id: "p5", source: "s1",   target: "s2",   label: "Dataset",            ...reqEdge },
+  { id: "p6", source: "s2",   target: "s3",   label: "Model",              ...reqEdge },
+  { id: "p7", source: "s1",   target: "s3o",  label: "writes",             ...pullEdge },
+  { id: "p8", source: "s2",   target: "s3o",  label: "writes",             ...pullEdge },
+  { id: "p9", source: "s3",   target: "s3o",  label: "writes Metrics",     ...pullEdge },
+  { id: "p10", source: "argo", target: "ml",  label: "lineage events",     ...pullEdge },
+];
+
+The shape of an ML workload is a DAG: prepare the data, train the model, evaluate, package, deploy. Each step is a container with declared inputs and outputs; each arrow is a typed artifact (a dataset, a model, a metrics blob) that flows between steps. You want this graph to run reliably, cache cleanly when inputs haven't changed, and tell you afterwards which artifacts came from which run.
+
+**Kubeflow Pipelines (KFP)** is that primitive. A Python SDK compiles your decorated functions into a portable intermediate representation; an API server stores it; an orchestration engine (Argo Workflows, or Tekton on OpenShift) executes the steps as containers; ML Metadata records the lineage. This module is the SDK v2 happy path — what you write, what it compiles to, what runs.
+
+## What KFP actually is
+
+Three things stitched together:
+
+- **The KFP SDK** — a Python library you import as `kfp`. Provides decorators (`@dsl.component`, `@dsl.pipeline`), a compiler, and a client for submitting runs.
+- **The KFP backend** — an API server, a `MySQL` or `MariaDB` metadata DB, and an orchestration engine. The engine is Argo Workflows on most installs; Tekton is an alternative the project maintains.
+- **The KFP UI** — a tab in the Central Dashboard for browsing pipelines, runs, artifacts, and lineage.
+
+You don't have to know Argo to write a pipeline. The IR is engine-agnostic — the same pipeline.yaml runs on Argo or Tekton without recompilation. In practice, every install you'll see runs Argo Workflows; KFP is one of the largest consumers of Argo in the wild.
+
+<Whiteboard client:load data={{ nodes: pipeNodes, edges: pipeEdges }} height={580} />
+
+Reading the diagram: Python source compiles to a portable pipeline IR. The IR is uploaded to the KFP API server. The API server dispatches it to Argo Workflows, which runs each step as a container. Steps pass typed artifacts to each other through MinIO/S3 — KFP handles the upload/download so your component code just sees `OutputPath("Dataset")` and a local path to write to. Every transition emits a lineage event into ML Metadata.
+
+## KFP v1 vs v2 — which to use
+
+KFP v1 was the original SDK, in service from 2018 through 2022. KFP v2 is a major redesign — typed component IR, lightweight Python components, first-class artifact handling, better v1-compatibility shims. **v2 has been GA since mid-2023.** Don't write new pipelines in v1.
+
+The two are not source-compatible. Recognising the difference at a glance:
+
+| Idiom | v1 | v2 |
+| --- | --- | --- |
+| Parameter type | `kfp.dsl.PipelineParam` | Python-native (`str`, `int`, `float`, `bool`) |
+| Component decorator | `@func_to_container_op` (or `dsl.ContainerOp`) | `@dsl.component` |
+| Output type | `OutputArtifact("Dataset")` | `Output[Dataset]` or `OutputPath("Dataset")` |
+| Compiler entry | `kfp.compiler.Compiler().compile(...)` | `kfp.compiler.Compiler().compile(...)` (same name, different IR) |
+
+If you're reading a tutorial that imports `kfp.components.func_to_container_op`, it's v1 — read it as legacy and find a v2 equivalent. The KFP project maintains a v1-compatibility mode but it papers over real differences in artifact handling and caching; don't rely on it for new work.
+
+## The Python-function component pattern
+
+The single most common component shape in v2 is a Python function decorated with `@dsl.component`. KFP packages the function, its dependencies, and a slim base image into a container at compile time:
+
+```python
+from kfp import dsl
+from kfp.dsl import Dataset, Output
+
+@dsl.component(
+    base_image="python:3.11-slim",
+    packages_to_install=["pandas==2.2.*"],
+)
+def prepare_data(input_path: str, output_dataset: Output[Dataset]):
+    import pandas as pd
+    df = pd.read_csv(input_path)
+    df = df.dropna()
+    df.to_parquet(output_dataset.path)
+    output_dataset.metadata["rows"] = len(df)
+```
+
+What the decorator does: at *compile* time, it inspects the function's signature and serialises the function body. At *run* time, the step's container pulls the base image, `pip install`s the named packages, materialises the function, and calls it with the right paths. KFP handles uploading the output Parquet to object storage as a `Dataset` artifact and recording its URI.
+
+Two non-obvious behaviours. **One**: `Output[Dataset]` gives you `output_dataset.path` (a local filesystem path the container writes to) and `output_dataset.metadata` (a dict you populate with anything — KFP stores it as part of the artifact's lineage record). **Two**: `packages_to_install` runs at the start of every step unless the step is cached. For pipelines you run more than a few times, build a *custom base image* with the packages baked in and reference it via `base_image=...` instead.
+
+## The container-component pattern
+
+When you can't use a Python function — you have an existing Docker image with the training code, the step needs a non-Python runtime, or the training has CLI flags you want to surface — use a `dsl.container_component`:
+
+```python
+from kfp import dsl
+
+@dsl.container_component
+def train_model_container(
+    dataset: dsl.Input[dsl.Dataset],
+    model: dsl.Output[dsl.Model],
+    epochs: int = 10,
+):
+    return dsl.ContainerSpec(
+        image="ghcr.io/our-org/trainer:v1.2.0",
+        command=["python", "/app/train.py"],
+        args=[
+            "--data", dataset.path,
+            "--out",  model.path,
+            "--epochs", epochs,
+        ],
+    )
+```
+
+Less ergonomic than the Python-function pattern — you give up the convenience of writing the step body in-line — but more flexible: any image, any entrypoint, any CLI shape. The lineage and artifact handling still work the same way; the component still declares typed inputs and outputs.
+
+## A two-step pipeline
+
+Wire the two component patterns into a pipeline:
+
+```python
+from kfp import dsl, compiler
+
+@dsl.pipeline(name="churn-train")
+def churn_pipeline(input_path: str = "gs://demo/churn.csv", epochs: int = 10):
+    prep = prepare_data(input_path=input_path)
+    train = train_model_container(
+        dataset=prep.outputs["output_dataset"],
+        epochs=epochs,
+    )
+
+compiler.Compiler().compile(
+    pipeline_func=churn_pipeline,
+    package_path="churn_pipeline.yaml",
+)
+```
+
+The `@dsl.pipeline` decorator turns the function into a pipeline definition. Each call to a component (`prepare_data(...)`, `train_model_container(...)`) creates a *task* in the DAG; the connection between `prep.outputs[...]` and the next task's input is what wires the DAG edges. The compiler emits a YAML file you can upload to the KFP UI or pass to the SDK client.
+
+`pipeline_func` takes the *function*, not a function call. The compiler introspects the function to figure out the parameter shape and the task graph.
+
+## Parameters vs artifacts
+
+A core distinction in KFP v2: every value flowing through the pipeline is either a **parameter** or an **artifact**.
+
+| | Parameter | Artifact |
+| --- | --- | --- |
+| Carries | Small typed value | Large blob with metadata |
+| Stored | In MLMD DB as JSON | In object storage (MinIO/S3) |
+| Examples | `epochs: int = 10`, `lr: float = 0.001` | `Dataset`, `Model`, `Metrics`, `HTML`, `Markdown` |
+| Type hint | Native Python (`int`, `str`, `bool`) | `Input[X]`, `Output[X]` |
+| Limit | A few KB — serialised JSON | Bounded by your object store |
+
+Choose **parameter** when the value fits in a few hundred bytes and you'd be comfortable seeing it in a log. Choose **artifact** when it's a Parquet file, a model checkpoint, a confusion-matrix PNG, or anything else where lineage matters and the size is non-trivial (rule of thumb: anything over ~10 MB).
+
+Artifacts get first-class lineage in the UI — *"this Model was produced by step `train` in run `r-2026-05-12-1530`, from `Dataset` produced by step `prepare`."* Parameters get logged but don't get tracked as lineage nodes.
+
+## Caching — the cost lever you'll actually use
+
+KFP v2 caches a step's output if its inputs (parameters + artifact URIs + image digest) match a previous run's. Saves real time when you're iterating — `prepare_data` doesn't re-run if neither the input CSV nor the component code has changed since last time.
+
+The hash includes the **image digest**, not the image tag. This means:
+
+- A `@dsl.component`-built image is rebuilt on every compile if you don't pin `base_image=` to a digest. Cache hits drop.
+- A `container_component` referencing `image: "ghcr.io/our-org/trainer:v1.2.0"` resolves the tag to a digest at submit time. If the tag is mutable (the image gets rebuilt and re-tagged `v1.2.0`), the digest changes and the cache misses.
+- For deterministic caching, **pin every image to a digest**: `image: "ghcr.io/our-org/trainer@sha256:abc123..."`. Yes, even your own images. The KFP UI's "from cache" green tick is worth it.
+
+Disable caching per-task when you actually want re-execution (e.g., the evaluation step should re-run even if the model didn't change, because the held-out set is different today):
+
+```python
+eval_task = evaluate_model(model=train.outputs["model"])
+eval_task.set_caching_options(enable_caching=False)
+```
+
+## Running a pipeline
+
+Three submission paths, in roughly the order you'll meet them:
+
+- **Central Dashboard UI.** Upload the compiled `pipeline.yaml`, click *Create Run*, fill the parameter form. Best for the first run of a new pipeline; you see the form the SDK generates and verify nothing is missing.
+- **KFP CLI.** `kfp pipeline create -p pipeline.yaml`, then `kfp run create --experiment my-experiment ...`. Best for CI: the CLI is scriptable and there's no auth dance in a service-account context.
+- **Python SDK from a notebook.** `kfp.Client().create_run_from_pipeline_func(...)`. Best for the iteration loop — author in JupyterLab, submit and watch the run, tweak, re-submit. The SDK can take a pipeline function directly without writing the YAML first.
+
+```python
+from kfp import Client
+client = Client()
+run = client.create_run_from_pipeline_func(
+    pipeline_func=churn_pipeline,
+    arguments={"input_path": "s3://bucket/churn.csv", "epochs": 20},
+    experiment_name="churn-iteration",
+)
+print(run.run_url)
+```
+
+The `run_url` is a deep link into the KFP UI's run view. Click it and you see the live DAG, per-step logs, and any artifacts produced so far.
+
+## Artifact storage
+
+By default, KFP writes artifacts to a MinIO instance deployed alongside the KFP backend. Production installs either use a real S3 / GCS / Azure Blob bucket or scale MinIO to a multi-node deployment. The artifact URIs look like `s3://mlpipeline/v2/artifacts/<pipeline-name>/<run-id>/<step-name>/<output-name>`.
+
+The KFP UI knows how to fetch from these URIs as long as its service account has read permission on the bucket. If you've swapped MinIO for a different S3-compatible store, also configure the KFP server's `ml-pipeline-ui-artifact` ConfigMap with the right credentials — otherwise the UI shows artifact entries but the "Open in browser" link 404s.
+
+For the lab's MinIO at `30.30.30.14:9000` (when Kubeflow eventually lands), the install would point KFP's `minio-service` to that endpoint with appropriate `S3_ACCESS_KEY` / `S3_SECRET_KEY` env vars, and the same MinIO instance would back artifact storage, model storage (for Module 06's KServe + ModelMesh), and Pipelines-internal storage.
+
+## The lab posture
+
+The lab fleet doesn't run Kubeflow today. The track is portable to any KFP install — the SDK is identical across distributions (open-source Kubeflow, AWS SageMaker for Kubeflow, Google Vertex AI Pipelines, Azure ML pipelines all consume the same IR). Write your pipelines against the SDK; the install differences are operational, not authorial.
+
+## Try this
+
+**1. Write a three-step pipeline.** `prepare_data` → `train_model` → `evaluate_model`, all Python-function components. Use `Dataset` between step 1 and 2, `Model` between 2 and 3, and `Metrics` as the final output of step 3. Compile to `pipeline.yaml` and inspect it — the YAML is verbose but legible. Note where the parameter and artifact definitions land.
+
+**2. Disable caching on the eval step.** Add `set_caching_options(enable_caching=False)` to the eval task. Compile and re-submit two runs back-to-back with the same inputs. Confirm in the UI that steps 1 and 2 show "from cache" on the second run and step 3 re-ran.
+
+**3. Submit a run from a notebook.** From the same JupyterLab session you built in Module 03, `pip install kfp` (or use the team-base image that already has it), import the pipeline function, and submit a run via `kfp.Client().create_run_from_pipeline_func(...)`. Open the returned `run_url`. The full author → submit → watch loop now lives inside the notebook.
+
+## Common failure modes
+
+**Pipeline compiles but the first step's pod stays `ImagePullBackOff`.** Two top causes. First, the `packages_to_install` requires outbound network to PyPI but the namespace has a default-deny `NetworkPolicy` blocking egress — `kubectl describe pod` shows the pod is up but the wrapper script is waiting on `pip install`. Fix: add a NetworkPolicy that allows egress to your internal PyPI mirror (or the public one for dev clusters). Second, you referenced a `base_image=` that the cluster can't pull because it's private and the namespace SA has no `imagePullSecrets`. Fix: add the pull secret to the namespace's `default` SA, or set `image_pull_secrets=...` on the component.
+
+**Step times out during execution.** KFP doesn't impose a per-step timeout by default, but Argo Workflows has a `activeDeadlineSeconds` you might have inherited from a workflow template. The fix is either to extend the deadline or — better — split the work. A 6-hour training step is a smell; if it dies at hour 5, you've lost everything. Checkpoint every N epochs and write the checkpoint as an intermediate artifact, then make the training step resumable.
+
+**UI shows the artifact but the "Open" link 404s.** The KFP UI tries to fetch the artifact via its server-side artifact handler, which needs credentials for the underlying object store. If you swapped MinIO for an external bucket and didn't update the UI's credentials, the entry exists in MLMD but the download fails. Fix: update the `ml-pipeline-ui-artifact` ConfigMap and restart the UI deployment.
+
+**`@dsl.component`-decorated function imports a local module that isn't packaged.** Symptom: step starts, the wrapper script runs, the function call fails with `ImportError: No module named 'my_local_utils'`. The decorator only ships the function body and the named `packages_to_install`; it doesn't see anything else in your `PYTHONPATH`. Fix: either pull the helper logic *into* the function (less reuse, but works), or build a custom base image that includes your shared utility package.
+
+**Run shows "Pending" forever.** Usually the orchestration engine isn't running. `kubectl get pods -n kubeflow` and look for `workflow-controller` (Argo) or `tekton-pipelines-controller` — if either is `CrashLoopBackOff`, no pipeline runs will progress. Diagnose the controller before debugging your pipeline.
+
+## Where this is heading
+
+You've got a working two- or three-step pipeline, you understand parameters vs artifacts, and you know which way the cache hits. The next module is everything you reach for when the pipeline grows past linear — conditionals, parallel for-loops with aggregation, nested pipelines, scheduled runs, secret handling, multi-tenant runs, and the bottlenecks that show up at scale.
+
+**Next:** [Module 05 — Pipelines (advanced)](/learn/kubeflow/05-pipelines-advanced) — control flow, ParallelFor + Collected, scheduled retraining, and the metadata / lineage story BFSI auditors will eventually ask you about.
+
+## References
+
+- Kubeflow Pipelines documentation: [kubeflow.org/docs/components/pipelines/](https://www.kubeflow.org/docs/components/pipelines/)
+- Kubeflow Pipelines SDK v2 user guide: [kubeflow.org/docs/components/pipelines/v2/](https://www.kubeflow.org/docs/components/pipelines/v2/)
+- KFP source repository: [github.com/kubeflow/pipelines](https://github.com/kubeflow/pipelines)
+- KFP v2 component authoring reference: [kubeflow.org/docs/components/pipelines/v2/components/](https://www.kubeflow.org/docs/components/pipelines/v2/components/)
+- ML Metadata (MLMD) project: [github.com/google/ml-metadata](https://github.com/google/ml-metadata)
+- Argo Workflows (the typical KFP backend engine): [argoproj.github.io/argo-workflows/](https://argoproj.github.io/argo-workflows/)
