@@ -1,0 +1,235 @@
+---
+title: "Kafka monitoring on spoke-dc-v6"
+description: "External Kafka broker observability: kafka-exporter Deployment, JMX javaagent on the 3 broker VMs, the OTel fanout collector to SigNoz + Tempo, and the namespace label defect that broke UWM scrape under issue #269."
+sidebar_label: "Kafka monitoring"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+import Whiteboard from "../../../../components/Whiteboard";
+
+export const ctrlBox = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const dataBox = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+export const crBox   = { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center" };
+export const extBox  = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center" };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const muted    = { style: { stroke: "#6b7280" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" } };
+
+export const kafkaNodes = [
+  { id: "k0",      position: { x: 0,   y: 0   }, data: { label: "kafka-0 VM\n30.30.30.24" }, style: extBox },
+  { id: "k1",      position: { x: 0,   y: 100 }, data: { label: "kafka-1 VM\n30.30.30.25" }, style: extBox },
+  { id: "k2",      position: { x: 0,   y: 200 }, data: { label: "kafka-2 VM\n30.30.30.26" }, style: extBox },
+  { id: "jmx",     position: { x: 240, y: 100 }, data: { label: "JMX javaagent\n:9404 (each VM)" }, style: extBox },
+  { id: "expo",    position: { x: 480, y: 0   }, data: { label: "kafka-exporter\n(danielqsj) :9308" }, style: ctrlBox },
+  { id: "fanout",  position: { x: 480, y: 200 }, data: { label: "OTel kafka-fanout\nDeployment" }, style: ctrlBox },
+  { id: "sm",      position: { x: 720, y: 0   }, data: { label: "ServiceMonitor\nkafka-exporter" }, style: crBox },
+  { id: "pr",      position: { x: 720, y: 100 }, data: { label: "PrometheusRule\nkafka.rules" }, style: crBox },
+  { id: "uwm",     position: { x: 960, y: 0   }, data: { label: "user-workload\nmonitoring Prom" }, style: ctrlBox },
+  { id: "signoz",  position: { x: 720, y: 280 }, data: { label: "SigNoz VM\n30.30.30.33:4317" }, style: extBox },
+  { id: "tempo",   position: { x: 960, y: 200 }, data: { label: "TempoStack\n(tracing ns)" }, style: ctrlBox },
+];
+
+export const kafkaEdges = [
+  { id: "j0", source: "k0", target: "jmx", ...muted },
+  { id: "j1", source: "k1", target: "jmx", ...muted },
+  { id: "j2", source: "k2", target: "jmx", ...muted },
+  { id: "e1", source: "expo", target: "k0", label: ":9092 PLAINTEXT", ...pullEdge },
+  { id: "e2", source: "expo", target: "k1", ...pullEdge },
+  { id: "e3", source: "expo", target: "k2", ...pullEdge },
+  { id: "m1", source: "expo", target: "sm", ...muted },
+  { id: "m2", source: "sm", target: "uwm", label: "scrape :9308", ...reqEdge },
+  { id: "m3", source: "pr", target: "uwm", label: "rules eval", ...muted },
+  { id: "f1", source: "expo", target: "fanout", label: "prometheus rcvr", ...muted },
+  { id: "f2", source: "jmx", target: "fanout", label: "Phase 2 scrape", ...pullEdge },
+  { id: "f3", source: "fanout", target: "signoz", label: "OTLP gRPC", ...reqEdge },
+  { id: "f4", source: "fanout", target: "tempo", label: "traces tee", ...reqEdge },
+];
+
+The lab Kafka cluster runs on three VMs outside OpenShift — `kafka-0/1/2.sub.comptech-lab.com` on `30.30.30.24/25/26`, Kafka 4.2.0 KRaft on OpenJDK 21. Monitoring lives on `spoke-dc-v6` so the metrics surface stays adjacent to the workloads that produce against Kafka. This page is the Phase 1 shape — the namespace, the danielqsj `kafka-exporter` Deployment, the JMX broker-side javaagent install, the OTel fanout collector, and the open defect under issue #269 that still has `KafkaExporterDown` firing.
+
+## Why on spoke and not on the brokers
+
+Two reasons:
+
+- **Consumer-group lag and cluster-shape metrics come from a Kafka admin client, not from JMX.** danielqsj/kafka-exporter speaks the Kafka protocol, asks the cluster for topic/partition/group metadata, and exposes Prometheus metrics. Running that next to the brokers wastes a VM; running it on the cluster gives it the same lifecycle as everything else (Argo, RBAC, NetworkPolicy, image supply via Nexus).
+- **JMX is per-JVM.** Broker internals (`UnderReplicatedPartitions`, `ActiveControllerCount`, raft-channel rates) need a `jmx_prometheus_javaagent` loaded into each broker's JVM. The agent is on the VMs; the scrape target is `30.30.30.24-26:9404` reached over the cluster's egress NetworkPolicy.
+
+UFW on each broker allows `30.30.0.0/16 → :9404` only — the cluster's pod CIDR ranges fit inside `30.30.0.0/16`, no broader allow.
+
+## Architecture
+
+<Whiteboard client:load data={{ nodes: kafkaNodes, edges: kafkaEdges }} height={420} />
+
+Reading the diagram:
+
+- The three broker VMs each run a JMX javaagent on `:9404`. UFW allows scrape from `30.30.0.0/16` only.
+- `kafka-exporter` in the `kafka-monitoring` namespace dials `kafka-0/1/2:9092` over PLAINTEXT and exposes consumer-group/topic/partition metrics on `:9308`.
+- A `ServiceMonitor` plus a `PrometheusRule` (`kafka.rules`) wire the exporter into user-workload monitoring; alerts come from this path.
+- A second OTel `OpenTelemetryCollector` (`kafka-fanout`) prometheus-scrapes the same exporter and tees traces + metrics + logs to **SigNoz** (VM at `30.30.30.33:4317`) and traces also to the in-cluster TempoStack via `otelcol-platform-collector`.
+
+## Components
+
+| Component | Kind | Namespace | Purpose |
+| --- | --- | --- | --- |
+| `kafka-exporter` | Deployment | `kafka-monitoring` | danielqsj exporter; metrics `:9308` |
+| `kafka-exporter` | Service | `kafka-monitoring` | ClusterIP, port `metrics: 9308` |
+| `kafka-exporter` | ServiceMonitor | `kafka-monitoring` | UWM Prometheus picks it up |
+| `kafka-rules` | PrometheusRule | `kafka-monitoring` | 4 exporter-backed alerts (broker count, URP, lag, exporter down) |
+| `kafka-fanout` | OpenTelemetryCollector | `kafka-monitoring` | OTLP receiver + prometheus scraper → SigNoz + Tempo |
+| `app-registry-pull` | Secret (ESO) | `kafka-monitoring` | dockerconfigjson pull secret from Vault `vault-platform` |
+| 4× NetworkPolicy | NetworkPolicy | `kafka-monitoring` | default-deny + DNS + Kafka VMs `:9092/:9404` + UWM ingress on `:9308` |
+
+The exporter is pinned by digest from the Nexus app-registry: `app-registry.apps.sub.comptech-lab.com/platform/kafka-exporter@sha256:2c98dab...c46c`. The image is hardened for OCP `restricted-v2` — `runAsNonRoot`, drop ALL caps, `readOnlyRootFilesystem`, seccomp RuntimeDefault.
+
+## Broker-side JMX javaagent
+
+The agent is `jmx_prometheus_javaagent-1.0.1.jar`, pinned by SHA-256 `7d61f737fd661610ccc14aea79764faa1ea94a340cbc8f0029b3d2edea3d80c1`. It is sourced from Maven Central. Maven Central does not publish a `.sha256` sibling for this artifact — we verify the download against the published `.sha1` (`f9c53eb0aa1828c3c9cd7647238563e43a4ed68c`) and `.md5` (`f525facee9d400d163e5366c02d3aa68`), then record the SHA-256 for our records and re-verify on each broker after copy.
+
+Files placed on each broker (root:root):
+
+```text
+/opt/jmx-exporter/jmx_prometheus_javaagent.jar              (0644)
+/opt/jmx-exporter/kafka-jmx-config.yml                      (0644)
+/etc/systemd/system/kafka.service.d/10-jmx-exporter.conf    (0644)
+```
+
+The systemd drop-in (identical on all three brokers):
+
+```ini
+[Service]
+Environment="KAFKA_OPTS=-javaagent:/opt/jmx-exporter/jmx_prometheus_javaagent.jar=9404:/opt/jmx-exporter/kafka-jmx-config.yml"
+```
+
+`server.properties`, `log4j2.yaml`, and the pre-existing `KAFKA_HEAP_OPTS` / `LOG_DIR` / `KAFKA_LOG4J_OPTS` environment are **not touched**. The rolling restart is one broker at a time with URP=0 verified between each. Each broker heals in &lt;15s; KRaft leadership transitions are expected during the restart of the current leader.
+
+### The 17-rule JMX config
+
+The config has 17 rule blocks (well under the ~25 cap). Rules are ordered specific-first so per-topic/per-partition matches take precedence over the generic catch-all:
+
+| # | Block | What it captures |
+| --- | --- | --- |
+| 1 | per-topic per-partition `<>Value` | gauges for partition offsets, ISR shape |
+| 2 | per-topic broker `<>Count` | message-rate counters |
+| 3 | per-broker replica fetcher | follower lag metrics |
+| 4 | KRaft raft `*-total` / `*-rate` | quorum + log-replication counters |
+| 5 | KRaft raft other attrs | gauges for state |
+| 6 | KRaft raft channel | raft-channel rate/throughput |
+| 7 | per-user/per-client quota | request quota counters |
+| 8 | network processor connection | connection rate, idle |
+| 9 | request metrics counters | per-API call counts |
+| 10 | request metrics percentiles | latency p50/p95/p99 |
+| 11 | generic `<>Count` | catch-all counters |
+| 12 | generic `<>Percentile` | catch-all gauges |
+| 13 | generic `<>Value` | covers `ReplicaManager,UnderReplicatedPartitions` and `KafkaController,ActiveControllerCount` |
+| 14 | JVM heap/non-heap | memory pools |
+| 15 | JVM GC count/time | GC pressure |
+| 16 | JVM thread counters | thread pool size |
+| 17 | tail catch-all `kafka.*` → `kafka_generic_*` UNTYPED | so unknown beans are not blackholed |
+
+Each broker emits ~10k `kafka_` metric lines per scrape; ~40% of the volume is the tail catch-all. Scrape latency from `localhost:9404/metrics` is ~600ms, response ~1.34 MB. If fleet-scale ingestion becomes a problem, tighten the tail at scrape time via `metricRelabelConfigs` `drop` actions on the ServiceMonitor rather than re-rolling the broker config.
+
+## The OTel fanout collector
+
+`kafka-fanout` is a second `OpenTelemetryCollector` (mode `Deployment`, 1 replica) that exists for one reason — the lab wants every Kafka signal in **SigNoz**, not just Prometheus metrics. The collector has three pipelines:
+
+- **traces** — OTLP-in from `bank-employees-jboss-chat` producers/consumers → SigNoz + Tempo (tee'd, so existing Tempo workflows keep working).
+- **metrics** — OTLP-in and a built-in `prometheus` receiver that scrapes the danielqsj exporter on `kafka-exporter.kafka-monitoring.svc:9308` → SigNoz.
+- **logs** — OTLP-in → SigNoz.
+
+The prometheus receiver also has a `kafka-broker-jmx` job staged for Phase 2, scraping `kafka-0/1/2.sub.comptech-lab.com:9404`. The job is in the config; whether it actually scrapes depends on Phase 2 (see §Phase 2 below).
+
+Sampling on the trace pipeline is the same tail-sampling shape as the bank-payment fanout — keep every error, keep every span over 500ms, sample 10% of the rest:
+
+```yaml
+tail_sampling:
+  decision_wait: 10s
+  num_traces: 5000
+  policies:
+    - { name: keep-errors, type: status_code, status_code: { status_codes: [ERROR] } }
+    - { name: keep-slow,   type: latency,     latency:     { threshold_ms: 500 } }
+    - { name: sample-rest, type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+```
+
+Resource attributes are upserted onto every signal: `deployment.environment=lab`, `service.namespace=kafka`, `k8s.cluster.name=spoke-dc-v6`. SigNoz's Services view groups brokers, jboss-chat producer, and jboss-chat consumer under one logical "kafka" surface.
+
+## Alerts (kafka.rules)
+
+| Alert | Expression | For | Severity |
+| --- | --- | --- | --- |
+| `KafkaExporterDown` | `up{job="kafka-exporter"} == 0` | 2m | critical |
+| `KafkaBrokerCountLow` | `kafka_brokers < 3` | 5m | critical |
+| `KafkaUnderReplicatedPartitions` | `sum(kafka_topic_partition_under_replicated_partition) > 0` | 5m | critical |
+| `KafkaConsumerGroupLagHigh` | `kafka_consumergroup_lag > 10000` | 10m | warning |
+
+Broker-internal alerts (`ActiveControllerCount`, `OfflinePartitions`, `LogDirBytes`, `RequestHandlerIdle`) are deferred to Phase 2 — they require the JMX scrape to actually land in UWM.
+
+## The open defect — issue #269
+
+At 2026-05-12 closeout the validation pass found a true-positive `KafkaExporterDown`. Root cause is two-part:
+
+1. **Namespace was mislabeled `openshift.io/cluster-monitoring: "true"`.** OCP routes any ServiceMonitor in that namespace to the **platform** Prometheus (`openshift-monitoring/k8s`), not UWM. Effect: UWM has 0 active targets; platform Prom claims the ServiceMonitor.
+2. **NetworkPolicy ingress only allows UWM.** `allow-ingress-from-user-workload-monitoring` allows ingress from `openshift-user-workload-monitoring` only — not from `openshift-monitoring`. The platform scrape then hits the default-deny and times out with `context deadline exceeded`. `up=0` → `KafkaExporterDown` fires true-positive.
+
+The fix (preferred): **drop the mislabel.** The namespace description in `namespace.yaml` already says "Scraped by the openshift-user-workload-monitoring Prometheus" — the label was a copy-paste from a hub-side namespace. The MR removes the label only; the NetworkPolicy stays as-is because UWM is the intended scraper.
+
+Alternative (rejected): expand the ingress NetworkPolicy to also allow `openshift-monitoring`. Rejected because it would silently route the ServiceMonitor to the wrong Prometheus and the alert would clear without anyone noticing the platform/UWM split was wrong.
+
+## Phase 2 — broker JMX scrape via UWM
+
+Tracked under issue #273. The blocker is that the spoke's `argocd-cm` `resource.exclusions` excludes **both** `core/Endpoints` **and** `discovery.k8s.io/EndpointSlice` (non-default; see [the spoke argo exclusions reference](../05-gitops-operating-model)). The external-IP scrape target needs one of those representations and Argo will not sync either today.
+
+The two options Phase 2 picks between:
+
+- Relax the exclusion list to allow `EndpointSlice` (smaller blast radius than re-enabling `Endpoints`).
+- Pick a representation Argo will sync — a `Probe` CR pointing at the JMX endpoints, or a selectorless Service + an externally managed EndpointSlice.
+
+Broker-side javaagents are installed and idle. UFW `:9404` ingress is in place. The cluster cannot scrape them until #273 lands.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# Argo app + objects
+oc --kubeconfig "$K" -n openshift-gitops get app spoke-dc-v6-cluster-config
+oc --kubeconfig "$K" -n kafka-monitoring get all,servicemonitor,prometheusrule,networkpolicy
+
+# Exporter healthy
+oc --kubeconfig "$K" -n kafka-monitoring logs deploy/kafka-exporter --tail=20
+
+# UWM target presence
+oc --kubeconfig "$K" -n openshift-user-workload-monitoring \
+  exec -c prometheus prometheus-user-workload-0 -- \
+  curl -fsS http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job=="kafka-exporter")'
+
+# Live broker JMX endpoint (from a worker node, or any 30.30.0.0/16 host)
+curl -fsS http://kafka-0.sub.comptech-lab.com:9404/metrics | head -20
+```
+
+Expected once issue #269 is closed:
+
+- `Application/spoke-dc-v6-cluster-config` `Synced/Healthy`.
+- `kafka-exporter` pod 1/1 Running.
+- UWM has one active target for `job=kafka-exporter`, `up=1`, `kafka_brokers=3`.
+- `KafkaExporterDown` not firing.
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| `KafkaExporterDown` firing despite the pod being Running. | Namespace mislabeled `openshift.io/cluster-monitoring=true` and platform Prom can't reach the pod. | Drop the label; UWM picks the ServiceMonitor up correctly. |
+| Exporter pod `ImagePullBackOff`. | `app-registry-pull` Secret not materialised yet — ESO still reconciling. | `oc -n kafka-monitoring get externalsecret app-registry-pull` should show `SecretSynced Ready=True`. |
+| Exporter Running but no `kafka_brokers` series. | The exporter can't reach `kafka-0/1/2:9092` from the worker. | Check `allow-egress-kafka-vms` NetworkPolicy; verify UFW on the brokers allows `30.30.0.0/16`. |
+| JMX scrape from a worker pod times out. | Broker-side UFW doesn't allow the source IP. | UFW must allow `30.30.0.0/16` (not just specific worker IPs). |
+| `kafka-fanout` collector restarting. | Tail-sampling memory pressure under high span volume. | Raise `num_traces` ceiling or shorten `decision_wait`; or scale to 2 replicas. |
+
+## References
+
+- Issue #269 — Kafka monitoring Phase 1 closeout (open at 2026-05-12; namespace mislabel fix MR in flight).
+- Issue #273 — Phase 2 broker JMX scrape via UWM.
+- Issue #274 — Full-capability SigNoz demo; OTel fanout collector design.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/kafka-monitoring/`.
+- `opp-full-plat/reports/sessions/2026-05-11-kafka-monitoring-phase1-brokers.md` — broker-side install evidence.
+- `opp-full-plat/reports/sessions/2026-05-12-kafka-monitoring-phase1-closeout.md` — validation that surfaced the defect.

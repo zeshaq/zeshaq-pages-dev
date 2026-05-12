@@ -1,0 +1,150 @@
+---
+title: "Lab CA trust through Proxy.trustedCA"
+description: "How the spoke-dc-v6 Lab CA is merged into the cluster-wide trust bundle via openshift-config/lab-ca-bundle + Proxy.trustedCA, so the auth-operator and every other re-validating client trust cert-manager-issued ingress certs."
+sidebar_label: "Lab CA trust + Proxy"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+The lab is air-gapped. Nexus, Vault, HAProxy edge, and the cluster's own ingress all serve TLS certificates signed by a local Lab CA — there is no public root in the chain. For the cluster's own components to trust those certs (the auth-operator re-validates the ingress cert on every reconcile, ESO speaks TLS to Vault, operators pull from Nexus mirrors), the Lab CA has to be in the cluster's trust bundle. This page is the one-CM-plus-one-Proxy-edit wiring that does it.
+
+## What problem this solves
+
+Concrete failure modes when the Lab CA is **not** in the trust bundle:
+
+| Symptom | Component | Why |
+| --- | --- | --- |
+| `auth-operator` `Degraded=True` with `x509: certificate signed by unknown authority` against `oauth-openshift.apps.spoke-dc-v6.sub.comptech-lab.com` | OCP auth-operator | re-validates the ingress cert; the cert-manager-issued leaf is fine but the chain ends at the Lab CA |
+| ESO `external-secrets` pods fail Vault login with `x509: certificate signed by unknown authority` | ESO | Vault is at `https://vault.sub.comptech-lab.com` behind HAProxy with a Lab-CA-issued cert |
+| Operator pods `ImagePullBackOff` against `nexus.apps.sub.comptech-lab.com` | any operator | Nexus serves with a Lab-CA-issued cert |
+| `argocd-application-controller` cannot pull from GitLab `https://gitlab.apps.sub.comptech-lab.com` | OpenShift GitOps | GitLab edge is Lab-CA-signed |
+| Console **Observe → Logs** returns `unknown authority` on LokiStack queries | console-operator | the LokiStack gateway uses a service-ca cert, but the front-channel goes via the cluster Route |
+
+None of these need cert-manager fixes or HAProxy fixes — they all need the same trust bundle wiring.
+
+## How the wiring works
+
+The chain is:
+
+1. **`ConfigMap/lab-ca-bundle`** in `openshift-config` carries the PEM of the spoke-dc-v6 Lab CA root.
+2. **`Proxy/cluster.spec.trustedCA.name`** points at that ConfigMap by name.
+3. The **Cluster Network Operator (CNO)** reads `Proxy.trustedCA`, merges its content into `openshift-config-managed/trusted-ca-bundle` (the canonical injected bundle), and propagates to any ConfigMap labelled `config.openshift.io/inject-trusted-cabundle: "true"`.
+4. **`v4-0-config-system-trusted-ca-bundle`** is one of those auto-injected CMs; auth-operator consumes it. Every other operator that opts into the inject-label gets the merged bundle too.
+
+The CA itself rotates Never — it's a 10-year self-signed root cert-manager creates on the spoke. Embedding the PEM directly in the GitOps ConfigMap is fine because the value is stable for a decade.
+
+## The ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab-ca-bundle
+  namespace: openshift-config
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+data:
+  ca-bundle.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIFZDCCA0ygAwIBAgIUaIF7xYDO1byzwkgVgANQg9FQs4UwDQYJKoZIhvcNAQEN
+    ... (snip: 10-year spoke-dc-v6 Lab CA root) ...
+    -----END CERTIFICATE-----
+```
+
+Three load-bearing details:
+
+- **`namespace: openshift-config`.** The Proxy CR only reads ConfigMaps from `openshift-config` (it's hard-coded). Putting it anywhere else means the Proxy reference silently fails.
+- **`data.ca-bundle.crt`.** The key name is non-negotiable; CNO's merge logic only looks at `ca-bundle.crt`. Naming it `ca.crt` or `tls.crt` produces a CM that exists but contributes nothing.
+- **PEM, not DER.** The merge logic concatenates PEM blocks; a DER blob gets passed through and breaks every downstream consumer.
+
+## The Proxy edit
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: Proxy
+metadata:
+  name: cluster
+  annotations:
+    argocd.argoproj.io/sync-wave: "25"
+    argocd.argoproj.io/sync-options: ServerSideApply=true
+spec:
+  trustedCA:
+    name: lab-ca-bundle
+```
+
+Two notes:
+
+- **Server-side apply.** The `Proxy/cluster` resource is managed by cluster-bootstrap (proxy settings, no-proxy lists, etc.). Without SSA, Argo and cluster-bootstrap fight over the rest of the spec forever. SSA confines our ownership to `spec.trustedCA` only.
+- **Sync-wave 25.** Runs after the ConfigMap (wave 20) but before the IngressController (wave 40), so the trust bundle is in place by the time the ingress operator rolls the cert. Otherwise the auth-operator briefly goes `Degraded` while the bundle catches up.
+
+## How CNO consumes it
+
+CNO watches the Proxy CR. When `spec.trustedCA.name` is set:
+
+1. CNO reads `openshift-config/<name>/ca-bundle.crt`.
+2. Concatenates that content with the system CA bundle.
+3. Writes the result to `openshift-config-managed/trusted-ca-bundle/ca-bundle.crt`.
+4. The OCP injection controller watches for ConfigMaps labelled `config.openshift.io/inject-trusted-cabundle: "true"` and copies the merged bundle into them on each reconcile.
+
+`v4-0-config-system-trusted-ca-bundle` (in `openshift-authentication`) is the auth-operator's consumer; it's auto-created with the inject label. The same path covers every operator that opted into the same pattern — `external-secrets`, `argocd`, the cluster-monitoring stack, etc.
+
+## State on spoke-dc-v6 at 2026-05-12
+
+Applied direct to the cluster on 2026-05-11 during the cluster-issuer rotation work (issue OP-HEALTH1). The ConfigMap + Proxy edit clear the auth-operator `Degraded` and ESO Vault-login errors immediately.
+
+**Needs GitOps backport.** The files exist in `platform-gitops/clusters/spoke-dc-v6/security/`:
+
+- `configmap-lab-ca-bundle.yaml`
+- `proxy-cluster-trusted-ca.yaml`
+
+…but the live-applied state has not yet been reconciled with what the Argo Application would sync if it was given the chance. Argo selfHeal would revert any direct edit, so the backport is a hygiene step rather than a load-bearing change — the live state already matches the desired state byte-for-byte.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# The Proxy edit
+oc --kubeconfig "$K" get proxy cluster -o jsonpath='{.spec.trustedCA.name}{"\n"}'
+# expect: lab-ca-bundle
+
+# Source CM
+oc --kubeconfig "$K" -n openshift-config get cm lab-ca-bundle -o jsonpath='{.data.ca-bundle\.crt}' | head -2
+
+# Merged CM (CNO output)
+oc --kubeconfig "$K" -n openshift-config-managed get cm trusted-ca-bundle \
+  -o jsonpath='{.data.ca-bundle\.crt}' | grep -c 'BEGIN CERTIFICATE'
+
+# Auth-operator picked it up
+oc --kubeconfig "$K" -n openshift-authentication get cm v4-0-config-system-trusted-ca-bundle \
+  -o jsonpath='{.data.ca-bundle\.crt}' | grep -c 'BEGIN CERTIFICATE'
+
+# Auth-operator clean
+oc --kubeconfig "$K" get clusteroperator authentication -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}{"\n"}'
+```
+
+Expected:
+
+- `Proxy.spec.trustedCA.name = lab-ca-bundle`.
+- `openshift-config/lab-ca-bundle` has the BEGIN CERTIFICATE block.
+- `openshift-config-managed/trusted-ca-bundle` shows N+1 certs (N system roots + our Lab CA).
+- `openshift-authentication/v4-0-config-system-trusted-ca-bundle` shows the same count.
+- `clusteroperator/authentication` `Degraded=False`.
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| Proxy edit applied but `trusted-ca-bundle` is unchanged. | CM name typo in `Proxy.spec.trustedCA.name`, or CM in the wrong namespace. | The Proxy only reads `openshift-config`; the name must match exactly. |
+| Bundle in `trusted-ca-bundle` but auth-operator still `Degraded`. | `v4-0-config-system-trusted-ca-bundle` missing the inject label. | Re-label the CM with `config.openshift.io/inject-trusted-cabundle=true` (auth-operator should create it pre-labelled). |
+| ESO still rejecting Vault TLS after wiring. | ESO's reconciler hasn't restarted since the inject controller updated its CM. | `oc -n external-secrets rollout restart deploy/external-secrets`; CMs are mounted at pod start. |
+| Nexus pulls still fail with `unknown authority`. | The operator was running before the inject; mounted CM is stale. | Restart the operator pod; mounted CA bundles are read once on container start. |
+| Argo loops on Proxy reconcile. | `sync-options: ServerSideApply=true` annotation missing. | Add SSA; cluster-bootstrap and Argo otherwise fight over the rest of the spec. |
+| CA was regenerated; trust bundle still shows the old root. | Hard-coded PEM in `configmap-lab-ca-bundle.yaml` is stale. | Regenerate from `oc -n cert-manager get secret spoke-dc-lab-ca-tls -o jsonpath='{.data.tls\.crt}' \| base64 -d`. |
+
+## Related
+
+- [§09.3 Ingress and Routes](./03-ingress-and-routes) — where the cluster wildcard cert this trust enables is actually served.
+- [§14.1 cert-manager](../14-platform-services/01-cert-manager) — the CA itself comes from a `ClusterIssuer` here.
+- `platform-gitops/clusters/spoke-dc-v6/cert-manager/clusterissuer-lab-ca.yaml`.
+- `platform-gitops/clusters/spoke-dc-v6/security/configmap-lab-ca-bundle.yaml` and `proxy-cluster-trusted-ca.yaml`.

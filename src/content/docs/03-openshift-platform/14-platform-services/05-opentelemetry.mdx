@@ -1,8 +1,8 @@
 ---
-title: "OpenTelemetry Collector"
-description: "The OpenTelemetryCollector operand on spoke-dc-v6 — Deployment-mode collector that receives OTLP from app pods and forwards to TempoStack, and the Tekton push-image-quay Task that pairs the collector with the rest of the build evidence."
+title: "OpenTelemetry Collector — dual sinks for SigNoz + Tempo"
+description: "The OpenTelemetryCollector operand on spoke-dc-v6 — the platform-shared collector that forwards to TempoStack, the second kafka-fanout collector that tees to SigNoz, and the Tekton push-image-quay Task that closes out the build evidence chain."
 sidebar_label: "OpenTelemetry Collector + push-image-quay"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -159,6 +159,31 @@ processors:
 ```
 
 That is configured in the collector, not in the app SDK. The "no app changes to change sampling" property is the whole reason the collector exists.
+
+## Dual sinks — Tempo for short-term, SigNoz for long-term
+
+The lab runs **two** OpenTelemetryCollectors in production, not one:
+
+| Collector | Namespace | Sinks |
+| --- | --- | --- |
+| `otelcol-platform` | `tracing` | TempoStack (in-cluster) |
+| `kafka-fanout` | `kafka-monitoring` | SigNoz VM (`30.30.30.33:4317`) + TempoStack (tee) |
+
+The split is deliberate. Tempo's strength is fast trace search over a short retention window — it lives next to the data, queries are sub-second, but spans roll off when the TempoStack PVCs say so. SigNoz on the dedicated VM is the long-term sink: metrics + traces + logs all in one queryable store, with retention measured in months. Apps don't have to choose — the kafka-fanout collector tees the trace pipeline so the same span lands in both.
+
+App namespaces that need the dual-sink (`bank-employees-jboss-chat`, `bank-payment`) point their OTLP exporter at the `kafka-fanout` collector instead of `otelcol-platform`. App namespaces that only need short-term Tempo (`apps-platform-sample`, the older tenants) keep pointing at `otelcol-platform`. The Instrumentation CR is the single knob — flipping the endpoint reroutes the namespace to the dual-sink path with no app redeploy.
+
+The `kafka-fanout` collector also has a `prometheus` receiver that scrapes danielqsj/kafka-exporter and ships metrics directly into SigNoz. See [§14.15 Kafka monitoring](./15-kafka-monitoring-on-spoke) for the full collector shape, the tail-sampling config, and the Phase 2 broker JMX scrape job that's staged in the config.
+
+### App-side NetworkPolicy
+
+App namespaces that egress OTLP need explicit `allow-egress` to the right collector. The `bank-payment` and `bank-employees-jboss-chat` namespaces ship rules permitting:
+
+- `tracing` namespace `:4317/:4318` — the legacy `otelcol-platform` endpoint.
+- `kafka-monitoring` namespace `:4317/:4318` — the new `kafka-fanout` endpoint.
+- The SigNoz VM at `30.30.30.33:4317/4318` — only for collectors, not for app pods, so this rule has a `podSelector` matching the collector pod label (`app.kubernetes.io/name=kafka-fanout`) rather than `{}`.
+
+Cluster default-deny is on; the rules are additive.
 
 ## The Tekton push-image-quay Task
 
