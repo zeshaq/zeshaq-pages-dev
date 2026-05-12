@@ -1,0 +1,324 @@
+---
+title: "BFSI Production-Readiness Gap Analysis"
+description: "Honest gap analysis between the current single-DC lab platform and a tier-2 BFSI production deployment — domain by domain, with H/M/L gap severity, S/M/L/XL effort estimates, and a prioritized roadmap."
+sidebar_label: "BFSI readiness review"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+## Why this page exists
+
+The lab is currently hosting a live proof-of-concept for **BRAC Bank** (a Bangladesh commercial bank), reachable at `brac-poc.apps.sub.comptech-lab.com` and built on top of the v6 fleet documented elsewhere on this site. The POC is technically convincing — eight panels demoing API gateway, IdP, mesh mTLS, canary, observability, Redis Sentinel failover, Nexus supply chain, and Kafka — but the platform underneath it is, today, a **single-DC lab**, operated by a single human, with no DR pair built and no HSM, WAF, SIEM, or PAM in the picture.
+
+This page is the honest assessment of what would have to be added, replaced, or operationalised to take the platform from "POC behind a Let's Encrypt wildcard" to "tier-2 commercial bank production cluster passing a PCI-DSS Level 1 QSA audit." It's written for the lab owner's planning, not as a sales pitch. The intended reader is a senior architect, a CTO, or an external auditor.
+
+## The reference profile
+
+The baseline is a **tier-2 commercial bank or payments processor**:
+
+- **Payment-card scope.** &gt;6M card transactions/year &rarr; **PCI-DSS v4.0.1 Level 1** with annual QSA audit.
+- **Cross-border payments.** SWIFT or domestic RTGS connectivity &rarr; **SWIFT CSP v2024** controls.
+- **Regulator.** Bangladesh Bank ICT Security Guideline (BRAC's regulator); RBI Cyber Security Framework for Banks is the near-neighbour reference.
+- **Resilience.** **RPO &le; 15 min, RTO &le; 4 hr** for core-banking. Audit logs retained 7 years.
+- **Architecture.** Multi-DC active-passive or active-active across two seismic/power zones, diverse-path MPLS &ge;10 Gbps, FIPS 140-2 Level 3 HSMs, hardware LBs in HA pair, WAF + IPS + DDoS at edge, 24x7 NOC + SOC, PAM with session recording, DLP at egress, tokenization for card data.
+
+| Frame | What it requires | Why it applies |
+| --- | --- | --- |
+| **PCI-DSS v4.0.1 L1** | 12 control objectives, ~250 sub-requirements; FIPS-validated crypto; CDE network segmentation; quarterly internal + ASV external scans; pen-testing; 1yr hot + 7yr cold audit retention | Card-present and card-not-present transactions; required by Visa/Mastercard for L1 merchants and acquiring banks |
+| **SWIFT CSP v2024** | 32 mandatory controls (CSCF v2024), independent assessment annually; segmented SWIFT zone; 2FA on operator workstations; daily integrity check of message reconciliation | Any participant on SWIFTNet; failure suspends connectivity |
+| **Bangladesh Bank ICT Security Guideline** | DC + DR with documented RTO/RPO; locally-hosted core banking data (data-localisation); annual VAPT; 7-year retention | Mandatory for all scheduled banks operating in Bangladesh |
+| **ISO 27001:2022** | ISMS with 93 Annex A controls; statement of applicability; risk register; annual surveillance audit, 3-yearly recertification | Common contractual ask from correspondent banks and large corporate clients |
+| **SOC 2 Type II** | Trust Services Criteria (Security, Availability, Confidentiality, Processing Integrity, Privacy); 6-12 month observation window | Required when banking-as-a-service or API-banking customers are downstream |
+
+The lab today targets PCI-DSS v4.0 via the Compliance Operator tailored profile and partially aligns with the others. The 18 domains below break down where the gaps are.
+
+## Domain-by-domain analysis
+
+Each domain: **Current state (lab)** with doc citations, **BFSI production expectation** with concrete products + controls, **Gap severity** (&#x1F534; High / &#x1F7E1; Medium / &#x1F7E2; Low), **Effort** (S &le;2wk / M 1-2mo / L 3-6mo / XL 6-12mo), **Production blocker?** (Yes / No-audit / No-operational), and **Reference standard**.
+
+### 1. Resilience and Disaster Recovery
+
+**Current (lab).** Active fleet is `hub-dc-v6` + `spoke-dc-v6` on a single hypervisor (`dl385`); `hub-dr-v6`/`spoke-dr-v6` are reserved names, **not built** ([ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge)). Site-replication readiness tracked under REP-* but the dry-run gate (REP-7) is BLOCKED ([REP overview](/docs/08-history-and-replay/04-site-replication-readiness)). OADP writes Velero backups to a single local MinIO with no offsite copy ([OADP install](/docs/03-openshift-platform/13-backup-oadp/01-operator-install)). No end-to-end DR drill executed.
+
+**BFSI expectation.** Two physically separate DCs in different seismic/power zones, diverse-path leased lines &ge;10 Gbps. RPO &le; 15 min, RTO &le; 4 hr for core banking. Quarterly DR drills with regulator-shareable evidence. Geo-redundant object storage (S3 cross-region, MinIO site replication). Storage-array-level synchronous replication for the transactional tier (Dell PowerMax, NetApp MetroCluster, IBM SVC).
+
+**Severity:** &#x1F534; **High** — single hypervisor is an SPOF. **Effort:** **XL** (capex for second-DC hardware, leased lines, third hypervisor for quorum). **Blocker?** **Yes.** **Reference:** PCI-DSS Req 12.10; Bangladesh Bank ICT Guideline §6 (BCP/DR); ISO 27001 A.5.29, A.5.30.
+
+### 2. Cryptographic Key Management
+
+**Current (lab).** Vault OSS 1.21.1 on three Ubuntu VMs in a Raft cluster, auto-unsealed by a separate single-node transit-seal Vault with Shamir 5/3 shares in offline custody ([Vault deployment](/docs/02-lab-infrastructure/06-vault-vm/01-deployment-and-storage)). Root key protection is software-only. etcd encryption-at-rest is `aesgcm`; ODF cluster-wide encryption is on — but underlying key material is held by software KMS, not an HSM. cert-manager issues TLS via Let's Encrypt; ACME private keys live in OpenShift Secrets.
+
+**BFSI expectation.** **FIPS 140-2 Level 3** HSMs from Thales (nShield Connect XC / Luna), Entrust, or Utimaco. Vault Enterprise with PKCS#11 or HSM seal type rooting transit keys in the HSM. Card-data encryption (PAN, track2) using DUKPT or AES-256 with HSM-resident KEKs. Quarterly key ceremony with dual-control + split-knowledge per PCI Req 3.6/3.7. HSM cluster pair with sync replication.
+
+**Severity:** &#x1F534; **High** — software KMS is a hard PCI L1 finding when cardholder data is in scope. **Effort:** **L** (procurement, HSM VLAN, Vault integration, ceremony docs). **Blocker?** **Yes** if PAN-bearing flows hit the cluster; **No (audit finding)** if the platform never sees card data and scope is reduced via tokenization. **Reference:** PCI-DSS Req 3.5, 3.6, 3.7; FIPS 140-2; ISO 27001 A.8.24.
+
+### 3. Edge Security (WAF / IPS / DDoS)
+
+**Current (lab).** HAProxy 2.8.16 on a single VM does **L4 + TLS termination only** with the Let's Encrypt wildcard; no WAF rules, no rate limiting beyond config defaults, no IPS, no bot management ([HAProxy architecture](/docs/02-lab-infrastructure/04-edge-ingress-haproxy/01-architecture-overview)). OpenShift Routes terminate at the in-cluster ingress controller, also without a WAF. No DDoS protection; lab is reachable on a single public IP.
+
+**BFSI expectation.** WAF in blocking mode in front of every public surface — **F5 BIG-IP ASM, Imperva SecureSphere, Akamai Kona**, or **ModSecurity 3 + OWASP CRS 4.x** on NGINX/HAProxy. IPS via Check Point, Palo Alto, or Suricata in-line. DDoS via **Cloudflare Magic Transit, Akamai Prolexic, Imperva**. Bot management. HA pair of hardware LBs (F5/Citrix ADC) for L7.
+
+**Severity:** &#x1F534; **High** — no WAF on an internet-facing banking application fails PCI Req 6.4.2 outright. **Effort:** **M** for ModSecurity + OWASP CRS in front of HAProxy; **L** for licensed Imperva / F5 ASM with managed rules. **Blocker?** **Yes.** **Reference:** PCI-DSS Req 6.4.2; SWIFT CSCF 2.4A; ISO 27001 A.8.23.
+
+### 4. Network Segmentation
+
+**Current (lab).** Every platform VM and both OpenShift clusters live on a single Linux bridge `br30` carrying the lab's `30.30.0.0/16` ([Lab Infrastructure overview](/docs/02-lab-infrastructure/01-overview)). No DMZ / internal / management VLAN separation, no firewall between OpenShift node CIDRs and platform-VM CIDRs, no network-layer microsegmentation. In-cluster NetworkPolicy with default-deny + named allows is per-tenant ([Security overview](/docs/03-openshift-platform/11-security/01-overview)) — genuinely good — but the flat bridge underneath would not pass any PCI segmentation review.
+
+**BFSI expectation.** Tiered zones (Internet edge / DMZ / app / data / management) on separate VLANs with firewall enforcement between zones. CDE on its own VLAN with documented flows. Banking core on a separate isolated VLAN. PCI Req 1.2 segmentation testing every 6 months. Hardware firewalls in HA pair (Palo Alto, Cisco Firepower, Check Point) + NSX-T / ACI for east-west microsegmentation.
+
+**Severity:** &#x1F534; **High** — flat L2 is the headline PCI segmentation finding. **Effort:** **L** (VLAN redesign, firewall procurement, IP renumbering, cross-zone flow validation). **Blocker?** **Yes** — without segmentation the entire platform falls into PCI scope. **Reference:** PCI-DSS Req 1.2, 1.3, 1.4; Bangladesh Bank ICT Guideline §4.
+
+### 5. SIEM and Security Event Correlation
+
+**Current (lab).** RHACS Central produces runtime + admission alerts ([RHACS overview](/docs/03-openshift-platform/11-security/01-overview)). Cluster logs flow Vector &rarr; LokiStack &rarr; NooBaa/MinIO, tenanted as `application`/`audit`/`infrastructure` ([Cluster Logging and Loki](/docs/03-openshift-platform/14-platform-services/03-cluster-logging-and-loki)) with `1x.demo` sizing. SigNoz is APM, not a SIEM. No central correlation engine, no SOAR, no UEBA, no threat-intel feed, no documented hot/cold retention.
+
+**BFSI expectation.** A real SIEM (**Splunk Enterprise Security, IBM QRadar, Microsoft Sentinel, Securonix, Exabeam**) ingesting cluster audit, OS audit, firewall, WAF, IDS, RHACS, Vault audit, IdP, and DLP events with **1yr hot + 6yr cold** retention. Correlation rules covering OWASP Top 10, MITRE ATT&CK for Containers, PCI event categories. SOAR (**Splunk SOAR, XSOAR, Tines**) for automated triage.
+
+**Severity:** &#x1F534; **High** — no SIEM means no central audit-evidence story. **Effort:** **L** for Splunk Cloud / Sentinel; longer for self-hosted Elastic/Wazuh. **Blocker?** **Yes** for PCI Req 10.4, 10.7. **Reference:** PCI-DSS Req 10; SWIFT CSCF 6.4; ISO 27001 A.8.15, A.8.16.
+
+### 6. Supply-Chain Security
+
+**Current (lab).** Both build paths run Trivy in server mode, fail-gate on CRITICAL CVEs, archive evidence to MinIO `developer-ci-evidence/<team>/<app>/<git-sha>/`, and write a digest-pinned MR back to the app GitOps repo ([Path A](/docs/04-application-delivery/03-build-paths/01-path-a-jenkins-trivy-nexus)). DefectDojo aggregates findings; Nexus enforces the image-supply path. **Missing:** cosign/Sigstore image signing, admission-policy signature verification, Syft/CycloneDX SBOM generation, SLSA-style provenance attestation.
+
+**BFSI expectation.** Signed images (cosign + Rekor transparency log, or Notary v2). **Sigstore Policy Controller** or **RHACS image-signing policy** enforcing signature verification at admission. CycloneDX or SPDX SBOMs per image. SLSA Level 2-3 provenance (in-toto attestations). Third-party dependency-graph review (Sonatype Lifecycle, Snyk, Black Duck).
+
+**Severity:** &#x1F7E1; **Medium** — Trivy + DefectDojo + digest-pinning gets most of the way; signing closes the loop. **Effort:** **M** (cosign on build agent, Rekor mirror in disconnected env, Policy Controller, SBOM step). **Blocker?** **No (audit finding).** **Reference:** PCI-DSS Req 6.3, 6.4; NIST SSDF SP 800-218; ISO 27001 A.8.28, A.8.30.
+
+### 7. Privileged Access Management (PAM)
+
+**Current (lab).** `kubeadmin` is documented in the operator workspace; Vault root token custody in `opp-full-plat/secrets/` (git-ignored) per the [credential custody rules](/docs/01-foundations/04-credential-custody-rules). Break-glass procedure codified ([on-call and escalation](/docs/05-operations/06-on-call-and-escalation)) with mandatory audit records. Vault holds application secrets but not privileged human credentials. **No PAM solution, no session recording, no JIT credential issuance for human admins, no joiner/mover/leaver (JML) automation.**
+
+**BFSI expectation.** A PAM platform — **CyberArk, BeyondTrust, Delinea Secret Server, HashiCorp Boundary** — with: JIT credential issuance, session recording (keystroke + screen), approval workflow for production-targeting SSH/RDP/kubectl, automated credential rotation, separation-of-duties between identity admins and secret-store admins, JML tied to HR.
+
+**Severity:** &#x1F534; **High** — static break-glass kubeconfig with manual audit logging fails PCI Req 7-8. **Effort:** **L** (procurement, Vault + IdP integration, jump-host architecture, training, JML). **Blocker?** **Yes** for PCI Req 8.2, 8.3. **Reference:** PCI-DSS Req 7.2, 8.2, 8.3, 8.6; SWIFT CSCF 5.1, 5.2; ISO 27001 A.5.15, A.5.18, A.8.2.
+
+### 8. Data Protection (DLP / Tokenization / Masking)
+
+**Current (lab).** No DLP at egress. No card-data tokenization pipeline (the POC has no real PAN flow). Audit logs mixed with application logs in the same Loki backend, tenanted but not cryptographically separated. No documented data-classification policy, no automated PII discovery, no non-prod masking. App secrets vaulted; data-at-rest encrypted via ODF; data-in-transit on TLS.
+
+**BFSI expectation.** Tokenization vault (Thales CipherTrust, Protegrity, Voltage SecureData) reducing PCI scope to the tokenization service. DLP at endpoint + email + egress (Broadcom/Symantec, Forcepoint, MS Purview). PII discovery (BigID, Varonis). Non-prod masking (Delphix, IBM Optim). Audit logs on WORM immutable storage.
+
+**Severity:** &#x1F534; **High** if card data flows through the platform; &#x1F7E1; **Medium** if tokenized upstream. **Effort:** **L** (DLP + tokenization onboarding). **Blocker?** **Yes** if PAN crosses the cluster boundary; **No (audit finding)** otherwise. **Reference:** PCI-DSS Req 3.4, 7.3; ISO 27001 A.5.12, A.8.10, A.8.11, A.8.12.
+
+### 9. Identity and Authentication
+
+**Current (lab).** Keycloak is **planned but not deployed** ([Keycloak/OIDC placeholder](/docs/02-lab-infrastructure/10-other-platform-vms/03-keycloak-oidc)). Nexus, Jenkins, GitLab, SigNoz, DefectDojo, Grafana, and Quay each run with local user databases. OpenShift uses `kubeadmin` + ACM identity. **MFA not consistently enforced.** Password rotation, session timeouts, JML all managed per-tool, manually. No SSO across the platform.
+
+**BFSI expectation.** Centralised IdP (Keycloak / RH-SSO, **Entra ID, Okta, Ping**) federated to corporate AD/LDAP. **MFA mandatory on every admin surface** (Console, RHACS, GitLab, Vault, Jenkins, Nexus, IdP itself) — FIDO2/WebAuthn or push, not SMS. Session timeouts &le;15 min for privileged consoles. JML tied to HR with automated deprovisioning &le;24 hrs.
+
+**Severity:** &#x1F534; **High** — no enforced MFA on admin surfaces violates PCI v4 Req 8.4, 8.5. **Effort:** **M** to stand up Keycloak and federate OIDC-capable services; **L** to cover stragglers + JML. **Blocker?** **Yes.** **Reference:** PCI-DSS Req 8.4, 8.5; SWIFT CSCF 4.2; ISO 27001 A.5.16, A.5.17, A.8.5.
+
+### 10. Audit Trail and Retention
+
+**Current (lab).** Audit logs flow through the same LokiStack as application and infrastructure logs ([Cluster Logging and Loki](/docs/03-openshift-platform/14-platform-services/03-cluster-logging-and-loki)), `tenants.mode: openshift-logging` separating them by tenant but storing on the same NooBaa/MinIO. **Retention not stated;** `1x.demo` sizing, no ILM on the bucket. No immutable WORM archive, no storage-layer separation of audit from app logs, no 7-year cold tier.
+
+**BFSI expectation.** Audit logs separated at the storage layer. **1yr hot + 6yr cold** per PCI Req 10.5.1. WORM immutable storage (S3 object-lock, MinIO object retention, NetApp SnapLock, Dell ECM). Cryptographic chaining of log batches. Regular integrity verification.
+
+**Severity:** &#x1F534; **High** — mixed-bucket Loki without ILM/object-lock fails Req 10.5. **Effort:** **M** (dedicated Loki audit tenant, dedicated MinIO bucket with object-lock + ILM, cold tier). **Blocker?** **Yes.** **Reference:** PCI-DSS Req 10.5, 10.6, 10.7; SWIFT CSCF 6.4; Bangladesh Bank ICT Guideline §5.6; ISO 27001 A.8.15.
+
+### 11. Change Management and Release Governance
+
+**Current (lab).** GitOps via `platform-gitops` on internal GitLab is the canonical change channel; ACM-orchestrated Argo CD pull reconciles everything. Break-glass permitted under [ADR 0025](/docs/06-architecture-decisions/21-adr-0025-gitops-only-operations-break-glass) with audit record. MRs go through code-owner review. **Missing:** CAB approval gate for production windows, formal change-freeze calendars, change-communication channels, change-success metrics, regulator-notifiable-change tracker.
+
+**BFSI expectation.** CAB workflow with named approvers (Change Manager, Security, Architecture, Operations, Business Owner). Formal change windows (Tue/Thu 22:00-02:00 local). Annual freeze calendar. Change-success rate tracked monthly. Emergency-change retroactive review &le;24 hrs. Tooling: **ServiceNow, Jira Service Management, BMC Helix**.
+
+**Severity:** &#x1F7E1; **Medium** — GitOps mechanics are strong, governance ceremony is the gap. **Effort:** **M** (codify CAB rules into MR approval policies, publish calendar, integrate ticketing). **Blocker?** **No (operational gap)** — auditors will flag, not fail. **Reference:** PCI-DSS Req 6.5; ITIL 4; ISO 27001 A.5.36, A.8.32.
+
+### 12. Operational Maturity (NOC / SOC / Support Tiers)
+
+**Current (lab).** Solo operator, no formal rotation, no 24x7 SLO ([on-call and escalation](/docs/05-operations/06-on-call-and-escalation)). Paging is best-effort; acceptable response window for `incident`-labelled GitHub issues is 90 minutes. No L1/L2/L3 split, no follow-the-sun, no SLA-driven severity matrix, no documented RCA cadence beyond incident-issue closeout.
+
+**BFSI expectation.** **24x7 NOC** with L1 (monitoring + first response, 15-min ack SLA), L2 (subject-matter response), L3 (architecture + escalation). **24x7 SOC** for security events (often outsourced to MSSP — IBM, Atos, NTT, Tata). Follow-the-sun across 2-3 zones. Severity matrix (Sev1 = customer-impacting, 15-min ack, 1-hr restore SLA). Formal RCA &le;5 business days per Sev1/Sev2.
+
+**Severity:** &#x1F534; **High** — solo operator + 90-min response is not a tier-2 posture. **Effort:** **XL** for organic hire; **L** for MSP partnership (Wipro/Infosys/TCS/domestic MSP). **Blocker?** **Yes** for customer-facing transactional workloads. **Reference:** Bangladesh Bank ICT Guideline §3.2; ISO 27001 A.5.24, A.5.26; SOC 2 CC7.
+
+### 13. Performance, Capacity, and Chaos
+
+**Current (lab).** No automated load-testing pipeline; no documented capacity-planning process; no chaos drills. The POC demos Redis Sentinel failover and canary traffic shifting (good narrative artefacts, not engineered chaos). Capacity is "whatever the dl385 has left." Cluster autoscaler not configured (spoke has three physical workers — fixed footprint).
+
+**BFSI expectation.** **k6, Locust, or Gatling** load-test pipeline producing per-release P95/P99 latency + error-rate at target RPS. Quarterly capacity reviews with explicit headroom (typically 40-50% peak headroom for transactional). **Chaos Mesh, Litmus, Gremlin** game days monthly — AZ failure, node loss, pod eviction, network partition, dependency failure. Quarterly RTO/RPO validation drills.
+
+**Severity:** &#x1F7E1; **Medium** — auditors expect *some* capacity documentation. **Effort:** **M** for k6 in CI; **L** for a chaos program with documented cadence. **Blocker?** **No (operational gap).** **Reference:** ISO 27001 A.5.30, A.8.6; SOC 2 A1.
+
+### 14. Compliance Scanning and Audit Readiness
+
+**Current (lab).** Compliance Operator 1.9.0 runs `ocp4-pci-dss-4-0` + `ocp4-pci-dss-node-4-0` on `spoke-dc-v6` ([PCI-DSS profile](/docs/03-openshift-platform/12-compliance/04-pci-dss-profile-baseline)) with current FAIL counts 8 high / 3 medium / 0 low against the tailored profile. Evidence lives in MinIO buckets. **Missing:** SOC 2 + ISO 27001 control mapping, regulator-facing reporting cadence (quarterly attestation packs), evidence-management workflow beyond raw object-store dumps. Cluster-scope scanning is best-in-class for OpenShift; the GRC overlay is not.
+
+**BFSI expectation.** Compliance Operator equivalent (already best-in-class). On top: **OneTrust, ServiceNow GRC, Archer, MetricStream** mapping controls to PCI/SOC2/ISO27001/BCB, collecting evidence, tracking remediation, generating auditor reports. Quarterly internal audit; annual external; ad-hoc regulator reporting.
+
+**Severity:** &#x1F7E1; **Medium.** **Effort:** **L** for full GRC rollout; **M** for a lightweight evidence-management workflow in GitLab + MinIO. **Blocker?** **No (audit finding).** **Reference:** PCI-DSS Req 12.8, 12.9; ISO 27001 A.5.34, A.5.35.
+
+### 15. Vendor and Third-Party Risk
+
+**Current (lab).** No documented vendor-risk program. The platform depends on Red Hat (OpenShift, RHACS, OADP), HashiCorp (Vault OSS), Sonatype (Nexus), Cloudflare (Pages — docs only, not production), Let's Encrypt (TLS), Ubuntu (HAProxy/PDNS/Vault OS), and open-source projects. No SOC 2 reports collected, no contractual SLAs tracked, no escrow agreements.
+
+**BFSI expectation.** Formal third-party risk program: annual SOC 2 Type II from every commercial vendor, documented SLAs, financial-stability monitoring (D&B, S&P), escrow for critical commercial software, exit plans for SaaS dependencies. Procurement gates require SIG/CAIQ before onboarding.
+
+**Severity:** &#x1F7E1; **Medium** — won't fail PCI but will fail ISO 27001 surveillance + correspondent-bank reviews. **Effort:** **M** to instantiate; ongoing. **Blocker?** **No (audit finding).** **Reference:** PCI-DSS Req 12.8; ISO 27001 A.5.19-A.5.23; SOC 2 CC9.2.
+
+### 16. Application Resilience Patterns
+
+**Current (lab).** OSSM3 ambient pilot on the BRAC POC's `bank-employees-jboss-chat` workload provides inter-pod mTLS. Kafka 3-broker cluster up. Redis Sentinel cluster operationalised ([Redis Sentinel](/docs/02-lab-infrastructure/10-other-platform-vms/02-redis-sentinel)) with documented hardening baseline. CloudNativePG operator installed. **Missing in application patterns:** standardised circuit-breaker libraries (Resilience4j / Polly / opossum), documented idempotency-key conventions, saga orchestration for distributed transactions (Camunda / Temporal / Axon), service-resilience playbook for app teams.
+
+**BFSI expectation.** Standardised resilience library per language. Idempotency-key headers mandatory on every state-changing API. Saga / compensating-transaction pattern (Camunda 8, Temporal, Step Functions) for cross-service flows. Bulkhead + rate-limit defaults at the mesh layer.
+
+**Severity:** &#x1F7E1; **Medium** — platform-layer resilience is mostly there; app-layer patterns are not standardised. **Effort:** **M** to publish an app-team contract + reference implementations. **Blocker?** **No (operational gap).** **Reference:** ISO 27001 A.5.30; PCI-DSS Req 6.3; SOC 2 PI1.
+
+### 17. Hardware, Power, and Network Redundancy
+
+**Current (lab).** Single libvirt/KVM hypervisor (`dl385`) hosts every platform VM and both OpenShift clusters' VM masters; three physical workers (`gold-1`, `gold-2`, `gpu-01`) alongside. Single power feed, single ISP, single TOR switch. Local NVMe storage with ODF for the cluster tier, MR408i HBA on physical workers. No remotely-replicated storage, no UPS / generator documented.
+
+**BFSI expectation.** A+B power feeds with UPS + diesel generator, &ge;72-hr runtime. Dual ISP with BGP/MPLS failover. Dual TOR in HA pair per rack. RAID 10 / erasure-coded on every persistent tier with snapshotting. Sync storage replication to DR (or async with RPO &le; 15 min). Hardware-level monitoring (Sunbird, Nlyte) feeding SIEM.
+
+**Severity:** &#x1F534; **High** — single hypervisor is the elephant. **Effort:** **XL**; DC build-out is the longest-pole item alongside DR. **Blocker?** **Yes.** **Reference:** TIA-942 Tier III/IV; Bangladesh Bank ICT Guideline §6.
+
+### 18. Banking-Network Integration
+
+**Current (lab).** No SWIFT / RTGS / IMPS / NEFT / NPP / BACS / SEPA connectivity. The BRAC POC's payment panel is a simulated demo, not a wired clearing-network integration. No HSM, no SWIFTNet VPN, no Alliance Access install, no domestic Bangladesh clearing adapter (BEFTN, BACH).
+
+**BFSI expectation.** For payment-message origination/termination: **SWIFT Alliance Access / Alliance Gateway** (or Alliance-Lite2), dedicated SWIFTNet VPN box, HSM-backed message signing, CSP-mandated jump-host architecture, annual SWIFT CSP attestation. For domestic rails, the BEFTN/BACH/IMPS adapter (Finastra Payments, Volante VolPay, FIS IST/Switch, Worldline).
+
+**Severity:** &#x1F7E1; **Medium** as a separable concern; **High** the moment the POC's payment flow leaves the lab. **Effort:** **XL** — SWIFT onboarding alone is 3-6 months. **Blocker?** **Yes** if real payment flows traverse the platform; **No** if positioned as channel/digital-experience only. **Reference:** SWIFT CSCF v2024 (32 controls); local clearing-network operator rules.
+
+## Scoreboard
+
+A single summary of all eighteen domains:
+
+| # | Domain | Severity | Effort | Production blocker? |
+| --- | --- | --- | --- | --- |
+| 1 | Resilience & DR | &#x1F534; High | XL | Yes |
+| 2 | Cryptographic Key Management | &#x1F534; High | L | Yes (if PAN in scope) |
+| 3 | Edge Security (WAF/IPS/DDoS) | &#x1F534; High | M-L | Yes |
+| 4 | Network Segmentation | &#x1F534; High | L | Yes |
+| 5 | SIEM & Correlation | &#x1F534; High | L | Yes |
+| 6 | Supply-Chain Security | &#x1F7E1; Medium | M | No (audit finding) |
+| 7 | Privileged Access Management | &#x1F534; High | L | Yes |
+| 8 | Data Protection (DLP/Token) | &#x1F534; High | L | Yes (if PAN in scope) |
+| 9 | Identity & Authentication | &#x1F534; High | M-L | Yes |
+| 10 | Audit Trail & Retention | &#x1F534; High | M | Yes |
+| 11 | Change Management & Release Gov | &#x1F7E1; Medium | M | No (operational gap) |
+| 12 | Operational Maturity (NOC/SOC) | &#x1F534; High | L-XL | Yes |
+| 13 | Performance / Capacity / Chaos | &#x1F7E1; Medium | M-L | No (operational gap) |
+| 14 | Compliance Scanning + Audit Readiness | &#x1F7E1; Medium | M-L | No (audit finding) |
+| 15 | Vendor & Third-Party Risk | &#x1F7E1; Medium | M | No (audit finding) |
+| 16 | Application Resilience Patterns | &#x1F7E1; Medium | M | No (operational gap) |
+| 17 | Hardware, Power, Network Redundancy | &#x1F534; High | XL | Yes |
+| 18 | Banking-Network Integration | &#x1F7E1; Medium | XL | Yes (if payment-rail flows) |
+
+Twelve domains rated High, six rated Medium; ten flagged as production blockers under PCI-DSS L1 + BCB. No domain rated Low — the lab is honest about its current scope.
+
+### Textual scorecard
+
+**Domains rated strong / mostly ready:**
+
+- **GitOps operating model.** Pull-model Argo CD reconciling federated `platform-gitops` is mature and traceable.
+- **Secrets-store wiring.** Vault + ESO bridging Kubernetes Secret material from per-division tenancy paths to operands is structurally correct.
+- **Runtime security.** RHACS Central + Sensor + Admission + Collector + Scanner V4 deployed and policy-enforcing.
+- **Compliance scanning.** Compliance Operator with PCI-DSS v4 tailored profile running continuously; FAIL counts trending down.
+- **Observability foundation.** SigNoz APM, Tempo distributed tracing, LokiStack logs, OTel collectors, Perses dashboards — full stack.
+- **API gateway.** WSO2 IS + APIM legacy but operational, with documented hostnames and gateway flows.
+- **CI image scanning.** Trivy + DefectDojo + digest-pin promotion across both build paths.
+
+**Domains rated weak / blocking:**
+
+- **DR** (no second site).
+- **HSM** (software KMS only).
+- **WAF/IPS/DDoS** (none).
+- **SIEM** (none — Loki is not a SIEM).
+- **Signed images + admission verification** (Trivy is build-side only).
+- **PAM** (no privileged-session tooling).
+- **DLP / tokenization** (no card-data path tested).
+- **Audit-log retention** (1yr hot + 7yr cold not configured).
+- **24x7 operations** (solo operator, 90-min ack).
+- **Hardware redundancy** (single hypervisor).
+
+## Prioritized roadmap
+
+Effort estimates below are wall-clock months at one platform-engineering FTE; the team-size assumption is two platform engineers plus part-time security and compliance.
+
+### Tier 1 — Production blockers (Q3 2026)
+
+**Goal: stop the highest-severity bleeding so the platform could conceivably host a small regulated workload by year-end.**
+
+1. **Build the DR pair (`hub-dr-v6` + `spoke-dr-v6`)** per [ADR 0022](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge), with a second hypervisor in a separate power zone (even within the same building, as an interim step before a true second DC). Configure ACM-based fleet management, async storage replication on ODF, MinIO site replication for OADP. **Effort: 6 person-months.**
+2. **Procure and deploy HSMs** (Thales nShield Connect XC or Entrust nShield) as an HA pair. Migrate Vault to Vault Enterprise with PKCS#11 seal type rooting transit keys in the HSM. Document key-ceremony procedure with dual-control. **Effort: 4 person-months. Dependency: HSM integration must precede image-signing rollout for full PCI Req 3.5.2 alignment.**
+3. **Insert a WAF** in front of HAProxy as an interim step: ModSecurity 3 + OWASP CRS 4.x deployed on a dedicated VM, in blocking mode for known signatures, log-only for the tail. Plan migration to a licensed Imperva / F5 ASM tier by Q4. **Effort: 2 person-months.**
+4. **Implement image signing** with cosign + Rekor (mirror Rekor's transparency log into the disconnected env). Enforce signature verification via RHACS image-signing policy or Sigstore Policy Controller as a ValidatingAdmissionPolicy. Generate Syft SBOMs in both build paths. **Effort: 2 person-months.**
+5. **Separate audit logs** into a dedicated LokiStack tenant and a dedicated MinIO bucket with object-lock + ILM (90-day hot, 6-year cold). Wire RHACS, Vault audit, OpenShift audit, OS audit, and HAProxy logs into this tenant. **Effort: 2 person-months.**
+
+**Tier 1 total: ~16 person-months across two engineers + capex for HSM (~$80-150k for an HSM pair), DR hypervisor + storage, and WAF licenses.**
+
+### Tier 2 — Audit readiness (Q4 2026)
+
+**Goal: pass an internal PCI-DSS readiness assessment and stand up the controls a QSA will ask about.**
+
+1. **Stand up a SIEM** — Splunk Cloud or Microsoft Sentinel (cloud-managed reduces ops burden); ingest the audit-log tenant from Tier 1, plus RHACS, OPA Gatekeeper, WAF, IPS (if procured), Vault audit, IdP login events, HAProxy access logs. Build correlation rules for OWASP Top 10 + MITRE ATT&CK for Containers. **Effort: 3 person-months.**
+2. **Deploy a PAM solution** — CyberArk or Delinea Secret Server for human admin credentials; Vault dynamic credentials for Tier-1 systems (database, cloud-API). Session recording on every privileged SSH/RDP/kubectl session targeting `spoke-dc-v6` or any platform VM. **Effort: 4 person-months.**
+3. **Formalize change management** with CAB workflow encoded as GitLab MR approval rules; named CAB approvers per change class; published change-freeze calendar; emergency-change retroactive-review process documented. **Effort: 1 person-month.**
+4. **Enforce MFA on every admin surface** — Keycloak / Red Hat SSO federating Console, RHACS, GitLab, Vault, Jenkins, Nexus, SigNoz, DefectDojo. FIDO2 / WebAuthn preferred; TOTP acceptable for the transition. Document JML automation. **Effort: 3 person-months.**
+5. **Stand up a baseline performance pipeline** — k6 in the Jenkins / Tekton chain producing per-release P95/P99 latency vs RPS baselines, archived to MinIO with a Perses dashboard. **Effort: 1 person-month.**
+
+**Tier 2 total: ~12 person-months + capex for SIEM licensing ($30-100k/yr Splunk depending on EPS), PAM licensing ($30-80k/yr CyberArk).**
+
+### Tier 3 — Operational maturity (H1 2027)
+
+**Goal: move from "platform that passes audit" to "platform that operates like a tier-2 bank's production cluster."**
+
+1. **Build out a 24x7 NOC.** Either organic hire (4-6 engineers) or MSP partnership (Wipro / Infosys / TCS / domestic MSP). L1 monitoring + first response, L2 incident response, L3 escalation to platform team. **Effort: ~12 calendar-months including hiring; partial reduction with MSP.**
+2. **Stand up a chaos-engineering program** — Chaos Mesh game days monthly, scenarios drawn from PCI-DSS Req 12.10.5 (DR/IR testing). **Effort: 2 person-months to bootstrap; ongoing.**
+3. **Quarterly capacity-planning reviews** with documented headroom targets, automated capacity-trend reports from Perses + Prometheus into a shared dashboard reviewed by capacity, finance, and platform leads. **Effort: 1 person-month to set up; ongoing.**
+4. **Vendor risk-management framework** — Annual SOC 2 collection, contractual SLA tracking, exit-plan documentation for every commercial dependency. **Effort: 2 person-months.**
+5. **SOC 2 Type II readiness assessment** — engage a Type II auditor for a 6-month observation window starting H2 2027. **Effort: 3 person-months internal prep + audit cost.**
+
+**Tier 3 total: ~20 person-months + 24x7 staffing ongoing OPEX.**
+
+### Dependency notes
+
+- **HSM &rarr; image signing &rarr; admission verification** is a sequential chain. Don't roll out image-signing enforcement until HSM-rooted signing keys are available; otherwise you're just moving the trust root from one software wallet to another.
+- **SIEM &rarr; SOC** is sequential — there's no point hiring a SOC team without a SIEM to give them.
+- **DR &rarr; everything DR-dependent** (backup-restore drills, RPO/RTO validation, BCB ICT Guideline §6 evidence).
+- **MFA &rarr; PAM** rollout — get MFA broadly in place first; PAM layers on top.
+- **WAF interim &rarr; WAF licensed** — ModSecurity buys time, but a managed WAF (Imperva, F5 ASM, Cloudflare WAF) is the production posture.
+
+## What the lab does better than typical BFSI
+
+It would be one-sided to publish only the gap list. Several things this platform does are unusually strong relative to what tier-2 banks actually run in production:
+
+- **Pull-model GitOps for fleet management.** ACM placement + Argo CD pull on each spoke means there is no admin "ssh into prod and `kubectl apply -f`" path; every cluster state change is a merged commit on `platform-gitops`. Most banks still operate clusters with hand-edited manifests applied through bastion hosts. The cultural shift to GitOps-only operations ([ADR 0025](/docs/06-architecture-decisions/21-adr-0025-gitops-only-operations-break-glass)) is harder than the tooling, and the lab has done it.
+- **Externalised secrets via ESO from Vault.** Per-division tenancy under `secret/apps/<division>/<app>/...` with `ClusterSecretStore` separation between platform and tenant secrets ([Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules)). Most banks have secrets sprawled across Jenkins credentials, env-var injection, hard-coded properties files, and ad-hoc PVC-mounted PEM bundles. This platform's secret-delivery posture is, structurally, ahead of typical.
+- **Compliance Operator with tailored PCI-DSS v4 profile** scanning continuously and producing machine-readable ComplianceCheckResult evidence ([PCI-DSS profile baseline](/docs/03-openshift-platform/12-compliance/04-pci-dss-profile-baseline)). Most banks run a PCI scan quarterly via Nessus / Qualys and patch frantically before the auditor visits. Continuous scanning with version-locked tailored profiles is the right answer; the gap is the GRC overlay on top, not the scanning itself.
+- **Federated GitLab** with per-division top-level groups, role groups (`ct-*`), and CODEOWNERS-enforced review on every merge. Mature SDLC governance built into the source-control plane rather than bolted on as a separate workflow tool.
+- **Ambient service mesh** (OSSM3 with ambient profile) on the BRAC POC's JBoss chat workload, providing transparent inter-pod mTLS without sidecar injection. Most banks have either not operationalised service mesh at all or are still on sidecar mTLS with high operational overhead.
+- **Immutable build paths** (Path A Jenkins + Path B Tekton) with digest-pin promotion via `update-overlay-digest.sh` — meaning `dev`, `stg`, `prd` overlays each pin a specific `@sha256:` digest, and promotion is a Git commit moving the digest forward. Many banks still tag-promote (`:latest`, `:rel-1.2`, `:prod`), which is a category of supply-chain risk this platform has eliminated.
+
+The pattern across these strengths: **the lab gets the *operating model* right** even where the *production-grade tooling* is missing. That matters, because operating models are far harder to change than tools; switching from HAProxy to F5 is a procurement exercise, while switching from "operators hand-edit prod" to "every change is a merged commit" is a multi-year cultural shift.
+
+## Conclusion
+
+Where the lab sits today on the maturity ladder: **a high-quality reference implementation of an OpenShift platform** with the operating-model patterns banks aspire to (GitOps-only operations, federated GitLab governance, externalised secrets, continuous compliance scanning, immutable build paths) and most of the *production-grade tooling* banks require still to be added (DR, HSM, WAF, SIEM, PAM, DLP, audit retention, 24x7 ops, hardware redundancy).
+
+The credible path to BFSI-grade looks like Tier 1 + Tier 2 of the roadmap above — roughly **9-12 months of focused platform-engineering work plus capex for HSM, WAF licenses, DR hypervisor, SIEM licensing, and PAM licensing**. The capex envelope is on the order of **$300-600k for a tier-2 deployment**, dominated by HSMs and the second-DC build-out. Tier 3 (24x7 operations) is the longest-pole item and is typically when banks bring in an MSP partnership to compress the timeline.
+
+For the BRAC POC specifically, the answer to "could this platform run a BRAC retail-banking digital channel in production today?" is **no** — the platform is missing too many of the hard-blocker controls listed above. The answer to "could this platform run a BRAC employee-facing internal application or a non-payment-handling digital-experience layer with appropriate scope reduction?" is **probably yes, with Tier 1 completed and a documented PCI scope reduction**. The answer to "would the platform's operating model survive scaling up to that production posture?" is **yes** — the GitOps, secrets, mesh, and supply-chain foundations are already correct.
+
+This document should be re-reviewed at the close of each Tier (Q3 2026, Q4 2026, H1 2027). The scoreboard above is the durable artifact; severity ratings should move from &#x1F534; to &#x1F7E1; to &#x1F7E2; as work lands, with linked evidence (ADR, runbook, PR, or scan output) for each downgrade.
+
+## References
+
+- [Overview of the CompTech Platform](/docs/01-foundations/01-overview-of-the-comptech-platform)
+- [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules)
+- [OpenShift Fleet Overview](/docs/03-openshift-platform/01-fleet-overview)
+- [HAProxy edge: architecture overview](/docs/02-lab-infrastructure/04-edge-ingress-haproxy/01-architecture-overview)
+- [Vault deployment and storage](/docs/02-lab-infrastructure/06-vault-vm/01-deployment-and-storage)
+- [PCI-DSS Profile Baseline (v4.0)](/docs/03-openshift-platform/12-compliance/04-pci-dss-profile-baseline)
+- [Security Overview (RHACS, VAP, NetworkPolicy)](/docs/03-openshift-platform/11-security/01-overview)
+- [Cluster Logging and LokiStack](/docs/03-openshift-platform/14-platform-services/03-cluster-logging-and-loki)
+- [OADP operator install](/docs/03-openshift-platform/13-backup-oadp/01-operator-install)
+- [On-call and escalation](/docs/05-operations/06-on-call-and-escalation)
+- [Path A — Jenkins/Trivy/Nexus](/docs/04-application-delivery/03-build-paths/01-path-a-jenkins-trivy-nexus)
+- [ADR 0022 — v6 fleet membership and future-DR naming](/docs/06-architecture-decisions/17-adr-0022-v6-fleet-purge)
+- [Site Replication Readiness (REP-* tracker)](/docs/08-history-and-replay/04-site-replication-readiness)
+- PCI SSC: [PCI DSS v4.0.1](https://www.pcisecuritystandards.org/)
+- SWIFT CSP: [Customer Security Programme](https://www.swift.com/myswift/customer-security-programme-csp)
+- Bangladesh Bank: [ICT Security Guideline](https://www.bb.org.bd/aboutus/regulationguideline/ict_security_guideline.pdf)
+- ISO/IEC 27001:2022
