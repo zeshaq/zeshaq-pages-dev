@@ -94,6 +94,81 @@ The pragmatic split:
 
 Putting noisy spoke-internal alerts on the hub turns the hub AlertManager into a fire hose. Putting fleet SLI alerts on a single spoke means you don't see the fleet-wide pattern. The lab keeps Loki and Tempo local-per-spoke for the same reason — high-volume signals stay close to where they're produced (`/docs/openshift-platform/platform-services/cluster-logging-and-loki/`).
 
+## Cluster health metrics — fleet status not workload status
+
+So far this module has been about workload observability: scrape Prometheus on each spoke, push curated metrics to the hub, draw dashboards. That's the *what's running, how busy is it* question. The other question — *is the cluster itself still alive?* — is observed with a different set of metrics, runs through a different alert path, and most of the time matters more.
+
+### The distinction
+
+A pod-level CrashLoop is a workload event. A spoke whose kube-apiserver has stopped serving for 30 seconds is a cluster event: every workload on it is collateral damage, and you'd rather know about the apiserver outage than wade through the 200 pod alerts that follow. RHACM treats cluster health as a first-class signal, separate from the workload metrics MCO fans in.
+
+| Question | Where the signal comes from |
+| --- | --- |
+| Is the spoke's kube-apiserver up? | Spoke's in-cluster monitoring exports `up` for the apiserver target |
+| Are all `ClusterOperator`s `Available=True`? | Spoke's `cluster-version-operator` exports `cluster_operator_up` and `cluster_operator_conditions` |
+| Is `ClusterVersion` healthy? | Spoke's CVO; surfaced as `cluster_version_payload` and the `Available` condition |
+| Is etcd quorate? | Spoke's etcd-operator exports `etcd_server_has_leader`, member counts |
+| Are certificates close to expiring? | Spoke's `kube_apiserver_pki_*` series and `apiserver_client_certificate_expiration_seconds` |
+| How many nodes are Ready? | Spoke's `kube_node_status_condition` from kube-state-metrics |
+| Is the spoke heartbeating to the hub? | Hub-side: `acm_managed_cluster_status_condition_available` |
+
+The first six come from each spoke's own `openshift-monitoring` stack and are forwarded to the hub by the same `observability-addon` that ships workload metrics — they're a small subset of the curated allowlist. The last one is hub-native, emitted by the registration controller on the hub and not present on any spoke.
+
+### Alerts the hub ships
+
+RHACM installs a small set of cluster-health alert rules into the hub's Thanos Ruler when observability is enabled. The names worth knowing:
+
+- **`ManagedClusterConditionUnknown`** — a spoke hasn't heartbeated for ~5 minutes. The registration controller flipped its `Available` condition from `True` to `Unknown`.
+- **`ManagedClusterImportUnavailable`** — the import process for a new spoke stalled. Common during fleet expansion if klusterlet rollout is blocked.
+- **`MultiClusterObservabilityClusterDown`** — the metrics-collector on a spoke has stopped pushing. Either the addon is unhealthy or the spoke's egress to the hub's Thanos Receive is broken.
+- **`PolicyGovernanceInfo`-shaped alerts** — RHACM's GRC operator emits a counter for each non-compliant policy; alerts evaluate that counter against thresholds.
+
+These need an Alertmanager route to your on-call channel. The default route in the hub's `alertmanager-main` Secret usually sends everything to a generic webhook; for real on-call coverage, write a route block that splits cluster-health alerts to the platform-team channel and policy alerts to the security-team channel.
+
+### The "ManagedCluster Unknown" trap
+
+The single most important alert in this set is `ManagedClusterConditionUnknown`. It fires whenever a managed cluster's registration agent stops heartbeating for the staleness window. The causes, in rough order of frequency:
+
+1. **Spoke kube-apiserver is down.** The agent can't authenticate to the hub if its own kube-apiserver isn't serving. This is the case where the alert is doing its real job — telling you the cluster has a control-plane outage before any of the spoke's own alerts can reach you (they can't reach you; the spoke is down).
+2. **Network partition between spoke and hub.** The agent is healthy on the spoke but can't open TCP/6443 outbound to the hub. WAN flaps, firewall changes, an Argo sync that nuked the hub's Route — all candidates.
+3. **Registration agent crashed.** The Pod itself OOMed or hit a CrashLoop. Spoke is fine; the messenger is sick. Look at the `klusterlet` namespace on the spoke.
+4. **Spoke's client cert rotation broke.** The agent rotates its identity cert periodically; if rotation fails and the existing cert expires, the agent goes Unknown silently. Module 02 covers the bootstrap-secret recovery flow.
+
+Crucially, when this alert fires, **none of the spoke's own alerts can reach the hub** for the duration of the partition — the same path that ships metrics is the path that ships alerts. The hub-side `ManagedClusterConditionUnknown` is your only fleet-level indicator that something is wrong cluster-wide. Treat it as a paging alert, not an email-best-effort one.
+
+### The lab's setup
+
+The lab keeps the workload-vs-health split deliberate. Workload observability lives in two places:
+
+- **Spoke-local Loki and Tempo**, for logs and traces with cluster-local correlation. See [/docs/openshift-platform/platform-services/cluster-logging-and-loki/](/docs/openshift-platform/platform-services/cluster-logging-and-loki/).
+- **SigNoz on a separate VM**, the long-term observability sink for out-of-cluster workloads. See [/docs/lab-infrastructure/observability-vms/signoz-overview](/docs/lab-infrastructure/observability-vms/signoz-overview).
+
+Cluster-health observability is hub-side. When MCO is enabled, the curated allowlist includes the cluster-health series and the hub's Thanos Ruler evaluates the RHACM-shipped alert rules. The on-call routing for cluster-health alerts is documented at [/docs/operations/incidents-and-runbooks/](/docs/operations/incidents-and-runbooks/) — that's the home for the runbooks that the alerts page into.
+
+For the lab today, MCO is not yet enabled on `hub-dc-v6` (the object-store wiring is parked behind the same NooBaa work that gates several other features). The `ManagedClusterConditionUnknown` alert still fires through the hub's `cluster-monitoring-operator` because the registration controller exports its conditions to the in-cluster Prometheus regardless of whether MCO is on. That's the minimum viable alerting posture; the full MCO-backed setup is a near-term upgrade.
+
+### Try this
+
+Three exercises, each ~10 minutes:
+
+**1. List every ClusterOperator status across the fleet via ACM Search.** From the ACM Search UI: `kind:ClusterOperator`. Add a column for the `Available` condition. Spot any operator showing `Degraded=True` across the fleet — these are the candidates for the next round of remediation policies.
+
+**2. Read the registration controller's exported metrics.** On the hub: `oc -n open-cluster-management-hub port-forward svc/registration-controller 8443:443` and curl `https://localhost:8443/metrics` (you'll need the in-cluster token). Find `acm_managed_cluster_status_condition_available` — the gauge that drives `ManagedClusterConditionUnknown`. Note the labels; they're how you'd build a hub-Grafana panel of "current heartbeat state per cluster."
+
+**3. Sketch the Alertmanager route.** Write the YAML for an Alertmanager `route` block that:
+   - Sends `ManagedClusterConditionUnknown` to the platform on-call channel with `severity: critical`.
+   - Sends `MultiClusterObservabilityClusterDown` to the observability team with `severity: warning`.
+   - Inhibits the second alert for a cluster when the first is already firing — no point waking observability when the cluster is down for unrelated reasons.
+
+The exercise is the route design, not the apply.
+
+### References
+
+- [docs.redhat.com — RHACM Health metrics](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.15/html/health_metrics/)
+- [docs.redhat.com — RHACM Observability service](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/observability/observability-service)
+- [docs.openshift.com — Cluster Operator monitoring](https://docs.openshift.com/container-platform/latest/monitoring/managing-alerts.html)
+- [open-cluster-management.io — Registration controller](https://open-cluster-management.io/concepts/registration/)
+
 ## Search
 
 The second addon. Different job entirely: not metrics, but *resource state*. The Search addon runs a `search-collector` on each managed cluster that watches the etcd state via the kube-apiserver, then publishes resource lists to a hub PostgreSQL index. The ACM Search UI queries that index.

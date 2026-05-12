@@ -229,6 +229,66 @@ oc get crd | grep cluster.open-cluster-management.io | wc -l
 
 The MCH phase should read `Running`. The `local-cluster` ManagedCluster should exist with `HUB ACCEPTED=true` (or be absent entirely if you set `disableHubSelfManagement: true`). The CRD count for `cluster.open-cluster-management.io` should be in the dozens — the install registers a couple of dozen CRDs across registration, work, placement, addon, and governance APIs. If you see fewer than fifteen, something stalled mid-install. The console plug-in is the last thing to register; reload the OpenShift web console and the *All Clusters* dropdown in the top-left header is your visual confirmation.
 
+## Multicluster Engine — the underlying lifecycle controller
+
+The single most useful thing you can internalise about ACM is that it isn't one product — it's two operators stacked. The lower one is **multicluster engine for Kubernetes** (MCE); the upper one is RHACM. Once you know which CRD belongs to which operator, half of "why is X broken" answers itself.
+
+MCE ships from OperatorHub as the `multicluster-engine` operator and reconciles a `MultiClusterEngine` CR. Everything in MCE is about *getting a cluster, registering it, and keeping it joined*: the `ManagedCluster` API, the klusterlet, Hive's provisioning controllers, the Assisted Service, ClusterPools, ClusterClaims, and the hosted-control-plane bits (the HypershiftAddon and the AgentServiceConfig that drives Assisted). RHACM, installed as the `advanced-cluster-management` operator and reconciled via a `MultiClusterHub` CR, sits on top and layers in the fleet-wide product surface: GRC policies, ApplicationSets and Subscriptions, multicluster observability, the Search index, the Insights pull, and the console plug-in that gives you the *All Clusters* dropdown. When you install ACM on a hub that doesn't already have MCE, the ACM operator installs MCE first and then proceeds.
+
+### Why the split exists
+
+The split is a product-packaging decision, not an architectural accident. Some customers want only cluster lifecycle — a centralised place to provision and register OpenShift clusters with no opinion about governance or applications — and Red Hat sells that to them as MCE standalone. Other customers want the full fleet management story; they buy ACM, which subsumes MCE. The boundary lets the lifecycle code ship and stabilise on its own cadence, and lets a smaller team adopt MCE without inheriting the surface area of policies and observability.
+
+For operators of an ACM hub, the practical consequence is that **two operators upgrade independently** and **two operators can fail independently**. The MCE channel and the ACM channel are separate Subscriptions; you pin them separately and you read their release notes separately.
+
+### CRD ownership
+
+Knowing which operator owns which API is the fastest way to triage a degraded hub. A rough split:
+
+| Owned by MCE | Owned by ACM (multiclusterhub) |
+| --- | --- |
+| `ManagedCluster`, `ManagedClusterSet`, `ManagedClusterSetBinding` | `Policy`, `PolicySet`, `PlacementBinding` |
+| `Klusterlet`, `KlusterletConfig`, `KlusterletAddonConfig` | `Subscription`, `Channel`, `PlacementRule` (legacy app model) |
+| `ClusterDeployment`, `ClusterImageSet`, `MachinePool` (Hive) | `ApplicationSet` (wrapper integrations for pull-model) |
+| `ClusterPool`, `ClusterClaim` | `MultiClusterObservability`, `ObservabilityAddon` |
+| `AgentServiceConfig`, `InfraEnv`, `BareMetalHost` (Assisted) | `SearchOperator`, `SearchCustomization` |
+| `HypershiftAddon`, `HostedCluster`, `NodePool` | `Insights` integration plumbing |
+| `Placement`, `PlacementDecision` | Console plug-in and the *All Clusters* surfaces |
+| `ManifestWork`, `ManifestWorkReplicaSet` | |
+
+`Placement` lives on the MCE side because it's the primitive for cluster-lifecycle work (where to provision, where to attach an addon). ACM components consume `PlacementDecision` but don't define the `Placement` CRD.
+
+### What this means in practice
+
+When ACM looks unhealthy, the first triage is "which operator?" Two `oc get pods` calls disambiguate it:
+
+```bash
+oc get pods -n multicluster-engine
+oc get pods -n open-cluster-management
+```
+
+If `multicluster-engine` is degraded, **cluster lifecycle is broken**. New imports stall, ManagedCluster reconciliation halts, Hive can't provision, and the `Placement` controller stops producing decisions — which transitively breaks any ACM component that reads `PlacementDecision`. The fleet is frozen at whatever shape it had at the moment MCE went sideways.
+
+If `open-cluster-management` is degraded, **governance and applications are broken**, but lifecycle continues. ManagedClusters stay joined, klusterlets keep heartbeating, but new Policies don't propagate, ApplicationSets don't generate, and the console plug-in may go dark. Existing workloads on managed clusters keep running because the spoke side doesn't depend on the hub-side governance controllers staying up.
+
+The same split shows up in upgrades. The MCE Subscription can roll forward on its own minor (for example, MCE 2.10 → 2.11) while ACM stays pinned to a compatible window. Read the release-notes compatibility matrix every upgrade — ACM's `multiclusterhub` operator declares an MCE version range it works with, and skipping it is how you get a permanently-`Installing` MCH CR.
+
+### MCE as a standalone product
+
+You can install MCE without ACM. The `multicluster-engine` Subscription on a fresh OpenShift cluster gives you `ManagedCluster`, the klusterlet bits, Hive, Assisted Service, HyperShift hosting, and cluster pools — but no Policy framework, no Applications, no Search, no Observability. The `MultiClusterEngine` CR exposes the same channel/version pinning you'd expect, and a small `spec.overrides.components` list lets you toggle the addons (HypershiftPreview, ClusterProxyAddon, ManagedServiceAccount, etc.) without ACM ever being in the picture.
+
+For a team that *only* wants centralised provisioning and registration — say, a SRE group that wants a single API to spin up dev clusters but already runs governance through a different tool — MCE standalone is the cheaper buy. For everyone else, MCE-under-ACM is the path.
+
+### The lab's posture
+
+`hub-dc-v6` runs both. The `multicluster-engine` operator and the `advanced-cluster-management` operator are installed via GitOps as separate Subscriptions; the MCE CR is reconciled first (sync wave 10), the MCH CR is reconciled in a later wave so the `multiclusterhub-operator` finds MCE already healthy. The actual Subscription and CR manifests are documented at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub) — read that page after this section to see how the lab pins both channels and which MCE components it disables.
+
+### References
+
+- [docs.redhat.com — multicluster engine operator overview](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.15/html/multicluster_engine_operator_with_red_hat_advanced_cluster_management/)
+- [docs.redhat.com — Installing multicluster engine standalone](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/clusters/cluster_mce_overview)
+- [open-cluster-management.io — ManagedCluster API](https://open-cluster-management.io/concepts/managedcluster/)
+
 ## Where things go wrong, architecturally
 
 If you're going to debug this, you'll be looking at three places.
