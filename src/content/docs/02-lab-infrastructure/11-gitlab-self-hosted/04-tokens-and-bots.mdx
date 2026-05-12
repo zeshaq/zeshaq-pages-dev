@@ -1,8 +1,8 @@
 ---
 title: "GitLab Tokens and Bots"
-description: "The credential model for GitLab in the lab — operator PAT, deploy tokens, runner registration tokens, project access tokens, and the secret-variable rules."
+description: "The credential model for GitLab in the lab — operator PAT (gitlab-md-pat), deploy tokens, runner registration tokens, project access tokens, the secret-variable rules, and the platform-gitops MR mechanics via the GitLab API."
 sidebar_label: "Tokens & Bots"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -12,7 +12,7 @@ GitLab has a sprawling token model. The lab keeps the surface deliberately small
 
 | Token type | Purpose | Custody |
 | --- | --- | --- |
-| **Operator PAT** | API access for the bootstrap operator; create groups/projects/shares; scoped fine-grained per ADR direction | the bootstrap GitLab PAT file (local-only) (Git-ignored) |
+| **Operator PAT** (`gitlab-md-pat`) | API access for the bootstrap operator; create groups/projects/shares; MR mechanics against project ID `12`; scoped fine-grained per ADR direction | `gitlab-md-pat` file in the local-only secrets directory (Git-ignored, mode `0700`) |
 | **Deploy token (read-only)** | Project clone access for Jenkins / Argo CD / runners | Jenkins credential store (`gitlab-<project>-read`); per-project |
 | **Deploy token (read-write)** | Image-registry push token if GitLab Container Registry is used | Not in scope today — Nexus is the registry |
 | **Project access token** | Per-project token, scoped to one project | Per-job custody |
@@ -23,13 +23,13 @@ GitLab has a sprawling token model. The lab keeps the surface deliberately small
 
 The bootstrap admin user `zahid` is the only user with broad GitLab API access today. Move-to-named-users + deploy-tokens is a roadmap item per the operator guide.
 
-## Operator PAT (bootstrap-admin convention)
+## Operator PAT (`gitlab-md-pat`)
 
-The operator's Personal Access Token is the main bootstrap credential:
+The operator's Personal Access Token is the main bootstrap credential. It is held in a single file named `gitlab-md-pat` under the local-only secrets directory, and it is the credential that drives every platform-gitops API call.
 
 ```bash
-GITLAB_URL=http://<lab-IP-for-gitlab>
-GITLAB_PAT=""$GITLAB_PAT"  # bootstrap-admin PAT in local secrets dir"
+GITLAB_URL=http://30.30.30.5
+GITLAB_PAT="$(cat <secrets-dir>/gitlab-md-pat)"
 curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
   "$GITLAB_URL/api/v4/version"
 unset GITLAB_PAT
@@ -37,9 +37,47 @@ unset GITLAB_PAT
 
 Custody discipline:
 
-- The PAT lives only in the bootstrap GitLab PAT file (local-only). The directory is Git-ignored and mode-restricted (`0700`).
+- The PAT lives only in `<secrets-dir>/gitlab-md-pat`. The directory is Git-ignored and mode-restricted (`0700`); the file is mode `0600`.
 - The PAT is never printed, copied into issues, pasted into wiki, or echoed in shell history.
 - The PAT scope is operator-driven (currently `api` scope for the operator workspace). Future hardening: narrow to per-task scopes.
+- The PAT is the **only** credential authorized for platform-gitops MR work today — see the MR mechanics section below.
+
+## platform-gitops MR mechanics (GitLab API, not `gh`)
+
+The platform GitOps repository is a **GitLab project** (project ID `12`), not a GitHub repo. That means merge requests go via the GitLab REST API with the operator PAT — not the `gh` CLI. The shape of an MR-creating call:
+
+```bash
+GITLAB_URL=http://30.30.30.5
+GITLAB_PAT="$(cat <secrets-dir>/gitlab-md-pat)"
+PROJECT_ID=12
+
+curl -fsS \
+  --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+  --request POST \
+  --data "source_branch=<branch>" \
+  --data "target_branch=main" \
+  --data "title=<title>" \
+  --data "description=<body>" \
+  "$GITLAB_URL/api/v4/projects/$PROJECT_ID/merge_requests"
+unset GITLAB_PAT
+```
+
+The repeatable working-copy convention is:
+
+| Convention | Value |
+| --- | --- |
+| Local clone | `/home/ze/claude-agent/clones/platform-gitops` (worktree-of-`main`) |
+| Remote | `http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git` |
+| Sync-wave for new operator installs | `10` (operator-install pattern) |
+| Project ID | `12` |
+| API base | `http://30.30.30.5/api/v4` |
+
+Critical reminders:
+
+- **Don't use `gh`** for platform-gitops work. `gh` talks to GitHub, not GitLab; the platform GitOps repo lives only in GitLab.
+- **Don't use the public route** (`gitlab.apps.sub.comptech-lab.com`) for `git push` or MR API calls. Smart-HTTP clone over the public route is non-functional by design; automation uses the LAN endpoint.
+- **Branch first, MR second.** Never push to `main`; `main` is protected, force-push is disabled, and only the bootstrap maintainer can merge.
+- **Don't `--no-edit` rebase** — interactive rebase isn't supported in the agent shell and changes to existing commits should be opened as new commits.
 
 ## Deploy tokens (read-only)
 
@@ -153,7 +191,7 @@ Every break-glass action must record:
 
 **Root cause.** Pasted into a chat, an issue, an MR comment, or a screenshot.
 
-**Fix.** Revoke the PAT immediately in GitLab UI. Create a new PAT. Update the bootstrap GitLab PAT file (local-only). Audit any tools that may have cached the old value.
+**Fix.** Revoke the PAT immediately in GitLab UI. Create a new PAT. Update `<secrets-dir>/gitlab-md-pat`. Audit any tools that may have cached the old value.
 
 **Prevention.** Never paste tokens into anything. Use the runbook pattern: `load from custody, unset after use`.
 
@@ -190,6 +228,7 @@ Every break-glass action must record:
 ## References
 
 - `opp-full-plat/connection-details/gitlab-operator-guide.md` — secret and variable policy.
-- `opp-full-plat/adr/0023-federated-gitlab-group-repo-ownership.md` — ownership boundary the tokens enforce.
+- `opp-full-plat/adr/0023-federated-gitlab-group-repo-ownership.md` — ownership boundary the tokens enforce; sister to the [FG-1 readiness gate](./01-deployment-and-runner-classes#fg-1-readiness-gate--in-progress).
+- [Deployment & Runners](./01-deployment-and-runner-classes) — endpoint table, FG-1 acceptance criteria.
 - [Protected runner model](./03-protected-runner-model) — runner-token specifics.
 - `opp-full-plat/runbooks/secrets-custody-drift-check.md` — periodic drift check across credential custody.

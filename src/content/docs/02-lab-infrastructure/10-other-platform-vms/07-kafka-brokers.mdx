@@ -1,0 +1,246 @@
+---
+title: "Kafka brokers (KRaft cluster)"
+description: "Three combined broker/controller VMs running Kafka 4.2.0 in KRaft mode at 30.30.30.24/25/26, with a pinned JMX exporter exposing ~10k kafka_* metrics per broker on :9404."
+sidebar_label: "Kafka brokers"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+Kafka is deployed as **three private VMs in KRaft mode** — no Zookeeper. Each VM is a combined broker + controller voter. PLAINTEXT only on the internal LAN today; TLS/SASL/ACLs are deferred gates. The brokers expose Prometheus-format metrics on `:9404` via a pinned `jmx_prometheus_javaagent` jar; OpenShift-side scraping is tracked separately under the [Kafka monitoring](../../) follow-up.
+
+## What it is
+
+| Property | Value |
+| --- | --- |
+| Brokers | `kafka-0`, `kafka-1`, `kafka-2` |
+| IPs | `30.30.30.24`, `30.30.30.25`, `30.30.30.26` |
+| Bootstrap | `kafka-bootstrap.sub.comptech-lab.com:9092` (PLAINTEXT) |
+| Mode | KRaft (no Zookeeper); 3-voter quorum, each node is broker + controller |
+| Kafka version | `4.2.0` |
+| JVM | OpenJDK 21 |
+| Cluster id | `fBNALO9WTje8UgaGET7XoQ` |
+| VM size | 4 vCPU / 8 GiB RAM / 80 G OS + 200 G data |
+| Data path | `/var/lib/kafka/kraft-combined-logs` |
+| Listener ports | `9092` (client PLAINTEXT), `9093` (controller, per-broker only) |
+| JMX exporter port | `:9404` open to `30.30.0.0/16` |
+| Public exposure | None — private lab only |
+| TLS / SASL / ACLs | **No** (gate; issue #17) |
+| Backups / DR | **No** (gate; issue #12) |
+
+DNS is served from PowerDNS at `30.30.30.53`. The `kafka-bootstrap` name is a multi-A round-robin across all three broker IPs.
+
+## Topology — KRaft, not Zookeeper
+
+Each VM runs a single `kafka.service` (systemd) that is both broker and controller. KRaft replaces Zookeeper with an internal Raft quorum of the three controllers. Practical consequence: there is no separate Zookeeper ensemble to operate, no `zkCli.sh`, and metadata reads go through `kafka-metadata-quorum.sh describe --status` (3 voters expected; `LeaderId` must be non-empty).
+
+The `:9093` controller listener is firewalled to **just the three broker IPs** — no other host on the lab network can reach the controller plane. Client traffic uses `:9092`.
+
+## JMX exporter wiring
+
+Metrics are collected by `jmx_prometheus_javaagent` loaded into the Kafka JVM as a `-javaagent`. The agent listens on `:9404` and serves `/metrics` in Prometheus exposition format. Wiring is in three pieces:
+
+### 1. Pinned jar artifact
+
+| Property | Value |
+| --- | --- |
+| Artifact | `jmx_prometheus_javaagent-1.0.1.jar` |
+| Path on each broker | `/opt/jmx-exporter/jmx_prometheus_javaagent.jar` |
+| Owner / mode | `root:root` `0644` |
+| SHA-256 | `7d61f737fd661610ccc14aea79764faa1ea94a340cbc8f0029b3d2edea3d80c1` |
+| Source | Maven Central `repo.maven.apache.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/1.0.1/` |
+| Integrity | Maven Central publishes `.sha1` + `.md5` siblings only (no `.sha256` sibling) — both Maven-published sums verified at download, SHA-256 recorded for our records and re-verified on every broker after copy |
+
+The jar is pinned by version *and* by SHA-256. Re-verify the hash after any redistribution.
+
+### 2. Systemd drop-in
+
+The drop-in lives at `/etc/systemd/system/kafka.service.d/10-jmx-exporter.conf` (identical on all three brokers):
+
+```ini
+[Service]
+Environment="KAFKA_OPTS=-javaagent:/opt/jmx-exporter/jmx_prometheus_javaagent.jar=9404:/opt/jmx-exporter/kafka-jmx-config.yml"
+```
+
+Crucially the drop-in **only** adds `KAFKA_OPTS`. It does not touch `server.properties`, `log4j2.yaml`, `KAFKA_HEAP_OPTS`, `LOG_DIR`, or `KAFKA_LOG4J_OPTS`. Confirmed post-install with `systemctl show kafka -p Environment`.
+
+### 3. Host firewall (UFW)
+
+```
+9404/tcp                   ALLOW IN    30.30.0.0/16               # kafka jmx exporter
+```
+
+Added with `sudo ufw allow proto tcp from 30.30.0.0/16 to any port 9404 comment 'kafka jmx exporter'`. UFW default is `deny (incoming) / allow (outgoing)`. No nftables direct rules in play.
+
+## JMX config — 17 rules, specific → generic
+
+The exporter rule file (`/opt/jmx-exporter/kafka-jmx-config.yml`, sha256 `21168263d8…3d92ab0c`) is **13 specific rules + 4 generic catch-all rules**. The order matters — JMX exporter evaluates rules top-to-bottom and stops at the first match, so per-topic / per-partition rules go above generic `<>Value` ones.
+
+| # | Rule | What it captures |
+| --- | --- | --- |
+| 1 | Per-topic per-partition `<>Value` gauges | Partition-level offsets, lag, ISR membership |
+| 2 | Per-topic broker metrics `<>Count` | `BytesInPerSec`, `BytesOutPerSec`, `MessagesInPerSec` per topic |
+| 3 | Per-broker replica fetcher metrics | Fetcher max lag, follower fetch rate |
+| 4 | KRaft `raft-metrics *-total` / `*-rate` | Raft message counts and rates |
+| 5 | KRaft raft other attrs → gauges | Quorum state, current leader, voter ids |
+| 6 | KRaft raft channel metrics | Inter-controller channel send/receive rates |
+| 7 | Per-user / per-client quota metrics | Throttle and quota gauges |
+| 8 | Network processor connection metrics | Active connections per processor |
+| 9 | Request metrics counters | `RequestsPerSec`, `ErrorsPerSec` by API |
+| 10 | Request metrics percentiles | Local time, total time, queue time p50/p95/p99 |
+| 11 | Generic `<>Count` counters | Catch-all counters (rule 11 of 13 specific) |
+| 12 | Generic `<>Percentile` gauges | Catch-all percentiles |
+| 13 | Generic `<>Value` gauges | Includes `UnderReplicatedPartitions` and `ActiveControllerCount` |
+| 14 | JVM heap / non-heap memory | JVM memory pools |
+| 15 | JVM GC count / time | GC collector metrics |
+| 16 | JVM thread counters | Thread state counts |
+| 17 | Tail catch-all `kafka.*` → `kafka_generic_*` UNTYPED | Unknowns are surfaced rather than blackholed |
+
+### Cardinality note
+
+Rule 17 (the tail catch-all) emits about 4,045 of the ~10,000 `kafka_*` lines on each broker — roughly 40% of the scrape volume. Functional and intentional ("don't blackhole the unknown"), but at fleet scale this may double UWM ingestion volume vs a more curated config. If scrape latency or cardinality becomes a problem, the follow-up is either:
+
+- Drop low-value subtrees at scrape time with `metricRelabelConfigs` on the `ServiceMonitor`, keeping the broker-side config permissive; or
+- Tighten rule 17 to specific subtrees and accept fewer unknowns.
+
+Scrape latency observed on `localhost:9404/metrics` (3 runs on `kafka-0`): 0.624s / 0.631s / 0.564s; response size ~1.34 MB. Line counts per broker: `kafka-0` ~10,114, `kafka-1` ~10,066, `kafka-2` ~10,028.
+
+## Rolling restart — zero-URP procedure
+
+Restarting the Kafka cluster requires one broker at a time and a between-each `UnderReplicatedPartitions=0` (URP) check. The procedure used during the JMX rollout was:
+
+1. **Pre-flight on every broker.**
+
+   ```bash
+   ssh ze@kafka-0 'sudo /usr/local/bin/kafka-topics.sh \
+     --bootstrap-server kafka-bootstrap.sub.comptech-lab.com:9092 \
+     --under-replicated-partitions'
+   ```
+
+   Expect empty output. If anything comes back, **abort** — do not restart with pre-existing URP.
+
+2. **Restart one broker.**
+
+   ```bash
+   ssh ze@kafka-0 'sudo systemctl restart kafka'
+   ```
+
+3. **Wait for the broker to come back up.**
+
+   Poll `:9092` listening and `curl -fsS localhost:9404/metrics` succeeding, 5-second interval, 90-second budget. The 90-second budget is generous; observed times to heal were 9–14 s per broker during the JMX rollout.
+
+4. **Verify KRaft quorum.**
+
+   ```bash
+   ssh ze@kafka-0 'sudo /usr/local/bin/kafka-metadata-quorum.sh \
+     --bootstrap-server localhost:9092 \
+     describe --status'
+   ```
+
+   Expect 3 voters and a non-empty `LeaderId`. Leadership transitions during the rolling restart are normal and not a fault condition — they just mean one voter took over while the previous leader was down.
+
+5. **Re-verify URP is zero before moving to the next broker.**
+
+   Same `kafka-topics.sh --under-replicated-partitions` call as step 1. Empty output is required.
+
+6. **Repeat for `kafka-1`, then `kafka-2`.**
+
+   Order is `kafka-0` → `kafka-1` → `kafka-2`. If URP is non-zero after a restart, **stop**; restart only resumes after URP returns to 0.
+
+The discipline matters because Kafka tolerates one broker out at a time without partition unavailability. Two brokers out simultaneously, with a partition whose two replicas are on those two brokers, leaves that partition offline.
+
+## Operational guardrails
+
+- **No public IPs, no public DNS, no HAProxy wildcard** for Kafka. Private LAN only until TLS/SASL/ACLs close.
+- **Don't restart all three at once.** Use the rolling procedure above. Even for cosmetic changes — the URP=0 gate is the only thing that prevents a half-restart from going wrong.
+- **Don't touch `server.properties` or `log4j2.yaml` from the JMX wiring.** The drop-in adds `KAFKA_OPTS` and nothing else.
+- **Don't widen UFW.** `:9404` is open to `30.30.0.0/16` only. Don't open it wider; UWM scraping reaches it from the OpenShift workers, all on the same `/16`.
+- **Don't break the rule order in `kafka-jmx-config.yml`.** Specific rules go above generic ones; moving the tail catch-all up would mask everything below.
+
+## Issue #269 — Phase 1 broker side done; OCP scraping blocked
+
+Issue [#269](https://github.com/zeshaq/codex-opp-agent/issues/269) covers Kafka monitoring end-to-end. The **broker side** of Phase 1 is complete:
+
+- Pinned JMX exporter is loaded on all three brokers and serving on `:9404`.
+- 17-rule config landed; ~10k `kafka_*` lines per broker.
+- Rolling restart completed with URP=0 throughout (3-voter quorum maintained).
+- UFW updated to `30.30.0.0/16` only for `:9404`.
+
+The **OCP side** of Phase 1 is blocked. The spoke's `argocd-cm` `resource.exclusions` blocks both `core/Endpoints` *and* `discovery.k8s.io/EndpointSlice` from Argo sync. Without an Endpoints/EndpointSlice flavor that Argo will sync, UWM cannot scrape an external-IP target. Phase 2 (issue #273) either relaxes that exclusion or picks a target representation Argo will sync. The platform-side Kafka monitoring stack ships a `kafka-exporter` deployment which scrapes `:9092` (broker protocol), not the brokers' `:9404` JMX endpoint — those four exporter alerts are independent of the broker-side javaagent work documented here.
+
+## Validation
+
+```bash
+# DNS
+dig @30.30.30.53 kafka-0.sub.comptech-lab.com A +short
+dig @30.30.30.53 kafka-bootstrap.sub.comptech-lab.com A +short
+
+# Listener ports
+ssh ze@kafka-0 'ss -lntp | grep -E "(9092|9093|9404)"'
+
+# JMX exporter
+ssh ze@kafka-0 'curl -fsS localhost:9404/metrics | wc -l'
+ssh ze@kafka-0 'curl -fsS localhost:9404/metrics | grep -E "^kafka_server_replicamanager_underreplicatedpartitions|^kafka_controller_kafkacontroller_activecontrollercount"'
+
+# KRaft quorum
+ssh ze@kafka-0 'sudo /usr/local/bin/kafka-metadata-quorum.sh \
+  --bootstrap-server localhost:9092 describe --status'
+
+# URP
+ssh ze@kafka-0 'sudo /usr/local/bin/kafka-topics.sh \
+  --bootstrap-server kafka-bootstrap.sub.comptech-lab.com:9092 \
+  --under-replicated-partitions'
+```
+
+A scripted validation lives at `opp-full-plat/scripts/rebuild/kafka/validate-kafka-kraft.sh`.
+
+## Failure modes
+
+### Symptom: `UnderReplicatedPartitions > 0` after a restart
+
+**Root cause.** The just-restarted broker hasn't caught up on replication yet; or a replica's data disk filled; or a NIC dropped.
+
+**Fix.** Wait. URP normally clears within seconds of the broker coming back. If it stays non-zero past a minute, check the broker logs (`journalctl -u kafka -n 200`) and replica fetcher metrics. Do not restart the next broker until URP returns to 0.
+
+**Prevention.** Use the rolling restart procedure above; respect the URP=0 gate.
+
+### Symptom: `:9404` returns nothing or `connection refused`
+
+**Root cause.** The systemd drop-in didn't get reloaded (`systemctl daemon-reload` missed), or `KAFKA_OPTS` was overridden by another env source, or UFW denied the source IP.
+
+**Fix.** Verify `systemctl show kafka -p Environment` includes the `-javaagent:` line. Check `ufw status` for `9404/tcp ALLOW IN 30.30.0.0/16`. If both look correct, look at `journalctl -u kafka` for jmx-exporter startup errors.
+
+**Prevention.** `systemctl daemon-reload` before `systemctl restart kafka` when changing drop-ins.
+
+### Symptom: KRaft quorum reports only 2 voters
+
+**Root cause.** One broker is down, or the controller listener on `:9093` is blocked between voters.
+
+**Fix.** Check `kafka.service` status on each broker. Verify `:9093` is firewalled allow-listed for the *other* two broker IPs (not the wider lab `/16`). Restart the failed broker; quorum should re-form.
+
+**Prevention.** Don't change the `:9093` firewall rules without re-verifying the three-IP allow list.
+
+### Symptom: a client reports `LEADER_NOT_AVAILABLE` after a broker restart
+
+**Root cause.** Client cached the leader from before the restart; the client's metadata refresh hasn't fired yet.
+
+**Fix.** Usually self-heals on the next metadata refresh. Verify the cluster itself is healthy (`URP=0`, 3 voters). If the client doesn't recover, restart the client.
+
+**Prevention.** Use a Kafka client library version that refreshes metadata on `LEADER_NOT_AVAILABLE`.
+
+### Symptom: ~40% of `:9404` output looks like `kafka_generic_*` lines
+
+**Root cause.** Rule 17 (tail catch-all) intentionally emits `UNTYPED` `kafka_generic_*` lines for un-mapped beans, so unknowns surface rather than disappear.
+
+**Fix.** Not a fault. If scrape volume is a real problem, drop these at the `ServiceMonitor` with `metricRelabelConfigs` rather than removing rule 17.
+
+**Prevention.** Don't blackhole at the broker; filter at scrape time.
+
+## References
+
+- `opp-full-plat/connection-details/kafka.md` (planned) — runbook.
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/kafka-kraft-plan.md` — VM plan.
+- Issue [#269](https://github.com/zeshaq/codex-opp-agent/issues/269) — Kafka monitoring Phase 1.
+- Issue [#273](https://github.com/zeshaq/codex-opp-agent/issues/273) — Kafka monitoring Phase 2 (broker JMX scrape from UWM).
+- Issue [#17](https://github.com/zeshaq/codex-opp-agent/issues/17) — TLS/SASL/ACL hardening gate.
+- Issue [#12](https://github.com/zeshaq/codex-opp-agent/issues/12) — retention, backup, and data durability.
+- [HAProxy backend conventions](../04-edge-ingress-haproxy/04-backend-conventions) — Kafka SNI passthrough notes if and when Kafka is fronted by HAProxy.
