@@ -1,0 +1,209 @@
+---
+title: "Security with RHACS"
+sidebar_label: "09 — Security (RHACS)"
+description: "Wire Red Hat Advanced Cluster Security into your ACM fleet so every managed cluster is registered with Central, scanned, and watched at runtime."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const rhacsNodes = [
+  { id: "hub", data: { label: "Hub cluster" }, position: { x: 60, y: 40 }, style: ctrl, type: "shape" },
+  { id: "central", data: { label: "RHACS Central\n(UI + policy engine + DB)" }, position: { x: 60, y: 130 }, style: ctrl, type: "shape" },
+  { id: "scanner", data: { label: "Scanner V4\n(image scanning)" }, position: { x: 60, y: 230 }, style: ctrl, type: "shape" },
+  { id: "spoke1", data: { label: "Spoke A" }, position: { x: 420, y: 40 }, style: stage, type: "shape" },
+  { id: "sensor1", data: { label: "Sensor" }, position: { x: 420, y: 130 }, style: agent, type: "shape" },
+  { id: "collector1", data: { label: "Collector (DaemonSet)" }, position: { x: 420, y: 220 }, style: agent, type: "shape" },
+  { id: "admission1", data: { label: "Admission webhook" }, position: { x: 420, y: 310 }, style: agent, type: "shape" },
+  { id: "spoke2", data: { label: "Spoke B" }, position: { x: 740, y: 40 }, style: stage, type: "shape" },
+  { id: "sensor2", data: { label: "Sensor" }, position: { x: 740, y: 130 }, style: agent, type: "shape" },
+  { id: "collector2", data: { label: "Collector (DaemonSet)" }, position: { x: 740, y: 220 }, style: agent, type: "shape" },
+  { id: "admission2", data: { label: "Admission webhook" }, position: { x: 740, y: 310 }, style: agent, type: "shape" },
+  { id: "registry", data: { label: "Image registry\n(Quay / Nexus)" }, position: { x: 60, y: 340 }, style: ext, type: "shape" },
+];
+
+export const rhacsEdges = [
+  { id: "e1", source: "hub", target: "central", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "central", target: "scanner", style: { stroke: "#1f2937" } },
+  { id: "e3", source: "spoke1", target: "sensor1", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "sensor1", target: "collector1", style: { stroke: "#1f2937" } },
+  { id: "e5", source: "sensor1", target: "admission1", style: { stroke: "#1f2937" } },
+  { id: "e6", source: "spoke2", target: "sensor2", style: { stroke: "#1f2937" } },
+  { id: "e7", source: "sensor2", target: "collector2", style: { stroke: "#1f2937" } },
+  { id: "e8", source: "sensor2", target: "admission2", style: { stroke: "#1f2937" } },
+  { id: "p1", source: "sensor1", target: "central", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "TLS, init-bundle" },
+  { id: "p2", source: "sensor2", target: "central", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "TLS, init-bundle" },
+  { id: "p3", source: "scanner", target: "registry", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "scan on push" },
+];
+
+ACM lifecycles your clusters. It does not secure them. The product that secures them — runtime behaviour, image CVEs, admission rules, compliance scans — is **Red Hat Advanced Cluster Security (RHACS)**, the Stackrox-derived sibling that ships alongside ACM in most Red Hat fleets.
+
+This module is the integration story. You will not learn RHACS from scratch; you will learn how to wire it into a fleet that ACM already manages, where the policies fan out automatically and the secured-cluster Application lands on every spoke without manual roxctl runs.
+
+## Two products, one fleet
+
+ACM and RHACS overlap on the word "policy," and that overlap is the source of every confused first conversation. Keep them straight:
+
+| Concern | ACM | RHACS |
+| --- | --- | --- |
+| Cluster lifecycle | Yes | No |
+| Declarative config policy ("every ns has a NetworkPolicy") | Yes | No |
+| Runtime detection ("a shell spawned in a payments pod") | No | Yes |
+| Image CVE scanning | No | Yes |
+| Build-time policies enforced at admission | No | Yes |
+| Compliance reports against PCI, HIPAA, NIST | Some | Yes (deeper) |
+| Fan-out to managed clusters | Yes (Policy framework, ApplicationSet) | Indirectly — via ACM |
+
+The integration is intentionally loose. ACM does not call the RHACS API; RHACS does not import ACM CRs. What they share is a fleet topology: ACM provisions and labels managed clusters, and RHACS treats those same clusters as secured-cluster targets for its sensor.
+
+In practice that means RHACS is **fan-out as Application**: Central is one Argo CD Application targeting the hub, and SecuredCluster is one ApplicationSet with a cluster generator that lands an instance on every spoke. The result is that adding a new managed cluster to ACM also gives you a secured cluster a few minutes later, with no roxctl on a laptop in sight.
+
+## RHACS architecture
+
+<Whiteboard client:load data={{ nodes: rhacsNodes, edges: rhacsEdges }} height={500} />
+
+Reading the diagram:
+
+- **Central** runs in one place — almost always the hub OpenShift cluster, in its own namespace. It owns the UI, the policy engine, the violations database, and the central authentication endpoint.
+- **Scanner V4** sits next to Central. It scans images at push time (via registry webhooks) and on demand when admission asks for a verdict. V4 replaced the older Stackrox-Scanner in late 2025; it ships an embedded vulnerability DB and supports OCI artifacts directly.
+- **SecuredCluster** is the per-managed-cluster footprint. It contains three components: a **sensor** Deployment (single replica; talks to Central over mutual TLS), a **collector** DaemonSet (one pod per node, reads syscalls via eBPF or a kernel module), and an **admission webhook** (validates pod specs before they are created).
+- **Solid black** = local intra-cluster traffic. **Dashed green** = spoke-initiated mTLS connections out to Central, and the scanner reaching back to the image registry.
+
+The deployment looks fat — three workloads per spoke — but the resource footprint is modest. A sensor needs ~500 MiB, the collector ~200 MiB per node, and the admission webhook is a couple of small replicas. Most lab clusters absorb it without any node sizing changes.
+
+## Bootstrap: the init-bundle
+
+The interesting wrinkle in RHACS is **how the sensor authenticates to Central**. There is no API token. There is no kubeconfig federation. Each SecuredCluster receives an **init-bundle** — a small bag of TLS Secrets (the sensor's certificate, the collector's certificate, an admission-controller certificate) signed by Central's internal CA. The sensor uses its certificate to mutual-TLS into Central; Central recognises the certificate and registers the cluster.
+
+You generate the bundle once per managed cluster, apply it to the SecuredCluster's namespace **before** the operator runs, and from then on the sensor is on its own. The bundle has a default expiry — by convention, one year — and rotation is its own dance.
+
+In a lab without automation, you generate the bundle by running roxctl on a laptop, downloading a YAML file, and `oc apply`-ing it onto the spoke. That is fine for a demo. It is not fine for a fleet, because at 30 clusters you have 30 YAML files containing private keys floating around someone's `~/Downloads`.
+
+The pattern this lab uses instead — see [`/docs/openshift-platform/security/init-bundle-via-eso/`](/docs/openshift-platform/security/init-bundle-via-eso) — is:
+
+1. A scheduled job calls **Central's REST API** directly: `POST /v1/cluster-init/init-bundles` with `{"name": "<cluster-name>"}`. The response is a JSON document containing all the bundle's Secret materials.
+2. The job flattens the response into Vault under `secret/ocp/<cluster>/rhacs/init-bundle`.
+3. Each managed cluster runs **External Secrets Operator (ESO)** with a `ClusterSecretStore` pointing at Vault. An `ExternalSecret` materialises the bundle's three Secrets into the `stackrox` namespace.
+4. The SecuredCluster operator finds the Secrets at startup, sensor talks to Central, cluster registers.
+
+No roxctl on anyone's machine, no Secrets in git, and rotation is a single Vault write away.
+
+## Policies in RHACS vs Policies in ACM
+
+The biggest source of confusion in this product pair is the word "policy." They mean different things.
+
+- An **ACM Policy** is a declarative configuration rule. It says "every namespace on this cluster set must have a `NetworkPolicy` named `default-deny`." If the rule is violated, ACM either reports it (`inform`) or fixes it (`enforce`). The unit of work is a Kubernetes object that should or should not exist.
+- An **RHACS policy** is a security rule evaluated against runtime behaviour, image content, or admission requests. It says "an image with a CVSS &gt;= 7 vulnerability must not run on production-labelled clusters." If the rule is violated, RHACS either alerts (`inform`), blocks the deploy at admission (`enforce-on-create`), or kills the running pod (`enforce-on-runtime`). The unit of work is a behaviour or attribute.
+
+You need both. Network policy in every namespace is not a security rule; it is a baseline-config rule. A pod that opens a shell into `/bin/bash` at runtime is not a config issue; it is a security event. They are complementary, not competing.
+
+For the lab's per-tenant policy set — for example the platform-team Policy that enforces a default-deny NetworkPolicy across every PCI-scoped namespace — see [`/docs/openshift-platform/security/app-team-policy-set/`](/docs/openshift-platform/security/app-team-policy-set). For the RHACS side, the default policy library that ships with Central is the starting point; almost every operator adds a few of their own.
+
+## Per-tenant policy exceptions
+
+Real fleets need exceptions. A tenant's base image has a known CVE; the upstream maintainer has not pushed a fixed image yet; the tenant cannot stop shipping. The right answer is a **time-bounded exception** with a written justification, not a permanent disable of the policy.
+
+RHACS supports this natively: each policy violation can be deferred or marked as a false positive, with an expiry and a comment. The lab wraps that in a documented workflow — the tenant opens a ticket, the platform team reviews, the exception is applied with a 30-day clock, and a recurring report surfaces exceptions that are about to expire. See [`/docs/application-delivery/tenant-onboarding/rhacs-tenant-exception-process/`](/docs/application-delivery/tenant-onboarding/rhacs-tenant-exception-process).
+
+The mistake to avoid is **silent permanent exceptions**. The exception expires, the team rotates, nobody remembers what the original justification was, and a year later the CVE is still there and nobody can explain why.
+
+## Image scanning at admission
+
+Scanner V4 sits between two surfaces: **the registry** and **the kube-apiserver**.
+
+- **At push time**, the registry's webhook posts to Scanner; Scanner pulls the manifest, layers, and SBOM, computes vulnerabilities, and stores the result against the image digest.
+- **At admission time**, the admission webhook on each spoke calls Sensor; Sensor asks Central for the policy verdict on the image digests in the incoming pod spec; Central pulls the latest scan result (or triggers a scan if missing) and returns allow/deny.
+
+The mistake everyone makes once is **setting the admission webhook to `enforce` without first running it in `inform`**. The first day in `enforce` mode, kube-controller-manager itself fails to schedule pods because some openshift- namespace image has a high-severity CVE you did not know about. Run in `inform` for at least a week; sort out the violations; then flip to enforce. For the lab's policy set and the cluster-scope rules, see [`/docs/openshift-platform/security/scanner-v4-and-image-policies/`](/docs/openshift-platform/security/scanner-v4-and-image-policies).
+
+A useful trick: an admission policy can exempt the `openshift-*` namespaces (Red Hat images, which are scanned and patched by Red Hat) and enforce only against tenant namespaces. That is the practical compromise — most of the noise is in the openshift- namespaces; most of the actual risk is in tenant images.
+
+## Central admin password rotation via Vault + ESO
+
+A pragmatic operational concern. The first Central admin password is generated by the operator at install time. That password is what every operator who SSHs into the UI uses; it is also what the lab's init-bundle generator uses to call the Central API. Rotating it is therefore non-trivial.
+
+The lab's pattern — captured in [`/docs/operations/routine-tasks/rotate-rhacs-central-admin/`](/docs/operations/routine-tasks/rotate-rhacs-central-admin) — is:
+
+1. Generate a new password in Vault: `vault kv put secret/ocp/platform/rhacs-admin password=<new>`.
+2. ESO sees the change and updates the Kubernetes Secret `central-admin-password` in `stackrox`.
+3. The Central CR's `adminPasswordSecret` field points at that Secret.
+4. **Restart Central**: `oc rollout restart deploy/central`. This is the load-bearing step. Central reads the htpasswd file once at startup and caches it in memory; without a restart, the new password sits in the Secret but does not work.
+
+The lab does **not** populate `central-htpasswd.password` — that field is empty by design, because the password lives in `central-admin-password` instead. The init-bundle automation reads the same Vault path, so a rotation propagates everywhere in one step.
+
+## The hub-on-spoke pattern
+
+Where do you put Central?
+
+The default answer is **on the hub OpenShift cluster**, in a dedicated `stackrox` namespace. The hub is the natural home: it is the cluster everyone already trusts, it has the operator catalogue, and it does not run customer workload. Central is itself just an Argo CD Application on the hub — declared in the GitOps repo, owned by the hub's Argo instance, sync wave 10 so the operator installs before the CR.
+
+The fan-out side is an ApplicationSet on the hub with a **cluster generator**. For every ManagedCluster registered to ACM, the generator produces one SecuredCluster Application, each parameterised by the cluster's name. As ACM imports a new spoke, the generator produces a new Application; Argo CD pushes the SecuredCluster manifest at the spoke; ESO materialises the init-bundle from Vault; sensor reports to Central.
+
+In the lab today, Central runs on **hub-dc-v6** and SecuredCluster runs on **spoke-dc-v6**. Adding a second spoke is a labelling change on the ManagedCluster, nothing else.
+
+## Try this
+
+1. **Read the SecuredCluster CR on a managed cluster.**
+
+   ```
+   oc --context spoke get securedcluster -n stackrox -o yaml
+   ```
+
+   Note the operator version, the `centralEndpoint`, and the `imagePullSecrets`. The CR is small — the heavy lifting is in the operator's reconciler.
+
+2. **Add an RHACS policy in `inform` mode.** In the Central UI, clone the built-in "90-Day-Image-Age" policy, set the scope to your spoke's cluster, leave enforcement at `inform`. After 5 minutes, check the violations page: every staging image older than 90 days lights up. Do not flip it to enforce yet.
+
+3. **Generate a fresh init-bundle via the Central API.** From a node that can reach Central:
+
+   ```
+   curl -sk -u admin:"$RHACS_ADMIN" \
+     -X POST https://central-stackrox.apps.HUB/v1/cluster-init/init-bundles \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"spoke-test"}' | jq .
+   ```
+
+   The response is the full bundle as JSON. In a real workflow it goes to Vault; for this exercise just inspect the shape — three Secret blobs, plus the kubectlBundle for manual installs.
+
+## Common failure modes
+
+**SecuredCluster never reports to Central.** The first thing to check is the three init-bundle Secrets in `stackrox` on the spoke: `sensor-tls`, `collector-tls`, `admission-control-tls`. If any are missing or empty, ESO did not deliver them; check the `ExternalSecret`'s status. If the Secrets exist but sensor is in CrashLoopBackOff, the bundle has expired — generate a new one. The second thing to check is network: sensor reaches Central on `:443`, and on a NetworkPolicy-tight cluster that egress has to be explicitly allowed.
+
+**Admission webhook times out and blocks deploys.** Scanner V4 is sometimes slow on the first scan of a new image; if admission cannot get a verdict in time, the policy might fail-open or fail-closed depending on configuration. The fix is either to bump Scanner V4 replicas (Central CR's `scanner.replicas`) or to enable admission caching so repeat checks of the same digest are instantaneous. Do not set the admission webhook to `failurePolicy: Ignore` to "fix" the symptom — that just means a slow scanner becomes a security gap.
+
+**Collector OOMKilled on a fleet of mixed kernels.** Collector tries eBPF first and falls back to a kernel module. On older RHEL kernels the eBPF program can fail to load and the collector restarts in a loop. The fix is to set the collector's `collectionMethod` to `KERNEL_MODULE` on those clusters, or to upgrade the node OS. The DaemonSet's logs are the place to look.
+
+## Cross-link
+
+ACM Governance gives you the declarative-config side of the fleet's security posture; RHACS gives you the runtime-and-image side. Together they are the defence-in-depth that compliance audits actually expect to see. For the lab's integrated view — how Policy reports and RHACS violations feed the same compliance dashboard — see [`/docs/openshift-platform/security/rhacs-overview/`](/docs/openshift-platform/security/rhacs-overview).
+
+## References
+
+- Red Hat ACS documentation: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/`
+- Stackrox upstream: `https://www.stackrox.io/`
+- RHACS API reference (`/v1/cluster-init/init-bundles`): `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/api_reference/`
+- Red Hat ACM Policy framework: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/latest/html/governance/governance`
+- Open Cluster Management policy framework upstream: `https://open-cluster-management.io/getting-started/integration/policy-framework/`
+
+**Next:** [Module 10 — Backup and Disaster Recovery](/learn/acm-multicluster/backup-and-disaster-recovery).
