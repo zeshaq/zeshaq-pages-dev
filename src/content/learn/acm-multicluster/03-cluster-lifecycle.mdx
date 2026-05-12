@@ -159,6 +159,119 @@ If you ever import a cluster, then later `oc delete managedcluster`, then later 
 
 ClusterPool flows complicate this further: a cluster taken from a pool via `ClusterClaim` is destroyed when the claim is deleted. Pools and claims are out of scope here; we cover them in Module 08.
 
+## Access control across the fleet
+
+Once you have more than one managed cluster, *who can do what to which one* stops being a per-cluster question. RHACM adds an authorization layer on top of the per-cluster ones, and the two layers are easy to confuse.
+
+### Two layers, not one
+
+RHACM does **not** replace per-cluster RBAC. Each managed cluster still has its own kube-apiserver, its own OAuth or OIDC identity provider, and its own RoleBindings. When a user `oc`-logs into the spoke directly, none of the hub's RBAC is in the path — the spoke authenticates and authorises that request the same way it did before it was managed.
+
+What RHACM adds is a **fleet-wide authorisation layer for operations that go through the hub**. Creating an `ApplicationSet` that targets ten clusters, applying a `Policy` that fans out to a subset, opening the All-Clusters view in the console, running a `Search` query across the fleet — every one of those is an operation against the hub API, and the hub's RBAC decides who's allowed to do them. Per-cluster RBAC then decides what the addon agents are permitted to apply on the target.
+
+You need both layers correct. A user with hub-side `policy:admin` and no spoke-side identity can still author and propagate policies; their identity stops at the hub. A user with cluster-admin on one spoke but no hub binding can't see that spoke through the ACM console at all.
+
+### ManagedClusterSet and ManagedClusterSetBinding
+
+The hub-side grouping primitive is `ManagedClusterSet`. A set is a named collection of `ManagedCluster`s, either chosen explicitly or matched by a `clusterSelector`. Out of the box you get `default` (everything that doesn't belong to a named set lands here) and `global` (every managed cluster, always).
+
+A `ManagedClusterSetBinding` is what scopes a set into a particular hub-side namespace. Without a binding in your namespace, your `Placement` resources cannot target the set — the `PlacementDecision` will come back empty no matter how good your label selectors are. The binding is the gate that stops `team-a` in namespace `app-team-a-policies` from accidentally targeting the `prod-eu` set that belongs to `team-b`.
+
+The mental model: the set is the grouping, the binding is the *permission* to consume the grouping from a specific namespace.
+
+### The bind / admin / view ClusterRole pattern
+
+ACM ships three ClusterRoles per set, named with a predictable pattern:
+
+| ClusterRole | What the holder can do |
+| --- | --- |
+| `open-cluster-management:managedclusterset:view:<name>` | See the set and its members; read-only. |
+| `open-cluster-management:managedclusterset:bind:<name>` | Create a `ManagedClusterSetBinding` referencing this set from any namespace the user has write access to. |
+| `open-cluster-management:managedclusterset:admin:<name>` | Full control over the set and the `ManagedCluster`, `ClusterDeployment`, and `ClusterClaim` resources that carry the matching set label. |
+
+The `bind` role is the load-bearing one and the one people forget. A user with `admin` on a set still cannot make the set usable from their namespace unless they also have `bind` — without it, the binding-creation request is rejected. In a tenant onboarding flow, `bind` is the role you actually delegate; `admin` stays with the platform team.
+
+### How identities reach the spoke
+
+A second misconception: ACM does **not** project user identities into managed cluster RBAC by default. The hub knows that Alice is `alice@corp` with hub-side permissions; the spoke has no idea Alice exists unless you've solved the identity problem separately.
+
+Two patterns work:
+
+- **Federated identity provider.** Every cluster — hub and spokes — uses the same OAuth/OIDC source, so the same user logs into all of them with the same identity. Spoke-side `ClusterRoleBindings` reference the same `alice@corp` username (or group claim) that the hub uses. The lab takes this path with Keycloak: see [/docs/lab-infrastructure/other-platform-vms/keycloak-oidc](/docs/lab-infrastructure/other-platform-vms/keycloak-oidc). One IdP, every cluster trusts it, identities line up by name.
+- **Service-account projection per cluster.** Where federation isn't available — disconnected sites, third-party tenants — ACM addons run as their own ServiceAccount on the spoke, and you map those SAs to spoke-side ClusterRoles via the `cluster-permission` component. This is how RHACS, GitOps, and other addons get whatever spoke privileges they need without bringing user identities into the loop.
+
+Most labs and most enterprises end up with the first model. The second is the fallback when policy or topology forbids a shared IdP.
+
+### A worked example
+
+A small but complete set of resources that scopes a team's reach to a single environment:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSet
+metadata:
+  name: production
+spec:
+  clusterSelector:
+    selectorType: LabelSelector
+    labelSelector:
+      matchLabels:
+        env: prod
+---
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSetBinding
+metadata:
+  name: production
+  namespace: app-team-foo
+spec:
+  clusterSet: production
+```
+
+Now grant `app-team-foo` the `bind` role on the set, plus the usual namespace `admin` for their own policies and applications:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: app-team-foo-bind-production
+  namespace: app-team-foo
+subjects:
+  - kind: Group
+    name: app-team-foo
+roleRef:
+  kind: ClusterRole
+  name: open-cluster-management:managedclusterset:bind:production
+  apiGroup: rbac.authorization.k8s.io
+```
+
+With these three resources, anyone in the `app-team-foo` group can author `Placement`, `ApplicationSet`, and `Policy` resources in their namespace that target the `production` set — and only that set. Their `PlacementDecisions` will list cluster names from the set; nothing else.
+
+### klusterlet-work-sa — the audit identity on the spoke
+
+When a hub-side `Application` or `Policy` lands a Deployment on a spoke, the request to the spoke kube-apiserver is not authenticated as the user who created the hub-side resource. It's authenticated as the `klusterlet-work-sa` ServiceAccount, which lives in `open-cluster-management-agent` on the spoke. Every action ACM takes on a spoke shows up in the spoke's audit log as this identity.
+
+Auditors notice this. The mitigation is twofold: keep the `klusterlet-work-sa` scoped tightly via the addon's RBAC, and make sure the hub-side audit log captures the user-identity-to-Application-creation chain — so you can reconstruct *Alice asked for X, ACM applied X as `klusterlet-work-sa` on cluster Y*.
+
+### Try this
+
+A short tour you can run on a hub with at least one managed cluster:
+
+```bash
+oc get managedclusterset
+oc get managedclustersetbinding -A
+oc -n <your-namespace> auth can-i create placement
+```
+
+The first two commands list every set on the hub and every namespace that has a binding. The third tells you whether your identity in `<your-namespace>` can actually create a `Placement` — useful before you spend ten minutes writing one only to discover the binding was missing.
+
+### Common failure modes
+
+**A user has `admin` on a set but cannot place anything.** Almost always the `ManagedClusterSetBinding` is missing in their namespace. `admin` is necessary but not sufficient; without a binding, `Placement` resources in that namespace see zero clusters.
+
+**A Policy fans out to nobody.** The Placement looks correct, the labels look correct, but `PlacementDecision` is empty. Check that the Placement's `clusterSets` field references a set that's bound into the same namespace as the Policy. A typo in the set name or a missing binding produces the same symptom.
+
+**A user can see clusters in the console but operations fail on the spoke.** They have hub-side view, but no projected identity on the spoke. Either wire the federated IdP, or accept that this user is a hub-only operator and route any direct-to-spoke work through the addon SA.
+
 ## The lab's actual flow
 
 `spoke-dc-v6` was imported, not provisioned. It was installed standalone (compact-3-AIO + 3 baremetal workers via agent-based installer), then once the install was stable, six manifests in `platform-gitops` landed on `hub-dc-v6` to register it — the namespace, the ManagedCluster, the KlusterletAddonConfig, a ManagedClusterSetBinding, a Placement, and a GitOpsCluster. The bootstrap import bundle was applied once on the spoke as a break-glass operation; everything after is GitOps.
