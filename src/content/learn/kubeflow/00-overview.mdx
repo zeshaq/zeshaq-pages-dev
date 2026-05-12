@@ -1,0 +1,112 @@
+---
+title: "Overview"
+sidebar_label: "00 — Overview"
+description: "What this track covers, who it's for, and how to use it. The platform layer for the ML workflow on Kubernetes."
+estimated_minutes: 10
+last_updated: 2026-05-12
+---
+
+This is a self-paced track on **upstream Kubeflow** — the CNCF project that turns Kubernetes into the platform layer for the ML workflow. By the end you'll have run notebooks, kicked off distributed PyTorch training, swept hyperparameters with Katib, built a pipeline that goes data-prep → train → eval → deploy, and served a model on KServe with request-driven autoscaling — all as Kubernetes-native objects you can `kubectl get`.
+
+The track is opinionated. It teaches the patterns that ship in real Kubeflow deployments as of 2026, on the **vanilla manifests** install path, not the dozen vendor-specific variations. Where the project gives you three ways to do something — Argo vs Tekton for the pipeline DAG, `notebookcontroller` vs straight Pods for notebooks, vanilla vs distro-bundled Kubeflow — I'll tell you the dominant choice and call out the alternatives where they actually matter.
+
+A note on what this track is **not**: it teaches **upstream Kubeflow** from [kubeflow.org](https://www.kubeflow.org/). It is **not** [Red Hat OpenShift AI](https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai) (RHOAI), and it is **not** [Open Data Hub](https://opendatahub.io/) (ODH). Both bundle some Kubeflow components — KFP and KServe in particular — but the install path, packaging, UX shell, and support model differ enough that you should treat them as their own products. We'll point out where the lineage matters in Module 01; everything else is upstream.
+
+## Who this is for
+
+Engineers who:
+
+- Operate one or more Kubernetes clusters and want to **host ML workloads themselves** instead of calling OpenAI, Anthropic, or a managed-service API.
+- Use `kubectl` without thinking; have written a kustomize overlay or a Helm chart; can read a CRD.
+- Know one programming language well — Python preferred, since most ML code is Python.
+- Have built or trained an ML model before — even a small scikit-learn classifier counts. You should know what a training loop, a checkpoint, and an inference call are.
+- Understand the **model-train-deploy lifecycle** at a conceptual level: data lands somewhere, gets cleaned, becomes a training set, a model is trained on it, that model is evaluated, the winner gets deployed.
+
+If you've never trained a model at all, do a short ML primer first — Andrew Ng's [Machine Learning Specialization](https://www.coursera.org/specializations/machine-learning-introduction) on Coursera, or fast.ai's [Practical Deep Learning](https://course.fast.ai/) — and come back. If you've never used Kubernetes, do the upstream [Kubernetes Basics](https://kubernetes.io/docs/tutorials/kubernetes-basics/) tutorial first. Kubeflow assumes both.
+
+If you want **agents that call LLMs**, the [Agentic AI track](/learn/agentic-ai/) is the right read. Kubeflow is for the layer below — training and serving the models the agents use.
+
+## What you'll learn
+
+After completing the track:
+
+- The **agent loop**-equivalent of ML on Kubernetes: notebook → pipeline → trained model → served endpoint, each step a CRD.
+- Run a **Jupyter notebook on Kubernetes** with mounted persistent storage, GPU access, and the right OIDC identity.
+- Build a **Kubeflow Pipeline** (KFP v2) — components as containers, a DAG over them, artifact passing, conditional steps, caching.
+- Launch a **multi-GPU PyTorch job** with `PyTorchJob`, configure NCCL communication, and reason about the operator's view of node failure.
+- Run a **hyperparameter sweep** with Katib — random, Bayesian, and Hyperband — and read the suggestion/trial controllers' state when things stall.
+- Serve a model with **KServe**, including scale-to-zero, canary rollout, request-based autoscaling, and a Transformer for pre/post-processing.
+- Operate **multi-tenancy** with `Profile` — one Kubernetes namespace per user or team, with RBAC, network policies, and a Central Dashboard view of their own work.
+- **Install Kubeflow from `kubeflow/manifests`** the way the project intends — kustomize overlays, the dependency order, the Istio + cert-manager prerequisites.
+- The **production patterns** that mature deployments adopt: external Postgres for KFP, S3-compatible object storage for artifacts, an external identity provider, GPU operator wiring, MIG slicing.
+- A **capstone**: build an end-to-end project — data → pipeline → trained model → KServe endpoint — and walk away with something you can extend.
+
+## The 13-module map
+
+| # | Module | What you build/do |
+| --- | --- | --- |
+| 00 | Overview *(this page)* | — |
+| 01 | Foundations | Why ML on Kubernetes; what Kubeflow actually is; the distro landscape |
+| 02 | Architecture | Every controller and pod in a working install, with a diagram |
+| 03 | Notebooks | A Jupyter notebook running on Kubernetes with PVC + GPU |
+| 04 | Pipelines — basics | Your first KFP v2 pipeline: components, parameters, artifacts |
+| 05 | Pipelines — advanced | DAGs, conditionals, caching, parallel-for, schedules |
+| 06 | Training operators | A multi-GPU `PyTorchJob`; the Training Operator's view of failure |
+| 07 | Katib (HPO + NAS) | A Bayesian hyperparameter sweep; reading suggestions and trials |
+| 08 | KServe (model serving) | Serve a model with autoscaling, canary rollout, and a Transformer |
+| 09 | Multi-tenancy + Profiles | One `Profile` per team; RBAC, network policy, dashboard scoping |
+| 10 | Installation + Manifests | Install vanilla Kubeflow from `kubeflow/manifests` end-to-end |
+| 11 | Production patterns | External Postgres, S3 artifacts, OIDC, GPU operator, MIG slicing |
+| 12 | Build a project | Capstone: data → pipeline → model → endpoint, all in one project |
+
+Each module is self-contained but assumes the previous ones. Expect 30-90 minutes per module depending on whether you do the exercises.
+
+## How to use this track
+
+Three patterns work:
+
+- **Sequential.** Start at 01, walk through 12. Best for first-timers and for anyone who hasn't internalised the "everything is a CRD" mental model.
+- **Reference.** Use the sidebar; jump to the module you need. Best if you already operate Kubeflow and want a specific topic — *"I just want to fix KServe's scale-to-zero."*
+- **Project-driven.** Skip to 12, pick the capstone, walk backwards through the modules whose content you need. Best for engineers who learn by building.
+
+If you have a cluster — even a single-node kind or minikube — actually do the exercises. Kubeflow is one of those projects where reading about a `PyTorchJob` CR and watching `kubectl get pytorchjobs -w` are completely different experiences.
+
+## What you need
+
+- A **Kubernetes cluster**. For modules 01-04, a `kind` or `minikube` cluster on your laptop is enough. From Module 05 onward, especially for GPU work in 06-08, you want a real cluster.
+- For real clusters: **AKS**, **EKS**, **GKE**, or **OpenShift** all work. Vanilla upstream Kubernetes works too. GKE has the smoothest GPU experience out of the box; EKS the cheapest GPU spot instances; AKS the best Windows-node story (irrelevant here); OpenShift has the most pre-wired security and identity but adds Red Hat opinions you'll have to work around if you want vanilla Kubeflow specifically. The track is portable across all four.
+- `kubectl` (matching your cluster's minor) and **`kustomize`** — the manifests repo is kustomize-native and you'll be reading overlays in Module 10.
+- **Python 3.10+** locally to drive the KFP and Kubeflow SDKs, and to run notebook clients against the cluster.
+- An **OIDC-compatible identity provider** for serious multi-tenant work — Dex (shipped by default in the manifests), or any external OIDC. For solo dev, the default Dex install with a static user is fine.
+- Optional but recommended for Module 08: a **container registry** you can push to (Docker Hub, GHCR, ECR, GCR), since custom serving runtimes are containers.
+
+## Where this track lives in the bigger picture
+
+Kubeflow sits next to two other tracks in this curriculum:
+
+- The [Agentic AI track](/learn/agentic-ai/) covers the **LLM-application** layer — agents that use tools and call hosted model APIs. Kubeflow is the layer below — the platform that trains and serves the model the agent calls. If your agent is consuming a fine-tuned LLM or a custom embedding model, that model probably lives on a KServe `InferenceService`.
+- The [ACM Multicluster track](/learn/acm-multicluster/) covers operating **many Kubernetes clusters from one hub**. Fleet-wide Kubeflow — one ML platform footprint replicated across every regional cluster, with GitOps-driven Profile reconciliation — is an ACM pattern. If you only have one cluster, you don't need ACM; the moment you have three, the multicluster track is the right read.
+
+The split is deliberate: this track teaches Kubeflow the platform; the others teach the layers on top and the operational shell around it. Read all three if you want the full picture.
+
+## A note on what's *not* here
+
+This track doesn't cover:
+
+- **Model training as a discipline.** We assume you can already train a model; we teach you how to run that training on Kubernetes. Loss functions, optimisers, network architectures — different subject.
+- **MLOps as a generic topic.** Many MLOps stories — MLflow, Airflow, Prefect, ZenML, Metaflow, Argo Workflows directly — solve overlapping problems. We touch the landscape in Module 01 and then commit to Kubeflow.
+- **Frontier-research material** — diffusion-model fine-tuning loops, RLHF rigs, MoE sharding strategies. Mentioned where relevant; not the focus.
+- **Cloud-managed alternatives** end-to-end. Vertex AI, SageMaker, and Azure ML are real options; Module 01 explains when to pick them over self-hosted Kubeflow. We don't teach them.
+
+The goal is to make you the engineer who can stand up, operate, and ship workloads on a Kubeflow platform — not the researcher who can publish a new architecture, and not the SaaS customer who's outsourced the whole thing to a hyperscaler.
+
+**Ready?** Continue to [Module 01 — Foundations](/learn/kubeflow/foundations).
+
+## References
+
+- [kubeflow.org — the project home](https://www.kubeflow.org/)
+- [github.com/kubeflow/kubeflow — main repo](https://github.com/kubeflow/kubeflow)
+- [github.com/kubeflow/manifests — installation manifests](https://github.com/kubeflow/manifests)
+- [github.com/kubeflow/pipelines — KFP](https://github.com/kubeflow/pipelines)
+- [github.com/kserve/kserve — KServe](https://github.com/kserve/kserve)
+- [CNCF — Kubeflow project listing](https://www.cncf.io/projects/kubeflow/)
