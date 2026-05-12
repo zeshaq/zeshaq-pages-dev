@@ -1,0 +1,241 @@
+---
+title: "Notebooks: JupyterLab, RStudio, VS Code on Kubernetes"
+sidebar_label: "03 — Notebooks"
+description: "How Kubeflow turns a notebook server into a multi-tenant Kubernetes primitive — the Notebook CR, image catalogue, volume strategy, GPU sharing, quotas, and the failure modes that show up the day a real team uses it."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const nbNodes = [
+  { id: "user",    position: { x: 60,  y: 0   }, data: { label: "Data scientist\n(browser)" },                  style: stage },
+  { id: "dash",    position: { x: 360, y: 0   }, data: { label: "Central Dashboard\n(per-Profile namespace)" },  style: ctrl },
+  { id: "ctrl",    position: { x: 360, y: 140 }, data: { label: "Notebook Controller\n(reconciles Notebook CR)" }, style: ctrl },
+  { id: "cr",      position: { x: 60,  y: 140 }, data: { label: "Notebook CR\n(spec.template.spec)" },          style: stage },
+
+  { id: "pod",     position: { x: 360, y: 280 }, data: { label: "Notebook Pod\nJupyterLab / VS Code / RStudio" }, style: agent },
+  { id: "pvc",     position: { x: 60,  y: 280 }, data: { label: "PVC for $HOME\n(RWO, 50 GiB)" },                style: stage },
+  { id: "shared",  position: { x: 660, y: 280 }, data: { label: "Shared dataset\nPVC (RWX) / S3 FUSE" },         style: stage },
+
+  { id: "gpu",     position: { x: 660, y: 140 }, data: { label: "GPU node\n(MIG or time-slice)" },               style: ext },
+  { id: "quota",   position: { x: 60,  y: 420 }, data: { label: "ResourceQuota\nPriorityClass" },                style: stage },
+  { id: "rbac",    position: { x: 660, y: 420 }, data: { label: "Profile RBAC\n(per-namespace)" },               style: stage },
+];
+
+export const nbEdges = [
+  { id: "n1", source: "user",   target: "dash",   label: "log in (OIDC)",          ...reqEdge },
+  { id: "n2", source: "dash",   target: "cr",     label: "create Notebook",        ...reqEdge },
+  { id: "n3", source: "cr",     target: "ctrl",   label: "watched",                ...pullEdge },
+  { id: "n4", source: "ctrl",   target: "pod",    label: "creates Pod",            ...reqEdge },
+  { id: "n5", source: "pod",    target: "pvc",    label: "mounts $HOME",           ...reqEdge },
+  { id: "n6", source: "pod",    target: "shared", label: "mounts (RWX)",           ...reqEdge },
+  { id: "n7", source: "pod",    target: "gpu",    label: "scheduled (limits)",     ...reqEdge },
+  { id: "n8", source: "quota",  target: "pod",    label: "caps",                   ...reqEdge },
+  { id: "n9", source: "rbac",   target: "pod",    label: "gates",                  ...reqEdge },
+];
+
+A data scientist wants JupyterLab. The platform team wants reproducibility, multi-tenancy, and a story for when the same team comes back next month asking for *"the env we used for the Q3 churn model — exactly that one."* Vanilla `kubectl run jupyter` doesn't bridge those wants. Volumes don't persist across pod restarts; GPUs are unshareable; everyone authenticates as `default` SA; image management is "the senior MLE picked a tag last year and we all use it."
+
+Kubeflow Notebooks is the answer to that gap — a Custom Resource (`Notebook`), a controller that reconciles it into a Deployment / Pod / Service / Istio policy, and a Central Dashboard that lets users spin up a notebook into their own namespace without ever writing YAML. This module is what's underneath, what to wire up before turning it on for a team, and where it bites.
+
+## The notebook problem on Kubernetes
+
+The thing that's hard about *"give the team JupyterLab on the cluster"* is not running Jupyter — it's everything around it:
+
+- **Volume persistence.** A notebook pod gets rescheduled; the user's home directory has to come back. That means a PVC, and PVCs have semantics — RWO vs RWX, storage class, resize support, snapshot support.
+- **GPU sharing.** A 6-person team can't each have an A100 to themselves. You need MIG partitions or time-sliced GPU exposure, and the notebook runtime has to request the right shape.
+- **Access control.** Each notebook is one user's session. You can't put everyone in `default` and call it done — you need per-user namespaces, RoleBindings, and an OIDC integration so logins map to identities.
+- **Image management.** "The data science image" is a multi-gigabyte beast that pins Python, CUDA, cuDNN, PyTorch, Pandas, and a hundred more. Without a story for *how* this image is built and *how it gets to the registry*, the team rebuilds it each quarter from a fork of a fork.
+- **Lifecycle.** Idle notebooks pin GPUs for weeks. Without a stop-on-idle policy, your fleet's GPU utilisation drops to single digits.
+
+Kubeflow Notebooks doesn't make these problems disappear; it gives them named places to live.
+
+<Whiteboard client:load data={{ nodes: nbNodes, edges: nbEdges }} height={560} />
+
+Reading the diagram: the user goes through the Central Dashboard, which writes a `Notebook` CR to the user's Profile namespace. The Notebook Controller reconciles that CR into a Pod, mounted with the user's `$HOME` PVC and any shared dataset volumes, scheduled onto a GPU node if `nvidia.com/gpu` is requested. ResourceQuota caps the namespace; Profile RBAC governs who can do what in it.
+
+## The `Notebook` CR
+
+The CR is small and most of it is a pod template. A trimmed example:
+
+```yaml
+apiVersion: kubeflow.org/v1
+kind: Notebook
+metadata:
+  name: pytorch-dev
+  namespace: alice
+spec:
+  template:
+    spec:
+      containers:
+        - name: pytorch-dev
+          image: kubeflownotebookswg/jupyter-pytorch-full:v1.8.0
+          resources:
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/jovyan
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: alice-workspace
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+```
+
+Three things make this CR worth its own controller. First, the controller wraps the pod template in a `StatefulSet`-shaped Deployment so restart behaviour and DNS are stable. Second, it generates a `Service` and an Istio `VirtualService` / `AuthorizationPolicy` so the Central Dashboard's reverse proxy can reach the notebook only when the right user is on the other end. Third, it labels everything for the dashboard — `notebooks.kubeflow.org/last-activity` and friends — so idle detection works.
+
+The `/dev/shm` volume is non-cosmetic. PyTorch's `DataLoader` workers communicate through shared memory; the container's default 64 MiB is too small and you get `RuntimeError: DataLoader worker (pid X) is killed by signal: Bus error.` Make `/dev/shm` an `emptyDir.medium: Memory` of at least 2-4 GiB on any PyTorch notebook.
+
+## The default-image catalogue
+
+Kubeflow Notebooks ships a small set of opinionated base images under `kubeflownotebookswg/` on Docker Hub and the project's own registry. The set you actually use, in order of how often we see them in the wild:
+
+| Image | What's in it | Typical size |
+| --- | --- | --- |
+| `jupyter-pytorch-full` | JupyterLab + PyTorch + CUDA + Pandas + scikit-learn | ~7 GiB |
+| `jupyter-tensorflow-full` | JupyterLab + TensorFlow + CUDA + Pandas + scikit-learn | ~7 GiB |
+| `jupyter-scipy` | JupyterLab + SciPy stack, no DL framework | ~3 GiB |
+| `codeserver-python` | VS Code in browser (code-server) + Python | ~2 GiB |
+| `rstudio-tidyverse` | RStudio Server + tidyverse | ~3 GiB |
+
+These are *catalogue* images — pinned to a Kubeflow version and a specific framework version. They're convenient for the first month and a hazard after that. Two reasons.
+
+First, they're huge. A 7 GiB image pull from a fresh node adds minutes to notebook start, especially on a cluster that doesn't pre-warm. Second, every team needs *their* libs on top, and `pip install` at notebook startup is not the answer — it's slow, non-reproducible, and breaks on air-gapped clusters.
+
+Production posture: **pin the catalogue image to a digest** (not a tag) and treat it as the read-only base for your own team images.
+
+## Custom notebook images
+
+The right shape is two layers of derived image:
+
+- **Team-base image.** Built once per team per quarter. Derives from a digest-pinned catalogue image, adds the team's internal Python packages from a private index, pins compatible versions of every framework-adjacent library. Pushed to a private registry with a content-addressable tag.
+- **Personal layer (optional).** A user who wants a specific extra (a profiler, a custom kernel) layers it on top of the team-base. Most users won't need this; the few who do can pin their `requirements.txt` in their `$HOME` and `pip install` at session start.
+
+A minimal team-base Dockerfile:
+
+```dockerfile
+FROM kubeflownotebookswg/jupyter-pytorch-full@sha256:7c3f...
+USER root
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY --chown=jovyan:users cosml_utils /opt/cosml_utils
+RUN pip install --no-cache-dir /opt/cosml_utils
+USER jovyan
+```
+
+Two non-obvious rules. **One**: `USER root` is required for `pip install` because the base image runs as `jovyan` (UID 1000) and your registry-pulled wheel install needs write access to `/usr/local/lib`. Drop back to `jovyan` before the image's `CMD`. **Two**: don't `RUN pip install` separate packages in multiple `RUN` layers — each layer adds image size even if the install footprint is small, and the cache invalidation rules will burn you when one of the package versions changes.
+
+## Volume strategy
+
+Each user's notebook gets one PVC for `$HOME` — typically 10-50 GiB. The storage class matters more than the size:
+
+- **RWO (ReadWriteOnce).** Default for block storage. Pins the notebook to one node — bad if you need to reschedule onto a GPU node that's free elsewhere. The PVC has to detach and reattach, which means the notebook is unavailable for a minute or two.
+- **RWX (ReadWriteMany).** From NFS, CephFS, or a CSI that supports it. The notebook reschedules cleanly. Pay the latency cost for filesystem operations.
+
+Shared datasets — the 200 GiB Parquet corpus that every team member reads from — live in a separate RWX PVC or an S3-backed FUSE mount. Don't bake them into the home PVC; you'll multiply storage cost by N users and you'll lose the property that "the dataset" has a single version everyone trains against.
+
+For S3/MinIO-backed dataset access without FUSE, the cleaner pattern is `s3fs` / `boto3` from Python — no kernel mount required, no PVC needed, and IAM credentials can be projected into the pod via a ServiceAccount token bound to an S3-compatible IAM role. The lab's MinIO at 30.30.30.14:9000 would fit this pattern when (if) Kubeflow eventually lands.
+
+## GPU notebooks
+
+You request a GPU in the Notebook CR via `resources.limits.nvidia.com/gpu: "1"`. The Notebook Controller doesn't itself schedule onto GPU nodes; it relies on the **NVIDIA GPU Operator** having labelled GPU nodes and installed the device plugin, plus a `nodeSelector` or affinity that targets those nodes. On OpenShift, the GPU Operator is installable from OperatorHub; on vanilla Kubernetes, it's a Helm install.
+
+For multi-tenant GPU, two approaches:
+
+- **MIG (Multi-Instance GPU).** On A100/H100, the GPU is partitioned at the hardware level into 2/3/7 smaller logical GPUs with isolated memory and SM slices. Each notebook gets a `nvidia.com/mig-1g.5gb` (or similar) resource. **Hard isolation, no co-tenancy noise.** Available only on supported cards.
+- **Time-sliced GPU.** The GPU Operator exposes the same physical GPU as N "fake" GPUs; jobs share execution time-sliced. **Soft isolation, OOM possible across tenants.** Available on any modern card.
+
+Pick MIG for production multi-tenancy. Time-slice is acceptable for dev clusters where the cost of an OOM is "the notebook restarts" and not "the model fails to converge."
+
+## Multi-tenant access
+
+Kubeflow's tenancy primitive is the **Profile** CR. One Profile per user (or per team) creates a Kubernetes namespace with a managed set of RoleBindings: the user gets `admin`-ish rights inside their own namespace, nothing outside it. The Profile Controller also wires up an Istio `AuthorizationPolicy` so cross-namespace traffic is denied by default.
+
+Logins flow through the Central Dashboard's OIDC integration (Dex by default, federated to whatever IdP you run). The dashboard pulls the authenticated user's identity and routes them to the namespace whose Profile matches. A team that shares a namespace is just a Profile whose owner is a group, with extra `contributor`-tier RoleBindings inside.
+
+Cross-namespace notebook access — *"Alice's notebook needs to read from `team-b/datasets`"* — is **not free**. You need an explicit RoleBinding in `team-b` granting Alice's notebook ServiceAccount (`default-editor` in her namespace, by default) read access to the relevant resources, plus an Istio `AuthorizationPolicy` carve-out if you've turned on strict mTLS. Don't paper over this with a wildcard; that's how secrets leak across teams.
+
+## Resource quotas and lifecycle
+
+Without quotas, one user can park five GPUs forever. Set a `ResourceQuota` per Profile namespace:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: alice-quota
+  namespace: alice
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 32Gi
+    requests.nvidia.com/gpu: "2"
+    limits.nvidia.com/gpu: "2"
+    persistentvolumeclaims: "5"
+```
+
+Two non-obvious traps. **One**: quotas apply to **requests**, not **limits**, for CPU/memory by default — make sure you also bound `limits.nvidia.com/gpu` because the GPU device plugin treats the request/limit as the same value. **Two**: a `ResourceQuota` rejects new pods past the cap, but doesn't preempt existing ones. Add a `PriorityClass` if you want a way to bump idle low-priority notebooks for incoming high-priority work.
+
+For idle stopping, the `notebook-controller-config` ConfigMap exposes `CULL_IDLE_TIME` and `IDLENESS_CHECK_PERIOD`. Set them and the controller stops notebooks that haven't seen kernel activity in N minutes. The PVC stays around; the pod is gone. The user clicks *Start* and the notebook resumes with the same `$HOME`. Tune the idle threshold to your team's working pattern — 4 hours is a sane default for a workday-only team; 30 minutes is appropriate for a shared GPU cluster where capacity is precious.
+
+## The lab posture reality check
+
+The lab fleet (`hub-dc-v6` + `spoke-dc-v6`) doesn't run Kubeflow today. Both OpenShift AI (RHOAI) and OpenShift Virtualization are deferred, and Kubeflow itself isn't installed. This track is forward-looking — written so the operator who picks this up next year has the shape of the work in their head before they start.
+
+If you're following along on a different cluster: the manifests in this module are portable to vanilla Kubernetes, EKS, GKE, AKS, and OpenShift with adjustments to the Istio assumption (OpenShift's default ingress is Routes, not Istio; Kubeflow installs its own istio-system on OpenShift to keep the model intact).
+
+## Try this
+
+**1. Sketch a `Notebook` CR for a PyTorch dev environment.** 4 vCPU / 16 GiB RAM / 1 GPU / 50 GiB home PVC, with a 4 GiB `/dev/shm` and a shared dataset RWX mount at `/datasets`. Don't run it — just write the YAML and convince yourself you can read every field without looking it up.
+
+**2. Author a team-base `Dockerfile`.** Derive from `kubeflownotebookswg/jupyter-pytorch-full` (pin to a digest), `pip install pandas==2.2.* scikit-learn==1.5.*`, then install your internal `cosml-utils` package from a copied source tree. Push to a private registry. Verify image size delta over the base is small (under a few hundred MiB) — if it isn't, you're shipping wheels you don't need.
+
+**3. Write a `ResourceQuota` that limits a Profile namespace to ≤8 vCPU and ≤2 GPUs.** Bind it to the Profile namespace. Apply, then `oc apply` a Notebook that requests 4 GPUs and watch it get rejected with a quota-exceeded admission error. The error message tells you exactly which field tripped — useful when you're tightening quotas on a live tenant.
+
+## Common failure modes
+
+**Notebook pod stuck `Pending` with `0/N nodes available`.** Run `kubectl describe pod`. Almost always: "Insufficient `nvidia.com/gpu`" — no GPU node has capacity. Fix by waiting for capacity, by scaling the GPU node group, or by switching the notebook to a CPU image temporarily. Less commonly: the pod has a `nodeSelector` that no node matches (typo in the GPU class label).
+
+**PVC stuck `Pending`.** The CSI provisioner can't allocate. `kubectl describe pvc` shows the events. Two top causes: the named `StorageClass` doesn't exist (typo or the class wasn't installed); the provisioner pod is `CrashLoopBackOff` (look in the storage operator's namespace). Check the controller manager logs; the actual error is there.
+
+**Notebook starts but JupyterLab returns 502 in the browser.** The pod is up but the Central Dashboard's reverse proxy can't reach it. Almost always an Istio policy: the namespace's `AuthorizationPolicy` is blocking the dashboard's ServiceAccount. Run `istioctl proxy-config listener <pod>` and look for the policy that denied the request. The fix is usually to add the dashboard's SA to the policy's allow list.
+
+**Home directory full.** The PVC is too small. If your CSI supports `allowVolumeExpansion: true`, edit the PVC to the larger size and the filesystem expands online. If it doesn't, you have to snapshot, recreate larger, restore — disruptive.
+
+**`/dev/shm` too small for PyTorch DataLoader workers.** Symptom: training crashes with `Bus error`, often after several minutes when the dataloader's prefetch queue fills. Fix: add the `dshm` volume from the CR example above. The default 64 MiB is the limit if you didn't override it.
+
+**Notebook image pull is glacial.** A fresh 7 GiB pull on a slow link is brutal. Two mitigations: pin to a digest and pre-warm the image on GPU nodes (a `DaemonSet` that just `imagePullPolicy: Always`-pulls); switch the team-base image to a slimmer derivative that doesn't ship every framework version under the sun.
+
+**Idle notebook never stops despite `CULL_IDLE_TIME`.** Almost always: the user has an open kernel that's executing a cell (or has a `while True: time.sleep(60)` running, intentionally or not). The idle detector looks at kernel activity, not browser presence. The cleaner fix is to also limit the `ResourceQuota` so an idle hog at least can't expand.
+
+## Where this is heading
+
+You can now reason about how a multi-user JupyterLab/RStudio/VSCode environment is composed on Kubernetes: the `Notebook` CR shape, what the controller does with it, where volumes and GPUs and identities meet. The next two modules take a notebook user from *"I have a working dev environment"* to *"I can author a repeatable pipeline that trains, evaluates, and deploys a model on a schedule."*
+
+**Next:** [Module 04 — Pipelines (Basics)](/learn/kubeflow/04-pipelines-basics) — KFP SDK v2, Python-function components, artifact-aware outputs, and the two-step pipeline you'll keep referencing for the rest of the track.
+
+## References
+
+- Kubeflow Notebooks documentation: [kubeflow.org/docs/components/notebooks/](https://www.kubeflow.org/docs/components/notebooks/)
+- Kubeflow notebook images (kubeflownotebookswg): [github.com/kubeflow/notebooks](https://github.com/kubeflow/notebooks)
+- Kubeflow Notebook Controller source: [github.com/kubeflow/kubeflow/tree/master/components/notebook-controller](https://github.com/kubeflow/kubeflow/tree/master/components/notebook-controller)
+- Kubeflow Profiles and namespace tenancy: [kubeflow.org/docs/components/central-dash/profiles/](https://www.kubeflow.org/docs/components/central-dash/profiles/)
+- NVIDIA GPU Operator (MIG + time-slice): [docs.nvidia.com/datacenter/cloud-native/gpu-operator/](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/)
+- Kubernetes ResourceQuota reference: [kubernetes.io/docs/concepts/policy/resource-quotas/](https://kubernetes.io/docs/concepts/policy/resource-quotas/)
