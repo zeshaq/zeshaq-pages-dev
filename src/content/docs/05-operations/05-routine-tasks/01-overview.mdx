@@ -1,8 +1,8 @@
 ---
 title: "Routine tasks — overview"
-description: "Six recurring operator workflows that own the fleet's running state: secret rotation, operator bumps, fleet onboarding, policy rollout, evidence backfill."
+description: "Nine recurring operator workflows that own the fleet's running state: secret rotation, operator bumps, fleet onboarding, policy rollout, evidence backfill, kubeadmin and RHACS Central rotation, division onboarding, Loki OBC bridge."
 sidebar_label: "Overview"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -52,7 +52,7 @@ Every page in this subsection follows the same shape:
 
 If you find yourself reading a task page and it does not have those five sections, the page is incomplete — file an issue under #229 against this section.
 
-## The five routine tasks
+## The nine routine tasks
 
 | # | Page | Cadence | Triggers |
 |---|---|---|---|
@@ -61,8 +61,12 @@ If you find yourself reading a task page and it does not have those five section
 | 04 | [Add a cluster to the fleet](/docs/05-operations/05-routine-tasks/04-add-a-cluster-to-the-fleet) | On capacity event or DR build-out | New ManagedCluster onboarding |
 | 05 | [Roll out a policy](/docs/05-operations/05-routine-tasks/05-roll-out-a-policy) | On compliance gate or new finding | PCI-DSS scan finding; ACM PolicySet update |
 | 06 | [Backfill evidence to MinIO](/docs/05-operations/05-routine-tasks/06-backfill-evidence-to-minio) | When an evidence-pack window closes | CI run; compliance close-out; lifecycle audit |
+| 07 | [Rotate the kubeadmin password](/docs/05-operations/05-routine-tasks/07-rotate-kubeadmin-password) | Quarterly or on personnel change | OCP 4.20 23-char minimum; htpasswd-Secret recreate; Vault custody |
+| 08 | [Rotate the RHACS Central admin](/docs/05-operations/05-routine-tasks/08-rotate-rhacs-central-admin) | Quarterly or after init-bundle regen | Vault `secret/ocp/platform/rhacs-admin` -> ESO -> `rollout restart deploy/central` |
+| 09 | [Add a division to federated GitLab](/docs/05-operations/05-routine-tasks/09-add-division-to-federated-gitlab) | On new client engagement or compliance scope-change | `ct-*` role groups; CODEOWNERS; runner-class tags; Vault path tree |
+| 10 | [Publish the Loki OBC bridge](/docs/05-operations/05-routine-tasks/10-publish-loki-obc-bridge) | One-shot under #233 | LokiStack stuck `Warning Degraded`; backport of the Tempo bridge `!43` |
 
-The cadence column matters: tasks 02 and 06 are calendar-driven; tasks 03 and 04 are event-driven; task 05 is gate-driven. The on-call rotation [escalation matrix](/docs/05-operations/06-on-call-and-escalation) tells you who owns each.
+The cadence column matters: tasks 02 / 06 / 07 / 08 are calendar-driven; tasks 03 / 04 / 09 are event-driven; tasks 05 / 10 are gate-driven (compliance and incident-follow-up respectively). The on-call rotation [escalation matrix](/docs/05-operations/06-on-call-and-escalation) tells you who owns each.
 
 ## What is *not* in this subsection
 
@@ -92,4 +96,4 @@ These prefixes are not enforced by any hook — they are the lab's conventional 
 - `opp-full-plat/connection-details/platform-admin-handoff.md`
 - `opp-full-plat/runbooks/secrets-custody-drift-check.md`
 - `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
-- Issues: #229 (this section), #137 (hub mirror capture — example of evidence-backfill class)
+- Issues: #229 (this section), #137 (hub mirror capture — example of evidence-backfill class), #233 (Loki OBC bridge backport), #255 / MR `!73` (RHACS Central admin via Vault + ESO)

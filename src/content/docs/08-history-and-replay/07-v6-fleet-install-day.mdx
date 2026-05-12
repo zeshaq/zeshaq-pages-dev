@@ -1,0 +1,196 @@
+---
+title: "2026-05-09 — v6 Fleet Install Day"
+description: "The single biggest operational day on the v6 fleet — hub-dc-v6 and spoke-dc-v6 both installed, ODF data plane brought up on the spoke, and the management pull-model baselined. The implicit day-wrap that sits between the pre-v6 reset and the day-2 wave."
+sidebar_label: "2026-05-09 v6 Install Day"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const hub = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const spoke = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 200, textAlign: "center", fontWeight: 600 };
+export const node = { background: "#fafafa", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const phys = { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 8, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const gw = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+
+export const seqEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const acmEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const fleetNodes = [
+  { id: "hub",   position: { x: 80, y: 30 }, data: { label: "hub-dc-v6\ncompact 3-AIO\nstorage-light" }, style: hub },
+  { id: "m0",    position: { x: 30,  y: 130 }, data: { label: "master-0\n30.30.75.13\nctrl-plane+worker" }, style: node },
+  { id: "m1",    position: { x: 30,  y: 200 }, data: { label: "master-1\n30.30.75.14\nctrl-plane+worker" }, style: node },
+  { id: "m2",    position: { x: 30,  y: 270 }, data: { label: "master-2\n30.30.75.15\nctrl-plane+worker" }, style: node },
+
+  { id: "spoke", position: { x: 560, y: 30 }, data: { label: "spoke-dc-v6\n3 VM masters + 3 phys workers\nODF data plane" }, style: spoke },
+  { id: "sm0",   position: { x: 480, y: 130 }, data: { label: "master-0 VM\n30.30.75.33" }, style: node },
+  { id: "sm1",   position: { x: 480, y: 195 }, data: { label: "master-1 VM\n30.30.75.34" }, style: node },
+  { id: "sm2",   position: { x: 480, y: 260 }, data: { label: "master-2 VM\n30.30.75.35" }, style: node },
+  { id: "gold1", position: { x: 680, y: 130 }, data: { label: "gold-1 phys\n30.30.75.36\nens1f1np1" }, style: phys },
+  { id: "gold2", position: { x: 680, y: 195 }, data: { label: "gold-2 phys\n30.30.75.37\nens1f1np1" }, style: phys },
+  { id: "gpu01", position: { x: 680, y: 260 }, data: { label: "gpu-01 phys\n30.30.75.38\nens15f3" }, style: phys },
+
+  { id: "acm",   position: { x: 350, y: 350 }, data: { label: "ACM pull model\n(ADR 0018)" }, style: gw },
+];
+
+export const fleetEdges = [
+  { id: "h0", source: "hub", target: "m0", ...seqEdge },
+  { id: "h1", source: "hub", target: "m1", ...seqEdge },
+  { id: "h2", source: "hub", target: "m2", ...seqEdge },
+  { id: "s0", source: "spoke", target: "sm0", ...seqEdge },
+  { id: "s1", source: "spoke", target: "sm1", ...seqEdge },
+  { id: "s2", source: "spoke", target: "sm2", ...seqEdge },
+  { id: "p0", source: "spoke", target: "gold1", ...seqEdge },
+  { id: "p1", source: "spoke", target: "gold2", ...seqEdge },
+  { id: "p2", source: "spoke", target: "gpu01", ...seqEdge },
+  { id: "a0", source: "spoke", target: "acm", ...acmEdge, label: "registered to" },
+  { id: "a1", source: "acm",   target: "hub", ...acmEdge, label: "managed from" },
+];
+
+2026-05-09 is the single most consequential operational day in the v6 fleet's lifetime. Both clusters — `hub-dc-v6` and `spoke-dc-v6` — went from agent ISOs on `ocp-bootstrap` to `oc get nodes` green inside ~16 hours. The day did not get an explicit "day wrap" GitHub issue the way 2026-05-10 did under [#159](https://github.com/zeshaq/opp-full-plat/issues/159); the implicit day-wrap is the **mid-day session-closeout report** at `opp-full-plat/reports/sessions/20260509-112323-session-closeout.md`, plus the chain of ~30 per-session reports the day produced.
+
+This page collects what happened that day, what shape the fleet took, and where to pick up the thread.
+
+## Fleet shape that emerged
+
+<Whiteboard client:load data={{ nodes: fleetNodes, edges: fleetEdges }} height={440} />
+
+Reading the diagram:
+
+- **Hub (left)** is the compact 3-AIO management cluster — three nodes, each carrying `control-plane,master,worker` roles. No physical workers, no ODF, deliberately storage-light per ADR 0018.
+- **Spoke (right)** is the workload cluster — three VM masters plus three physical worker boxes (`gold-1`, `gold-2`, `gpu-01`), with the physical workers running on the `30.30.0.0/16` NIC ports after the first MAC selection picked the wrong path.
+- **Green dashed line** is the ACM pull model: the spoke registers to the hub, the hub manages the spoke through ACM + per-cluster Argo, and `platform-gitops` is the source of truth on both sides.
+
+The hub install completed at `08:00 UTC`; the spoke base install completed at `15:20 UTC`. Everything else on this day was the work needed to get those two milestones across the line, plus the immediate day-2 baseline that turned the installed clusters into a fleet.
+
+## The implicit day-wrap
+
+`reports/sessions/20260509-112323-session-closeout.md` (closed at 11:23 UTC, mid-day) is the day's only explicit closeout artifact. It scoped the morning:
+
+| Item | What |
+| --- | --- |
+| **Scope** | developer readiness + Docker runtime handoff; federated GitOps ADR/milestones/gates + GitLab FG-1 execution; workspace submodule cleanup; spoke-dc-v6 install preflight |
+| **Key decisions** | ADR 0014 (developer-readiness contract); ADR 0015 (federated GitOps repo architecture); Gate H1 added; FG-1 GitLab group skeleton |
+| **Follow-ups carried forward** | [#83 FG-1](https://github.com/zeshaq/opp-full-plat/issues/83) (open until CODEOWNERS, CE-compatible merge controls, validation pipelines, runner posture, negative access tests); [#67 developer-readiness gate](https://github.com/zeshaq/opp-full-plat/issues/67) (open until sample app/template, Trivy/MinIO evidence, secret custody, OpenShift namespace onboarding, end-to-end smoke evidence) |
+| **Closing instruction** | Resume with the `spoke-dc-v6` install-input package; do not boot anything until inputs reviewed and the user explicitly approves |
+
+The user did approve, mid-afternoon, and the spoke went up. The afternoon's work isn't covered by that closeout — it's covered by the per-session report chain.
+
+## Per-session report chain — what happened, in order
+
+Times are UTC. Slugs map to files under `opp-full-plat/reports/sessions/20260509-<HHMMSS>-<slug>.md`.
+
+### Morning — hub install + image supply
+
+| Time | Slug | Result |
+| --- | --- | --- |
+| 06:37 | oc-mirror-partial-complete | Day-prior oc-mirror partial completion captured; sets up the disconnected install with mirrored release + operator content |
+| 06:45 | hub-dc-v6-install-preflight | Preflight checks: pull-secret, IDMS, ITMS, agent install workdir all staged on `ocp-bootstrap` |
+| 06:53 | hub-dc-v6-install-workdir-prep | Install workdir at `/home/ze/ocp-clusters/hub-dc-v6` staged |
+| 07:11 | hub-dc-v6-iso-vm-definitions | Agent ISO generated + libvirt VM XMLs for `hub-dc-v6-master-{0,1,2}` |
+| 08:00 | hub-dc-v6-boot-install-complete | **Hub install complete.** OCP `4.20.18`, all three masters `Ready` `control-plane,master,worker`, all `ClusterOperators` clean, DNS resolves api/api-int/apps to the planned VIPs `30.30.75.10`/`.11` |
+| 08:15 | hub-dc-v6-local-connection-cleanup | Local-only `auth/` output handled on `ocp-bootstrap`; nothing committed |
+| 08:23 | hub-dc-v6-day1-checkpoint-baseline | Day-1 baseline recorded |
+| 08:43 | hub-dc-v6-disconnected-catalog-baseline | IDMS/ITMS applied; mirrored catalogs added; default `CatalogSource` set disabled; master MCP rolled once before pulls worked correctly |
+
+The hub install itself was the easy part — the real load-bearing piece of work was the catalog baseline at 08:43, which is what made the hub usable for operator installs. That manifest set is exactly what REPRO-HUB-1 later adopted into `platform-gitops` (see the dedicated REPRO-HUB-1 page).
+
+### Mid-morning — developer readiness + federated GitOps ADRs
+
+The morning split into two threads. While the hub was rolling its catalog baseline, a second thread set up the developer-readiness and federated-GitOps contracts:
+
+| Time | Slug | Result |
+| --- | --- | --- |
+| 08:55 | developer-readiness-track | ADR 0014 (developer-readiness contract), milestone #23, issue #67 |
+| 08:57 | hub-dc-v6-openshift-gitops-install | OpenShift GitOps operator `v1.20.3` installed |
+| 09:01 | developer-handbook-scaffold | mdBook-compatible developer handbook scaffolded |
+| 09:12 | hub-dc-v6-minimal-gitlab-gitops-bootstrap | First Argo `Application/hub-dc-v6-bootstrap` `Synced/Healthy` |
+| 09:14 | developer-handbook-runtime-scope | Handbook expanded to include the Docker-runtime path |
+| 09:28 | hub-dc-v6-gitops-appproject-hardening | AppProject hardening on the hub |
+| 09:34 | docker-runtime-vm | `docker-runtime-vm` deployed as the alternative app-delivery target |
+| 09:39 | hub-dc-v6-bootstrap-namespace-baseline | Bootstrap namespace baseline recorded |
+| 10:08 | federated-gitops-adr-and-milestones | ADR 0015 (federated GitOps repo architecture) + milestones |
+
+By 10:08 the hub was Argo-bootstrapped against `platform-gitops` and the federated-GitOps contract was written. From this point, every subsequent operator install on either cluster ships through a GitLab MR.
+
+### Mid-day — spoke install package + workspace governance
+
+| Time | Slug | Result |
+| --- | --- | --- |
+| 11:17 | spoke-dc-v6-install-preflight | Read-only preflight |
+| 11:23 | session-closeout | **Implicit day-wrap.** Morning scope closed; user gate set on spoke boot |
+| 11:31 | spoke-dc-v6-install-inputs | Spoke install inputs prepared |
+| 11:54 | spoke-dc-v6-install-workdir-prep | Spoke workdir staged |
+| 13:02 | spoke-dc-v6-iso-vm-definitions | Spoke agent ISO + VM definitions |
+| 13:25 | spoke-dc-v6-physical-worker-gate | Physical worker boot safety gate — explicit checklist before any iLO action |
+| 14:14 | parallel-agent-worktree-isolation | Parallel-agent worktree isolation policy → ADR 0017 (the cost of NOT having it was a misleading commit subject on origin earlier in the week) |
+
+### Afternoon — spoke base install + ODF disk reset
+
+| Time | Slug | Result |
+| --- | --- | --- |
+| 15:20 | spoke-dc-v6-install-complete | **Spoke base install complete.** OCP `4.20.18`, 3 VM masters (`30.30.75.33/34/35`) + 3 physical workers (`30.30.75.36/37/38`) all `Ready`. Physical-worker MACs corrected to `ens1f1np1` (gold-1/gold-2) and `ens15f3` (gpu-01); iLO virtual USB media used instead of CD/DVD because byte-range behavior matters; virtual media ejected before installed-RHCOS reboot |
+| 15:34 | spoke-dc-v6-odf-preflight-blocked | ODF preflight blocked on disk inventory — devices not safe to wipe without review |
+| 15:52 | spoke-dc-v6-odf-disk-remediation | Disk remediation pass |
+| 16:16 | spoke-dc-v6-odf-lso-gitops-drift-audit | LSO drift audit — identified manual residue from the failed first attempt |
+| 16:27 | spoke-dc-v6-manual-odf-lso-removal | Manual ODF + LSO removal (full reset before a clean GitOps-driven install) |
+| 16:32 | hub-dc-v6-management-gitops-reset | Hub management GitOps reset — clean slate for the pull-model bootstrap |
+| 16:49 | management-gitops-pull-model-baseline | ADR 0018 — pull-model baseline (ACM + per-cluster Argo on the spoke) |
+
+The spoke base install itself was clean. ODF was the painful part — the disks weren't safe to wipe without a review pass, the first attempt left residue, and the cleanup ran across 16:16-16:27 before the cluster was ready for a GitOps-driven ODF install.
+
+### Evening — ACM registration + Nexus image-supply baseline
+
+| Time | Slug | Result |
+| --- | --- | --- |
+| 20:10 | spoke-dc-v6-acm-registration | spoke-dc-v6 ACM-registered to hub |
+| 20:15 | argo-orphan-warning-review | Argo orphan-warning review |
+| 20:42 | acm-openshift-gitops-pull-starter | ACM + OpenShift GitOps pull starter — the gitops-addon path |
+| 22:13 | spoke-dc-v6-odf-storage-consumer-cleanup | ODF StorageConsumer cleanup |
+| 22:47 | spoke-dc-v6-odf-csi-mirror-fix | ODF CSI image mirror fix ([#120](https://github.com/zeshaq/opp-full-plat/issues/120)) |
+| 23:27 | nexus-image-supply-baseline | **ADR 0019 — Nexus-only image supply baseline** |
+
+By 23:27 the fleet had the foundational guardrails written down: ADR 0014 (developer-readiness), ADR 0015 (federated GitOps), ADR 0017 (parallel-agent worktree isolation), ADR 0018 (pull-model baseline), ADR 0019 (Nexus-only image supply). Every operator install that ships after this day is bound by them.
+
+## What this day produced
+
+| Output | Where it lives today |
+| --- | --- |
+| **`hub-dc-v6` cluster** | live; compact 3-AIO; ACM hub + OpenShift GitOps + day-1 hub catalog adopted into `platform-gitops` later under [REPRO-HUB-1](/docs/history-and-replay/repro-hub-1-hub-adoption) |
+| **`spoke-dc-v6` cluster** | live; 3 VM + 3 phys workers; ODF data plane (after the manual reset); ACM-registered to hub |
+| **OpenShift GitOps bootstrap on hub** | first `Application/hub-dc-v6-bootstrap` `Synced/Healthy` at 09:12 UTC |
+| **OpenShift GitOps bootstrap on spoke** | wired into ACM pull model by 20:42 UTC |
+| **ADR 0014** | developer-readiness platform contract |
+| **ADR 0015** | federated GitOps repo architecture |
+| **ADR 0017** | parallel-agent worktree isolation (after a real incident earlier in the week) |
+| **ADR 0018** | management-GitOps pull-model baseline |
+| **ADR 0019** | Nexus-only image supply baseline (three-endpoint split: install / dev pull / app push) |
+| **GitLab FG-1 group skeleton** | issue #83 follow-ups carried forward |
+| **Developer handbook scaffold** | mdBook-compatible, includes Docker-runtime path |
+| **Issues opened** | #93 (spoke install), #120 (ODF CSI image mirror), milestone #28 (spoke install), milestone #23 (developer readiness) |
+
+## How this day relates to the rest of the history
+
+This day sits between two other entries in the history-and-replay section:
+
+- **Upstream: [pre-v6 → v6 transition](/docs/history-and-replay/pre-v6-to-v6-transition).** The pre-v6 fleet (`hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr` under ADR 0001) was retired; ADR 0022 supersedes ADR 0001 and reserves the v6 names. 2026-05-09 is the day the active half of that supersession became physical clusters.
+- **Downstream: the day-2 wave.** Everything after 2026-05-09 — operator installs, PCI-DSS chain, ODF storage-consumer cleanup, ACM gitops-addon Routes-CRD incident, REPRO-HUB-1 adoption — runs against the clusters this day produced. The [Day-Wrap Archive](/docs/history-and-replay/day-wrap-archive) carries the per-day record from 2026-05-10 onward.
+
+## Why the implicit day-wrap was enough
+
+A formal day-wrap GitHub issue (the way 2026-05-10 got #159) wasn't needed for this day. The two install milestones each have their own session-closeout records (`hub-dc-v6-boot-install-complete`, `spoke-dc-v6-install-complete`) with the actual `Install complete` lines, the `oc get nodes` output, the residual risks, and the next-step gates. The mid-day session-closeout covers the morning's ADR + milestone work. The afternoon and evening run was per-session reports plus `SESSION_LOG.md`. Together they produce the same audit trail as a day-wrap roll-up, with less duplication.
+
+The convention going forward (set on 2026-05-05 18:39 UTC under `session-routines.md`): per-session reports are mandatory for any non-trivial session; day-wrap issues are reserved for days that produce enough roll-up-able churn that the per-session reports alone leave gaps. 2026-05-09 didn't have those gaps — it had two crisp install completes and the contract ADRs to bind them.
+
+## References
+
+- Session reports (UTC times): all under `opp-full-plat/reports/sessions/20260509-<HHMMSS>-<slug>.md`
+- Day's implicit closeout: `opp-full-plat/reports/sessions/20260509-112323-session-closeout.md`
+- Hub install completion: `opp-full-plat/reports/sessions/20260509-080024-hub-dc-v6-boot-install-complete.md`
+- Spoke install completion: `opp-full-plat/reports/sessions/20260509-152004-spoke-dc-v6-install-complete.md`
+- Hub catalog baseline (becomes REPRO-HUB-1 input): `opp-full-plat/reports/sessions/20260509-084300-hub-dc-v6-disconnected-catalog-baseline.md`
+- [Pre-v6 to v6 transition](/docs/history-and-replay/pre-v6-to-v6-transition) — what came before
+- [REPRO-HUB-1 hub adoption](/docs/history-and-replay/repro-hub-1-hub-adoption) — how the hub day-1 baseline became GitOps after the fact
+- [Day-Wrap Archive](/docs/history-and-replay/day-wrap-archive) — the per-day record from 2026-05-10 onward
+- ADRs accepted this day: 0014 (developer-readiness), 0015 (federated GitOps), 0017 (parallel-agent worktree isolation), 0018 (pull-model baseline), 0019 (Nexus-only image supply)

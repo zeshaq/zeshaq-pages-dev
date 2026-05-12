@@ -2,7 +2,7 @@
 title: "Site Replication Readiness"
 description: "The REP-* tracker — promoting opp-full-plat + dc-lab into a replicable site-builder framework: profile schema, GitLab bootstrap, scripts refactor, template generators, and the dry-run gate."
 sidebar_label: "Site Replication Readiness"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -21,14 +21,14 @@ export const repNodes = [
 
   { id: "rep1", position: { x: 80,  y: 140 }, data: { label: "REP-1 #145\nProfile schema +\ndc-lab profile.yaml\nCLOSED" }, style: closed },
   { id: "rep2", position: { x: 280, y: 140 }, data: { label: "REP-2 #146\nHandoff templates\nCLOSED (Phase 1)" }, style: closed },
-  { id: "rep3", position: { x: 480, y: 140 }, data: { label: "REP-3 #147\nGitLab bootstrap TF\nOPEN (Phase 1)" }, style: open },
+  { id: "rep3", position: { x: 480, y: 140 }, data: { label: "REP-3 #147\nGitLab bootstrap TF\nOPEN (Phase 2)" }, style: open },
   { id: "rep4", position: { x: 680, y: 140 }, data: { label: "REP-4 #148\nscripts/rebuild refactor\nOPEN (Phase 1)" }, style: open },
   { id: "rep5", position: { x: 880, y: 140 }, data: { label: "REP-5 #149\nmake new-site\ngenerator\nOPEN (Phase 1)" }, style: open },
 
   { id: "rep6", position: { x: 80,  y: 280 }, data: { label: "REP-6 #150\nNotes → runbooks\nCLOSED" }, style: closed },
   { id: "rep22", position: { x: 280, y: 280 }, data: { label: "REP-2.2 #243\nUnify profiles\nCLOSED" }, style: closed },
-  { id: "rep21", position: { x: 480, y: 280 }, data: { label: "REP-2.1 #241\nParameterize\nremaining docs\nOPEN" }, style: open },
-  { id: "rep42", position: { x: 680, y: 280 }, data: { label: "REP-4.2 #244\nRefactor ~22 more scripts\nOPEN" }, style: open },
+  { id: "rep21", position: { x: 480, y: 280 }, data: { label: "REP-2.1 #241\nParameterize\nremaining docs\nOPEN (+8 docs)" }, style: open },
+  { id: "rep42", position: { x: 680, y: 280 }, data: { label: "REP-4.2 #244\nRefactor remaining scripts\nCLOSED" }, style: closed },
 
   { id: "rep7", position: { x: 340, y: 420 }, data: { label: "REP-7 #151\nDry-run rebuild\non test infra\nOPEN (BLOCKED — proof gate)" }, style: gate },
 ];
@@ -87,14 +87,14 @@ REP-0 at the top is the parent meta. Solid arrows are sequence dependencies; das
 | [REP-0 #144](https://github.com/zeshaq/opp-full-plat/issues/144) | OPEN (long-running parent) | n/a |
 | [REP-1 #145](https://github.com/zeshaq/opp-full-plat/issues/145) — profile schema + dc-lab extraction | **CLOSED** | `plans/disconnected-rebuild/site-profile-schema.md` + `plans/disconnected-rebuild/environments/dc-lab/profile.yaml` + `scripts/validate-profile.py` (295/295 PASS) |
 | [REP-2 #146](https://github.com/zeshaq/opp-full-plat/issues/146) — parameterize handoffs | **CLOSED (Phase 1)** | `scripts/render-handoffs.py` + 3 handoffs as `.j2` templates; dc-lab byte-clean render |
-| [REP-2.1 #241](https://github.com/zeshaq/opp-full-plat/issues/241) — parameterize remaining docs | OPEN | RUNBOOK.md + remaining `connection-details/` |
-| [REP-2.2 #243](https://github.com/zeshaq/opp-full-plat/issues/243) — unify the two profile.yaml files | **CLOSED** | Single canonical profile at `environments/<site>/profile.yaml`; schema doc updated |
-| [REP-3 #147](https://github.com/zeshaq/opp-full-plat/issues/147) — GitLab content bootstrap | OPEN (Phase 1) | `plans/disconnected-rebuild/gitlab-bootstrap-design.md` + `terraform/gitlab-bootstrap/` + `scripts/gitlab/render-codeowners.py` |
-| [REP-3.2/3.3/3.4 #235/#236/#237](https://github.com/zeshaq/opp-full-plat/issues/235) | OPEN | Role groups + shares + branch protection / runner registration / full repo seeding |
+| [REP-2.1 #241](https://github.com/zeshaq/opp-full-plat/issues/241) — parameterize remaining docs | OPEN (in flight) | Jinja templates parameterized for 8 more handoff/connection-details docs; RUNBOOK.md still pending |
+| [REP-2.2 #243](https://github.com/zeshaq/opp-full-plat/issues/243) — unify the two profile.yaml files | **CLOSED** | Single canonical profile at `environments/<site>/profile.yaml`; dc-lab `profile.yaml` unified into the single canonical schema; schema doc updated |
+| [REP-3 #147](https://github.com/zeshaq/opp-full-plat/issues/147) — GitLab content bootstrap | OPEN (Phase 2) | Phase 1 design + scaffold; Phase 2 GitLab Terraform bootstrap module landing + runner-token helper |
+| [REP-3.2/3.3/3.4 #235/#236/#237](https://github.com/zeshaq/opp-full-plat/issues/235) | OPEN (active) | GitLab Terraform bootstrap module covers groups + role groups + branch protection (#235); runner-token helper landed (#236); full repo seeding (#237) is the remaining work |
 | [REP-4 #148](https://github.com/zeshaq/opp-full-plat/issues/148) — `scripts/rebuild/` profile-aware refactor | OPEN (Phase 1) | `scripts/rebuild/REFACTOR-PATTERN.md` + `lib/profile.sh` + 3 reference refactors; 11/11 smoke PASS |
-| [REP-4.2 #244](https://github.com/zeshaq/opp-full-plat/issues/244) — refactor remaining ~22 scripts | OPEN | n/a (large mechanical pass) |
+| [REP-4.2 #244](https://github.com/zeshaq/opp-full-plat/issues/244) — refactor remaining `scripts/rebuild/*` | **CLOSED** | Profile-aware refactor of every remaining `scripts/rebuild/*` script — the pattern is now uniform across Nexus, Jenkins, Vault, SigNoz, DefectDojo, Monitoring, docker-runtime, WSO2, Trivy, edge-DNS, MinIO, vm-provisioning, developer-smoke |
 | [REP-5 #149](https://github.com/zeshaq/opp-full-plat/issues/149) — `make new-site` generator | OPEN (Phase 1) | `Makefile` + `scripts/new-site.py` + `templates/issues/r-chain/` R0-R6 |
-| [REP-5.2/3/4/5 #238/#239/#240/#242](https://github.com/zeshaq/opp-full-plat/issues/238) | OPEN | L0-L7 / PCI / FG+DH chains + GitHub Projects v2 GraphQL |
+| [REP-5.2/3/4/5 #238/#239/#240/#242](https://github.com/zeshaq/opp-full-plat/issues/238) | OPEN (active) | L-chain (#238), PCI-chain (#239), FG-DH-chain (#240) issue templates progressing; GitHub Projects v2 GraphQL integration (#242) wired so `make new-site` populates the project board |
 | [REP-6 #150](https://github.com/zeshaq/opp-full-plat/issues/150) — notes → runbooks | **CLOSED** | 5 operator notes migrated to `runbooks/*` + `connection-details/signoz.md` |
 | [REP-7 #151](https://github.com/zeshaq/opp-full-plat/issues/151) — dry-run rebuild | OPEN (BLOCKED — proof gate) | Comment listing preconditions |
 
@@ -169,7 +169,9 @@ A `scripts/validate-profile.py` exists and passed 295/295 checks against the dc-
 
 The three operator handoff docs (`platform-admin-handoff.md`, `gitlab-operator-guide.md`, `compliance-implementor-handbook.md`) were converted into Jinja-style `.j2` templates with `{{ profile.* }}` references. A `scripts/render-handoffs.py` reads the profile and renders site-specific markdown into `environments/<site>/rendered/`.
 
-Phase-1 acceptance: render the templates against `dc-lab/profile.yaml` and diff against today's checked-in handoff docs. The diff must be empty (or only cosmetic whitespace). This was achieved. Remaining work in REP-2.1: `RUNBOOK.md` + the per-service connection-details docs (`nexus.md`, `jenkins.md`, `minio.md`, `vault-app-secrets.md`, etc.) still need conversion.
+Phase-1 acceptance: render the templates against `dc-lab/profile.yaml` and diff against today's checked-in handoff docs. The diff must be empty (or only cosmetic whitespace). This was achieved.
+
+REP-2.1 (#241) is now in flight: eight more handoff/connection-details documents have been converted to `.j2` templates with `\{\{ profile.* \}\}` references and render byte-clean against the unified dc-lab profile. `RUNBOOK.md` remains the last large conversion target; the per-service connection-details docs (`nexus.md`, `jenkins.md`, `minio.md`, `vault-app-secrets.md`, and the rest) that haven't already been converted are mechanical follow-ups against the same render pipeline.
 
 ## REP-2.2 — profile unification (closed)
 
@@ -178,23 +180,23 @@ REP-1 and REP-2 each landed *a different* `profile.yaml` for dc-lab:
 - REP-1 canonical at `plans/disconnected-rebuild/environments/dc-lab/profile.yaml` — 432 lines, flat `operators` list, `top_level_groups` / `subgroups` split, validated by `scripts/validate-profile.py`.
 - REP-2 handoff at `environments/dc-lab/profile.yaml` — 223 lines, superset shape with `gitops`, `governance`, `image_supply_reports` sections.
 
-Two YAMLs for the same site = drift trap. REP-2.2 unified them at `environments/<site>/profile.yaml` as the canonical path, extending the REP-1 schema to absorb REP-2's extra sections. The old path was retired with a deprecation note.
+Two YAMLs for the same site = drift trap. REP-2.2 unified them at `environments/<site>/profile.yaml` as the canonical path, extending the REP-1 schema to absorb REP-2's extra sections; the dc-lab profile was migrated into the unified schema. The old path was retired with a deprecation note.
 
-## REP-3 — GitLab content bootstrap (open, Phase 1)
+## REP-3 — GitLab content bootstrap (open, Phase 2)
 
 The GitLab operator guide describes the target federated structure (groups, role groups, repos, runners, branch protection, CODEOWNERS). Without automation, new sites would have to click through GitLab UI for hours and likely diverge.
 
-Phase-1 delivered:
+Phase-1 delivered the design + scaffold:
 
 - `plans/disconnected-rebuild/gitlab-bootstrap-design.md` — the design.
 - `terraform/gitlab-bootstrap/` — Terraform module skeleton using the `gitlabhq/gitlab` provider.
 - `scripts/gitlab/render-codeowners.py` — Python helper that renders CODEOWNERS files per repo from the profile's `repo_role_map`.
 
-Open sub-issues:
+Phase-2 (active) is the actual Terraform bootstrap module:
 
-- [REP-3.2 #235](https://github.com/zeshaq/opp-full-plat/issues/235) — role groups + project shares + branch protection via Terraform.
-- [REP-3.3 #236](https://github.com/zeshaq/opp-full-plat/issues/236) — runner registration token generation + Vault storage.
-- [REP-3.4 #237](https://github.com/zeshaq/opp-full-plat/issues/237) — full repo seeding (infra-ops, platform-services, tenant-registry, divisions).
+- [REP-3.2 #235](https://github.com/zeshaq/opp-full-plat/issues/235) — the GitLab Terraform bootstrap module landed: top-level groups + 11 `ct-*` role groups + group share permissions + project-level branch protection are now declarable from the profile.
+- [REP-3.3 #236](https://github.com/zeshaq/opp-full-plat/issues/236) — runner-token helper landed: generates GitLab runner registration tokens and writes them to Vault so the planned runner classes can be brought up against the same custody path the rest of the framework uses.
+- [REP-3.4 #237](https://github.com/zeshaq/opp-full-plat/issues/237) — full repo seeding (infra-ops, platform-services, tenant-registry, divisions) is the remaining gap before a new site can stand up its GitLab content end-to-end from the profile.
 
 ## REP-4 — scripts/rebuild profile-aware refactor (open, Phase 1)
 
@@ -206,7 +208,7 @@ Phase-1 reference refactors:
 - `scripts/rebuild/minio/configure-ci-evidence-bucket.sh` — converted.
 - `scripts/rebuild/edge-dns/setup-haproxy-rke2.sh` — converted.
 
-Smoke test `scripts/rebuild/lib/test-profile-lib.sh` passes 11/11. The remaining ~22 scripts are tracked under [REP-4.2 #244](https://github.com/zeshaq/opp-full-plat/issues/244) as a mechanical pass.
+Smoke test `scripts/rebuild/lib/test-profile-lib.sh` passes 11/11. [REP-4.2 #244](https://github.com/zeshaq/opp-full-plat/issues/244) — the mechanical pass over the remaining `scripts/rebuild/*` — is **closed**. The refactor pattern is now uniform across Nexus, Jenkins, Vault, SigNoz, DefectDojo, Monitoring, docker-runtime, WSO2, Trivy, edge-DNS, MinIO, vm-provisioning, and developer-smoke. Every script reads its site-specifics from `profile.yaml` via `lib/profile.sh`; no hardcoded constants or `pwd`-local files remain.
 
 ## REP-5 — make new-site generator (open, Phase 1)
 
@@ -220,12 +222,12 @@ Phase-1 delivered:
 - `scripts/new-site.py` — the generator.
 - `templates/issues/r-chain/` — R0–R6 issue bodies as templates.
 
-Open sub-issues:
+Open sub-issues (active):
 
-- [REP-5.2 #238](https://github.com/zeshaq/opp-full-plat/issues/238) — L0-L7 chain templates.
-- [REP-5.3 #239](https://github.com/zeshaq/opp-full-plat/issues/239) — PCI-0..PCI-5 chain templates.
-- [REP-5.4 #240](https://github.com/zeshaq/opp-full-plat/issues/240) — FG-0..FG-6 + DH chain templates.
-- [REP-5.5 #242](https://github.com/zeshaq/opp-full-plat/issues/242) — GitHub Projects v2 GraphQL integration.
+- [REP-5.2 #238](https://github.com/zeshaq/opp-full-plat/issues/238) — L-chain (L0-L7) issue templates progressing; each layer the framework defines now has an issue body template the generator can populate.
+- [REP-5.3 #239](https://github.com/zeshaq/opp-full-plat/issues/239) — PCI-chain (PCI-0..PCI-5) issue templates progressing, modeled on the closed dc-lab PCI chain.
+- [REP-5.4 #240](https://github.com/zeshaq/opp-full-plat/issues/240) — FG-DH-chain (FG-0..FG-6 + DH-1..DH-9) issue templates progressing.
+- [REP-5.5 #242](https://github.com/zeshaq/opp-full-plat/issues/242) — GitHub Projects v2 GraphQL integration wired so `make new-site` creates the milestone, the project board with a custom Status field, and links every generated phase issue onto the board as one batched operation.
 
 ## REP-6 — memory → runbooks (closed)
 
@@ -273,7 +275,7 @@ Success criteria:
 - Developer pipeline did one round-trip: GitLab → Jenkins → Trivy → Nexus → docker-runtime → MinIO evidence.
 - **Zero ad-hoc lookups** during execution; every step traceable to a checked-in artifact.
 
-REP-7 is **blocked on:** REP-2.1 (remaining handoffs), REP-3.2/3.3/3.4 (full GitLab bootstrap), REP-4.2 (remaining scripts), REP-5.2/3/4/5 (remaining chain templates), AND test infrastructure availability.
+REP-7 is **blocked on:** REP-2.1 (remaining handoffs + RUNBOOK), REP-3.4 (full repo seeding; REP-3.2 + REP-3.3 are landed), REP-5.2/3/4/5 (remaining chain template content + Projects v2 end-to-end validation), AND test infrastructure availability. REP-4.2 is no longer a blocker.
 
 ## Hub + spoke site-replication strategy
 
@@ -325,10 +327,10 @@ Current status: **single Central on hub-dc-v6 covering the v6 fleet.** Replicate
 | --- | --- | --- |
 | Profile schema (REP-1) | Yes | Schema covers all observed sections (REP-2.2 unified); no known gaps |
 | Profile validation (`validate-profile.py`) | Yes | 295/295 PASS on dc-lab |
-| Handoff rendering (REP-2 Phase 1) | Yes for 3 handoffs | REP-2.1: RUNBOOK.md + per-service connection-details |
-| GitLab bootstrap automation | Design + module skeleton | Full TF modules (REP-3.2/3.3/3.4) |
-| `scripts/rebuild/` profile-aware | Pattern + 3 refactors | Remaining ~22 scripts (REP-4.2) |
-| `make new-site` | Skeleton + R-chain templates | L/PCI/FG+DH chains; GitHub Projects v2 (REP-5.2-5.5) |
+| Handoff rendering (REP-2 Phase 1) | Yes for 3 handoffs | REP-2.1: +8 docs converted; RUNBOOK.md still pending |
+| GitLab bootstrap automation | Design + module skeleton + Terraform bootstrap module + runner-token helper | Full repo seeding (REP-3.4) |
+| `scripts/rebuild/` profile-aware | Pattern + all scripts refactored (REP-4.2 closed) | none |
+| `make new-site` | Skeleton + R-chain templates + L/PCI/FG-DH chains + Projects v2 GraphQL integration in flight | Final chain template content + cross-link validation |
 | Memory → runbooks migration | Yes | none |
 | End-to-end proof | no | REP-7 dry-run rebuild on test infra |
 | MinIO replication | n/a | Forward-looking; requires DR |
@@ -337,13 +339,14 @@ Current status: **single Central on hub-dc-v6 covering the v6 fleet.** Replicate
 
 ## Where the work continues
 
-Next visible chunks (per REP-0 status, post-Wave 3):
+Next visible chunks (per REP-0 status, post-Wave 3, current as of 2026-05-12):
 
-1. **REP-2.1** — close out remaining handoff/connection-details parameterization. Mostly mechanical.
-2. **REP-3.2 → 3.3 → 3.4** — complete the GitLab bootstrap Terraform; this is the second-largest remaining body of work.
-3. **REP-4.2** — mechanical refactor of the remaining `scripts/rebuild/*` to consume the profile. The pattern + helpers exist; this is "apply the pattern to each script."
-4. **REP-5.2 / 5.3 / 5.4 / 5.5** — fill out the chain templates and wire the Projects v2 GraphQL integration so `make new-site` produces a fully-populated project board.
-5. **Test infra** — REP-7 needs hardware. Could be budget-friendly Proxmox or cloud VMs.
+1. **REP-2.1** — finish `RUNBOOK.md` parameterization and the last connection-details holdouts. Eight more handoff docs have already been templated; the remaining work is mostly the long `RUNBOOK`.
+2. **REP-3.4** — full repo seeding (infra-ops, platform-services, tenant-registry, divisions). The Terraform bootstrap module (REP-3.2) and runner-token helper (REP-3.3) are in. Seeding is the last gap before the GitLab content layer is reproducible end-to-end.
+3. **REP-5.2 / 5.3 / 5.4 / 5.5** — finalize the chain template content (L, PCI, FG-DH) and validate the Projects v2 GraphQL integration end-to-end against a throwaway milestone.
+4. **Test infra** — REP-7 needs hardware. Could be budget-friendly Proxmox or cloud VMs.
+
+REP-4.2 is now closed, which removes one of REP-7's gating dependencies.
 
 REP-0 itself remains open as the long-running parent issue.
 

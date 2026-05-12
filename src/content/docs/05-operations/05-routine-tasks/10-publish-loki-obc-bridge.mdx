@@ -1,0 +1,231 @@
+---
+title: "Publish the Loki OBC -> operand Secret bridge"
+description: "Backport the Tempo bridge pattern (MR !43) to LokiStack: ExternalSecret + Kubernetes-provider SecretStore that templates the lowercase-key Secret LokiStack expects (endpoint, bucketnames, access_key_id, access_key_secret) from the NooBaa OBC's AWS_*-keyed Secret. Tracked under issue #233."
+sidebar_label: "Loki OBC bridge"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page is the routine-task wrapper for the Loki backport of the [OBC -> operand Secret bridge](/docs/05-operations/04-incidents-and-runbooks/05-obc-operand-secret-bridge) pattern. The Tempo equivalent lives at `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml` and landed via `!43`; the Loki version is tracked under issue #233 and is the routine "land this MR" the operator runs once. After the bridge is in place, LokiStack moves out of `Warning Degraded` and the in-cluster S3 reads / writes start succeeding.
+
+If you arrived here because LokiStack is in `Warning Degraded` with a missing-keys message, the incident page is [OBC -> operand Secret bridge](/docs/05-operations/04-incidents-and-runbooks/05-obc-operand-secret-bridge); this routine task is the GitOps MR that ships the fix.
+
+## When to run this
+
+- **Issue #233 is open and assigned.** The Loki backport is the open follow-up from the Tempo pattern landing.
+- **A new OBC consumer is added** that expects the lowercase-key Secret shape (`endpoint`, `bucketnames`, `access_key_id`, `access_key_secret`). The same bridge template covers any future consumer.
+- **The OBC was recreated.** A bucket-deletion-and-recreate cycle invalidates the previous OBC's AWS keys; the ExternalSecret refreshes automatically on the next interval, but a manual force-sync shortens the recovery window.
+
+This task is not appropriate for Quay — Quay uses its own config-bundle Secret format (`quay-config-bundle-secret` with a `config.yaml` field). The bridge pattern covers LokiStack and TempoStack only.
+
+## Prerequisites
+
+1. **NooBaa OBC for Loki already exists.** Confirm:
+
+   ```bash
+   K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+   oc --kubeconfig "$K" -n openshift-logging get objectbucketclaim
+   ```
+
+   Expected: a `Bound` OBC named `loki-storage` (or the convention name for the LokiStack instance). If the OBC does not exist, create it first per the LokiStack operator's storage section — bridge before bucket is meaningless.
+
+2. **OBC's `spec.bucketName` is set explicitly.** Without it, NooBaa auto-prefixes a UUID and the templated Secret's hardcoded bucket name will not match:
+
+   ```bash
+   oc --kubeconfig "$K" -n openshift-logging get objectbucketclaim loki-storage \
+     -o jsonpath='{.spec.bucketName}{"\n"}'
+   ```
+
+   Expected: a value like `loki-storage` (matching the OBC name). If empty, edit the OBC to set it before bridging.
+
+3. **MR rights on `platform-gitops`** and a working `platform-gitops` clone at `/home/ze/ops-workspace/clones/platform-gitops`.
+
+4. **A GitHub issue** — reuse #233 — and a branch under that issue: `policy/loki-obc-bridge-#233`.
+
+## Procedure
+
+Three steps: land the YAML, point LokiStack at the templated Secret, validate.
+
+### Step 1 — Add the bridge resources to platform-gitops
+
+Create `clusters/spoke-dc-v6/platform-services/logging/externalsecret-loki-storage.yaml` mirroring the Tempo pattern at `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml`. Four resources land together:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eso-obc-reader
+  namespace: openshift-logging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eso-obc-reader
+  namespace: openshift-logging
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    resourceNames: ["loki-storage"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eso-obc-reader
+  namespace: openshift-logging
+subjects:
+  - kind: ServiceAccount
+    name: eso-obc-reader
+    namespace: openshift-logging
+roleRef:
+  kind: Role
+  name: eso-obc-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: obc-loki-storage
+  namespace: openshift-logging
+spec:
+  provider:
+    kubernetes:
+      remoteNamespace: openshift-logging
+      server:
+        caProvider:
+          type: ConfigMap
+          name: kube-root-ca.crt
+          key: ca.crt
+          namespace: openshift-logging
+      auth:
+        serviceAccount:
+          name: eso-obc-reader
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: loki-storage
+  namespace: openshift-logging
+spec:
+  refreshInterval: "5m"
+  secretStoreRef:
+    kind: SecretStore
+    name: obc-loki-storage
+  target:
+    name: loki-storage
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        endpoint: "https://s3.openshift-storage.svc"
+        bucketnames: "loki-storage"
+        access_key_id: "{{ .access_key_id }}"
+        access_key_secret: "{{ .access_key_secret }}"
+  data:
+    - secretKey: access_key_id
+      remoteRef:
+        key: loki-storage
+        property: AWS_ACCESS_KEY_ID
+    - secretKey: access_key_secret
+      remoteRef:
+        key: loki-storage
+        property: AWS_SECRET_ACCESS_KEY
+```
+
+Four critical details, all matching the Tempo pattern:
+
+- **Lowercase keys in the templated Secret** — `endpoint`, `bucketnames`, `access_key_id`, `access_key_secret`. LokiStack's storage-Secret schema is lowercase; the OBC's Secret is `AWS_*`-keyed. The bridge does the translation.
+- **`endpoint` is hardcoded** to `https://s3.openshift-storage.svc` (the in-cluster NooBaa S3 service). The ESO Kubernetes provider can only read from Secrets, not ConfigMaps, so `BUCKET_HOST` from the OBC's ConfigMap cannot be pulled in via a `data:` reference.
+- **`bucketnames` is hardcoded** to `loki-storage` (matching the OBC's `spec.bucketName`). The deterministic name is what makes the template work; if the OBC autogenerates a UUID-prefixed bucket, this Secret points at the wrong bucket.
+- **`creationPolicy: Owner`** so the templated Secret is owned by the ExternalSecret — Argo CD reconcile does not fight ESO over the Secret.
+
+Add the kustomize directory to its parent `kustomization.yaml`:
+
+```yaml
+resources:
+  - logging/lokistack.yaml
+  - logging/externalsecret-loki-storage.yaml
+```
+
+Commit, push, open the MR.
+
+### Step 2 — Point LokiStack at the templated Secret
+
+In the same MR (or a follow-up MR if the LokiStack lives in a different overlay), update the LokiStack CR's `spec.storage.secret.name` to reference the templated Secret:
+
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: lab
+  namespace: openshift-logging
+spec:
+  storage:
+    secret:
+      name: loki-storage
+      type: s3
+```
+
+Note: the storage-Secret name (`loki-storage`) is the templated Secret created by ExternalSecret, not the OBC's own Secret. Both happen to share the same name in this convention, which is convenient — `creationPolicy: Owner` plus matching names mean the templated Secret replaces the OBC's Secret view at the operand's reference point.
+
+### Step 3 — Validate after the MR merges
+
+```bash
+K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-gitops get application <loki-app> \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+oc --kubeconfig "$K" -n openshift-logging get externalsecret loki-storage \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+
+oc --kubeconfig "$K" -n openshift-logging get secret loki-storage -o yaml \
+  | grep -E '^\s+(endpoint|bucketnames|access_key_id|access_key_secret):'
+
+oc --kubeconfig "$K" -n openshift-logging get lokistack \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+```
+
+Expected:
+
+- Argo CD reports `Synced Healthy` for the Loki application.
+- ExternalSecret `loki-storage` reports `Ready=True`.
+- The templated Secret holds the four lowercase keys.
+- LokiStack reports `Ready=True` and no longer shows the `Warning Degraded` `missing keys` condition.
+
+Then push a test log line and confirm it lands:
+
+```bash
+oc --kubeconfig "$K" -n openshift-logging logs deploy/lokistack-gateway --tail=20
+```
+
+Expected: queries and writes succeed; no `403 Forbidden` or `NoSuchBucket` errors.
+
+## Verification
+
+The backport is complete when ALL of these are true:
+
+1. The MR is merged on `platform-gitops` and references issue #233.
+2. Argo CD reports `Synced/Healthy` for the Loki application.
+3. The ExternalSecret `loki-storage` reports `Ready=True`.
+4. The templated Secret holds `endpoint`, `bucketnames`, `access_key_id`, `access_key_secret`.
+5. LokiStack moves out of `Warning Degraded` and reports `Ready=True`.
+6. A log line written via the gateway is queryable from the LogQL UI within a minute.
+7. Issue #233 is closed with the MR link, the validation evidence, and a cross-link to the Tempo pattern at `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml`.
+
+## Forbidden actions
+
+- **Do NOT change the OBC's bucket name after the bridge has shipped.** The templated Secret hardcodes the name; renaming the bucket invalidates the bridge. If the bucket must change, update the ExternalSecret template's `bucketnames` and the OBC's `spec.bucketName` in the same MR.
+- **Do NOT point LokiStack at the OBC's own Secret** thinking the AWS_*-keyed shape will work. LokiStack rejects it as a `missing keys` error — the whole reason this bridge exists.
+- **Do NOT pull `BUCKET_HOST` from the OBC's ConfigMap** by adding a second `data:` entry. The ESO Kubernetes provider does not read ConfigMaps; the workaround is the hardcoded `endpoint: https://s3.openshift-storage.svc` value.
+- **Do NOT use `ClusterSecretStore`.** The bridge is namespace-scoped on purpose — the SecretStore lives in `openshift-logging` and only reads Secrets in that namespace.
+- **Do NOT delete the OBC's auto-created Secret** thinking it is redundant. ESO's source data comes from that Secret; deleting it breaks the bridge until the OBC controller recreates it.
+
+## References
+
+- [OBC -> operand Secret bridge](/docs/05-operations/04-incidents-and-runbooks/05-obc-operand-secret-bridge) — the incident page that explains the why.
+- `clusters/spoke-dc-v6/platform-services/tracing/externalsecret-tempo-storage.yaml` — the working Tempo pattern this page backports.
+- Issue #233 — the open Loki backport.
+- MR `!43` on `platform-gitops` — the Tempo bridge landing.
+- `opp-full-plat/connection-details/openshift-spoke-dc-v6.md` ODF section — OBC inventory and the `spec.bucketName` convention.
+- LokiStack and TempoStack API docs (Red Hat OpenShift Logging / Tracing).

@@ -1,0 +1,84 @@
+---
+title: "REPRO-HUB-1 — Hub Adoption Into GitOps"
+description: "How REPRO-HUB-1 (#155, MR !12) closed the silent-hub-operators gap — and REPRO-HUB-2 (#137) pinned the hub catalog sources to digests — so hub-dr-v6 will derive from the same source as hub-dc-v6."
+sidebar_label: "REPRO-HUB-1 Hub Adoption"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+`hub-dc-v6` was installed on 2026-05-09 with a small fleet of operators wired by hand on day-1: `cluster-logging`, the OpenShift GitOps operator, the ACM operator, the cert-manager operator on the hub side, plus the image-supply plumbing (`ImageDigestMirrorSet`, `ImageTagMirrorSet`, `CatalogSource` overrides). These were installed live to get the hub functional, then development moved on. They were never declared in `platform-gitops`. Any future `hub-dr-v6` would have had to *re-discover* what was installed by reading the live `hub-dc-v6` cluster — a brittle, error-prone, undocumented starting point.
+
+REPRO-HUB-1 ([issue #155](https://github.com/zeshaq/opp-full-plat/issues/155), MR `!12`) closed that gap by adopting 15 hub catalog/IDMS/ITMS resources into `platform-gitops`. From this point on, the management hub is reproducible from GitOps the same way the spoke has been since day-2 of the v6 install.
+
+## The problem
+
+A v6 cluster install lands with a base OCP image set, no operators, and no image-supply plumbing. The 2026-05-09 hub install therefore required immediate hand-applied resources to make anything else work:
+
+| Layer | Purpose | Manifests touched |
+| --- | --- | --- |
+| `IDMS` / `ITMS` | Rewrite every operand image pull from upstream to the lab's Nexus mirror (ADR 0019) | One IDMS + one ITMS per logical image source — release, operator, RHACM, cert-manager, etc. |
+| Default `CatalogSource` disable | The default Red Hat catalog sources point to upstream registries unreachable from the disconnected cluster | A single `OperatorHub` patch disabling all the upstream defaults |
+| Replacement `CatalogSource` set | Point Operator Lifecycle Manager at the Nexus-mirrored operator index | One `CatalogSource` per index (Red Hat / Certified / Community) |
+| Operator queue | Day-1 hub operators — GitOps, ACM, cert-manager hub-side, cluster-logging | One `Subscription` + `OperatorGroup` per operator |
+
+Per the 2026-05-09 baseline session (`hub-dc-v6-disconnected-catalog-baseline`), the master MCP had to roll once after the IDMS/ITMS applied before the cluster would pull anything correctly. That happened. Operators then installed cleanly. The problem wasn't *whether* it worked — it worked fine — the problem was that the manifests that made it work lived in someone's shell history and in the live cluster, not in `platform-gitops`.
+
+This is the same kind of silent-state-on-the-cluster pattern ADR 0018 explicitly rejects for the spoke. The spoke is fully GitOps because the spoke runs the application workload — drift there is operationally expensive. The hub, by contrast, had been allowed to carry silent state because "it's just the management plane, we rebuild it rarely." That logic doesn't survive contact with a DR drill: when `hub-dr-v6` gets built, somebody has to know exactly what to apply.
+
+## The remediation — REPRO-HUB-1
+
+[Issue #155](https://github.com/zeshaq/opp-full-plat/issues/155) created the work. MR `!12` against `platform-gitops` adopted 15 hub resources into the GitOps tree under `clusters/hub-dc-v6/platform/`:
+
+- `clusters/hub-dc-v6/platform/catalogs/` — the disabled-default `OperatorHub` patch plus the Nexus-pointed `CatalogSource` set.
+- `clusters/hub-dc-v6/platform/image-mirrors/` — the `IDMS` + `ITMS` set covering release images, operator images, RHACM, cert-manager, OpenShift GitOps, cluster-logging, and the day-1 hub operator surface.
+
+The acceptance test is the one that matters: after MR `!12` merged and the hub Argo app reconciled, the hub still pulled images the same way (no churn), the same operators were `Succeeded`, and the live cluster state diff-matched the GitOps desired state with no drift. The hub catalog/image-supply layer is now declarative.
+
+For the day-1 operators themselves (GitOps operator, ACM, cert-manager, cluster-logging), the adoption pattern follows the same shape — every install MR that lands a new hub operator goes through `platform-gitops` from now on. The 2026-05-10 wave of seven operators that landed on the spoke + hub used that pattern; REPRO-HUB-1 is what made it possible to ship them through GitOps on the hub side without losing the day-1 baseline.
+
+## The complement — REPRO-HUB-2
+
+[Issue #137](https://github.com/zeshaq/opp-full-plat/issues/137) is the sibling work: digest-pin every `CatalogSource` and `ClusterCatalog` on the hub. Tag-based references (`:v4.18`, `:latest`, `:stable`) drift silently when the upstream re-pushes the same tag — meaning a hub rebuild against a `CatalogSource` referenced by tag could end up with a different operator index than the original install consumed.
+
+REPRO-HUB-2 replaced every tag reference with a `sha256:…` digest. Concretely:
+
+- Every `CatalogSource.spec.image` is a digest.
+- Every `ClusterCatalog.spec.source.image.ref` (Operator Lifecycle Manager v1 surface) is a digest.
+- The digest values are pinned to the exact image manifest produced by the most recent `oc-mirror` run that populated the Nexus mirror.
+
+The pairing is the point: REPRO-HUB-1 declares the resources; REPRO-HUB-2 guarantees the resources point at deterministic image content. Together, a `hub-dr-v6` install can pull the same `platform-gitops` revision against the same Nexus mirror state and produce the same operator queue, byte-identical.
+
+## Implication — hubs are now reproducible
+
+The replicability story for the v6 fleet, after REPRO-HUB-1 and REPRO-HUB-2:
+
+| Cluster role | Reproducible from GitOps? | Source of truth |
+| --- | --- | --- |
+| `spoke-dc-v6` workload + day-2 | yes (since 2026-05-09) | `platform-gitops` cluster directory + ACM pull model |
+| `hub-dc-v6` day-1 image supply + catalogs | yes (since REPRO-HUB-1) | `clusters/hub-dc-v6/platform/{catalogs,image-mirrors}/` |
+| `hub-dc-v6` day-1 operators | yes (incremental) | `platform-gitops` ApplicationSet of hub operator MRs |
+| `hub-dc-v6` cert-manager + ACM Hub | yes | `platform-gitops` |
+| `hub-dr-v6` (when built) | derives from the same source | reuses everything above against a different cluster name |
+
+The hub-dr-v6 cluster does not exist today. The whole point of REPRO-HUB-1 + REPRO-HUB-2 is that when it gets built, the operator path is "stand up a 3-node compact OCP, register it to the same `platform-gitops` revision, point it at the same Nexus mirror, watch the Argo bootstrap reconcile the same set of resources." That's the same path as the spoke. The silent-cluster-state assumption has been retired.
+
+## Where it slots into the framework
+
+| Site-replication layer (REP-0) | Pre-REPRO-HUB-1 state | Post-REPRO-HUB-1 state |
+| --- | --- | --- |
+| L3 OpenShift install | Manual agent install; live-applied catalog baseline | Manual agent install; catalog baseline applied via GitOps reconcile |
+| L4 Day-2 OpenShift platform | Spoke fully GitOps; hub partially GitOps with silent live state | Hub + spoke fully GitOps |
+| L5 Operator queue | Spoke through GitOps; hub day-1 ops live-applied | Hub + spoke both go through `platform-gitops` MRs |
+
+The remaining manual step at L3 — running the agent installer against the prepared agent ISO — is the only piece that doesn't yet reconcile. That's the install gate itself, not a drift trap.
+
+## References
+
+- [Issue #155](https://github.com/zeshaq/opp-full-plat/issues/155) — REPRO-HUB-1 adopt hub-dc-v6 catalog/IDMS/ITMS into platform-gitops
+- [Issue #137](https://github.com/zeshaq/opp-full-plat/issues/137) — REPRO-HUB-2 digest-pin hub CatalogSource and ClusterCatalog
+- `platform-gitops` MR `!12` — REPRO-HUB-1 adoption MR
+- `platform-gitops` paths: `clusters/hub-dc-v6/platform/catalogs/`, `clusters/hub-dc-v6/platform/image-mirrors/`
+- ADR 0018 — ACM + OpenShift GitOps pull model (why hub has its own Argo)
+- ADR 0019 — Nexus-only image supply baseline (why every reference goes through `app-registry` / `mirror-registry` / `docker-group`)
+- ADR 0022 — v6 fleet membership (which clusters are in scope, including the reserved `hub-dr-v6` name)
+- [Day-Wrap 2026-05-10 (Issue #159)](https://github.com/zeshaq/opp-full-plat/issues/159) — the day REPRO-HUB-1 was called out in the roll-up

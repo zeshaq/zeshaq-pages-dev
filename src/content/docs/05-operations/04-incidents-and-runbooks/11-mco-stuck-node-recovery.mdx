@@ -1,0 +1,213 @@
+---
+title: "MCO stuck-node recovery (desiredConfig annotation patch)"
+description: "When a bad MachineConfig has been reverted but MCO's max-unavailable safety guard refuses to roll an already-unavailable node, a one-line desiredConfig annotation patch per stuck node unsticks the drain -> apply -> reboot cycle."
+sidebar_label: "MCO stuck-node recovery"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page is the procedural companion to the [IPv6 disable / OVN-K incident (#135)](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn): the recovery method for unsticking a node that is `Ready=False` after a bad MachineConfig rollout, when the source MachineConfig has already been reverted in GitOps but MCO is refusing to roll the affected node back to the new rendered config. The pattern recurs anywhere an MC rollout leaves a node unavailable before MCO's max-unavailable count permits the next reconcile.
+
+The fix is a one-line annotation patch per stuck node. Drain -> apply -> reboot then proceeds normally.
+
+## Symptom
+
+All of the following are true together:
+
+1. A MachineConfig change was rolled out and left one or more nodes `Ready=False` (or `Ready=True` with persistent application-layer failure caused by the config change, such as `ovnkube-node` `CrashLoopBackOff`).
+2. The triggering MachineConfig has been reverted in GitOps and the revert has merged.
+3. The owning `MachineConfigPool`'s `.spec.configuration.name` reflects the new (post-revert) rendered config name.
+4. The affected nodes' `machineconfiguration.openshift.io/desiredConfig` annotation still points at the OLD (bad) rendered config name, and no `oc get mcp` event indicates MCO is trying to roll them.
+5. The MachineConfigPool is NOT `Degraded`, and the render controller shows no error in the MCO controller log.
+
+If the MachineConfigPool is `Degraded`, fix the upstream cause first (render-controller failure, conflicting MachineConfigs, unsatisfiable selector). This page only addresses the safety-guard-refuses-to-roll case.
+
+Diagnostic that pinpoints the cause:
+
+```bash
+K=/home/ze/.kube/configs/<cluster>.kubeconfig
+oc --kubeconfig "$K" get nodes \
+  -o custom-columns=\
+NAME:.metadata.name,\
+ROLE:.metadata.labels.node-role\.kubernetes\.io/worker,\
+READY:.status.conditions[?(@.type=="Ready")].status,\
+CURRENT:.metadata.annotations.machineconfiguration\.openshift\.io/currentConfig,\
+DESIRED:.metadata.annotations.machineconfiguration\.openshift\.io/desiredConfig
+```
+
+A stuck node shows `READY=False` (or unhealthy app-layer symptoms) with `CURRENT == DESIRED` pointing at the OLD rendered config name.
+
+## Root cause
+
+MCO has a max-unavailable safety guard. When a node is already `Ready=False`, the controller declines to update its `desiredConfig` because the per-pool unavailable count is already at the guard's ceiling — rolling the unhealthy node could push it over. The `MachineConfigPool` `.spec.configuration.name` moves forward to the new (good) rendered config, but the unhealthy node is left pointing at the old one.
+
+Result: the node sits permanently with the OLD `currentConfig == desiredConfig`, while every other node in the pool happily rolls to the new config. The pool reports the right desired state; the stuck node never gets the message.
+
+The one-line annotation patch overrides the safety guard for the stuck node. MCD on the node reads the new `desiredConfig`, detects the disruption type (`kargs:true`, `files:true`), and runs the drain -> apply -> reboot cycle. Once the node returns `Ready`, MCO's max-unavailable count drops back below the guard and normal reconciliation resumes.
+
+## Fix
+
+Patch one node at a time. Concurrent patches risk pushing the pool over its max-unavailable count and triggering a second class of failure.
+
+### Pre-action checklist
+
+1. **Identify the new (good) rendered-config name** for the owning pool:
+
+   ```bash
+   oc --kubeconfig "$K" get mcp <pool> \
+     -o jsonpath='{.spec.configuration.name}{"\n"}'
+   ```
+
+   This is the value the stuck node's `desiredConfig` annotation needs to be patched to.
+
+2. **Confirm the pool is NOT `Degraded`:**
+
+   ```bash
+   oc --kubeconfig "$K" get mcp <pool> \
+     -o jsonpath='{.status.conditions[*].type}{"\n"}{.status.conditions[*].status}{"\n"}'
+   ```
+
+   `Degraded=False` is required. If `Degraded=True`, abort and investigate the render-controller log:
+
+   ```bash
+   oc --kubeconfig "$K" -n openshift-machine-config-operator \
+     logs deploy/machine-config-controller --tail=200
+   ```
+
+3. **Confirm MCD is reachable on the stuck node:**
+
+   ```bash
+   oc --kubeconfig "$K" -n openshift-machine-config-operator get pods \
+     -o wide | grep <stuck-node>
+   ```
+
+   The `machine-config-daemon-<...>` pod for the stuck node must be `Running`. If it is not, this page does not apply — see [Console / SSH fallback](#console--ssh-fallback) below.
+
+4. **Open or update the incident issue** with stuck-node names, old vs new rendered-config names, and pool `Degraded` status. This becomes the audit record.
+
+### Action steps
+
+For each stuck node, in series:
+
+1. **Capture starting state** for audit:
+
+   ```bash
+   mkdir -p /tmp/mco-recovery-$(date -u +%Y%m%dT%H%M%SZ)
+   D=/tmp/mco-recovery-*
+   oc --kubeconfig "$K" get node <stuck-node> -o yaml > $D/before-<stuck-node>.yaml
+   oc --kubeconfig "$K" get mcp <pool> -o yaml > $D/before-mcp-<pool>.yaml
+   ```
+
+2. **Apply the annotation patch:**
+
+   ```bash
+   TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   GOOD=$(oc --kubeconfig "$K" get mcp <pool> \
+     -o jsonpath='{.spec.configuration.name}')
+   echo "$TS actor=$USER node=<stuck-node> desiredConfig=$GOOD" \
+     | tee -a $D/commands.log
+   oc --kubeconfig "$K" annotate node <stuck-node> \
+     machineconfiguration.openshift.io/desiredConfig=$GOOD \
+     --overwrite
+   ```
+
+3. **Watch the MCD pod log** — it should log `node desiredConfig changed` and begin the disruption cycle within seconds:
+
+   ```bash
+   MCD=$(oc --kubeconfig "$K" -n openshift-machine-config-operator \
+     get pods -o wide \
+     --field-selector spec.nodeName=<stuck-node> \
+     -l k8s-app=machine-config-daemon \
+     -o jsonpath='{.items[0].metadata.name}')
+   oc --kubeconfig "$K" -n openshift-machine-config-operator \
+     logs -f $MCD
+   ```
+
+   Expected sequence:
+
+   ```text
+   node <node> changed: desiredConfig -> <new-rendered-config>
+   Disruption type: <kargs|files|both>
+   Draining node <node>
+   ...
+   Applying config <new-rendered-config>
+   Rebooting node <node>
+   ```
+
+   After the reboot, MCD confirms the new `currentConfig` matches the `desiredConfig` and the node returns `Ready`.
+
+4. **Capture post-recovery state:**
+
+   ```bash
+   oc --kubeconfig "$K" get node <stuck-node> -o yaml > $D/after-<stuck-node>.yaml
+   ```
+
+5. **Repeat steps 1-4 for each remaining stuck node.** Patch one, wait for it to return `Ready`, patch the next.
+
+### Validation
+
+Recovery is complete when ALL of these are true:
+
+- `oc get nodes` shows every previously-stuck node `Ready=True`.
+- `currentConfig` and `desiredConfig` on each recovered node both point at the new (good) rendered-config name.
+- `oc get mcp <pool>` shows `UPDATED=True`, `UPDATING=False`, `DEGRADED=False`, `readyMachineCount == machineCount`.
+- Application-layer health that depended on the rollout is restored: for OVN-related rollouts, `oc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node` shows all containers `Ready` with no recent restarts.
+- Workloads that timed out during the stuck period have recovered (check the relevant pod logs for stale failure modes that need a manual restart).
+
+## Console / SSH fallback
+
+If MCD itself is unreachable on the stuck node (`CrashLoopBackOff`, unreachable kubelet, network partition), the annotation patch will not be picked up and a console-level recovery is required:
+
+1. Console into the affected node (out-of-band management or KVM).
+2. Drop to a root shell on RHEL CoreOS.
+3. Edit `/boot/loader/entries/ostree-*-rhcos.conf` to revert the kargs change manually (for `kargs:` disruption type) OR restore the previous config file from `/etc/machine-config-daemon/orig/` (for `files:` disruption type).
+4. Reboot the node manually.
+5. After the node returns `Ready`, run the annotation patch from "Action steps" to re-sync MCD's view.
+
+The console-level fallback is rare. The annotation patch covers &gt;95% of stuck-node-on-revert cases in practice.
+
+## Forbidden actions
+
+- **Do NOT patch `desiredConfig` to a rendered-config name that does NOT exist** in the cluster's `MachineConfig` list. MCD will refuse to apply it and the node remains stuck.
+- **Do NOT use `oc patch` on the rendered MachineConfig directly.** Rendered MachineConfigs are managed by the MCO controller; direct edits are reverted on the next render and break the audit chain.
+- **Do NOT skip the before/after capture.** The audit record is the evidence the recovery was clean.
+- **Do NOT patch multiple stuck nodes in parallel.** One at a time. Concurrent patches risk a second failure class.
+- **Do NOT use this procedure when the pool is `Degraded`.** Fix the render-controller cause first; the annotation patch will not help and may mask the real failure.
+- **Do NOT use this procedure to "force" a node onto a config the pool has not adopted** (to skip a problematic MachineConfig still in Git). The annotation must point at a rendered-config name the pool's `.spec.configuration.name` references; anything else gets reverted on the next render.
+
+## Example: 2026-05-10 #135 recovery
+
+Context: MR `!2` on `platform-gitops` added `ipv6.disable=1` to a master and worker MachineConfig. After the MR merged, OVN-K could not establish geneve overlay on the affected nodes (see [IPv6 disable / OVN-K](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn)) and they returned `Ready=False`.
+
+Recovery sequence on `spoke-dc-v6`:
+
+1. MR `!3` reverted the IPv6 MachineConfigs.
+2. The `master` and `worker` MachineConfigPools each updated `.spec.configuration.name` to a new rendered config within a minute of the revert merge.
+3. `spoke-dc-v6-master-1` and `spoke-dc-v6-worker-1` remained `Ready=False` with `desiredConfig` still pointing at the OLD rendered config. The MachineConfigPools were NOT `Degraded`.
+4. For each stuck node, applied the annotation patch:
+
+   ```bash
+   GOOD=$(oc get mcp master -o jsonpath='{.spec.configuration.name}')
+   oc annotate node spoke-dc-v6-master-1 \
+     machineconfiguration.openshift.io/desiredConfig=$GOOD --overwrite
+   ```
+
+5. MCD on `spoke-dc-v6-master-1` logged `node desiredConfig changed` within five seconds, ran the drain -> kargs change -> reboot cycle, and the node returned `Ready` about eight minutes later.
+6. Repeated for `spoke-dc-v6-worker-1`.
+7. Validated `ovnkube-node` pods `Ready` on all six nodes; the `ovnkube-node` CrashLoopBackOffs cleared as soon as the reverted MachineConfig was active.
+
+## Prevention
+
+The recovery procedure is itself the prevention contract — but it should run rarely. Two reinforcements:
+
+1. **MachineConfig changes land via a small canary first.** A pool of size 1 (a worker labelled for canary) absorbs the failure mode before the broader rollout. The lab has not yet wired this; tracked under #229 follow-ups.
+2. **The architectural lesson lives next door.** The IPv6 / OVN-K incident is the canonical case where MC changes break the network plugin. The [IPv6 disable / OVN-K page](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) and ADR 0026 are the standing references for what not to attempt; this page is the recovery if you attempt it anyway.
+
+## References
+
+- [IPv6 disable / OVN-K](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) — the architectural-lesson companion.
+- [Break-glass procedure](/docs/05-operations/04-incidents-and-runbooks/08-break-glass-procedure) — overall policy when this recovery has to bypass normal GitOps flow.
+- `opp-full-plat/runbooks/mco-stuck-node-recovery.md` — operator-facing source.
+- `opp-full-plat/connection-details/platform-admin-handoff.md` section "Known Gotchas From This Rebuild".
+- GitHub issue #135 (PCI-1.13) — the live incident this page was extracted from.
+- Internal GitLab MRs `!2`, `!3`, `!4`, `!7` on `comptech-platform/openshift-ops/openshift-platform-gitops`.
