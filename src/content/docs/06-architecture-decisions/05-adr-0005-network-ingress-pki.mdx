@@ -9,7 +9,7 @@ draft: false
 import Whiteboard from "../../../components/Whiteboard";
 
 **Date:** 2026-05-08
-**Status:** Accepted. *§IPv6 amended by [ADR 0026](#references) for OVN-Kubernetes clusters.*
+**Status:** Accepted. **§IPv6 superseded in part by [ADR 0026](/docs/06-architecture-decisions/22-adr-0026-ipv6-baseline-for-ovn-kubernetes)** for OVN-Kubernetes clusters — the host-kernel-disable mechanism is replaced by four verifiable invariants. The rest of this ADR (`30.30.0.0/16` machine network, PowerDNS authority, HAProxy out of OpenShift ingress, offline OpenSSL CA day-zero) remains in force.
 
 ## Context
 
@@ -110,7 +110,7 @@ The current (post-0026) rule for OVN-Kubernetes clusters is:
 
 - IPv6 stays enabled on hosts. **OVN-K needs the kernel IPv6 stack present.**
 - The four verifiable invariants are framed as *"IPv6 not used for cluster traffic"* rather than *"IPv6 not present on hosts."*
-- See [ADR 0026](#references) for the full invariant set.
+- See [ADR 0026](/docs/06-architecture-decisions/22-adr-0026-ipv6-baseline-for-ovn-kubernetes) for the full invariant set.
 
 For non-OVN-K nodes (the HAProxy edge VM, PowerDNS, Jenkins, the cluster of standalone lab service VMs), the original IPv4-only host baseline can still apply.
 
@@ -136,7 +136,7 @@ For non-OVN-K nodes (the HAProxy edge VM, PowerDNS, Jenkins, the cluster of stan
 - **Any old HAProxy console/route exposure snippets in imported scripts are historical helpers only.** They must be deleted or explicitly rewritten for non-OpenShift lab services before they ship in any current playbook.
 - **Internal OpenSSL CA material must have an offline backup and a documented rotation process** before it is used broadly. The lab does not yet have a periodic rotation drill; that drill is a separate piece of work.
 - **Public ingress requires a separate design gate** for address ownership, firewall/NAT policy, route selectors, Let's Encrypt DNS-01 automation, and certificate validation. Don't enable public exposure ad hoc.
-- **IPv6 disablement on hosts is no longer the rule for OVN-K nodes.** The OVN-K baseline (per [ADR 0026](#references)) replaces the original "disable IPv6 in host networking" line. For non-OVN-K VMs the original IPv4-only host baseline still applies.
+- **IPv6 disablement on hosts is no longer the rule for OVN-K nodes.** The OVN-K baseline (per [ADR 0026](/docs/06-architecture-decisions/22-adr-0026-ipv6-baseline-for-ovn-kubernetes)) replaces the original "disable IPv6 in host networking" line. For non-OVN-K VMs the original IPv4-only host baseline still applies.
 - **Lab memory has a guardrail** noting "HAProxy is for platform VM edge exposure only" (`feedback_haproxy_scope.md` in operator memory). Any agent or operator who proposes putting an OpenShift route behind HAProxy is reminded of this ADR.
 
 ## References

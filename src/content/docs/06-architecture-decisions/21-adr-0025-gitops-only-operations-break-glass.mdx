@@ -1,0 +1,123 @@
+---
+title: "ADR 0025 — GitOps-only operations and break-glass policy"
+description: "Normal OpenShift changes flow through GitOps. oc, console, SSH, and direct API are break-glass paths only, allowed under four named conditions, with five mandatory controls per action and a 24-hour backport clock."
+sidebar_label: "0025 — GitOps-only + break-glass"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+**Date:** 2026-05-10
+**Status:** Accepted. Operating rule for the v6 fleet under [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull) and [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops).
+
+## Context
+
+[ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) established the federated GitOps repository architecture and named Argo CD as the operational entry point for the OpenShift fleet. [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull) refined that into the ACM plus OpenShift GitOps Basic pull model for the v6 rebuild: `hub-dc-v6` coordinates ACM placement and ApplicationSet propagation, and each managed workload cluster runs OpenShift GitOps locally and reconciles its own desired state from internal GitLab.
+
+Both ADRs say that normal OpenShift changes must be GitOps-driven and that `oc`, console, SSH, and direct API mutation are break-glass paths. The platform admin handoff restates the same rule and lists acceptable break-glass examples. FG-6 in `plans/federated-gitops-readiness-gates.md` requires that every apply path records Git commit, pipeline run, actor, target, command summary, validation result, and rollback reference, and that break-glass records include an expiry/backport requirement.
+
+What was missing was a single ADR plus a concrete operator-facing runbook that closes the gap between policy statements scattered across the existing documents and an actionable procedure an on-call operator can execute without further consultation. Two failure modes motivate the policy:
+
+- **Routine drift.** An admin makes a "quick" live change with `oc edit` or the console, never opens an MR, Argo CD overwrites the live state on next sync, and the original fix is lost — or worse, a sync war begins.
+- **Untracked emergency change.** An incident is resolved by a live mutation that is never backported, never expires, and is invisible to the next reviewer or auditor. The cluster state diverges from Git silently.
+
+GitOps-only is not a coding-style preference. It is the only mechanism that keeps cluster state, audit evidence, and rollback paths coherent across `hub-dc-v6`, `spoke-dc-v6`, and future fleet members.
+
+## Decision
+
+### 1. Normal operations are GitOps-only
+
+Every resource that is reconciled by an Argo CD Application or ApplicationSet, on either hub or spoke, MUST be changed only by a merged commit to the GitOps repository that owns it. This covers, at minimum:
+
+- operators, Subscriptions, CatalogSources, ImageContentSourcePolicies, ImageTagMirrorSets;
+- namespaces, AppProjects, quotas, limit ranges;
+- RBAC, NetworkPolicies, pod security configuration;
+- StorageClasses, LocalVolumeSets, StorageClusters;
+- External Secrets wiring (SecretStore, ClusterSecretStore, ExternalSecret);
+- ACM ManagedCluster, ManagedClusterSet, Placement, GitOpsCluster;
+- ApplicationSet definitions and the Applications they generate;
+- tenant onboarding and namespace boundary configuration;
+- ingress, routes by policy, certificates by reference;
+- workload deployment registration in application GitOps repos.
+
+`oc apply`, `oc edit`, `oc patch`, `oc delete`, console-driven edits, SSH into a node, MachineConfig overrides, and direct Kubernetes API calls against the live cluster are NOT acceptable channels for any of the above during normal operations. "Faster than an MR" is not a valid reason.
+
+### 2. Break-glass is a defined exception, not a convenience
+
+Break-glass is permitted only when ALL four of the following hold:
+
+- there is a declared production incident or imminent production impact;
+- Argo CD cannot recover the cluster state on its own within the time budget (typically because Argo CD itself is degraded, a CRD is missing, or a finalizer/webhook blocks reconciliation);
+- a corrective action is required in under fifteen minutes;
+- no GitOps-driven path can complete inside that window.
+
+If any one of those conditions is false, the change is not break-glass. File an MR.
+
+### 3. Every break-glass action has mandatory controls
+
+Every break-glass action MUST produce all five of the following before the incident is considered closed:
+
+1. **A GitHub issue** (or an entry in an existing incident issue) naming the cluster, namespace, object, reason, and on-call actor.
+2. **Read-only capture of starting state.** Minimum: `oc get <kind> <name> -n <ns> -o yaml` for the resource being changed, stored in the audit record.
+3. **A maximum expiry of twenty-four hours** from the time of the live change. By the expiry the change is either backported to Git (Argo CD then reconciles it as durable state) or reverted.
+4. **An audit record committed to `reports/break-glass/YYYY-MM-DD-<incident-slug>.md`** using the template in the runbook. The record must include actor, timestamp (UTC), exact command, before/after evidence, MR link if backported, and Argo CD sync confirmation.
+5. **Argo CD returns to `Synced/Healthy`** for the owning Application after backport or revert.
+
+A break-glass action without all five controls is non-compliant and is flagged in the next session report and the FG-6 evidence trail.
+
+### 4. Prohibited break-glass actions
+
+Even during an incident, the following changes MUST NOT be made by break-glass — they require a normal GitOps MR with code-owner review:
+
+- bypassing or disabling an RHACS image, deployment, runtime, or admission policy ([ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops) makes RHACS authoritative for image supply);
+- disabling, modifying, or deleting security operators (RHACS, compliance, cert-manager, External Secrets, oauth) directly on the cluster;
+- granting `cluster-admin`, `cluster-role` bindings, or AppProject elevated destinations to a user or service account without code-owner review;
+- direct edits to MachineConfig rendered objects (`rendered-*`), to MachineConfigPool `desiredConfig` annotations as a substitute for a real MachineConfig change, or to `KubeletConfig`/`ContainerRuntimeConfig`;
+- direct edits to etcd, etcd Secrets, or the `kube-system` cluster signing keys;
+- silent rotation of Vault, Nexus, or GitLab credentials that are referenced by ExternalSecret without updating the source of truth.
+
+The only exception is when the prohibited action IS the incident remediation (for example, an RHACS misconfiguration is itself causing the outage). In that case the action requires an explicit acknowledgement in the audit record naming a second reviewer, and the backport MR carries a post-incident review label.
+
+### 5. Validation and audit record are non-negotiable
+
+The audit record is the single source of evidence for FG-6. If a break-glass action is not in `reports/break-glass/` within twenty-four hours, it is treated as an unauthorised live change and surfaced in the next FG-6 review.
+
+## Alternatives considered
+
+**Free-for-all admin access.** Allow any platform admin to make live changes with the convention of "please backport when you have time." Rejected — this is the de-facto industry pattern that produces silent drift and undermines every audit attempt. [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) and [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull) already chose against it.
+
+**Pure no-break-glass policy.** Forbid live mutation entirely. Rejected — Argo CD can itself be the broken component, CRDs can be missing, finalizers can block reconciliation, and the spoke-local pull model can have transient credential issues. A zero-tolerance policy turns recoverable incidents into prolonged outages.
+
+**Looser expiry (seven or thirty days).** Allow break-glass changes to remain un-backported for a week or longer. Rejected — longer expiry empirically becomes "never." Twenty-four hours keeps the cost of forgetting visible and aligns with normal on-call shift boundaries.
+
+## Consequences
+
+What this prevents:
+
+- silent drift between cluster state and Git;
+- "tribal knowledge" fixes that disappear when an operator leaves;
+- repeat-offender break-glass patterns that should have been promoted to GitOps;
+- regulated reviewers being unable to reconstruct what changed, who approved it, and how it was validated.
+
+What this adds:
+
+- modest overhead for incident response, primarily the audit-record capture and the backport MR;
+- a hard twenty-four-hour clock that forces backport scheduling.
+
+Edge cases handled by the policy:
+
+- **Emergency RBAC grant during an incident:** allowed only with the prohibited-actions exception above (named second reviewer, post-incident MR).
+- **ACM-managed spoke that has lost hub connectivity:** spoke-local Argo CD remains the reconciler per [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull), so break-glass on the spoke still requires a backport to the platform GitOps repo even if the hub is temporarily unreachable.
+- **Argo CD itself broken:** a bootstrap repair (re-applying the GitOps operator install) is the only break-glass that may pre-date its own audit record, and even then the audit record must be written within twenty-four hours.
+
+## References
+
+- Source: `opp-full-plat/adr/0025-gitops-only-operations-break-glass.md`
+- Federated GitOps architecture: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- ACM + OpenShift GitOps pull model: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Nexus-only image supply chain: [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)
+- Platform GitOps boundary: [ADR 0024](/docs/06-architecture-decisions/20-adr-0024-openshift-only-platform-gitops-boundary)
+- IPv6 baseline (forbidden-action enforcement): [ADR 0026](/docs/06-architecture-decisions/22-adr-0026-ipv6-baseline-for-ovn-kubernetes)
+- Platform admin handoff `Break-Glass Rules` section: `opp-full-plat/connection-details/platform-admin-handoff.md`
+- Readiness gate FG-6: `opp-full-plat/plans/federated-gitops-readiness-gates.md`
+- Break-glass runbook: `opp-full-plat/runbooks/break-glass-procedure.md`
+- GitHub issue #71 (closed by this ADR), milestone `Federated GitOps Architecture`

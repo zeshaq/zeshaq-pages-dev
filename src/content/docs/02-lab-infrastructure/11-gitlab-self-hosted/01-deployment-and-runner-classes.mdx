@@ -1,8 +1,8 @@
 ---
 title: "GitLab Deployment and Runner Classes"
-description: "GitLab CE 18.11.1 on a single VM behind HAProxy — internal LAN endpoint for automation, public route for browsers, eleven ct-* role groups, and the five planned runner classes."
+description: "GitLab CE 18.11.1 on a single VM at 30.30.30.5 behind HAProxy — internal LAN endpoint for automation, public route for browsers, eleven ct-* role groups, five planned runner classes, and the FG-1 readiness gate."
 sidebar_label: "Deployment & Runners"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -57,14 +57,15 @@ This split is non-negotiable per the operator guide.
 
 | Property | Value |
 | --- | --- |
-| Internal LAN endpoint | `http://<lab-IP-for-gitlab>` |
-| Human browser route | `https://gitlab.apps.sub.comptech-lab.com` |
+| VM | `gitlab` at `30.30.30.5` |
+| Internal LAN endpoint | `http://30.30.30.5` (port 80, no TLS) |
+| Human browser route | `https://gitlab.apps.sub.comptech-lab.com` (TLS at HAProxy edge) |
 | GitLab version | `18.11.1` |
 | Edition | GitLab CE (non-Enterprise) |
 | Current operational platform repo | `comptech-platform/openshift-ops/openshift-platform-gitops` (project ID `12`) |
-| Local clone for the platform GitOps repo | `/home/ze/platform-gitops` |
+| Local clone for the platform GitOps repo | `/home/ze/claude-agent/clones/platform-gitops` (worktree-of-`main` convention) |
 | Bootstrap admin user | `zahid` |
-| Operator PAT custody | the bootstrap GitLab PAT file (local-only) (Git-ignored) |
+| Operator PAT custody | `gitlab-md-pat` file in the local-only secrets directory (Git-ignored) |
 
 ## Why a single VM CE
 
@@ -151,6 +152,27 @@ Runner rules (per operator guide):
 
 Detailed runner privileges live on the [protected runner model page](./03-protected-runner-model).
 
+## FG-1 readiness gate — in progress
+
+FG-1 is the **first federated GitOps readiness gate** — the named, repeatable bar that GitLab must clear before more divisions onboard or production-like CI runs in-GitLab. It is tracked under issue [#83](https://github.com/zeshaq/codex-opp-agent/issues/83), governed by ADR 0023, and the formal ownership matrix it locks in lives on the [federated monorepo architecture page](./02-federated-monorepo-architecture).
+
+The gate's acceptance criteria, in current state:
+
+| Criterion | Status | Notes |
+| --- | --- | --- |
+| GitLab CE 18.11.1 at `30.30.30.5`, public route via HAProxy LE wildcard, internal LAN endpoint reachable | **Done** | preflight 2026-05-09; smart-HTTP clone fails through public route by design — automation uses LAN |
+| Two-tree group skeleton (`comptech-platform/` + `divisions/`) provisioned | **Done** | 11 `ct-*` role groups created with bootstrap membership |
+| `openshift-platform-gitops` at project ID 12, `main` protected, force-push disabled, Maintainers-only push/merge | **Done** | confirmed live |
+| CODEOWNERS on `openshift-platform-gitops` | **In progress** | CE limitations on approval-rule enforcement to be documented as a compensating control |
+| Validation-only pipeline on `openshift-platform-gitops` (Kustomize render, YAML parse, no plaintext Secrets, no unmanaged public images, no app-team cluster-admin) | **In progress** | runs on the (planned) validation runner class only |
+| Five protected runner classes provisioned with dedicated registration tokens | **Open** | covered on the [protected runner model page](./03-protected-runner-model); current `gitlab-vm-docker` runner is **not** a substitute |
+| Negative access tests (sandbox apps cannot write to platform repos, platform GitOps cannot read secrets, etc.) | **Open** | run after CODEOWNERS + runner classes land |
+| Documented MR mechanics for platform-gitops changes (PAT custody, sync-wave 10 convention, operator-install pattern) | **Done** | tokens-and-bots page documents the PAT flow; sync-wave convention lives in the platform GitOps repo |
+
+The gate's compensating control posture matters: GitLab CE doesn't expose the full approval-rules surface (the preflight saw HTTP `404` on the project approval-rules API). The lab compensates with CODEOWNERS, protected branches, the validation pipeline, and the protected-runner trust boundaries, rather than upgrading the GitLab edition.
+
+FG-1 closes when every criterion above is **Done**. Until then, app-team onboarding stays inside the sandbox division.
+
 ## Repository ownership
 
 The bootstrap-phase intent is captured fully on the [federated monorepo page](./02-federated-monorepo-architecture). The summary table:
@@ -188,18 +210,18 @@ Every operational repository runs with:
 
 ```bash
 # GitLab health
-curl -fsS "http://<lab-IP-for-gitlab>/-/readiness"
-curl -fsS "http://<lab-IP-for-gitlab>/-/liveness"
+curl -fsS "http://30.30.30.5/-/readiness"
+curl -fsS "http://30.30.30.5/-/liveness"
 
 # API check
-GITLAB_PAT=""$GITLAB_PAT"  # bootstrap-admin PAT in local secrets dir"
+GITLAB_PAT="$(cat <secrets-dir>/gitlab-md-pat)"
 curl -fsS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
-  "http://<lab-IP-for-gitlab>/api/v4/version"
+  "http://30.30.30.5/api/v4/version"
 unset GITLAB_PAT
 
 # Platform repo reachability
 git ls-remote \
-  http://<lab-IP-for-gitlab>/comptech-platform/openshift-ops/openshift-platform-gitops.git \
+  http://30.30.30.5/comptech-platform/openshift-ops/openshift-platform-gitops.git \
   main
 ```
 
@@ -238,16 +260,19 @@ Per the operator guide, watch for:
 
 ## Roadmap
 
-Immediate:
+Immediate (FG-1 close-out):
 
-1. Finish FG-1 branch protection and merge controls for `openshift-platform-gitops`.
-2. Add CODEOWNERS to `openshift-platform-gitops`.
-3. Add validation-only pipeline (Kustomize render, YAML parse, no plaintext Secrets, no unmanaged public images, no app-team cluster-admin).
-4. Create `vm-platform-ops` once ownership and first service adoption are ready.
-5. Create sandbox division repos with negative access tests.
-6. Decide GitLab CE limitations for approval rules and CODEOWNERS enforcement.
-7. **Define protected GitLab Runner classes and tags** (covered on [protected runner model page](./03-protected-runner-model)).
-8. Move from bootstrap admin/PAT usage to named users, deploy tokens, and Vault-backed or protected variable custody.
+1. Land CODEOWNERS on `openshift-platform-gitops` and document the CE compensating-control posture.
+2. Finish the validation-only pipeline (Kustomize render, YAML parse, no plaintext Secrets, no unmanaged public images, no app-team cluster-admin) — runs on the validation runner class only.
+3. **Define and provision the five protected GitLab Runner classes and tags** (covered on the [protected runner model page](./03-protected-runner-model)).
+4. Negative access tests for sandbox apps against platform repos.
+5. Close FG-1 (issue #83) — all criteria in the [FG-1 readiness gate](#fg-1-readiness-gate--in-progress) table at **Done**.
+
+Next:
+
+1. Create `vm-platform-ops` once ownership and first service adoption are ready.
+2. Create sandbox division repos with negative access tests.
+3. Move from bootstrap admin/PAT usage to named users, deploy tokens, and Vault-backed or protected variable custody.
 
 Longer:
 

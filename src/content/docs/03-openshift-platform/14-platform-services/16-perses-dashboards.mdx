@@ -1,0 +1,214 @@
+---
+title: "Perses dashboards via the COO Monitoring UIPlugin"
+description: "How the Cluster Observability Operator's Monitoring UIPlugin owns the Console (Perses) tab, why GitOps only ships the cluster-monitoring-view CRB, and the direct-Route workaround for users who can't reach the Console."
+sidebar_label: "Perses dashboards"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+The Cluster Observability Operator (COO) ships a Perses backend as part of its Monitoring UIPlugin. Enabling Perses is one boolean — `spec.monitoring.perses.enabled: true` on the `UIPlugin/monitoring` CR. COO auto-creates the Perses StatefulSet, the operator-managed datasource pointed at Thanos Querier, and the Console plugin that adds the **Observe → Dashboards (Perses)** tab. This page is what GitOps actually owns, the load-bearing RBAC, the direct-Route workaround for non-Console access, and the lab's first `PersesDashboard` (`kafka-cluster-overview`).
+
+## The one rule
+
+**Do not declare a second `Perses` CR.** The Monitoring UIPlugin already creates one; declaring another collides on Console plugin registration and leaves the (Perses) tab in a half-installed state where panels render but the datasource resolves to the wrong instance. Learned the hard way under issue #274.
+
+What GitOps owns:
+
+| Object | Kind | Why we own it |
+| --- | --- | --- |
+| `monitoring` | UIPlugin | enables the (Perses) tab — without this the Console doesn't load the Perses plugin |
+| `perses-thanos-reader-monitoring-view` | ClusterRoleBinding | grants `cluster-monitoring-view` to the operator-managed `perses-sa` ServiceAccount |
+| `kafka-cluster-overview` | PersesDashboard | the lab's first dashboard CR |
+| Perses Route + oauth-proxy | (separate sub-stack) | direct-Route access workaround — see below |
+
+What COO owns (do not duplicate):
+
+| Object | Kind | Owner |
+| --- | --- | --- |
+| `Perses` instance | perses.dev/v1alpha2 | COO auto-creates from the UIPlugin |
+| `perses-sa` | ServiceAccount | COO; the SA the Perses StatefulSet actually runs as |
+| `accelerators-thanos-querier-datasource` | PersesDatasource | COO auto-creates with `client.kubernetesAuth.enable: true` |
+| `monitoring-console-plugin` | ConsolePlugin | COO; registers the Console tab |
+
+## The Monitoring UIPlugin
+
+```yaml
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: monitoring
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+spec:
+  type: Monitoring
+  monitoring:
+    perses:
+      enabled: true
+```
+
+`spec.type: Monitoring` is what differentiates this from the `Logging` and `DistributedTracing` UIPlugins (see [§14.8 COO + UIPlugins](./08-cluster-observability-operator)). The `monitoring.perses.enabled` flag is the one that produces the **(Perses)** variant of the Observe → Dashboards page. The sibling `Dashboards` UIPlugin (the older ConfigMap-based dashboards) is independent and not enough on its own.
+
+After apply, the Console picks up the plugin on next refresh. **Observe → Dashboards** in the OCP Console now has a tab labeled `(Perses)` that renders any `PersesDashboard` CR in the COO namespace.
+
+## The Thanos-reader ClusterRoleBinding
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: perses-thanos-reader-monitoring-view
+subjects:
+  - kind: ServiceAccount
+    name: perses-sa
+    namespace: openshift-cluster-observability-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+```
+
+Three load-bearing details:
+
+- **`cluster-monitoring-view`** is the cluster role the COO-default `accelerators-thanos-querier-datasource` expects the bearer to hold. Without the binding, the Perses pod fetches metadata fine but `kube-rbac-proxy` returns 403 on `/api/v1/query` and every panel renders empty.
+- **`perses-sa`, not `perses`.** There are two ServiceAccounts in the namespace — a leftover `perses` (from an earlier perses-operator naming convention) and the actual `perses-sa` the StatefulSet runs as. Binding the old `perses` SA is the classic empty-dashboard trap. The StatefulSet's projected token comes from `perses-sa`; `kubernetesAuth.enable: true` in the datasource forwards that token to Thanos.
+- **COO does not auto-create this binding.** Verified live on `spoke-dc-v6` on 2026-05-12. The operator is happy to leave it missing and let the dashboards render empty.
+
+## Direct-Route workaround (MR !128)
+
+The Console (Perses) tab is the supported access path. For users who can't reach the Console — operator runbooks, automation, headless screenshot capture — the lab also exposes Perses on a dedicated Route at `perses-coo.apps.spoke-dc-v6.sub.comptech-lab.com`.
+
+The direct Route runs an oauth-proxy Deployment in `openshift-cluster-observability-operator`. The Route is `reencrypt` (Perses serves with an OpenShift service-ca cert internally), the oauth-proxy authenticates against OCP OAuth via `--provider=openshift`, and the bearer token is passed through to Perses so the upstream auths as the real user.
+
+MR !128 fixed a CSRF symptom: oauth-proxy refused the upstream handshake with a service-ca-signed cert because the proxy didn't trust the upstream CA. The fix is the `--upstream-ca` arg:
+
+```yaml
+args:
+  - --https-address=:8443
+  - --provider=openshift
+  - --openshift-service-account=perses-oauth-proxy
+  - --upstream=https://perses.openshift-cluster-observability-operator.svc.cluster.local:8080
+  - --upstream-ca=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+  - --tls-cert=/etc/tls/private/tls.crt
+  - --tls-key=/etc/tls/private/tls.key
+  - --cookie-secret-file=/etc/proxy/secrets/session_secret
+  - --pass-access-token=true
+  - --pass-user-bearer-token=true
+  - --skip-provider-button=true
+  - >-
+    --openshift-sar={"namespace":"openshift-cluster-observability-operator","resource":"persesdashboards","group":"perses.dev","verb":"get"}
+```
+
+Two things to note:
+
+- **`--openshift-sar`** gates access on the ability to `get persesdashboards.perses.dev` in the COO namespace — cluster-admin satisfies it; tighten via a dedicated Role for non-admin viewers.
+- **The cookie secret comes from Vault via ESO.** 32 bytes for AES-GCM. Stored at `secret/ocp/platform/perses-oauth-proxy` so a Perses pod restart doesn't invalidate user sessions.
+
+## PersesDashboard CRs
+
+Dashboards are `perses.dev/v1alpha2` `PersesDashboard` resources. They live in the **same namespace as the Perses instance** (`openshift-cluster-observability-operator`) so they join the same Perses project as the COO-managed datasource. The first one in the lab is `kafka-cluster-overview`:
+
+```yaml
+apiVersion: perses.dev/v1alpha2
+kind: PersesDashboard
+metadata:
+  name: kafka-cluster-overview
+  namespace: openshift-cluster-observability-operator
+spec:
+  instanceSelector:
+    matchLabels:
+      app.kubernetes.io/instance: perses-observability-operator
+  config:
+    display:
+      name: Kafka Cluster Overview
+    duration: 1h
+    datasources:
+      thanos:
+        default: true
+        plugin:
+          kind: PrometheusDatasource
+          spec:
+            proxy:
+              kind: HTTPProxy
+              spec:
+                secret: accelerators-thanos-querier-datasource-secret
+                url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+    panels:
+      brokerCount:
+        kind: Panel
+        spec:
+          display: { name: Broker count }
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format: { unit: decimal, decimalPlaces: 0 }
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: kafka_brokers
+```
+
+Three load-bearing details:
+
+- **Namespace placement.** `openshift-cluster-observability-operator`, not `kafka-monitoring`. The Console's (Perses) view defaults to the project the COO datasource lives in, and PersesDashboards have to join that project to be discoverable.
+- **The `thanos` datasource block mirrors the COO-managed datasource.** Same Thanos Querier URL, same Secret. Defining it at the dashboard level explicitly avoids the "dashboard loads but panels are empty" trap where panels fall back to a project-default that the monitoring-console-plugin UI doesn't honor.
+- **All panel queries hit Thanos Querier**, not Prometheus directly. This means the dashboard works on both spoke (UWM via Thanos) and hub (cluster Thanos) without any URL change.
+
+## Validation
+
+```bash
+K=/home/<user>/.kube/configs/spoke-dc-v6.kubeconfig
+
+# UIPlugin enabled
+oc --kubeconfig "$K" get uiplugin monitoring -o yaml | grep -A2 perses
+
+# COO-managed Perses instance + SA
+oc --kubeconfig "$K" -n openshift-cluster-observability-operator get perses,sa
+
+# The binding (the one GitOps owns)
+oc --kubeconfig "$K" get clusterrolebinding perses-thanos-reader-monitoring-view
+
+# Dashboard CR
+oc --kubeconfig "$K" -n openshift-cluster-observability-operator get persesdashboard kafka-cluster-overview
+
+# Direct Route
+curl -fsSk https://perses-coo.apps.spoke-dc-v6.sub.comptech-lab.com/oauth/healthz
+```
+
+Expected:
+
+- UIPlugin `Ready=True`.
+- One `Perses` instance, one `perses-sa` ServiceAccount.
+- ClusterRoleBinding subject = `perses-sa` in `openshift-cluster-observability-operator`.
+- Dashboard `Ready=True`, visible at **Observe → Dashboards (Perses)** in the Console.
+- The direct Route returns `ok` for `/oauth/healthz` and presents OCP login for `/`.
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| (Perses) tab present in Console but every panel renders empty. | The ClusterRoleBinding subject is `perses` (the leftover SA), not `perses-sa`. | Update the CRB to bind `perses-sa`. |
+| (Perses) tab absent from Console. | UIPlugin `Monitoring` not present, or `monitoring.perses.enabled` not set. | Apply the UIPlugin; refresh the Console. |
+| Direct Route returns 502. | oauth-proxy can't trust the upstream service-ca cert. | Confirm `--upstream-ca` arg is present (MR !128). |
+| User session breaks after a Perses pod restart. | Cookie secret regenerated by some out-of-band action. | Confirm the ESO ExternalSecret `perses-oauth-proxy-cookie` is materialised; rotation should go through Vault, not in-cluster. |
+| Dashboard CR `Ready=False`. | The dashboard is in the wrong namespace (not `openshift-cluster-observability-operator`). | Move it; or change `instanceSelector` to match a Perses in the dashboard's namespace (not recommended). |
+
+## Why not a second Perses
+
+A working pattern for self-managed Perses (no COO) is to install the perses-operator standalone and declare a `Perses` CR. On a cluster where COO already manages a Perses, that second instance:
+
+- Re-registers a `ConsolePlugin` with the same name, which OCP either refuses or silently overwrites with the second one (depending on Console version).
+- Owns its own datasource — even if you copy the COO datasource shape, the second Perses runs as a different SA and the cluster-monitoring-view CRB only covers one of them.
+- Confuses every `PersesDashboard` `instanceSelector` — dashboards labelled for the COO instance render in the COO Perses; dashboards without a selector go to both and the Console tab shows whichever the operator reconciler picked last.
+
+The shape that actually works is: COO owns Perses, GitOps owns the CRB + dashboards + (optionally) a direct Route. Anything else costs an evening.
+
+## References
+
+- Issue #274 — Full-capability SigNoz + Perses console enablement.
+- COO docs — `UIPlugin` types, the Perses sub-flag, the auto-created datasource.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/observability/perses/` — UIPlugin, CRB, dashboard CR.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/observability/perses-route/` — direct Route + oauth-proxy + cookie ESO.

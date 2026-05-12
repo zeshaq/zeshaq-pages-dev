@@ -1,8 +1,8 @@
 ---
 title: "RHACS Central on hub-dc-v6"
-description: "Installing and running RHACS Central + Postgres + Scanner V4 on hub-dc-v6: namespace, operator, Central CR shape, storage, Route, htpasswd admin, the Central API surface."
+description: "Installing and running RHACS Central + Postgres + Scanner V4 on hub-dc-v6: namespace, operator, Central CR shape, storage, Route, htpasswd admin, the Central API surface, and Vault-driven admin password rotation."
 sidebar_label: "Central on hub"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -121,6 +121,94 @@ oc -n stackrox get secret central-htpasswd \
 ```
 
 The plaintext is never copied into Git, issues, or chat. The Secret is created by Central on first reconcile and rotated only by manual operator action (`oc -n stackrox rsh deploy/central` then `roxctl central admin-password regenerate` from inside the pod — actually rare).
+
+## Admin password rotation via Vault + ESO
+
+Issue #255 / MR !73 (2026-05-11) replaced the "rsh into the pod" rotation path with a Vault-driven one. The flow:
+
+1. `vault put secret/ocp/platform/rhacs-admin password=<new-password>` — write the new password into Vault.
+2. An `ExternalSecret` (`central-admin-password` in `stackrox`) materialises a Secret with `password: <plaintext>`.
+3. The `Central` CR references that Secret via `spec.central.adminPasswordSecret.name: central-admin-password`.
+4. Central reads `password` from the referenced Secret at startup, hashes it as bcrypt, and treats that as the admin htpasswd line.
+
+The `central-htpasswd.password` field is now **intentionally empty** — it was the source-of-truth before this rotation pattern, but Central no longer reads it once `adminPasswordSecret` is set. Leaving the field empty is the explicit marker that the legacy path is no longer in use; populating it would silently shadow the Vault-sourced one.
+
+### Central CR snippet
+
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: Central
+metadata:
+  name: stackrox-central-services
+  namespace: stackrox
+spec:
+  central:
+    adminPasswordSecret:
+      name: central-admin-password
+    # ... rest of central spec ...
+```
+
+### The ExternalSecret
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: central-admin-password
+  namespace: stackrox
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: vault-platform
+  target:
+    name: central-admin-password
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        password: "{{ .password }}"
+  data:
+    - secretKey: password
+      remoteRef:
+        key: ocp/platform/rhacs-admin
+        property: password
+```
+
+### Rotate procedure
+
+```bash
+# 1. New password in Vault (32+ chars; the value is never logged).
+vault kv put secret/ocp/platform/rhacs-admin password=<new-pw>
+
+# 2. Force ESO refresh (otherwise wait up to refreshInterval).
+oc -n stackrox annotate externalsecret central-admin-password \
+  force-sync=$(date +%s) --overwrite
+
+# 3. Confirm the in-cluster Secret has the new value.
+oc -n stackrox get secret central-admin-password \
+  -o jsonpath='{.data.password}' | base64 -d | wc -c
+
+# 4. Restart Central — htpasswd is cached at pod startup.
+oc -n stackrox rollout restart deploy/central
+
+# 5. Wait for Ready, then verify new credential against /v1/clusters.
+oc -n stackrox rollout status deploy/central
+ROUTE=central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com
+NEW_PW=$(oc -n stackrox get secret central-admin-password -o jsonpath='{.data.password}' | base64 -d)
+curl -fsSk -u "admin:${NEW_PW}" "https://${ROUTE}/v1/clusters" | jq '.clusters[].name'
+```
+
+Step 4 is the gotcha — Central does **not** re-read the Secret on the fly. The htpasswd line is materialised once when the pod starts, hashed into memory, and used until the pod restarts. Rotating the Vault value without a `rollout restart` produces a Secret that nobody is reading.
+
+### Failure modes specific to rotation
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| `ExternalSecret/central-admin-password` `Ready=False, SecretSyncedError` | Vault path missing or token lacks read | `vault kv list secret/ocp/platform` to confirm the path; check the ESO `vault-platform` SA's policy. |
+| Secret has new value but login still rejects | Central pod was not restarted after rotation | `oc -n stackrox rollout restart deploy/central`. |
+| Login succeeds with both old and new password for ~30s after restart | Two Central replicas mid-rollout, one still on old htpasswd | Expected; goes away when the rollout completes. Confirm via `oc rollout status`. |
+| `central-htpasswd.password` is non-empty | Someone re-set the legacy path; the Vault rotation now silently shadows the wrong value | Clear it: `oc -n stackrox patch secret central-htpasswd --type=merge -p '{"data":{"password":""}}'`. |
 
 ## The Central API surface (what the rest of §11 uses)
 

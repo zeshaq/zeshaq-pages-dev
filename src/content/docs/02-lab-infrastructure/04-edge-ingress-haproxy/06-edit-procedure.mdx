@@ -1,0 +1,182 @@
+---
+title: "HAProxy edit procedure"
+description: "The repeatable safe-edit pattern for /etc/haproxy/haproxy.cfg — dated backup, in-process Python edit with unique-anchor asserts, config validate, hot reload (never restart), and roll-back on failure."
+sidebar_label: "Edit procedure"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+The HAProxy VM fronts every platform service in the lab — Jenkins, SigNoz, Trivy, DefectDojo, MinIO, Nexus, GitLab, WSO2, the OpenShift routers, and the public POC apps. A bad edit to `/etc/haproxy/haproxy.cfg` takes the whole lab off the public path. The fix is a procedure that's reversible by construction: dated backup before any change, edits that fail loudly if their anchor isn't unique, config validate before reload, and a hot reload that preserves in-flight connections.
+
+This page documents that procedure. It is the same five steps every time, regardless of whether the change is a new backend or a one-line ACL tweak. The procedure was last exercised on 2026-05-11 for the `brac-poc` backend addition.
+
+## Why the discipline
+
+HAProxy in this lab is a single VM with ~40 backends and a dense SNI ACL surface. The file is grep-able but not refactorable on a busy day. The edit pattern protects three things:
+
+- **Reversibility.** Every edit is paired with a dated backup, so a fast `cp` rolls back without touching the editor.
+- **Uniqueness of anchor strings.** The Python `count == 1` assert prevents a "replace one line" change from silently rewriting a second matching line elsewhere.
+- **Hot reload, not restart.** `systemctl reload haproxy` re-execs HAProxy with the new config while keeping existing connections; `restart` drops them. The lab has long-running Jenkins/SSE/SigNoz tail connections, so `reload` is the only correct command.
+
+`sed -i` and ad-hoc text editors fail at the first two of those. The procedure replaces both with a Python heredoc that's explicit about which anchor it expects to be unique.
+
+## The five steps
+
+### 1. Dated backup
+
+```bash
+sudo cp /etc/haproxy/haproxy.cfg \
+  /etc/haproxy/haproxy.cfg.$(date +%Y%m%d-%H%M%S).bak
+```
+
+The backup lives next to the live config. The dated filename makes the rollback `cp` trivial and gives `ls -lt /etc/haproxy/` a usable history. Backups accumulate; clean them up only with a deliberate retention decision, not as a routine.
+
+### 2. In-process Python edit with `assert count == 1` markers
+
+The edit itself runs as a heredoc'd Python script with sudo. It reads the file, asserts each anchor string appears exactly once, and only then writes the result back. The shape:
+
+```bash
+sudo python3 <<'PY'
+path = "/etc/haproxy/haproxy.cfg"
+with open(path) as f:
+    cfg = f.read()
+
+anchor = "use_backend signoz-vm-be if is_signoz_host"
+assert cfg.count(anchor) == 1, f"anchor not unique: count={cfg.count(anchor)}"
+
+addition = "    use_backend brac-poc-vm-be if is_brac_poc_host"
+new_cfg = cfg.replace(anchor, anchor + "\n" + addition)
+
+assert new_cfg.count(addition) == 1, "addition appeared more than once after replace"
+
+with open(path, "w") as f:
+    f.write(new_cfg)
+print("ok")
+PY
+```
+
+What the asserts buy:
+
+- If `anchor` matches zero lines, the edit aborts before writing — typically because someone renamed the backend or the comment shape changed.
+- If `anchor` matches more than one line, the edit aborts before writing — typically because the anchor was too generic (e.g., `mode http` alone).
+- If `addition` already exists, the edit aborts — the change is being re-applied, which is usually a bug.
+
+The Python lives in shell history (or a session log) so the same edit can be re-run on the DR HAProxy in lockstep. Don't paste it into the editor and run it interactively — the heredoc form is the auditable record.
+
+### 3. Validate
+
+```bash
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+```
+
+This parses the file without applying it. Expected output: `Configuration file is valid`. If the validate fails, **do not reload** — restore from the backup and try the edit again. The validate is cheap; running it before every reload is non-negotiable.
+
+A few common validate failures and what they mean:
+
+| Validate error | Cause |
+| --- | --- |
+| `unknown keyword '<X>'` | Typo, or a section is in the wrong block |
+| `backend '<name>' has no 'server' line` | A backend was stubbed but never given a server line |
+| `'use_backend' references non-existent backend '<name>'` | Frontend was wired to a backend that doesn't exist yet — order the edit so backends land first |
+| `bind '...' has the same address as another bind` | Duplicate `bind` on an existing listener |
+| `unable to load SSL certificate from '<path>'` | Cert file moved or chmod broke read access |
+
+### 4. Apply with reload (NEVER restart)
+
+```bash
+sudo systemctl reload haproxy
+```
+
+`reload` re-execs HAProxy with the new config and *keeps the existing process running long enough* to drain in-flight connections to it. Clients on long-lived connections (Jenkins SSE, SigNoz live tail, large git clones over GitLab) don't notice.
+
+`systemctl restart haproxy` **drops every in-flight connection**. It is the wrong command for routine edits. Restart is for the rare case where reload won't take a change (e.g., a bind on a new port that needs the socket re-opened with new capabilities).
+
+After `reload`, sanity-check:
+
+```bash
+sudo systemctl status haproxy --no-pager | head
+```
+
+The unit should be `active (running)`. The PID should be **new** — that's how you know reload actually re-execed.
+
+### 5. On failure: restore from the dated backup, reload
+
+```bash
+sudo cp /etc/haproxy/haproxy.cfg.20260511-101530.bak /etc/haproxy/haproxy.cfg
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg     # confirm the backup itself is valid
+sudo systemctl reload haproxy
+```
+
+Restore is two commands plus a reload. The validate step is still mandatory on the backup — if the backup itself is broken, you want to find out before reloading.
+
+If the *running* HAProxy is healthy but the edit was rejected at validate time, the restore is just to clean up the file so the next edit starts from a known-good state. If the running HAProxy is unhealthy after a bad reload, the restore + reload is what brings it back.
+
+## A concrete example — adding the `brac-poc` backend on 2026-05-11
+
+The 2026-05-11 edit added a backend for the BRAC Bank POC demo behind `brac-poc.apps.sub.comptech-lab.com`. The full ceremony was:
+
+1. `sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.20260511-101530.bak`
+2. Python heredoc added an `acl is_brac_poc_host hdr(host) -i brac-poc.apps.sub.comptech-lab.com` line + a `use_backend brac-poc-vm-be if is_brac_poc_host` line + a new `backend brac-poc-vm-be { mode http; option httpchk GET /; server brac-poc <ip>:<port> check }` block. Three asserts, all `count == 1`.
+3. `sudo haproxy -c -f /etc/haproxy/haproxy.cfg` returned `Configuration file is valid`.
+4. `sudo systemctl reload haproxy`.
+5. No failure; no restore needed. The demo URL came up green.
+
+This is the standard shape. Single backend additions take a minute end-to-end; the value is the procedure scales unchanged to messier edits where the anchor-unique check is the safety net.
+
+## When to deviate
+
+A few cases where the procedure changes:
+
+- **Cert renewal.** The Let's Encrypt renewal hook reloads HAProxy automatically (see [TLS and certificates](./05-tls-and-certificates)). Don't run it by hand; the hook is the canonical path.
+- **Editing both primary and DR HAProxy.** Run the exact same Python on both. The dated backups on the two hosts will have different timestamps (run separately) but should otherwise produce identical diffs.
+- **Adding a new bind on a new port.** If the new port requires Linux capabilities the running process doesn't have (uncommon), a reload won't take. In that case, schedule a deliberate restart and accept the drop.
+
+## Operational guardrails
+
+- **One change per backup.** Don't stack two unrelated edits between backups; if the second one breaks, you can't roll back just the second.
+- **Always validate before reload.** Even if the Python edit "looks right" — `haproxy -c -f` catches the cases the Python can't.
+- **Always reload, never restart.** Restart breaks in-flight long-lived connections.
+- **The dated backup is the rollback.** Don't rely on Git; the HAProxy config is **not** in Git today (a long-running gap; tracked under the HAProxy GitOps adoption work). The backups on the VM are the authoritative recent history.
+- **Treat primary + DR as one edit unit.** If you edit primary, run the same Python on DR. Skew between the two is a drift indicator that's caught the lab before.
+
+## Failure modes
+
+### Symptom: `haproxy -c -f` passes, reload appears to succeed, but the new backend returns 503
+
+**Root cause.** The frontend `use_backend` is wired but the backend health check is failing immediately (e.g., wrong path, wrong port). HAProxy validates the syntax, not the reachability.
+
+**Fix.** Hit the HAProxy stats page (or `socat /run/haproxy.sock <<<"show stat"`) and look at the new backend's `status`. `DOWN` means the health check is failing. Fix the health check or the target.
+
+**Prevention.** Pick a known-good health check path for the new backend before adding it. `curl -k -o /dev/null -s -w '%{http_code}'` against the target from the HAProxy VM is the cheapest pre-check.
+
+### Symptom: edit appears to land, reload reports success, but old behavior persists
+
+**Root cause.** Reload didn't actually re-exec. Usually because of a permissions issue on the socket or a hung worker.
+
+**Fix.** `sudo systemctl status haproxy --no-pager` — check the main PID. If it's the same PID as before the reload, the re-exec didn't happen. `journalctl -u haproxy -n 50` will show why.
+
+**Prevention.** Verify the PID changes after `reload`. If your edit volume is high, write a tiny wrapper that captures `systemctl show -p MainPID haproxy` before and after.
+
+### Symptom: Python edit fails with `anchor not unique: count=2`
+
+**Root cause.** The anchor string appears more than once. Either the file has near-duplicate stanzas, or the anchor was chosen too generically.
+
+**Fix.** Make the anchor more specific by including more surrounding context. `use_backend X if Y` is usually unique; `mode http` alone never is.
+
+**Prevention.** Choose anchors that include the unique service name; never anchor on a defaults line.
+
+### Symptom: rolled back from a bad edit but the lab is still half-broken
+
+**Root cause.** The bad reload moved some clients onto the broken state during the brief window. Long-running connections drained against the broken config.
+
+**Fix.** A second reload (after restore) pushes them back to the now-restored config. In extreme cases — only — `systemctl restart haproxy` is justified.
+
+**Prevention.** Always validate before reload. The five-step procedure exists to make this case rare, not to make it impossible.
+
+## References
+
+- [Backend conventions](./04-backend-conventions) — naming and shape rules for any new backend.
+- [SNI passthrough + loopback re-decrypt](./03-sni-passthrough-and-loopback-redecrypt) — the keystone pattern most edits touch.
+- [Frontends and binds](./02-frontends-and-bind-list) — listening surface; useful when an edit adds a frontend.
+- [TLS and certificates](./05-tls-and-certificates) — the renewal hook reloads HAProxy automatically.
+- `opp-full-plat/connection-details/platform-admin-handoff.md` — operator handbook.

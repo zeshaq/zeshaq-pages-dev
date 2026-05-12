@@ -1,8 +1,8 @@
 ---
 title: "OpenShift Service Mesh 3 — ambient mode"
-description: "How OSSM 3 is installed on spoke-dc-v6 using the sail-operator's openshift-ambient profile (Istio + IstioCNI + ZTunnel), how ambient differs from sidecar mode, and how workloads opt into the mesh."
+description: "How OSSM 3 is installed on spoke-dc-v6 using the sail-operator's openshift-ambient profile (Istio + IstioCNI + ZTunnel), how ambient differs from sidecar mode, the bank-employees-jboss-chat pilot, and why bank-payment was rolled back."
 sidebar_label: "OSSM 3 ambient"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -177,6 +177,94 @@ Ambient automatically does **strict mTLS** between ambient-labelled pods. There 
 
 For ambient policy enforcement you write `AuthorizationPolicy` CRs in `istio-system` or in the workload namespace; they apply to ambient traffic the same way as sidecar traffic.
 
+The lab's tenant convention is to additionally pin **PeerAuthentication** at the namespace level:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: <tenant-ns>
+spec:
+  mtls:
+    mode: STRICT
+```
+
+`STRICT` rejects any plaintext that somehow reaches a workload pod, even from inside the same namespace. Ambient already encrypts pod-to-pod via ztunnel, but PeerAuthentication is the explicit declaration that a tenant accepts mTLS-only — it's what an auditor will look for in the cluster, not a label on a namespace.
+
+### ztunnel workload-identity RBAC
+
+For ztunnel to mint SPIFFE certs on behalf of a tenant's ServiceAccounts, it needs `serviceaccounts/token` create + `serviceaccounts` impersonate **on that namespace**. This is namespace-scoped — not cluster-wide — so each tenant that joins ambient ships its own RoleBinding to the ztunnel SA:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ztunnel-workload-identity
+  namespace: <tenant-ns>
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ztunnel-workload-identity
+  namespace: <tenant-ns>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ztunnel-workload-identity
+subjects:
+  - kind: ServiceAccount
+    name: ztunnel
+    namespace: ztunnel
+```
+
+Missing this RoleBinding produces the most painful failure mode of ambient mode: istiod's CSR endpoint returns `request impersonation authentication failure` on every workload-identity request. Pods come up, but every kubelet probe fails because ztunnel can't authenticate the workload to itself.
+
+## Live tenants
+
+| Tenant ns | Mode | Notes |
+| --- | --- | --- |
+| `bank-employees-jboss-chat` | Ambient L4 mTLS | Pilot — MRs !130/!131/!132. ztunnel metrics confirm `connection_security_policy="mutual_tls"` for BFF→chat-backend and BFF→eap-domain-group-a/b. No waypoint. |
+| `ossm3-demo` | Ambient L4 mTLS | First mesh demo on the cluster; proves the ambient enrollment path. |
+| `bank-payment` | **Rolled back** | Attempted on `feature/bank-payment-ambient-mesh` then reverted on `feature/bank-payment-mesh-rollback`. See below. |
+
+### bank-employees-jboss-chat — the working ambient pilot
+
+The change footprint was small:
+
+- `namespace.yaml` adds `istio.io/dataplane-mode=ambient`.
+- A `ztunnel-workload-identity` namespace-scoped Role + RoleBinding.
+- NetworkPolicy adjustments to permit intra-namespace mesh traffic (including the HBONE port 15008) plus the app service ports.
+- App-side: probes converted to localhost `exec` so they aren't ambient-redirected (Recreate strategy on mutable-image demo Deployments).
+
+Validation evidence — ztunnel metrics scraped from `spoke-dc-v6-worker-1` showed:
+
+```text
+istio_tcp_connections_opened_total{
+  reporter="source",
+  source_workload="bff",
+  destination_service="chat-backend.bank-employees-jboss-chat.svc.cluster.local",
+  connection_security_policy="mutual_tls"
+} 14
+```
+
+…plus the same `connection_security_policy="mutual_tls"` for BFF → `eap-domain-group-a` and BFF → `eap-domain-group-b`. No waypoint is deployed; L7 features (HTTPRoute, AuthorizationPolicy at L7, retries) are not in scope for this pilot.
+
+### bank-payment — deliberately rolled back
+
+bank-payment was enrolled on `feature/bank-payment-ambient-mesh` (commit `08f14fc`) and reverted on `feature/bank-payment-mesh-rollback` (commit `ad0c652`) the same day. The commit message records the cause:
+
+> ztunnel cannot fetch SPIFFE certs for workloads in bank-payment: istiod returns `request impersonation authentication failure` on the CSR. The mesh-level RBAC grant that lets ztunnel issue certs for tenant ServiceAccounts has not been wired up on this cluster yet, so adding the namespace to ambient just breaks every pod's kubelet probes.
+
+Read: ambient enrollment depends on the namespace-scoped `ztunnel-workload-identity` Role + RoleBinding shipped from the `bank-employees-jboss-chat` pattern. Without it, the dataplane-mode label is a foot-gun — every pod in the namespace comes up, ztunnel intercepts the kubelet probe, the CSR fails, the probe times out, the pod restarts. The rollback was deliberate, not a regression; bank-payment re-enrolment will land once the workload-identity pattern is verified one more time on a non-production tenant.
+
 ## L7 with Waypoints
 
 A waypoint is a Gateway resource of type `istio.io/waypoint`:
@@ -239,9 +327,22 @@ Expected:
 | `istiod` cannot push xDS. | Network policy in `istio-system` blocks egress. | `oc get networkpolicy -n istio-system`; allow controller→ztunnel/waypoint. | Don't change `istio-system` policies without rerunning the conformance set. |
 | Sidecar-mode workload coexists badly. | Mixed mode on the same ns. | Pick one mode per ns. | Document the convention; lint catches mixed labels. |
 
+## Operator versions on spoke-dc-v6
+
+| Operator | Channel / version | Sync-wave | Notes |
+| --- | --- | --- | --- |
+| `servicemeshoperator3` | stable | 8 | The sail-operator that owns `Istio`/`IstioCNI`/`ZTunnel` |
+| `kiali-ossm` | OSSM v2.22.2 | 10 | Kiali bound to OpenShift monitoring; see [§14.7 Kiali](./07-kiali) |
+
+Both operators are mirrored into the cluster's app-catalog and pinned by version; the sync-waves keep the operator install before the operand CRs.
+
 ## References
 
+- Issue #278 — APP-JBOSS-CHAT8 ambient pilot; `bank-employees-jboss-chat` MRs !130–!132 + app repo MRs !31/!33.
+- Issue OSSM3-DEMO1 — ztunnel workload-identity RBAC reference.
 - DEV-OCP-1.4 #178 (Istio + Kiali OSSM 3 ambient).
 - `platform-gitops/clusters/spoke-dc-v6/platform-services/service-mesh/`.
+- `platform-gitops/clusters/spoke-dc-v6/tenants/ossm3-demo/ztunnel-workload-identity-rbac.yaml` — the namespace-scoped pattern.
+- `feature/bank-payment-ambient-mesh` (enrol) and `feature/bank-payment-mesh-rollback` (revert) — the rollback branches.
 - Sail Operator docs: `Istio`, `IstioCNI`, `ZTunnel` v1.
 - Istio ambient docs: `dataplane-mode`, Waypoint, HBONE.

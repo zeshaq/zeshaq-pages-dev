@@ -1,0 +1,232 @@
+---
+title: "Tekton — three Pipeline templates and four reusable Tasks"
+description: "The Path B build shape: TektonConfig operand sync-wave 11, three per-language Pipeline templates (Spring, Node, Liberty), four reusable Tasks (trivy-scan, overlay-patch, quay-push, evidence-publish), and the GitLab EventListener → PipelineRun fan-out."
+sidebar_label: "Tekton templates + tasks"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+The Path B build chain on `spoke-dc-v6` is the OCP-native CI/CD track — `git push` to GitLab triggers a per-language Tekton Pipeline that builds, scans, pushes, patches the GitOps overlay, and publishes evidence. The operator wiring (TektonConfig + EventListener + Triggers) lives in [§14.2](./02-openshift-pipelines-tekton); the `push-image-quay` Task lives next to the OTel collector in [§14.5](./05-opentelemetry) because the pairing is natural. This page is the shape one level above — the three per-language Pipeline templates and the four reusable Tasks that every Pipeline composes.
+
+## The Path B fan-out at a glance
+
+| Wave | Object | Issue | What it does |
+| --- | --- | --- | --- |
+| 11 | `TektonConfig/config` | DEV-OCP-1.1 #175 | OpenShift Pipelines operand; full profile, daily pruner |
+| 25 | `EventListener/gitlab-listener` | DEV-OCP-3B.2 #190 | GitLab webhook ingress; HMAC + CEL routing |
+| 25 | `gitlab-webhook-secret` | DEV-OCP-3B.2 #190 | HMAC token from Vault via ESO |
+| 30 | `Pipeline/liberty-build-deploy` | DEV-OCP-3B.1 #189 | per-language Pipeline template (Liberty) |
+| 30 | `Pipeline/node-build-deploy` | DEV-OCP-3B.1 #189 | per-language Pipeline template (Node) |
+| 30 | `Pipeline/spring-build-deploy` | DEV-OCP-3B.1 #189 | per-language Pipeline template (Spring) |
+| 30 | `Task/trivy-scan` | DEV-OCP-3B.3 #191 | image vulnerability scan, fail on HIGH/CRITICAL |
+| 30 | `Task/overlay-patch` | DEV-OCP-3B.4 #192 | git-clone, edit overlay, git-push back |
+| 30 | `Task/push-image-quay` | DEV-OCP-3B.5 #193 | skopeo copy to Quay with per-team robot Secret |
+| 30 | `Task/evidence-publish` | DEV-OCP-3B.5 #193 | upload SBOM + scan-result + manifest to evidence MinIO |
+
+## The three Pipeline templates
+
+The templates live in `openshift-pipelines` so every tenant reuses them — there is no per-tenant copy. The only thing that varies per tenant is the GitLab project tag (`tektonbuild-liberty`, `tektonbuild-node`, `tektonbuild-spring`) that the EventListener's CEL filter uses to pick the language.
+
+Each template is the same shape:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: liberty-build-deploy
+  namespace: openshift-pipelines
+spec:
+  params:
+    - { name: team,         type: string }
+    - { name: app,          type: string }
+    - { name: git-url,      type: string }
+    - { name: git-revision, type: string }
+    - { name: target-env,   type: string, default: dev }
+  workspaces:
+    - name: source
+    - name: dockerconfig
+  tasks:
+    - name: clone
+      taskRef: { name: git-clone, kind: ClusterTask }
+      params: [{ name: url, value: $(params.git-url) }, { name: revision, value: $(params.git-revision) }]
+      workspaces: [{ name: output, workspace: source }]
+    - name: build
+      taskRef: { name: buildah, kind: ClusterTask }
+      runAfter: [clone]
+      params: [{ name: IMAGE, value: "image-registry.openshift-image-registry.svc:5000/openshift-pipelines/$(params.app):build" }]
+      workspaces: [{ name: source, workspace: source }]
+    - name: scan
+      taskRef: { name: trivy-scan }
+      runAfter: [build]
+      params: [{ name: image, value: $(tasks.build.results.IMAGE_DIGEST) }]
+      workspaces: [{ name: source, workspace: source }]
+    - name: push
+      taskRef: { name: push-image-quay }
+      runAfter: [scan]
+      params:
+        - { name: image-name,   value: $(params.app) }
+        - { name: image-tag,    value: $(params.git-revision) }
+        - { name: team,         value: $(params.team) }
+        - { name: robot-secret, value: "quay-robot-$(params.team)" }
+      workspaces: [{ name: source, workspace: source }]
+    - name: patch-overlay
+      taskRef: { name: overlay-patch }
+      runAfter: [push]
+      params:
+        - { name: team,        value: $(params.team) }
+        - { name: app,         value: $(params.app) }
+        - { name: target-env,  value: $(params.target-env) }
+        - { name: image-ref,   value: $(tasks.push.results.image-ref) }
+        - { name: image-digest,value: $(tasks.push.results.image-digest) }
+    - name: evidence
+      taskRef: { name: evidence-publish }
+      runAfter: [patch-overlay]
+      params:
+        - { name: team,         value: $(params.team) }
+        - { name: app,          value: $(params.app) }
+        - { name: pipelinerun,  value: $(context.pipelineRun.name) }
+        - { name: image-digest, value: $(tasks.push.results.image-digest) }
+      workspaces: [{ name: source, workspace: source }]
+```
+
+The Liberty Pipeline uses the operator-installed `buildah` ClusterTask; the Node Pipeline swaps that for an `npm-build` step that runs `npm ci` + `npm run build` inside a Node 22 runner image and then `buildah` to package; the Spring Pipeline runs `./mvnw -B package` and then `buildah` with a JRE base. Every other step is identical — that's the contract.
+
+## The four reusable Tasks
+
+### `trivy-scan` — DEV-OCP-3B.3 #191
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: trivy-scan
+  namespace: openshift-pipelines
+spec:
+  params:
+    - { name: image,    type: string, description: "Image ref or digest to scan" }
+    - { name: severity, type: string, default: "HIGH,CRITICAL" }
+    - { name: ignore-unfixed, type: string, default: "true" }
+  workspaces:
+    - name: source
+  results:
+    - { name: scan-result-path, description: "Path inside workspace to the SARIF + JSON output" }
+  steps:
+    - name: scan
+      image: quay.io/aquasecurity/trivy:0.49.1
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        mkdir -p "$(workspaces.source.path)/evidence"
+        trivy image \
+          --severity "$(params.severity)" \
+          --ignore-unfixed="$(params.ignore-unfixed)" \
+          --format sarif \
+          --output "$(workspaces.source.path)/evidence/trivy.sarif" \
+          --exit-code 1 \
+          "$(params.image)"
+        echo "evidence/trivy.sarif" > "$(results.scan-result-path.path)"
+```
+
+`--exit-code 1` is the gate — any HIGH or CRITICAL fails the Task, which fails the Pipeline. The SARIF output is the evidence artefact. The `ignore-unfixed=true` default suppresses CVEs that have no upstream fix — a deliberate noise-reduction. Override to `false` on PCI tenants where every CVE must be tracked even without a patch.
+
+### `overlay-patch` — DEV-OCP-3B.4 #192
+
+Clones the platform-apps overlay repo, edits the per-tenant overlay's `kustomization.yaml` with the new image digest, commits, pushes. The Task uses a Vault-sourced GitLab deploy-token (also delivered by ESO) for the push.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: overlay-patch
+  namespace: openshift-pipelines
+spec:
+  params:
+    - { name: team,         type: string }
+    - { name: app,          type: string }
+    - { name: target-env,   type: string }
+    - { name: image-ref,    type: string }
+    - { name: image-digest, type: string }
+    - { name: deploy-token-secret, type: string, default: "gitlab-deploy-token-platform-apps" }
+  steps:
+    - name: clone
+      image: registry.access.redhat.com/ubi9/git:1-43.1716471284
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        cd /tmp
+        TOKEN=$(cat /workspace/git-creds/token)
+        git clone "https://oauth2:${TOKEN}@gitlab.apps.sub.comptech-lab.com/comptech-platform/platform-apps.git"
+    - name: edit-and-push
+      image: registry.access.redhat.com/ubi9/git:1-43.1716471284
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        cd /tmp/platform-apps/overlays/$(params.team)-$(params.app)-$(params.target-env)
+        ../../bin/set-image-digest "$(params.image-ref)@$(params.image-digest)"
+        git -c user.email=tekton@platform -c user.name=tekton add -u
+        git commit -m "[$(params.team)/$(params.app)] $(params.target-env) → $(params.image-digest)"
+        git push origin HEAD:main
+      volumeMounts:
+        - { name: git-creds, mountPath: /workspace/git-creds, readOnly: true }
+  volumes:
+    - name: git-creds
+      secret:
+        secretName: $(params.deploy-token-secret)
+```
+
+This is the link between Path B and Argo's pull side. The Pipeline doesn't `kubectl apply` anything; it edits the overlay and lets the cluster's Argo Application reconcile the new image. The cluster's Argo has cluster-admin on the overlay namespaces; the Pipeline does not.
+
+### `push-image-quay` — DEV-OCP-3B.5 #193
+
+Documented in detail on [§14.5 OpenTelemetry + push-image-quay](./05-opentelemetry). Key contract:
+
+- Param `robot-secret` is the **Secret name** in `openshift-pipelines` — the Task is reused unchanged across tenants; per-team isolation is the Secret name, not a per-Task copy.
+- The robot Secret is `kubernetes.io/dockerconfigjson`, materialised by ESO from Vault path `secret/apps/<division>/<app>/ci/quay-robot`.
+- `skopeo copy`, not `buildah push` — skopeo only needs the source workspace + the robot Secret, no privileged build container.
+
+### `evidence-publish` — DEV-OCP-3B.5 #193
+
+Uploads the per-build artefact set to MinIO at `30.30.30.14:9000`, prefixed by `<team>/<app>/<pipelinerun>/`:
+
+| Artefact | Source |
+| --- | --- |
+| `trivy.sarif` | from the `trivy-scan` Task workspace |
+| `image-digest.txt` | from `push-image-quay` results |
+| `manifest.yaml` | from `buildah` workspace (the image manifest) |
+| `evidence.json` | a small index file the Task generates: PipelineRun name + commit SHA + image digest + scan-result path + timestamp |
+
+The `evidence.json` shape matches the parity contract documented in `opp-full-plat/connection-details/ci-evidence-schema.md`. Path A (Jenkins on a VM) writes the same shape into the same MinIO prefix, so a consumer downstream (DefectDojo, compliance dashboard) does not need to know which path produced a build.
+
+## How a tenant onboards
+
+The platform team's onboarding script does:
+
+1. Create a Quay Organization + Robot Account for the team.
+2. Put the robot username + token into Vault at `secret/apps/<division>/<app>/ci/quay-robot`.
+3. Apply the per-tenant `ExternalSecret` so `quay-robot-<team>` materializes in `openshift-pipelines`.
+4. Tag the GitLab project with one of `tektonbuild-liberty`, `tektonbuild-node`, `tektonbuild-spring`.
+5. Add the Tekton webhook URL (`https://tekton-listener.apps.sub.comptech-lab.com`) to the GitLab project — same URL for every tenant.
+
+The first `git push` is then enough. No Pipeline copy, no Task copy, no operator changes.
+
+## Failure modes
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| `trivy-scan` fails on a CVE the team can't fix this week. | `--ignore-unfixed=true` already on; the CVE has a fix upstream but the team hasn't bumped. | Either bump the base image, or pin a per-tenant Task override that adds a `.trivyignore` for the specific CVE with an expiry date. |
+| `push-image-quay` fails 401. | Robot Secret missing or robot lacks `Write` on the Quay org. | Check ESO refresh; verify Quay org permissions. |
+| `overlay-patch` push rejected. | Deploy token expired or revoked. | Rotate via Vault; ESO refreshes the in-cluster Secret on next interval. |
+| `evidence-publish` fails to upload. | MinIO bucket policy didn't include the per-tenant prefix. | Update the bucket policy; evidence is replayable from the PipelineRun workspace. |
+| Pipeline succeeds but the overlay commit doesn't trigger Argo. | Argo Application repo URL or revision mismatch. | Check `Application.spec.source.repoURL` matches the overlay branch the Task pushed to. |
+
+## References
+
+- DEV-OCP-1.1 #175 — TektonConfig operand wave 11.
+- DEV-OCP-3B.1 #189 — Pipeline templates (Liberty, Node, Spring).
+- DEV-OCP-3B.2 #190 — EventListener + GitLab secret.
+- DEV-OCP-3B.3 #191 — `trivy-scan` Task.
+- DEV-OCP-3B.4 #192 — `overlay-patch` Task.
+- DEV-OCP-3B.5 #193 — `push-image-quay` + `evidence-publish` Tasks.
+- `opp-full-plat/connection-details/ci-evidence-schema.md` — Path A / Path B parity contract.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines-templates/` — Pipelines + EventListener + Triggers.
+- `platform-gitops/clusters/spoke-dc-v6/platform-services/pipelines-tasks/` — the four reusable Tasks.

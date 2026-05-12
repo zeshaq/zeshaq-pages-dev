@@ -2,9 +2,11 @@
 title: "Quay on cluster — operator, QuayRegistry, Organizations + Robot Accounts"
 description: "How Red Hat Quay is installed as the OCP-native registry for the Tekton (Path B) push target, the QuayRegistry CR with NooBaa-backed object storage, Clair scanning, the ESO-delivered config-bundle and superuser, and per-team Organizations + Robot Accounts."
 sidebar_label: "Quay Registry"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
+
+> **Status — 2026-05-12.** The `quay-operator` Subscription on `stable-3.13` is installed on spoke-dc-v6 and `Available`. The `QuayRegistry` **operand is currently deferred** under OP-HEALTH1 (#258) and is not active. The design below is the target state; Path B tenants today push to the Path A Nexus path as an interim. Tekton wiring (the [per-tenant Quay robot token](../../04-application-delivery/05-tenant-onboarding/09-quay-robot-token-per-tenant)) is ready to flip when the operand lands.
 
 import Whiteboard from "../../../../components/Whiteboard";
 
@@ -75,7 +77,7 @@ Reading the diagram:
 - **Object storage** is NooBaa via OBC (same pattern as Loki/Tempo).
 - The **config-bundle Secret** is materialised by ESO from Vault.
 - A **superuser** is bootstrapped from Vault on first install; subsequent users authenticate via OCP OAuth (configurable).
-- Per-team **Robot Accounts** are created in the Quay UI (or by API); their tokens are stored in Vault and materialised by ESO per the tenant convention (covered separately in §14.5 push-image and `reference_quay_robot_token_convention.md`).
+- Per-team **Robot Accounts** are created in the Quay UI (or by API); their tokens are stored in Vault and materialised by ESO per the tenant convention (covered separately at [per-tenant Quay robot token](../../04-application-delivery/05-tenant-onboarding/09-quay-robot-token-per-tenant)).
 
 ## Operator install
 
@@ -248,9 +250,9 @@ Each onboarded tenant gets:
 2. A **Robot Account** named `<team>+ci` with `Write` permission on the org's repos.
 3. The robot's token stored in Vault at `secret/apps/<division>/<app>/ci/quay-robot` with keys `username` + `token`.
 4. The tenant's `SecretStore` materialises the token into a `dockerconfigjson` Secret `quay-robot-team-<team>` in `openshift-pipelines`.
-5. The shared Tekton Task `push-image-quay` mounts that Secret per-pipeline (see §14.5).
+5. The shared Tekton Task `push-image-quay` mounts that Secret per-pipeline; the Secret name is a Task parameter, so the Task itself stays shared. See [per-tenant Quay robot token](../../04-application-delivery/05-tenant-onboarding/09-quay-robot-token-per-tenant) for the full pattern.
 
-This convention is documented in `reference_quay_robot_token_convention.md` and ensures tenant isolation at the registry level — Tenant A cannot push to Tenant B's org because their respective robot tokens have non-overlapping repo scope.
+This convention is documented in detail at the [per-tenant Quay robot token](../../04-application-delivery/05-tenant-onboarding/09-quay-robot-token-per-tenant) page and ensures tenant isolation at the registry level — Tenant A cannot push to Tenant B's org because their respective robot tokens have non-overlapping repo scope.
 
 ## Image registry allowlist
 
@@ -305,5 +307,6 @@ Expected:
 - DEV-OCP-1.6 #180 (Quay operator + QuayRegistry).
 - DEV-OCP-1.7 #181 (Quay Route + ESO superuser + Organizations).
 - DEV-OCP-3B.5 #193 (Tekton image push to Quay).
+- OP-HEALTH1 #258 — operand currently deferred; tracks the unblock.
 - `platform-gitops/clusters/spoke-dc-v6/platform-services/quay/` — QuayRegistry + OBC + config-bundle.
 - Red Hat Quay docs: `QuayRegistry` schema, Clair, Robot Accounts.
