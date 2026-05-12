@@ -1,0 +1,253 @@
+---
+title: "Container security: build, scan, sign, admit"
+sidebar_label: "04 — Container security"
+description: "Build minimal hardened images, scan them with Trivy, sign them with cosign, and reject unsigned or vulnerable images at admission. The four layers, the failure modes, and the lab posture."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const blockEdge= { style: { stroke: "#b91c1c", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const stackNodes = [
+  { id: "src",   position: { x: 60,  y: 0   }, data: { label: "Source\n+ Dockerfile" },                       style: stage },
+  { id: "build", position: { x: 360, y: 0   }, data: { label: "1. Build hygiene\nmulti-stage, distroless,\nnon-root, pinned" }, style: ctrl },
+  { id: "scan",  position: { x: 660, y: 0   }, data: { label: "2. Image scan\nTrivy (OS + lang deps)" },      style: ctrl },
+
+  { id: "sign",  position: { x: 660, y: 160 }, data: { label: "3. Sign\ncosign (keyless / KMS)" },            style: ctrl },
+  { id: "reg",   position: { x: 360, y: 160 }, data: { label: "Registry\n(immutable digest)" },               style: stage },
+  { id: "rekor", position: { x: 60,  y: 160 }, data: { label: "Rekor\ntransparency log" },                    style: ext },
+
+  { id: "admit", position: { x: 360, y: 320 }, data: { label: "4. Admission\nRHACS / Kyverno /\nSigstore PC" }, style: ctrl },
+  { id: "pod",   position: { x: 60,  y: 320 }, data: { label: "Pod\n(signed image)" },                        style: agent },
+  { id: "rej",   position: { x: 660, y: 320 }, data: { label: "Reject\n(unsigned / CVE / unscanned)" },       style: stage },
+];
+
+export const stackEdges = [
+  { id: "s1", source: "src",   target: "build", label: "docker build", ...reqEdge },
+  { id: "s2", source: "build", target: "scan",  label: "image artifact", ...reqEdge },
+  { id: "s3", source: "scan",  target: "sign",  label: "if clean",       ...reqEdge },
+  { id: "s4", source: "sign",  target: "reg",   label: "push + sig",     ...reqEdge },
+  { id: "s5", source: "sign",  target: "rekor", label: "log entry",      ...pullEdge },
+  { id: "s6", source: "reg",   target: "admit", label: "kubelet pull",   ...reqEdge },
+  { id: "s7", source: "admit", target: "pod",   label: "verify ok",      ...reqEdge },
+  { id: "s8", source: "admit", target: "rej",   label: "verify fail",    ...blockEdge },
+];
+
+A container image is a portable filesystem plus a chunk of declarative metadata. From a security perspective it's also a bundle of upstream code you didn't write, a non-trivial fraction of which has known vulnerabilities, running as a process you'd like to be confident isn't root. Four things have to happen to ship one safely: build it small and hardened, scan it, sign it, and reject it at admission if any of those didn't happen.
+
+Each of those four steps catches something the previous one missed. Skip any one and you'll find out at runtime — usually after an incident.
+
+## The four layers
+
+<Whiteboard client:load data={{ nodes: stackNodes, edges: stackEdges }} height={460} />
+
+Reading the diagram: source plus Dockerfile becomes a built image through hardened build patterns; the image gets scanned; if it passes, it gets signed by cosign (with the signing event logged to Rekor's transparency log) and pushed to the registry; the admission controller in the cluster verifies the signature and the scan result on every pull, admitting clean+signed images and rejecting the rest.
+
+The four layers in plain text:
+
+- **Build hygiene** — minimal base, no root, no unnecessary packages, pinned versions.
+- **Image scanning** — CVE check against OS packages + language deps + IaC + bundled tools.
+- **Image signing** — cryptographic provenance: this image was built by this identity at this time.
+- **Admission policy** — the cluster's contract: don't run images that didn't pass the first three.
+
+Each layer catches what the previous missed. The build catches the obvious "running as root with apt-get inside the container" mistakes. The scanner catches the CVE in `openssl` that the build didn't know about. The signature catches an attacker who replaced the image in the registry. The admission gate catches a developer who pushed an unsigned dev image to production.
+
+## Image build hygiene
+
+Concrete practices, in order of impact:
+
+- **Multi-stage Dockerfile.** Build in a `golang:1.22-alpine` (or `node:20-bullseye-slim`, etc.) stage that has the toolchain; copy only the built artifact into a `gcr.io/distroless/static-debian12` final stage. Final image goes from ~800 MiB to ~10-20 MiB. Less surface area is less attack surface.
+- **Non-root user.** `USER 65532:65532` (a conventional non-root UID in distroless). Mandatory for Kubernetes Pod Security Standards' `restricted` profile. The container's process never has UID 0; a container escape lands on a non-root user on the host.
+- **No package manager in the final image.** Use `gcr.io/distroless/...` (Google), `cgr.dev/chainguard/...` (Wolfi, Chainguard's hardened bases), or `FROM scratch` for static Go binaries. No `apt`, no `apk`, no `yum`; an attacker who lands a shell can't install tools to pivot.
+- **Pinned versions, by digest not tag.** `FROM golang:1.22.5-alpine3.18@sha256:...` not `FROM golang:1.22`. Tag drift is a supply-chain risk — the same tag points to a different image tomorrow, your build is non-reproducible, your security review is moot.
+- **HEALTHCHECK.** `HEALTHCHECK CMD curl -f http://localhost:8080/health || exit 1`. Ops cares because it makes restarts and rolling deploys correct; security cares because a container that won't recover from a wedge is a denial of service vector.
+
+A minimal multi-stage Dockerfile for a Go service:
+
+```dockerfile
+FROM golang:1.22.5-alpine3.18@sha256:abc123... AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/app ./cmd/app
+
+FROM gcr.io/distroless/static-debian12@sha256:def456...
+COPY --from=build /out/app /app
+USER 65532:65532
+ENTRYPOINT ["/app"]
+```
+
+The result is ~15 MiB, runs as UID 65532, contains exactly one binary and the Go runtime, has no shell, no `cat`, no `curl`, nothing for an attacker to live off the land with.
+
+## Dockerfile linting
+
+**Hadolint** catches the easy mistakes — `apt-get install` without `--no-install-recommends`, missing `USER`, `FROM ubuntu:latest`, `ADD` instead of `COPY`. Fast, opinionated, runs in pre-commit and CI in seconds. **Trivy config-scan** (`trivy config Dockerfile`) covers some of the same ground from a security-misconfiguration angle.
+
+Run hadolint in pre-commit (instant feedback for the developer) and in CI (the non-bypassable gate). The opinions are well-tuned; the few you disagree with go in `.hadolint.yaml` with a comment.
+
+## Image scanning at build time
+
+After `docker build`, before `docker push`, scan the image. The scanner reads the layers, identifies installed OS packages (from `dpkg`/`rpm`/`apk` databases) and language packages (from `package-lock.json`, `requirements.txt`, `go.sum`, etc.), and looks each up in the CVE feeds.
+
+| Tool | Strength | Notes |
+| --- | --- | --- |
+| Trivy | OSS, broad coverage, fast, JSON/SARIF/SBOM output | Lab default in both build paths |
+| Clair | OSS, Quay-integrated | Older, narrower; fine if you're already on Quay |
+| Snyk Container | Commercial, deep CVE-graph + fix-PR | Heavier UX; bundled with Snyk Code/OSS |
+| Aqua / Anchore / Prisma | Enterprise platforms | Audit-driven shops |
+| RHACS Scanner v4 | RHACS-bundled | Lab's runtime/admission scanner; see §7 |
+
+Pattern: scan the built image; fail the build on Critical (CVSS 9-10); report Medium+ to DefectDojo for tracking. The thresholds match Module 03 — Critical fails, High fails with a documented exception, the rest tracks without blocking.
+
+The scan happens *twice* in a mature pipeline: at build time (catches things before they're pushed) and at admission time (catches things that drift between build and deploy, or things that became CVEs after the build). RHACS does the admission-time scan; the build-time scanner is your choice.
+
+## Image signing — cosign and Sigstore
+
+The 2026 standard for image signing is **cosign**, part of the **Sigstore** project. The shape:
+
+- **cosign** — a CLI that signs and verifies container images. The signature is stored as an OCI artifact in the same registry as the image (under a `:sha256-<digest>.sig` tag).
+- **Sigstore Fulcio** — a certificate authority that issues short-lived X.509 certs to OIDC identities (Google, GitHub, GitLab, your IdP). Your CI job authenticates to Fulcio via its workload identity token; Fulcio issues a cert good for ~10 minutes; you sign with that. **No long-lived keys to rotate.**
+- **Sigstore Rekor** — a public, append-only transparency log of every signing event. The signing record is published to Rekor; verifiers can independently confirm the signature was made when claimed.
+
+The shift: from *"trust the registry"* (anyone with push credentials can publish an image) to *"trust a cryptographic signature, verifiable independently"* (the image was signed by a specific identity, logged in a public transparency log, at a specific time). The registry can be compromised; the signature still has to verify.
+
+Two signing modes:
+
+- **Keyless (Fulcio + OIDC).** No persistent key. CI authenticates to Fulcio, signs with a short-lived cert, the cert's `Subject` is the OIDC identity (`https://github.com/myorg/myrepo/.github/workflows/build.yml@refs/heads/main`). This is the pattern modern OSS projects use.
+- **KMS-backed key.** Long-lived signing key stored in AWS KMS / GCP KMS / Vault Transit / HSM. `cosign sign --key=hashivault://signing-key image@sha256:...`. The pattern most enterprises use, because regulators want a named key in a named HSM.
+
+## Signing in CI — the pattern
+
+A GitHub Actions workflow that builds, scans, signs, generates an SBOM, and updates the deployment manifest:
+
+```yaml
+- run: docker build -t $IMAGE .
+- run: trivy image --severity CRITICAL --exit-code 1 $IMAGE
+- run: docker push $IMAGE
+- run: |
+    DIGEST=$(crane digest $IMAGE)
+    cosign sign --yes ${IMAGE}@${DIGEST}
+    syft ${IMAGE}@${DIGEST} -o cyclonedx-json > sbom.json
+    cosign attest --yes --predicate sbom.json \
+      --type cyclonedx ${IMAGE}@${DIGEST}
+- run: yq -i ".image = \"${IMAGE}@${DIGEST}\"" deploy/values.yaml
+```
+
+Four non-obvious rules. **One**: sign the digest, not the tag. Tags are mutable; signing `myimage:v1.2.3` lets an attacker re-push a different image to the same tag with the original signature. Signing `myimage@sha256:abc...` binds the signature to exactly that content. **Two**: scan before sign, not after. A signed-but-vulnerable image is worse than an unsigned one — you've cryptographically attested to a CVE-laden artifact. **Three**: update the deployment manifest to the digest, not the tag, so the rollout uses the exact bytes you signed. **Four**: cosign + SBOM is two attestations on the image, both verifiable separately — the SBOM is covered in Module 05.
+
+## Verifying at admission — the gate
+
+Three implementations, in order of how often we see them on OpenShift:
+
+- **RHACS** — Advanced Cluster Security, the lab's runtime security tool. The *Trusted Image Signatures* policy verifies cosign signatures at admission; the *Fixable Severity at least Critical* policy blocks images with unfixed Critical CVEs. Policies attach to specific clusters / namespaces / scopes.
+- **Kyverno** — general-purpose policy engine; the `verify-images` rule supports cosign verification against named keys or keyless OIDC identities. Lightweight, OSS, easy to write rules in YAML.
+- **Sigstore Policy Controller** — Kubernetes admission webhook from the Sigstore project. Pure-cosign-aware; the most precise option for keyless verification with complex identity matching.
+
+Pick one. **Don't combine** unless you've thought through the admission-webhook ordering carefully — two webhooks both inspecting the same Pod can race, double-deny, or get into a state where one says yes and the other says no and the API server returns an unhelpful error.
+
+A minimal Kyverno policy that requires cosign-signed images:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: require-signed-images }
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: verify
+      match: { any: [{ resources: { kinds: [Pod] } }] }
+      verifyImages:
+        - imageReferences: ["registry.example.com/*"]
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/myorg/*"
+                    issuer: "https://token.actions.githubusercontent.com"
+```
+
+## Image registries — the hardening list
+
+The registry is the bridge between build and runtime. Five non-negotiables:
+
+- **Disable public pull on internal registries.** Default-allow on a registry hosting your private code is a leak vector.
+- **Force authenticated push with per-service-account credentials.** No shared admin tokens. A leaked CI token should only let an attacker push to one app's repo, not the whole registry.
+- **Image immutability.** Quay, Harbor, Nexus, ECR, Artifactory all support per-repo immutability — once a digest is pushed, it can't be overwritten or deleted (or only with admin override + audit). Enable it.
+- **Mirror upstream.** Pull-through cache mirrors of Docker Hub, Quay, GHCR mean (a) you don't rate-limit at build time, (b) you can scan the mirrored copy, (c) your build doesn't break when upstream is down. The lab's three-Nexus-endpoint pattern formalises this: `mirror-registry.*` for cluster install, `docker-group.*` for developer/CI pulls, `app-registry.*` for application pushes.
+- **Retention policy.** Untagged or stale images grow without bound; old vulnerable images linger forever. Set a per-repo retention (e.g., keep the latest N digests + anything tagged `stable-*`).
+
+## The pull-secret problem
+
+Every cluster needs credentials to pull from private registries. The blast radius of those credentials matters. Patterns:
+
+- **Cluster-wide pull secret.** One Secret merged into every node's kubelet config. Easy; the blast radius is enormous — a leaked node compromises pull access to every registry in the secret.
+- **Per-namespace pull secret via ESO.** The lab pattern: External Secrets Operator pulls registry credentials from Vault into a Secret in each tenant namespace, references it as `imagePullSecrets` on the workload's ServiceAccount. Per-tenant rotation; per-tenant blast radius.
+- **Workload Identity / IRSA.** AWS IRSA, GCP Workload Identity, Azure Workload Identity, OpenShift's Pod Identity Webhook — federated identity from cloud IAM to the Pod's ServiceAccount, no static credentials in cluster. The strongest pattern when available.
+
+## Lab posture
+
+The lab does:
+
+- **Trivy scan in both build paths** — Path A Jenkins + Path B Tekton, findings flowing to DefectDojo.
+- **RHACS image-policy enforcement at admission** — Trusted Image Signatures policy is wired up; Fixable Critical policy blocks vulnerable images.
+- **Three-endpoint Nexus split** with image-digest immutability enforced on the `app-registry` endpoint.
+- **Per-tenant pull secrets via ESO** materialising from Vault.
+
+What the lab *doesn't* yet do:
+
+- **cosign signing of built images** — Path A and Path B both produce unsigned images today. The admission policy is wired but doesn't have anything to verify. Tracked under the BFSI readiness review's Tier 1.
+- **SBOM generation** — covered in Module 05. The hooks aren't yet in either build path.
+- **Provenance attestation** — also Module 05; same gap.
+
+The shape is good; the cryptographic links are the next wave of work.
+
+## Try this
+
+**1. Convert a single-stage Go Dockerfile to multi-stage with distroless.** Start with the obvious `FROM golang:1.22` that builds and runs in the same image. Split into a `golang:1.22-alpine` build stage and a `gcr.io/distroless/static-debian12` final stage. Compare image sizes. You should see a 50-100x reduction.
+
+**2. Sign an image with cosign against a local registry.** Push `myimage:v1` to a local registry (`docker run -d -p 5000:5000 registry:2`). Run `cosign sign --key cosign.key localhost:5000/myimage@<digest>`. Verify with `cosign verify --key cosign.pub localhost:5000/myimage@<digest>`. Tamper with the registry (push a different image to the same tag) and watch the verify fail.
+
+**3. Write a Kyverno policy that blocks any Deployment whose image is unsigned.** Use the policy from §7 as a starting point. Apply to a test namespace. Deploy a signed image — admits. Deploy an unsigned image — admission denied with the policy name and rule in the rejection message.
+
+## Common failure modes
+
+**Image bloat — multi-stage Dockerfile copies `node_modules/` into the final stage.** The point of multi-stage is that the final stage is fresh; `COPY --from=build /src/dist /app` is fine, `COPY --from=build /src /app` drags the entire build tree. Audit the `COPY` lines.
+
+**Distroless image fails because the binary expects glibc.** Distroless `static-debian12` is for statically-linked binaries (Go with `CGO_ENABLED=0`, Rust with `musl`). Dynamically-linked binaries (Java, Python, most Node.js) need `gcr.io/distroless/base-debian12` (glibc) or `gcr.io/distroless/java17-debian12`. Pick the right base for the runtime.
+
+**RHACS rejects images at admission because the signing identity isn't in the allowlist.** Every new build pipeline minted a different keyless identity (different repo, different branch); the RHACS policy only allowed the old one. Update the policy's allowed-identity glob, or use a KMS key whose identity doesn't change.
+
+**`cosign verify` intermittently fails.** Rekor's transparency log is occasionally slow to confirm a fresh signature. Use `cosign verify --insecure-ignore-tlog` only in dev; in production, retry with exponential backoff or wait for the Rekor inclusion proof before attempting verify.
+
+**Pod can't pull the image — `ImagePullBackOff`.** The pull secret isn't in the namespace, isn't on the ServiceAccount, or has the wrong registry credentials. `kubectl describe pod` shows the kubelet's error verbatim; usually `unauthorized` or `denied: requested access to the resource is denied`. Check the Secret's `.dockerconfigjson` decodes to the right registry URL.
+
+**Image signed in CI but verify-on-build-machine fails locally.** The local machine isn't picking up the same Rekor instance or Fulcio root. `cosign verify` defaults to the public Sigstore instance; if you run a private Sigstore (some enterprises do), set `COSIGN_EXPERIMENTAL=1` and the right environment variables, or use the `--rekor-url` / `--certificate-chain` flags.
+
+## Where this is heading
+
+You can build minimal images, scan them, sign them, and gate them at the cluster. The remaining question is the one cosign half-answers: *given a signed image, what evidence do I have about how it was built, what was in its dependency graph, and that the build itself wasn't tampered with?* That's the supply-chain layer.
+
+**Next:** [Module 05 — Supply-chain security](/learn/devsecops/05-supply-chain-security) — SLSA levels, SBOM generation with syft, in-toto attestations, and the path from "we sign our images" to SLSA L3.
+
+## References
+
+- NIST SP 800-190 (container security guide): [csrc.nist.gov/publications/detail/sp/800-190/final](https://csrc.nist.gov/publications/detail/sp/800-190/final)
+- Sigstore documentation: [docs.sigstore.dev](https://docs.sigstore.dev/)
+- cosign: [github.com/sigstore/cosign](https://github.com/sigstore/cosign)
+- Rekor transparency log: [docs.sigstore.dev/rekor/overview/](https://docs.sigstore.dev/rekor/overview/)
+- Distroless images: [github.com/GoogleContainerTools/distroless](https://github.com/GoogleContainerTools/distroless)
+- Chainguard / Wolfi: [edu.chainguard.dev](https://edu.chainguard.dev/)
+- Hadolint: [github.com/hadolint/hadolint](https://github.com/hadolint/hadolint)
+- Trivy: [trivy.dev](https://trivy.dev/)
+- Kyverno verify-images: [kyverno.io/docs/writing-policies/verify-images/](https://kyverno.io/docs/writing-policies/verify-images/)
+- Sigstore Policy Controller: [docs.sigstore.dev/policy-controller/overview/](https://docs.sigstore.dev/policy-controller/overview/)
+- Kubernetes Pod Security Standards: [kubernetes.io/docs/concepts/security/pod-security-standards/](https://kubernetes.io/docs/concepts/security/pod-security-standards/)

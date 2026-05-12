@@ -1,0 +1,220 @@
+---
+title: "Supply-chain security: SLSA, SBOM, in-toto attestations"
+sidebar_label: "05 — Supply-chain security"
+description: "The SLSA framework, CycloneDX vs SPDX SBOMs, in-toto attestations, and a reference pipeline that gets you to SLSA L3. Plus a candid lab self-assessment and the failure modes that turn a signed claim into theatre."
+estimated_minutes: 75
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const mutedEdge= { style: { stroke: "#6b7280", strokeDasharray: "4,3" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const slsaNodes = [
+  { id: "src",   position: { x: 60,  y: 0   }, data: { label: "Source repo\nsigned commits,\nprotected main,\nmandatory review" }, style: ctrl },
+  { id: "build", position: { x: 360, y: 0   }, data: { label: "Build system\nisolated runner,\nbuild-as-code,\nno human access" }, style: ctrl },
+  { id: "img",   position: { x: 660, y: 0   }, data: { label: "Image\n+ attestations" },                       style: stage },
+
+  { id: "prov",  position: { x: 60,  y: 180 }, data: { label: "SLSA provenance\n(builder, source ref,\nmaterials)" }, style: agent },
+  { id: "sbom",  position: { x: 260, y: 180 }, data: { label: "SBOM\n(CycloneDX)" },                           style: agent },
+  { id: "vuln",  position: { x: 460, y: 180 }, data: { label: "Vuln scan\nattestation\n(Trivy result)" },      style: agent },
+  { id: "test",  position: { x: 660, y: 180 }, data: { label: "Test attestation\n(suite + outcome)" },         style: agent },
+
+  { id: "reg",   position: { x: 360, y: 340 }, data: { label: "Registry\nimmutable digests +\ncosign signatures" }, style: stage },
+  { id: "cl",    position: { x: 660, y: 340 }, data: { label: "Cluster admission\nverifies SLSA L3\nbefore pull" }, style: ctrl },
+  { id: "rekor", position: { x: 60,  y: 340 }, data: { label: "Rekor\ntransparency log" },                     style: ext },
+];
+
+export const slsaEdges = [
+  { id: "l1", source: "src",  target: "build", label: "fetch source",     ...reqEdge },
+  { id: "l2", source: "build", target: "img",  label: "produces",         ...reqEdge },
+  { id: "l3", source: "build", target: "prov", label: "emits",            ...pullEdge },
+  { id: "l4", source: "build", target: "sbom", label: "emits",            ...pullEdge },
+  { id: "l5", source: "build", target: "vuln", label: "emits",            ...pullEdge },
+  { id: "l6", source: "build", target: "test", label: "emits",            ...pullEdge },
+  { id: "l7", source: "img",  target: "reg",   label: "push + sign",      ...reqEdge },
+  { id: "l8", source: "prov", target: "rekor", label: "log",              ...mutedEdge },
+  { id: "l9", source: "reg",  target: "cl",    label: "pull request",     ...reqEdge },
+];
+
+A supply-chain attacker doesn't need to compromise your code. They need to compromise a dependency that ships into your code, or the build system that turns your code into a binary, or the registry the binary lands in. Three real incidents make this concrete:
+
+- **SolarWinds (2020).** An attacker modified the build server. The signed update — signed by SolarWinds's own legitimate key — shipped to 18,000 customers. The source code was fine; the build pipeline wasn't.
+- **log4shell (2021).** A remote-code-execution vulnerability in `log4j-core`, a transitive dependency of trillions of devices' worth of Java apps. Nobody chose log4j directly; everyone shipped it.
+- **XZ Utils backdoor (2024).** A multi-year social-engineering campaign placed a maintainer who introduced an SSH backdoor into `xz`, a near-universal Linux compression library. Spotted by accident, days from being merged into stable distributions.
+
+The shape of the answer is *evidence*: cryptographic claims connecting the source to the build to the artifact, with enough provenance that an attacker can't quietly substitute any of the three.
+
+## What "supply-chain security" actually covers
+
+Five distinct things that get bundled under the same heading:
+
+- **Source integrity.** Who can commit to the repo. Signed commits. Protected branches. Mandatory PR review. The control is *"the source we built from is the source we said we'd build from."*
+- **Build integrity.** The build runs in a controlled environment. No human SSH into the runner mid-build. Build definition as code, version-controlled, reviewed. The control is *"the binary was produced by the process we said would produce it."*
+- **Artifact integrity.** The binary that ships is verifiable as the one built from the named source by the named pipeline. The cosign signature from Module 04 starts here.
+- **Dependency integrity.** Every upstream dependency is identified, scanned, and pinned by hash. Trivy + SCA from Module 03 starts here.
+- **Attestation.** Cryptographic evidence linking source → build → artifact, in machine-checkable formats. SLSA provenance, SBOMs, in-toto. The connective tissue between the previous four.
+
+Skip any one and the chain breaks. A signed image without an SBOM is a sealed envelope you can't inspect. An SBOM without a provenance attestation is an inventory you can't trust the origin of. Provenance from a non-isolated build runner is a claim you can't verify.
+
+## SLSA — the framework
+
+**SLSA** (Supply-chain Levels for Software Artifacts; pronounced "salsa") is the umbrella framework. It defines four levels of progressive control:
+
+| Level | Source | Build | Provenance | Practical bar |
+| --- | --- | --- | --- | --- |
+| L1 | Version-controlled | Scripted | Exists (unsigned ok) | "We have a record of how this was built." |
+| L2 | Version-controlled, retained | Hosted, scripted | Signed by build system | Provenance has a verifiable producer. |
+| L3 | Verified history | Isolated, ephemeral runner | Non-forgeable, hardened build | Build system itself can't be tampered with mid-run. |
+| L4 | Two-person review | Hermetic, reproducible | + Two-person review for build defs | Hyperscaler-tier; rare outside Google/Meta. |
+
+The numbers are not a ranking of teams — they're a ranking of *what claims you can make and have someone independently verify*. Most production teams target **L3** as the practical bar. L4 is achievable only with serious investment in reproducibility, hermetic builds, and dual control.
+
+A common confusion: SLSA is about the **build pipeline**, not the runtime. An L3 build can still produce a CVE-laden image; SLSA doesn't replace SCA, scanning, or runtime security. It tells you that the image is genuinely the one your pipeline produced from the source you committed.
+
+## SBOM — the inventory
+
+A **Software Bill of Materials** enumerates every component that went into an artifact: direct deps, transitive deps, OS packages, bundled binaries, license metadata. Two competing formats:
+
+| Format | Steward | Strength | When to pick |
+| --- | --- | --- | --- |
+| CycloneDX | OWASP | JSON-first, broad tool support, ecosystem momentum | Default for most teams in 2026 |
+| SPDX | Linux Foundation | Strong license metadata, ISO standard | Compliance-heavy (government, healthcare, defence) |
+
+Pick one consistently across your org. Mixing formats means every consumer has to support both. CycloneDX has more momentum in 2026 (better tool coverage, JSON Schema, smaller spec); SPDX has stronger compliance grounding (it's an ISO standard, regulators name it explicitly).
+
+## Generating an SBOM
+
+Two patterns, both supported by **syft** (Anchore's OSS tool, the de facto standard):
+
+- **From source.** `syft <project-dir> -o cyclonedx-json > sbom.json`. Reads `package.json`, `requirements.txt`, `go.sum`, `Gemfile.lock`, etc. Resolves the dependency graph as declared.
+- **From a built image.** `syft <registry>/<image>:<tag> -o cyclonedx-json > sbom.json`. Introspects every layer of the container, picks up OS packages (from dpkg/rpm/apk DBs) and language packages.
+
+The image-derived SBOM is better. It catches things bundled at build time that aren't in any manifest — vendored binaries, statically-linked native libs, anything `COPY`d into the image from outside the package manager. The source-derived SBOM misses those by definition.
+
+Sign the SBOM with cosign, turning it into a verifiable attestation attached to the image:
+
+```bash
+syft registry/app@sha256:abc... -o cyclonedx-json > sbom.json
+cosign attest --yes \
+  --predicate sbom.json \
+  --type cyclonedx \
+  registry/app@sha256:abc...
+cosign verify-attestation \
+  --type cyclonedx \
+  --certificate-identity-regexp 'https://github.com/myorg/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  registry/app@sha256:abc...
+```
+
+The attestation is now an OCI artifact in the registry next to the image, signed by the build pipeline's identity, logged in Rekor. Anyone with access to the image can fetch and verify the SBOM independently.
+
+## in-toto attestations
+
+**in-toto** is the umbrella spec for *"evidence about a software artifact."* An attestation is a signed JSON document with three parts: a `subject` (which artifact it's about, identified by digest), a `predicateType` (what kind of evidence), and a `predicate` (the evidence itself). Common predicate types:
+
+- **SBOM attestation** — `predicateType: https://cyclonedx.org/bom` (or SPDX). "This image's SBOM is X."
+- **SLSA Provenance attestation** — `predicateType: https://slsa.dev/provenance/v1`. "This image was built by builder Y from source commit Z on date D with materials M."
+- **Vulnerability scan attestation** — `predicateType: https://cosign.sigstore.dev/attestation/vuln/v1`. "Trivy scanned this image at time T and found N CVEs at severity S."
+- **Test attestation** — custom predicate. "Test suite Q ran against this image with outcome R."
+
+All four are cosign-signed payloads, attached to the same image digest in the OCI registry, individually verifiable. A consumer can ask: *"show me the SLSA L3 provenance attestation for this image, signed by an identity matching `https://github.com/myorg/*`."*
+
+## The reference pipeline — SLSA L3 example
+
+<Whiteboard client:load data={{ nodes: slsaNodes, edges: slsaEdges }} height={500} />
+
+Reading the diagram: a source repo with signed commits, protected `main`, and mandatory PR reviews feeds an isolated build system. The build emits four parallel attestations alongside the image — SLSA provenance, SBOM, vulnerability scan result, and test outcome — each signed and logged to Rekor. The image and its attestations land in a registry that enforces digest immutability. The cluster's admission controller verifies the L3 claim (and the others) before allowing a pull.
+
+The concrete controls per stage:
+
+- **Source.** Branch protection on `main`, signed commits required, two-reviewer approval for changes to build definitions specifically.
+- **Build.** Hosted runner (GitHub-hosted, GitLab SaaS, or your own with the same property), ephemeral per build, no SSH, build definition committed alongside source, builder isolated from the developer's environment.
+- **Provenance.** Emitted by the build system, signed by the build system's identity (keyless via OIDC, or KMS), includes `builder.id`, `buildType`, `invocation`, `materials` (every dep with its hash).
+- **Registry.** Immutable digests, signature + attestation co-located with the image.
+- **Admission.** RHACS / Kyverno / Sigstore Policy Controller (Module 04) verifies the SLSA attestation matches the expected builder identity and version-level claim.
+
+That's L3. The hard parts are the build isolation and the non-forgeability of the provenance — everything else is plumbing.
+
+## Reproducible builds
+
+The strongest form of build integrity: running the same build twice produces **bit-identical output**. If two independent runners produce the same digest from the same source, an attacker who tampers with one runner is caught immediately.
+
+Hard in practice. Sources of non-determinism: build timestamps embedded in binaries, dependency-resolution order, parallelism, locale, the order `find` traverses a filesystem, anything that touches `/dev/urandom`. The Debian project's *Reproducible Builds* effort has been working through this for over a decade and has gotten roughly 95% of the Debian archive reproducible.
+
+For most teams, reproducibility is aspirational. For the most-sensitive artifacts (cryptographic libraries, things shipped to millions of devices), it's worth the investment. Tools: [reproducible-builds.org](https://reproducible-builds.org/) for guidance, **diffoscope** to compare two builds and surface what differs, language-specific flags (Go's `-trimpath`, Rust's `--remap-path-prefix`) to strip path-dependent metadata.
+
+## Lab posture — SLSA self-assessment
+
+A candid look at where the lab sits today, by SLSA control axis:
+
+| Control | Status | Where the lab is |
+| --- | --- | --- |
+| Source integrity | partial | GitLab CE 18.11.1 with protected branches and required reviews. Signed commits not enforced. |
+| Build integrity | partial | Jenkins + Tekton runners exist but are not isolated per build. Build defs are code, but the runner is long-lived. |
+| Artifact integrity | none | No cosign signing in either build path. Module 04's admission gate is wired but nothing to verify. |
+| Dependency integrity | strong | Trivy scans in both paths, Nexus mirrors upstream, IDMS/ITMS pin digests on OpenShift. |
+| Attestation | none | No SBOM, no SLSA provenance, no in-toto attestations of any kind. |
+
+Effective SLSA level: **~L1**. There's provenance in the loose sense (we can reconstruct what was built from Jenkins / Tekton logs), but nothing signed, nothing machine-verifiable, nothing an auditor would call provenance under the spec.
+
+Path to L3 is documented in the BFSI readiness review (Tier 1 backlog). The two heaviest items: per-build ephemeral runners, and cosign signing wired into both build paths with attestations emitted alongside. Dependency integrity is already strong; source integrity needs signed commits to cross from partial to strong.
+
+## GUAC and supply-chain knowledge graphs
+
+The frontier. **GUAC** (Graph for Understanding Artifact Composition) ingests SBOMs, provenance attestations, vulnerability scans, and license metadata from across an org into a queryable graph. The query *"which of our production images contain a transitively-included log4j ≤2.14?"* becomes a Cypher-style lookup instead of a multi-day investigation.
+
+GUAC is OSS, Kusari-stewarded, and integrates with Sigstore + in-toto natively. It's not yet operational for most teams — the input quality (lots of teams generate SBOMs but never centralise them) is the bottleneck more than the tool. Worth tracking. When SBOM generation becomes ubiquitous (a few years out, optimistically), GUAC or something like it becomes the answer to *"what's actually running in our fleet?"*
+
+## Try this
+
+**1. Generate a CycloneDX SBOM.** Pick a Go / Python / Node project. Run `syft <project-dir> -o cyclonedx-json > sbom.json`. Open the JSON. Count the components. Find a few you didn't know were dependencies. Now scan the SBOM itself with `trivy sbom sbom.json` — every CVE Trivy finds is one your image is shipping.
+
+**2. Sign the SBOM as a predicate attestation.** Push an image to a local registry. Run `cosign attest --predicate sbom.json --type cyclonedx <registry>/<image>@<digest>`. Run `cosign verify-attestation --type cyclonedx <registry>/<image>@<digest>` to confirm. The output is the unsigned predicate; the signature is verified before the predicate is returned.
+
+**3. Generate SLSA provenance.** If you're on GitHub, use `slsa-framework/slsa-github-generator` — a GitHub Actions reusable workflow that emits L3-compliant provenance and signs it via Sigstore. If you're on Jenkins / Tekton, hand-author the JSON to the [SLSA Provenance v1.0 schema](https://slsa.dev/spec/v1.0/provenance) and sign it with cosign. Either way, verify the result with `cosign verify-attestation --type slsaprovenance`.
+
+**4. Verify the attestation matches the image digest.** Manually tamper — re-push a different image to the same tag (if your registry permits it; many won't), and watch `cosign verify` fail because the predicate's `subject.digest` no longer matches the image you're querying. This is the gate.
+
+## Common failure modes
+
+**SBOM generated but never verified.** Same outcome as no SBOM. Generation is cheap; the discipline is in attaching it to the image as an attestation and having the admission gate (or a downstream consumer) actually read it.
+
+**SBOM contains hundreds of "no-version" entries.** The build skipped lockfile resolution, or the package manager fell back to "best effort." Fix the build (require lockfiles, fail on resolution errors), regenerate the SBOM. A version-less SBOM entry is unscannable noise.
+
+**SLSA provenance claims L3 but the build runner isn't isolated.** The provenance JSON says `buildType: https://slsa.dev/...l3/...`, but the runner is a long-lived VM that the team SSH-es into. The claim is *unverifiable* — an auditor or a thorough verifier will reject it. SLSA is what you can prove, not what you'd like to be true.
+
+**Cosign signing keys checked into `git`.** Major audit finding. The key has to live in an HSM, a KMS (AWS KMS, GCP KMS, Vault Transit), or be ephemeral via Fulcio. Long-lived signing keys in source control are functionally an attacker invitation.
+
+**Provenance attests to the wrong source repo.** Easy to do — the build pipeline runs on a fork or a mirror, the provenance points there, the verifier expects the canonical repo. Pin the expected source URL in the verification policy.
+
+**Attestations grow faster than the registry retains them.** Every build adds four attestations per image. Old digests' attestations linger forever unless the retention policy cleans them up. Set a per-repo retention that keeps attestations as long as their image — and no longer.
+
+## Where this is heading
+
+The source layer (Module 03), the container layer (Module 04), and the supply-chain layer (this module) cover the producer side of DevSecOps — everything that happens before an artifact is admitted to a cluster. The remaining modules pivot to the consumer side: what happens at the cluster gate, what happens at runtime, what happens when an attacker is already inside.
+
+**Next:** [Module 06 — Cluster security and admission control](/learn/devsecops/06-cluster-security-and-admission-control) — Pod Security Standards, OPA Gatekeeper, Kyverno, and the policy patterns that make the cluster a meaningful trust boundary.
+
+## References
+
+- SLSA specification: [slsa.dev/spec](https://slsa.dev/spec/)
+- SLSA build levels: [slsa.dev/spec/v1.0/levels](https://slsa.dev/spec/v1.0/levels)
+- CycloneDX specification: [cyclonedx.org/specification/overview/](https://cyclonedx.org/specification/overview/)
+- SPDX specification: [spdx.dev/specifications/](https://spdx.dev/specifications/)
+- in-toto attestation framework: [github.com/in-toto/attestation](https://github.com/in-toto/attestation)
+- syft (SBOM generator): [github.com/anchore/syft](https://github.com/anchore/syft)
+- cosign attest / verify-attestation: [docs.sigstore.dev/cosign/verifying/attestation/](https://docs.sigstore.dev/cosign/verifying/attestation/)
+- slsa-github-generator: [github.com/slsa-framework/slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator)
+- GUAC: [guac.sh](https://guac.sh/)
+- Reproducible Builds: [reproducible-builds.org](https://reproducible-builds.org/)
+- diffoscope: [diffoscope.org](https://diffoscope.org/)
+- NIST SP 800-218 (SSDF): [csrc.nist.gov/Projects/ssdf](https://csrc.nist.gov/Projects/ssdf)
+- XZ Utils backdoor analysis: [research.swtch.com/xz-timeline](https://research.swtch.com/xz-timeline)
