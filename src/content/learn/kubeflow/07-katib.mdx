@@ -1,0 +1,228 @@
+---
+title: "Katib — hyperparameter optimization and NAS"
+sidebar_label: "07 — Katib (HPO + NAS)"
+description: "Run a Katib Experiment to tune hyperparameters: search spaces, algorithms (Bayesian, TPE, Hyperband), metrics collection, early stopping, and reading results."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const phaseEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const metricEdge = { style: { stroke: "#6b7280", strokeDasharray: "4,4", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const exNodes = [
+  { id: "exp",    position: { x: 60,  y: 200 }, data: { label: "Experiment\n(search space + algo)" }, style: ctrl },
+  { id: "sug",    position: { x: 280, y: 80 },  data: { label: "Suggestion pod\n(proposes next HPs)" }, style: agent },
+  { id: "ctrl",   position: { x: 280, y: 320 }, data: { label: "Katib controller" }, style: ctrl },
+  { id: "t1",     position: { x: 520, y: 80 },  data: { label: "Trial 1\n(Job/PyTorchJob)" }, style: stage },
+  { id: "t2",     position: { x: 520, y: 200 }, data: { label: "Trial 2" }, style: stage },
+  { id: "t3",     position: { x: 520, y: 320 }, data: { label: "Trial 3" }, style: stage },
+  { id: "db",     position: { x: 760, y: 200 }, data: { label: "DB\n(trial metrics)" }, style: stage },
+];
+
+export const exEdges = [
+  { id: "e1", source: "exp",  target: "ctrl", label: "watch", ...phaseEdge },
+  { id: "e2", source: "ctrl", target: "sug",  label: "ask for HPs", ...phaseEdge },
+  { id: "e3", source: "sug",  target: "ctrl", label: "HP set", ...phaseEdge },
+  { id: "e4", source: "ctrl", target: "t1",   label: "create", ...phaseEdge },
+  { id: "e5", source: "ctrl", target: "t2",   ...phaseEdge },
+  { id: "e6", source: "ctrl", target: "t3",   ...phaseEdge },
+  { id: "e7", source: "t1",   target: "db",   label: "metric", ...metricEdge },
+  { id: "e8", source: "t2",   target: "db",   ...metricEdge },
+  { id: "e9", source: "t3",   target: "db",   ...metricEdge },
+  { id: "e10",source: "db",   target: "sug",  label: "history", ...metricEdge },
+];
+
+Module 06 got a training job running. The next question is what hyperparameters to use — the learning rate, batch size, dropout, weight decay, optimiser choice, dozens of other dials. Wrong combinations train fine but converge to a worse model, or don't converge at all.
+
+**Katib** is Kubeflow's answer. It runs many training jobs with different hyperparameter combinations and tracks which combination produced the best metric. It also supports Neural Architecture Search, which is the same idea applied to model architecture choices.
+
+## Hyperparameter Optimization in plain terms
+
+You have a model with hyperparameters. You want the best combination. Three strategies:
+
+| Strategy | What it does | Cost |
+| --- | --- | --- |
+| **Grid search** | Try every combination in a fixed grid. | Exponential in dimensions. |
+| **Random search** | Sample uniformly from the space. N independent trials, no learning between them. | Linear in trial count. |
+| **Bayesian / sequential** | Build a surrogate model of "HPs → metric" from completed trials; propose the next HP set that maximises expected improvement. | Linear, but each trial is informed. |
+
+Random beats grid for any reasonably high-dimensional space (the classic Bergstra-Bengio result). Bayesian beats random for smooth objective functions and small trial budgets — typically 50–90% less compute for the same final metric. Reasonable defaults for production HPO: TPE or Bayesian for continuous spaces, Hyperband or BOHB when each trial is expensive.
+
+## The Katib mental model
+
+Three CRDs you'll actually touch:
+
+- **`Experiment`** — the top-level object. Defines the search space, the optimisation algorithm, the objective metric, the trial template, and the budget (max trials, parallel trials).
+- **`Trial`** — one execution of the training code with one set of hyperparameters. Created by Katib's controller, runs a Job (or PyTorchJob, TFJob, MPIJob), emits a metric.
+- **`Suggestion`** — the algorithm-specific pod that proposes the next set of hyperparameters. One Suggestion per Experiment. Bayesian/TPE/Hyperband have different Suggestion images.
+
+You write the Experiment. Katib creates the Suggestion pod, asks it for the next HP set, creates a Trial with those values, waits for the Trial to emit a metric, feeds the result back to the Suggestion, and repeats until the budget is exhausted.
+
+<Whiteboard client:load data={{ nodes: exNodes, edges: exEdges }} height={420} />
+
+Reading the diagram: the controller is the orchestrator; the Suggestion pod is the algorithm; the Trials are the actual training runs; metrics flow back to the DB and from there to the Suggestion so it can propose better HPs next time.
+
+## A first Experiment
+
+A small Experiment tuning two hyperparameters on a stock MNIST trainer:
+
+```yaml
+apiVersion: kubeflow.org/v1beta1
+kind: Experiment
+metadata: { name: mnist-tune }
+spec:
+  parallelTrialCount: 3
+  maxTrialCount: 24
+  maxFailedTrialCount: 6
+  objective:
+    type: maximize
+    objectiveMetricName: validation-accuracy
+    goal: 0.99
+  algorithm:
+    algorithmName: bayesianoptimization
+  parameters:
+    - name: learning-rate
+      parameterType: double
+      feasibleSpace: { min: "1e-5", max: "1e-2" }
+    - name: batch-size
+      parameterType: categorical
+      feasibleSpace: { list: ["16", "32", "64", "128"] }
+  trialTemplate:
+    primaryContainerName: training-container
+    trialParameters:
+      - name: learningRate
+        reference: learning-rate
+      - name: batchSize
+        reference: batch-size
+    trialSpec:
+      apiVersion: batch/v1
+      kind: Job
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: training-container
+                image: registry.lab/ml/mnist-train:v2
+                command:
+                  - python
+                  - /opt/train.py
+                  - --lr=${trialParameters.learningRate}
+                  - --batch-size=${trialParameters.batchSize}
+```
+
+Key fields. `objective.type` is `maximize` or `minimize`; `objectiveMetricName` is the string Katib looks for in the trial's output. `algorithm.algorithmName` selects the Suggestion image. `parameters` describes the search space — `double`, `int`, `categorical`, `discrete`, each with their own `feasibleSpace` shape. `trialTemplate.trialSpec` is a full Job (or PyTorchJob) manifest with `${trialParameters.X}` placeholders that Katib substitutes per trial.
+
+## The TrialTemplate
+
+The Trial template is where things get sharp. You're embedding one Kubernetes resource (a Job or a TFJob) inside another (the Experiment), and Katib does string substitution into it at runtime. Two practical points.
+
+First, the template can be a **`Job`** for single-pod training or a **`PyTorchJob`** / **`TFJob`** / **`MPIJob`** for distributed training — Katib doesn't care, it just creates the resource and watches for completion. Distributed HPO is real: you can run a Bayesian search where every trial is itself a 4-GPU PyTorchJob. The budget arithmetic gets steep fast.
+
+Second, the placeholders use `${trialParameters.<name>}` syntax, where `<name>` is the `trialParameters[].name` value, not the `parameters[].name`. The `reference` field bridges the two. The reason for the indirection is to let you reshape parameter names between the search space and the training command — fine in theory, source of typos in practice.
+
+## Algorithms shipped
+
+Katib's algorithm catalogue, ordered by when to actually pick each:
+
+| Algorithm | When to pick |
+| --- | --- |
+| **`random`** | Baseline. Always run a 20-trial random first to know what "no optimisation" gives you. |
+| **`grid`** | Tiny categorical spaces only. Don't use for &gt;3 dimensions. |
+| **`bayesianoptimization`** | Smooth continuous spaces, small budgets, you trust the assumption that nearby HPs give similar metrics. |
+| **`tpe`** | Tree-structured Parzen Estimator. Strong default for mixed continuous + categorical. Optuna-style. |
+| **`hyperband`** | Each trial is expensive; aggressively early-stops bad trials. Best wall-clock efficiency. |
+| **`bohb`** | Bayesian + Hyperband combined. Current SOTA for many problems. |
+| **`cmaes`** | Continuous, non-separable problems. Niche outside research. |
+
+For most production tuning jobs, `tpe` or `bohb` is the right starting point. `bayesianoptimization` is fine for low-dimensional continuous problems. `hyperband` shines when one trial costs hours and most random configs are obviously bad after a few minutes.
+
+## Metrics collection
+
+Katib has to read the trial's metric. Three collector patterns:
+
+- **stdout parsing.** The trial prints lines like `Validation-Accuracy=0.87` and a sidecar in the trial pod tails stdout, regex-matches metric lines, and POSTs them to the Katib DB. Simplest setup, flakiest behaviour — newline buffering, multi-line outputs, and mixed-stream logs break it.
+- **File-based.** The trial writes JSON lines to `/var/log/katib/metric.log` and the sidecar reads the file. More reliable than stdout because you control the format precisely.
+- **TensorBoard.** Katib reads from the TF summary writer. Useful if your team is already using TensorBoard; otherwise overkill.
+
+The collector is declared in `spec.metricsCollectorSpec`. The default is stdout with a Katib-compatible regex; override `source.filter.metricsFormat` for custom formats. The trap: a metric format mismatch means trials complete with `Status: Succeeded` but `metric: <empty>`, which the Suggestion happily treats as "this HP gave a 0" and learns the wrong thing. Always verify with a single-trial run before launching a 100-trial Experiment.
+
+## Early stopping
+
+For algorithms that don't early-stop intrinsically (random, grid, Bayesian), Katib supports an explicit early-stopping policy. `medianstop` is the standard choice: after `minTrialsRequired` baseline trials are complete, Katib drops any new trial whose intermediate metric (at step N) is below the median of completed trials at the same step. Cheap, intuitive, and saves real compute.
+
+```yaml
+spec:
+  earlyStopping:
+    algorithmName: medianstop
+    algorithmSettings:
+      - name: min_trials_required
+        value: "5"
+      - name: start_step
+        value: "4"
+```
+
+Hyperband and BOHB do this kind of pruning natively, so you don't add a separate `earlyStopping` block for them.
+
+## NAS — Neural Architecture Search
+
+Katib supports Neural Architecture Search via `darts`, `enas`, and `pbt` (population-based training). NAS is the same primitive — propose, train, score, propose better — but the search space is over architectures, not numbers. You declare a graph of candidate ops (3x3 conv, 5x5 conv, skip, max-pool, none) at each layer; the algorithm picks the connections.
+
+The honest take: NAS is **expensive**. The compute to discover a custom ResNet-class architecture is orders of magnitude more than fine-tuning an off-the-shelf one. Production teams almost universally pick a known architecture (ResNet, EfficientNet, a Transformer flavour) and tune its hyperparameters. NAS earns its keep in research, in edge-deployment compression problems where every FLOP matters, and in domains with no good off-the-shelf architecture. For everything else, HPO over a hand-picked architecture is the right tool.
+
+## Resource budgets and parallelism
+
+`spec.maxTrialCount` is the total budget. `spec.parallelTrialCount` is concurrency. `spec.maxFailedTrialCount` lets you cap failed trials before declaring the Experiment a failure — set it to ~25% of `maxTrialCount` so a buggy image doesn't waste your whole quota.
+
+Parallelism interacts with the algorithm. Random and grid are perfectly parallel — every trial is independent, so set `parallelTrialCount` to whatever your cluster can run. Bayesian and TPE are **sequential** by design: each new trial benefits from the metrics of all completed trials. Setting parallel &gt; ~4 with Bayesian wastes the algorithm's advantage; you're effectively running 4 parallel random searches that occasionally re-coordinate. The sweet spot is parallel=4 for Bayesian/TPE; parallel=trial_cost / wall_clock_budget for Hyperband.
+
+## Reading results
+
+The Katib UI in the Central Dashboard renders two views per Experiment. A trials table sortable by metric; the row of the winner has the HP combination you want. And a **parallel-coordinates plot** where each trial is a polyline crossing axes (one axis per HP, last axis the objective metric, colour-coded by metric value). Patterns jump out — "every trial with lr&gt;1e-3 is bad", "batch size and lr trade off", "every winner is in this corner of the space."
+
+The CLI works too: `kubectl get experiment <name> -o yaml` shows `status.currentOptimalTrial.parameterAssignments` and `status.currentOptimalTrial.observation.metrics`. That's the winner. Copy those HPs, plug them into a non-Katib training run with full epochs and the production dataset, and ship that model.
+
+## Production-grade HPO workflow
+
+A few practices that separate "Katib ran" from "Katib helped":
+
+- **Separate compute pool.** Don't run HPO on the same GPU pool as your production training. HPO bursts are bursty; use spot/preemptible nodes and let the Experiment retry on eviction.
+- **Pin the random seed in the trial code.** Otherwise the metric Katib observes has a noise component the algorithm can't distinguish from real HP effects.
+- **Use a small dataset slice for HPO.** Full-dataset HPO is wasteful — the right HPs on 10% of the data are usually the right HPs on 100% of the data. Confirm on full data only for the top 3 candidates.
+- **Random baseline first.** Always run a 20-trial random Experiment before a 100-trial Bayesian one. If random's best is close to Bayesian's best, your search space is too narrow or your metric is too noisy.
+- **Log the winning HPs to your model registry.** "Best learning rate from Experiment X" should be a queryable attribute of the model you ship.
+
+## Try this
+
+1. Write an Experiment for tuning **learning rate (1e-5 to 1e-2, double, log scale)** and **batch size (categorical: 16, 32, 64, 128)** with the **TPE** algorithm, budget 30 trials, 4 in parallel. Use a stock MNIST or CIFAR-10 image as the training container.
+2. Add **MedianStop** early-stopping with `min_trials_required: 5` and a `start_step` matching your reporting frequency. Compare wall-clock and total GPU-hours vs the same Experiment without early stopping.
+3. Run two Experiments on the same problem: `random` vs `tpe`, both with `maxTrialCount: 30`. Chart the cumulative best metric vs trial number. TPE should reach a high-quality region in fewer trials.
+
+## Common failure modes
+
+**Suggestion pod CrashLoopBackOff.** The Bayesian / TPE suggestion images pin specific `numpy` and `scikit-learn` versions; in some environments the image gets pulled with a stale digest and breaks. Pin `spec.algorithm.algorithmSettings` if you need a non-default suggestion image, or check the controller logs for the actual stack trace.
+
+**Trials complete with `metric: <empty>`.** Metrics collector regex doesn't match the trial's output. Run the trial container interactively, print one epoch, and verify the regex against the actual stdout. `metricsCollectorSpec.source.filter.metricsFormat` is the override.
+
+**Experiment stalls at N trials of M.** `parallelTrialCount` exceeds the cluster's GPU capacity, or gang scheduling is missing for distributed trials. Reduce parallelism, or install Volcano (see Module 06).
+
+**Best trial reports 99.99% accuracy.** Almost always target leakage — your validation set shares samples with training, or the metric is computed on the training set by mistake. Treat impossibly-good metrics with the suspicion they deserve.
+
+**Bayesian search converges fast then plateaus.** The algorithm is exploiting a local optimum. Widen the search space, run a second Experiment with `random` to confirm there's no better region you've missed, or switch to TPE/CMA-ES which explore more aggressively.
+
+## References
+
+- Kubeflow Katib docs — `https://www.kubeflow.org/docs/components/katib/`
+- Katib on GitHub — `https://github.com/kubeflow/katib`
+- Bergstra & Bengio, "Random Search for Hyper-Parameter Optimization" — `https://www.jmlr.org/papers/v13/bergstra12a.html`
+- Hyperband — `https://arxiv.org/abs/1603.06560`
+- BOHB — `https://arxiv.org/abs/1807.01774`
+- Optuna (the TPE reference implementation) — `https://optuna.org/`
+- DARTS — `https://arxiv.org/abs/1806.09055`
+
+**Next:** [Module 08 — KServe](/learn/kubeflow/kserve) covers what happens after Katib hands you a winning hyperparameter set and a trained model: serving it.

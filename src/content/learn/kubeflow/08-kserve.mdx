@@ -1,0 +1,259 @@
+---
+title: "KServe — model serving on Kubernetes"
+sidebar_label: "08 — KServe"
+description: "Deploy trained models behind stable inference endpoints with autoscaling, canary traffic splitting, transformers, and Prometheus metrics — InferenceService end-to-end."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const phaseEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const metricEdge = { style: { stroke: "#6b7280", strokeDasharray: "4,4", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#6b7280", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const isvcNodes = [
+  { id: "client",  position: { x: 40,  y: 200 }, data: { label: "client\n(curl / app)" }, style: ext },
+  { id: "ing",     position: { x: 220, y: 200 }, data: { label: "Knative Ingress\n(routing)" }, style: ctrl },
+  { id: "trans",   position: { x: 420, y: 200 }, data: { label: "Transformer\n(pre/post)" }, style: agent },
+  { id: "pred1",   position: { x: 640, y: 110 }, data: { label: "Predictor v1\n(stable, 90%)" }, style: stage },
+  { id: "pred2",   position: { x: 640, y: 290 }, data: { label: "Predictor v2\n(canary, 10%)" }, style: stage },
+  { id: "store",   position: { x: 860, y: 200 }, data: { label: "model store\n(s3://, pvc://)" }, style: ext },
+  { id: "prom",    position: { x: 420, y: 380 }, data: { label: "Prometheus" }, style: ctrl },
+];
+
+export const isvcEdges = [
+  { id: "i1", source: "client", target: "ing",  ...phaseEdge },
+  { id: "i2", source: "ing",    target: "trans",...phaseEdge },
+  { id: "i3", source: "trans",  target: "pred1",label: "90%", ...phaseEdge },
+  { id: "i4", source: "trans",  target: "pred2",label: "10%", ...phaseEdge },
+  { id: "i5", source: "pred1",  target: "store",label: "pull at startup", ...phaseEdge },
+  { id: "i6", source: "pred2",  target: "store",...phaseEdge },
+  { id: "i7", source: "pred1",  target: "prom", label: "metrics", ...metricEdge },
+  { id: "i8", source: "pred2",  target: "prom", ...metricEdge },
+];
+
+A trained model on disk is not a product. To use it, something has to load it into memory, accept HTTP or gRPC requests, return predictions, scale with traffic, and report metrics. **KServe** is that something on Kubernetes.
+
+This module is the last of the technical sequence. By the end you can stand up an `InferenceService` against a model in object storage, scale it on traffic, and split traffic between a stable and a canary version.
+
+## The model-serving problem
+
+A trained model is a file — `.pt`, `.pkl`, `.onnx`, `.safetensors`. Serving it means doing all of the following:
+
+- Loading the file into process memory (sometimes GPU memory) once at startup.
+- Exposing an HTTP or gRPC endpoint that accepts inference requests.
+- Autoscaling pod count on traffic — including scale-to-zero when idle.
+- Routing between versions for A/B tests and canary rollouts.
+- Batching small requests into one model call for throughput.
+- Emitting latency, throughput, and error metrics for monitoring.
+
+Rolling your own with Flask + Gunicorn + Deployment + HorizontalPodAutoscaler works, but it reinvents primitives that exist. KServe is the platform-layer reinvention; you declare an `InferenceService`, the rest is wiring underneath.
+
+## KServe vs the older KFServing — a note on naming
+
+History matters because old tutorials still surface. **KFServing** was a Kubeflow sub-project from 2019 to 2021, under API group `serving.kubeflow.org`. In 2021 it was renamed **KServe**, split into a standalone CNCF project, and moved to API group `serving.kserve.io`. The CRDs evolved — `ServingRuntime` was introduced; `InferenceService` was reshaped.
+
+Use KServe. If a tutorial shows `apiVersion: serving.kubeflow.org/v1beta1`, it's pre-2021 KFServing and the YAML will not apply on a modern cluster. The shapes are mostly similar but the API group has changed and so have several spec fields.
+
+## The InferenceService CR
+
+The top-level object. A minimal spec for a TensorFlow model in S3:
+
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata: { name: flowers }
+spec:
+  predictor:
+    model:
+      modelFormat: { name: tensorflow }
+      storageUri: s3://my-bucket/models/flowers/1/
+      resources:
+        requests: { cpu: "1", memory: 2Gi }
+        limits:   { cpu: "2", memory: 4Gi }
+```
+
+That's enough to deploy. KServe will spin up a Knative Service backed by the matching predictor runtime (TFServing in this case), pull the model from S3 at pod startup, register an endpoint at `flowers-predictor-default.<ns>.svc.cluster.local` (and an external URL via Knative routing), and start serving.
+
+`spec` has three optional top-level blocks beyond `predictor`:
+
+- **`transformer`** — a pod sitting in front of the predictor. Useful for input encoding (tokenisation, image resizing, feature normalisation) and output decoding (top-k label lookup, JSON shaping).
+- **`explainer`** — a sidecar that returns explanations for predictions. Wraps Alibi, SHAP, or a custom explainer container.
+
+Predictor is required; transformer and explainer are optional.
+
+## Predictor frameworks
+
+KServe ships predictor runtimes for common frameworks via the `ServingRuntime` CRD. The catalogue, by frequency-of-use:
+
+| Runtime | Use for | GPU? |
+| --- | --- | --- |
+| **TFServing** | TensorFlow SavedModel | yes |
+| **TorchServe** | PyTorch (`.mar` archive) | yes |
+| **Triton** | Multi-framework (TF, PyTorch, ONNX, TensorRT) in one pod | yes |
+| **MLServer** | sklearn, XGBoost, LightGBM, MLflow | no |
+| **ONNX Runtime** | ONNX models cross-framework | yes |
+| **HuggingFace** | Hugging Face Transformers / Diffusers | yes |
+| **SKLearn / XGBoost / LightGBM** | built-in runtimes for those formats | no |
+
+Pick by framework match and GPU support. Triton is the right choice when you need to serve multiple model formats from one pod sharing GPU memory; TFServing and TorchServe are the right choice for single-framework deployments.
+
+You can list the available runtimes with `kubectl get servingruntime -A`. Cluster admins can add custom runtimes by applying a `ClusterServingRuntime`.
+
+## Custom containers — BYO predictor
+
+When KServe's built-ins don't fit (vendor model, weird framework, custom batching logic), supply your own container that implements the [V2 inference protocol](https://kserve.github.io/website/master/modelserving/data_plane/v2_protocol/) (also known as the Open Inference Protocol). Two endpoints to implement: `POST /v2/models/<name>/infer` for synchronous inference, `GET /v2/models/<name>` for model metadata. That's it.
+
+```yaml
+spec:
+  predictor:
+    containers:
+      - name: kserve-container
+        image: registry.lab/ml/custom-predictor:v3
+        ports: [{ containerPort: 8080, protocol: TCP }]
+        env:
+          - { name: STORAGE_URI, value: "s3://my-bucket/models/x/" }
+```
+
+The container speaks the V2 protocol; KServe handles the routing, autoscaling, and metrics around it. The escape hatch for anything KServe's built-ins can't model.
+
+## Storage URIs
+
+Models are pulled from a storage location at pod startup. Schemes supported:
+
+- `s3://bucket/path/` — AWS S3 or any S3-compatible (MinIO).
+- `gs://bucket/path/` — Google Cloud Storage.
+- `pvc://<claimname>/path/` — a PVC mounted in the predictor pod.
+- `http://` / `https://` — a tarball URL.
+- `hdfs://` — Hadoop.
+
+Credentials come from a Secret attached to the predictor's ServiceAccount. The convention is annotating the SA with `serving.kserve.io/s3-endpoint`, `serving.kserve.io/s3-region`, etc., and the storage initialiser sidecar reads them. For on-prem and air-gap, MinIO behind an internal endpoint is the standard answer — the URIs look identical, the endpoint just points at the lab's MinIO.
+
+A practical note: model size matters for cold start. A 7B parameter LLM weighing ~14 GB takes minutes to pull from object storage even on fast links. For latency-sensitive endpoints, pre-stage the model to a PVC (`pvc://`) and pull from there, which avoids the network hop entirely.
+
+## Autoscaling — Knative-based
+
+KServe builds on Knative Serving for serverless ergonomics. By default the predictor scales on **concurrent requests per pod** (target=100), and scales **all the way to zero** when there's no traffic for ~60 seconds.
+
+Two knobs you care about:
+
+```yaml
+spec:
+  predictor:
+    minReplicas: 1            # set to 0 for scale-to-zero
+    maxReplicas: 10
+    scaleTarget: 60           # target concurrent reqs/pod
+    scaleMetric: concurrency  # or "rps", "cpu", "memory"
+    model: { ... }
+```
+
+**Scale-to-zero saves money on idle GPU endpoints** — a serving pod holding an A100 hostage at 2 AM is expensive. The cost is **cold start**: when the first request arrives, KServe spins up a pod, the storage initialiser pulls the model, the runtime loads it into memory (and onto the GPU). For a small CPU model, cold start is seconds. For a large GPU model, it's tens of seconds to minutes.
+
+For latency-sensitive endpoints — anything user-facing — set `minReplicas: 1`. The cost is one pod always running. For batch endpoints and dev environments, `minReplicas: 0` is fine.
+
+<Whiteboard client:load data={{ nodes: isvcNodes, edges: isvcEdges }} height={460} />
+
+Reading the diagram: requests enter via Knative Ingress, hit the optional transformer for pre-processing, then split between the stable predictor (90%) and the canary predictor (10%); each predictor pulls its model from object storage at startup and emits Prometheus metrics.
+
+## Traffic splitting — canary
+
+KServe has a built-in canary primitive. The pattern:
+
+1. You have a stable `InferenceService` running model v1.
+2. Update the spec with a new `storageUri` pointing at v2 and set `spec.predictor.canaryTrafficPercent: 10`.
+3. KServe spins up a v2 predictor alongside v1 and routes 10% of traffic to v2.
+4. You watch latency, error rate, and offline accuracy metrics on v2.
+5. Bump `canaryTrafficPercent` step by step — 25, 50, 100 — or roll back to 0 if v2 misbehaves.
+6. When v2 is fully promoted, KServe tears down v1.
+
+```yaml
+spec:
+  predictor:
+    canaryTrafficPercent: 10
+    model:
+      modelFormat: { name: pytorch }
+      storageUri: s3://my-bucket/models/x/v2/
+```
+
+The granularity is per-request — Knative's ingress does the percentage split. There's no built-in metric-gated auto-promotion (KServe defers that to whatever orchestrates the manifest changes — Argo Rollouts, a human, a CI job). Watch your monitoring dashboard while you do the bumps.
+
+## Transformers and Explainers
+
+A **transformer** is a pod in front of the predictor running the V2 inference protocol. Typical jobs: tokenise a text input before sending it to a HuggingFace model, resize/normalise an image before feeding a vision model, look up label IDs to human-readable strings on the way back, reshape JSON request bodies to whatever the predictor expects. Same scaling primitives, separately scalable from the predictor.
+
+An **explainer** is a sidecar (or separate pod) that returns explanations for predictions — SHAP values for tree models, integrated gradients for deep learning, Alibi for general-purpose. Explainers are slow (often 10–100× a prediction call) and typically wired into a separate `/explain` endpoint rather than the hot path. Use for compliance and debugging, not for every production prediction.
+
+Both are optional. A vanilla deployment is predictor-only. Add transformers when input/output shaping is non-trivial enough that pushing it into client code is a bad idea.
+
+## GPU serving
+
+Request GPUs like any pod:
+
+```yaml
+spec:
+  predictor:
+    model:
+      modelFormat: { name: pytorch }
+      storageUri: s3://...
+      resources:
+        limits: { nvidia.com/gpu: 1, memory: 16Gi }
+```
+
+For multi-model GPU sharing in one pod, **Triton** is the right runtime — it loads multiple models into one process, sharing GPU memory and routing requests across them. Useful when you have many small models that individually don't justify a whole GPU. For hardware isolation between tenants, **MIG partitions** (covered in Module 06) let you carve one A100 into seven independent slices.
+
+Cold-start cost is higher for GPU models because model weights have to be copied from host RAM to GPU memory after the storage initialiser finishes. A 7B model is ~14 GB on disk, ~14 GB in GPU memory; copying that takes seconds even on PCIe Gen4. Plan `minReplicas: 1` for any user-facing GPU endpoint.
+
+## Observability
+
+KServe emits Prometheus metrics from every predictor pod out of the box:
+
+| Metric | What |
+| --- | --- |
+| `request_count` | Per-pod request counter, labelled by status code. |
+| `request_duration_seconds` | Latency histogram. |
+| `prediction_latency_seconds` | Time inside the model call, excluding transformer/network. |
+| `kserve_*` | KServe-specific counters from the storage initialiser, etc. |
+
+Logs go to stdout, captured by whichever log pipeline you run. The piece you usually have to add: **payload logging** for inference-specific observability — model drift, data drift, fairness audits. KServe's [request-response logger](https://kserve.github.io/website/master/modelserving/logger/logger/) writes every request/response pair to a configurable async sink (Knative event broker, S3, Kafka). You wire that into your offline analysis pipeline — drift detection, retraining triggers, dataset for the next round of HPO.
+
+## The lab posture
+
+The comptech lab does not currently run KServe. RHOAI (OpenShift AI) and OpenShift Virtualization are deferred to a later wave; KServe ships inside RHOAI on OpenShift. This module is forward-looking — you can run KServe today on any Kubernetes cluster with Knative installed, but the lab's hub-dc-v6 / spoke-dc-v6 fleet doesn't have it deployed.
+
+If you're following along, the easiest standalone install is the upstream KServe quick-install on a kind or k3d cluster, which brings Knative Serving and KServe up together in one script. The CRDs and the model are identical to what you'd see in RHOAI.
+
+## Try this
+
+1. Deploy a **TFServing InferenceService** pointing at a sample flowers model in MinIO. `curl` the resulting endpoint; verify the model returns predictions. Set `minReplicas: 0` and watch it scale to zero after 60 seconds.
+2. Add a **transformer container** that lowercases incoming text payloads before they reach the predictor. Implement the V2 inference protocol; verify the predictor sees the transformed input.
+3. Deploy **v2 of the model** at a new `storageUri` with `canaryTrafficPercent: 10`. Send 1000 requests; verify roughly 100 hit v2 by inspecting per-pod `request_count` in Prometheus. Bump the canary percentage to 100 to promote.
+
+## Common failure modes
+
+**InferenceService stuck `Pending`.** The most common cause is Knative Serving not installed or unhealthy. `kubectl get pods -n knative-serving` should show activator, autoscaler, controller, webhook, all `Running`. The webhook in particular causes silent failures when its TLS cert is expired.
+
+**Predictor `ImagePullBackOff` or storage init failing.** The storage URI references credentials that aren't wired up. Check the SA's annotations (`serving.kserve.io/s3-endpoint`, etc.) and the Secret it references. `kubectl logs <pod> -c storage-initializer` shows the actual error from the initialiser — usually a clear "AccessDenied" or "NoSuchBucket".
+
+**Model loaded but `/v1/models/<name>:predict` returns 500.** Input shape mismatch — the predictor loaded the model fine but your request payload doesn't match what the model expects. Enable request logging, capture a failing request, compare its tensor shape to what `saved_model_cli show --all` says the model wants.
+
+**Cold-start hits a 30-second timeout.** Knative's default activator timeout is too short for large GPU model loads. Increase via the `progressDeadlineSeconds` knob on the Knative Service or pin `minReplicas: 1` to keep one pod warm.
+
+**Predictor scales up but the new pod doesn't serve traffic.** Usually a readiness probe issue — TFServing and TorchServe take seconds to load the model before they're ready, but the default Knative readiness probe pings them immediately. The runtime emits a 503 on `/v1/models/<name>` until the model is loaded; that's correct, just give it long enough by adjusting probe `initialDelaySeconds`.
+
+**`canaryTrafficPercent: 10` but everything still hits v1.** The Knative route hasn't propagated. `kubectl get ksvc <name> -o yaml` should show two revisions and a traffic split; if it shows one, the InferenceService spec update didn't trigger a new revision (likely because the spec didn't actually change). Verify the new `storageUri` differs from the old.
+
+## References
+
+- KServe docs — `https://kserve.github.io/website/`
+- KServe on GitHub — `https://github.com/kserve/kserve`
+- V2 (Open) Inference Protocol — `https://kserve.github.io/website/master/modelserving/data_plane/v2_protocol/`
+- KServe model storage URIs — `https://kserve.github.io/website/master/modelserving/storage/storagecontainers/`
+- Knative Serving autoscaling — `https://knative.dev/docs/serving/autoscaling/`
+- NVIDIA Triton — `https://github.com/triton-inference-server/server`
+- KServe request/response logger — `https://kserve.github.io/website/master/modelserving/logger/logger/`
+
+**Next:** [Module 09 — Pipelines deep dive](/learn/kubeflow/pipelines-deep-dive) returns to the orchestration layer to wire Training, Katib, and KServe into one reproducible workflow.
