@@ -276,6 +276,29 @@ The plain-HTTP port on the backend (`9080`) stays open for the
 OpenShift platform's own probes and for the public-facing API Routes,
 which are already protected by the bearer token from WSO2.
 
+## Egress controls — what the pods can talk to
+
+By default the pods in the `bank-payment` namespace **cannot reach
+anything outside their own namespace**, not even the wider cluster.
+Every outbound destination is opened by an explicit allow-rule. This
+limits the blast radius of a compromised pod — a leaked credential
+can't be exfiltrated to a public server, the pod can't pivot into
+other tenant namespaces, and the only external destination it can
+reach is the bank's own identity service.
+
+| Destination | Why it's needed | How it's allowed |
+| --- | --- | --- |
+| **In-cluster DNS** (`openshift-dns`) | Resolving Service names like `payment-client-svc.bank-payment.svc.cluster.local` | NetworkPolicy `allow-egress-dns` — UDP/TCP 53 |
+| **Cluster monitoring** (`openshift-monitoring`) | Prometheus scrape from the platform's monitoring stack | NetworkPolicy `allow-egress-cluster-monitoring` — TCP 9091-9093 |
+| **WSO2 Identity Server** (lab VM, `160.30.63.134/138:443`) | Liberty fetches the JWKS signing keys here to validate every incoming user token | NetworkPolicy `allow-egress-wso2-is` — restricted to those exact two IPs on TCP 443 |
+| **Other pods in the same namespace** | The approver service calling the customer service, the NGINX proxy calling the backends, etc. | NetworkPolicy `allow-intra-namespace` |
+| **The public internet** | — | **Not allowed.** No NetworkPolicy opens this. |
+| **Other tenant namespaces** | — | **Not allowed.** Pods in `bank-payment` cannot speak to pods in any other tenant. |
+
+The full set of NetworkPolicies for this tenant lives in the platform
+GitOps repository — adding a new outbound destination is a small Git
+commit, reviewed and audited like everything else.
+
 ## Live health view
 
 `/obs/` shows two cards, one per backend service, refreshed every five
