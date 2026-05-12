@@ -1,0 +1,120 @@
+---
+title: "Overview"
+sidebar_label: "00 — Overview"
+description: "What this track covers, who it's for, and how to use it. Shift-left, runtime, and compliance automation as code."
+estimated_minutes: 10
+last_updated: 2026-05-12
+---
+
+This is a self-paced track on **DevSecOps** — the practice of pushing security into every stage of the software delivery lifecycle, automating the gates, and treating security as a property of every commit instead of a quarterly audit. By the end you'll have a pipeline that fails the build on a critical CVE, signs every image with cosign and verifies signatures at admission, runs RHACS / Falco in production for runtime detection, manages secrets through Vault and ESO, and produces the evidence pack an auditor will actually accept.
+
+The track is opinionated. It teaches the patterns most platform and application teams ship in production as of 2026, not every option in every vendor's catalogue. Where DevSecOps gives you four ways to do something — Snyk vs Trivy vs Aqua vs Anchore, OPA vs Kyverno vs VAP, Falco vs Tetragon vs Tracee — I'll name the dominant choice for each pattern and call out the alternatives where they actually matter.
+
+The angle is specific: **security as code, evaluated by automation, owned by the team that ships.** Not security-as-PDFs, not security-as-quarterly-sprints, not security-as-gatekeeper-bottleneck. The teams that get this right have a security control catalogue checked into Git, applied by CI, enforced at admission, monitored at runtime, and audited against evidence the controls themselves produce.
+
+## Who this is for
+
+Engineers who:
+
+- Ship software on Kubernetes / containers and want to integrate security without slowing the team to a crawl.
+- Are comfortable with **Docker** and **Kubernetes basics** — you can write a `Dockerfile`, understand what a Pod is, can read a `Deployment` manifest.
+- Have used a **CI/CD system** (Jenkins, GitHub Actions, GitLab CI, Tekton, anything) and can write a pipeline definition.
+- Understand **HTTP**, **TLS**, and **IAM** at a working level — not at PKI-RFC depth, but enough to know what a JWT is, what mTLS does, and why service accounts have RBAC.
+- Want to own security for your service end-to-end rather than throw findings over a wall.
+
+If you've never deployed anything to Kubernetes, do the upstream [Kubernetes Basics](https://kubernetes.io/docs/tutorials/kubernetes-basics/) tutorial first. If you've never written a CI pipeline, work through any vendor's quickstart — twenty minutes — and come back.
+
+If you want **multi-cluster governance** on top of these per-cluster patterns, the [ACM Multicluster track](/learn/acm-multicluster/) is the right read. DevSecOps is the per-service practice; ACM is the fleet operator's view.
+
+## What you'll learn
+
+After completing the track:
+
+- The **DevSecOps loop** as a primitive — what security control sits at each phase from Plan to Monitor, and what fails if you skip one.
+- **Threat modeling** as a recurring engineering exercise — STRIDE on a data-flow diagram, output integrated into the team's backlog with concrete mitigations.
+- **Source-code security** — SAST with Semgrep / SonarQube, dependency / SCA scanning with Snyk / Trivy / Dependabot, secret detection with gitleaks, pre-commit hooks that catch issues before a PR opens.
+- **Container security** — image scanning with Trivy / Grype / Clair, minimal base images, distroless and Wolfi, build-time vs registry-time vs runtime scans.
+- **Supply-chain security** — **SLSA L1-L4**, **SBOM** generation with Syft, **image signing and verification** with cosign, **provenance attestations** with in-toto, NIST SSDF (SP 800-218) alignment.
+- **Infrastructure-as-code security** — Terraform / Helm / Kubernetes manifest scanning with Checkov, Trivy-config, kube-linter, kube-bench against CIS Benchmarks.
+- **Runtime security** — RHACS, Falco, Tetragon, eBPF-based detection, baselining, policy-as-code at admission with OPA Gatekeeper, Kyverno, and Kubernetes' built-in Validating Admission Policy (VAP).
+- **Secrets management** — Vault as the source of truth, External Secrets Operator for cluster delivery, dynamic credentials, rotation, and the "no static secrets in Git" rule.
+- **Identity and zero trust** — OIDC for human auth, workload identity for service-to-service, mTLS via service mesh, the assume-breach mental model.
+- **Compliance and audit** — PCI-DSS v4.0, NIST 800-53, ISO 27001, the Compliance Operator on OpenShift, evidence packs that survive an audit.
+- **Security observability and SIEM** — what to log, where to store it, how to detect a breach in the noise.
+- A **capstone**: build a fully gated deployment pipeline — SAST → SCA → image build → SBOM → signed → admission-policy-verified → runtime-monitored — and walk away with a template you can copy.
+
+## The 13-module map
+
+| # | Module | What you build/do |
+| --- | --- | --- |
+| 00 | Overview *(this page)* | — |
+| 01 | Foundations | The DevSecOps loop, shift-left vs shift-right, the frameworks you'll meet |
+| 02 | Threat modeling | STRIDE + DFD on a real microservice; output a backlog of mitigations |
+| 03 | Source-code security | SAST + SCA + secret scanning in CI; pre-commit hooks; PR-blocking gates |
+| 04 | Container security | Image scanning, minimal base images, distroless / Wolfi, the build-time vs registry-time gate |
+| 05 | Supply-chain security | SLSA L1-L4, SBOM with Syft, image signing with cosign, in-toto attestations |
+| 06 | Infrastructure-as-code security | Terraform / Helm / Kubernetes manifest scanning; Checkov + kube-linter; CIS Benchmarks via kube-bench |
+| 07 | Runtime security | RHACS + Falco + Tetragon; OPA Gatekeeper / Kyverno / VAP admission; behavioural baselines |
+| 08 | Secrets management | Vault + External Secrets Operator; dynamic credentials; rotation; "no static secrets in Git" |
+| 09 | Identity + zero trust | OIDC, workload identity, mTLS via mesh, assume-breach posture |
+| 10 | Compliance + audit | PCI-DSS v4.0, NIST 800-53, ISO 27001; Compliance Operator; evidence collection |
+| 11 | Security observability + SIEM | Audit logs, telemetry pipelines, detection rules, SOC handoff |
+| 12 | Build a project (capstone) | A fully gated deployment pipeline — SAST → SCA → build → SBOM → sign → admit → monitor |
+
+Each module is self-contained but assumes the previous ones. Expect 30-60 minutes per module depending on whether you do the exercises.
+
+## How to use this track
+
+Three patterns work:
+
+- **Sequential.** Start at 01, walk through 12. Best for first-timers and for anyone who hasn't built a full pipeline before.
+- **Reference.** Use the sidebar; jump to the module you need. Best if you already run some of this and want a specific topic — *"I just want to fix cosign verification at admission."*
+- **Project-driven.** Skip to 12, pick the capstone, walk backwards through the modules whose content you need. Best for engineers who learn by building.
+
+If you have a cluster — even a single-node kind or minikube — actually do the exercises. DevSecOps is one of those topics where reading about an admission webhook and watching `kubectl describe` show your image blocked because the signature didn't verify are completely different experiences.
+
+## What you need
+
+- A **Kubernetes cluster** — `kind`, `minikube`, or `k3d` is enough for development. From Module 07 onward (runtime security, admission policy), a real cluster with at least three nodes makes the network-policy and admission examples easier to reason about.
+- A **Git repository** you control (GitHub, GitLab, Gitea) and a **CI runner** attached to it. The examples use GitHub Actions and Tekton; the patterns port to anything.
+- **Docker** or **Podman** locally, plus access to a container registry you can push to (Docker Hub, GHCR, Quay, ECR, a self-hosted Nexus).
+- **cosign**, **syft**, **trivy** installed locally for Modules 04-05.
+- Optional but recommended for Modules 07-08: **Vault** (dev mode is fine), **External Secrets Operator** in the cluster, and the **RHACS** central + a sensor on the cluster.
+
+The lab this track was written against runs **RHACS** for runtime security ([rhacs-central-on-hub](/docs/openshift-platform/openshift-platform/security/rhacs-central-on-hub)), **Trivy + DefectDojo** in the build paths ([path-a-jenkins-trivy-nexus](/docs/openshift-platform/application-delivery/build-paths/path-a-jenkins-trivy-nexus)), the **Compliance Operator** with a tailored PCI-DSS v4 profile ([pci-dss-profile-baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline)), and **Vault + ESO** for secrets ([architecture](/docs/openshift-platform/openshift-platform/secrets-eso/architecture)). The [BFSI readiness review](/docs/openshift-platform/foundations/bfsi-readiness-review) tracks the gaps. Each module flags where the lab already covers a topic and where work remains.
+
+## Where this track lives in the bigger picture
+
+DevSecOps sits next to two other tracks in this curriculum:
+
+- The [ACM Multicluster track](/learn/acm-multicluster/) — especially [Module 04 — Policies](/learn/acm-multicluster/policies) (governance-as-code at fleet scale) and [Module 09 — Security with RHACS](/learn/acm-multicluster/security-with-rhacs) (RHACS + ACM integration). DevSecOps teaches the per-cluster + per-pipeline practices; ACM teaches how to apply them to ten or fifty clusters from one hub.
+- The [BFSI readiness review](/docs/openshift-platform/foundations/bfsi-readiness-review) — the gap analysis that motivated most of this track for a banking context. If you're operating in a regulated industry, that document is the *why*; this track is the *how*.
+
+The split is deliberate: this track teaches the practice, the docs show one lab's wiring. Read both if you want to see the abstract patterns pinned to concrete YAML.
+
+## A note on what's *not* here
+
+This track doesn't cover:
+
+- **Application security as a discipline.** OWASP Top 10, ASVS controls, secure coding patterns by language — important, well-covered elsewhere. We use them as inputs; we don't re-teach them.
+- **Offensive security / red-teaming.** Different practice, different audience. The track is built for defenders who ship software.
+- **Compliance certification end-to-end.** PCI-DSS QSA assessments, SOC2 Type II audits, ISO 27001 certification — those are formal engagements that go beyond an engineering track. Module 10 teaches the technical controls and evidence; the formal certification path is your auditor's job.
+- **Vendor-specific deep dives.** RHACS, Snyk, Aqua, Sysdig, Wiz, Lacework — all named where they fit, none taught end-to-end. The track is product-agnostic; pick the tool that fits your stack.
+
+The goal is to make you the engineer who can stand up, operate, and evolve a DevSecOps practice — not the analyst who can recite the NIST 800-53 control catalogue.
+
+**Ready?** Continue to [Module 01 — Foundations](/learn/devsecops/foundations).
+
+## References
+
+- [OWASP — project home](https://owasp.org/)
+- [OWASP Top 10 (2021)](https://owasp.org/www-project-top-ten/)
+- [OWASP ASVS — Application Security Verification Standard](https://owasp.org/www-project-application-security-verification-standard/)
+- [OWASP SAMM — Software Assurance Maturity Model](https://owaspsamm.org/)
+- [NIST SP 800-218 — Secure Software Development Framework (SSDF)](https://csrc.nist.gov/publications/detail/sp/800-218/final)
+- [NIST SP 800-53 Rev. 5 — Security and Privacy Controls](https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final)
+- [NIST SP 800-190 — Application Container Security Guide](https://csrc.nist.gov/publications/detail/sp/800-190/final)
+- [SLSA — Supply-chain Levels for Software Artifacts](https://slsa.dev/)
+- [Sigstore — sigstore.dev](https://www.sigstore.dev/)
+- [in-toto — in-toto.io](https://in-toto.io/)
+- [CNCF — cloud-native security whitepaper](https://github.com/cncf/tag-security/tree/main/security-whitepaper)

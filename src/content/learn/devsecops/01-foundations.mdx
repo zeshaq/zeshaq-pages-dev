@@ -1,0 +1,195 @@
+---
+title: "Foundations: DevOps → DevSecOps, shift-left vs shift-right, and the frameworks you'll meet"
+sidebar_label: "01 — Foundations"
+description: "What changes when DevOps becomes DevSecOps, the DevSecOps loop with a gate at every stage, the frameworks (SSDF, SLSA, SAMM, ASVS, CIS, PCI-DSS, NIST 800-53, ISO 27001), and the honest division of responsibility."
+estimated_minutes: 40
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const flowEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const gateEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const loopNodes = [
+  { id: "plan",    position: { x: 40,   y: 40  }, data: { label: "Plan" },     style: ctrl },
+  { id: "code",    position: { x: 240,  y: 40  }, data: { label: "Code" },     style: ctrl },
+  { id: "build",   position: { x: 440,  y: 40  }, data: { label: "Build" },    style: ctrl },
+  { id: "test",    position: { x: 640,  y: 40  }, data: { label: "Test" },     style: ctrl },
+  { id: "release", position: { x: 640,  y: 220 }, data: { label: "Release" },  style: ctrl },
+  { id: "deploy",  position: { x: 440,  y: 220 }, data: { label: "Deploy" },   style: ctrl },
+  { id: "operate", position: { x: 240,  y: 220 }, data: { label: "Operate" },  style: ctrl },
+  { id: "monitor", position: { x: 40,   y: 220 }, data: { label: "Monitor" },  style: ctrl },
+
+  { id: "g-plan",    position: { x: 40,   y: 130 }, data: { label: "Threat modeling" },                   style: agent },
+  { id: "g-code",    position: { x: 240,  y: 130 }, data: { label: "Pre-commit hooks\nIDE plugins" },     style: agent },
+  { id: "g-build",   position: { x: 440,  y: 130 }, data: { label: "SAST + SCA\nSBOM" },                  style: agent },
+  { id: "g-test",    position: { x: 640,  y: 130 }, data: { label: "DAST + fuzz\nContainer scan" },       style: agent },
+  { id: "g-release", position: { x: 640,  y: 310 }, data: { label: "Image signing\nAttestations" },       style: agent },
+  { id: "g-deploy",  position: { x: 440,  y: 310 }, data: { label: "Admission policy\nOPA / Kyverno" },   style: agent },
+  { id: "g-operate", position: { x: 240,  y: 310 }, data: { label: "Runtime detection\nRHACS / Falco" },  style: agent },
+  { id: "g-monitor", position: { x: 40,   y: 310 }, data: { label: "SIEM + audit\nSOC alerts" },          style: agent },
+];
+
+export const loopEdges = [
+  { id: "plan-code",       source: "plan",    target: "code",    ...flowEdge },
+  { id: "code-build",      source: "code",    target: "build",   ...flowEdge },
+  { id: "build-test",      source: "build",   target: "test",    ...flowEdge },
+  { id: "test-release",    source: "test",    target: "release", ...flowEdge },
+  { id: "release-deploy",  source: "release", target: "deploy",  ...flowEdge },
+  { id: "deploy-operate",  source: "deploy",  target: "operate", ...flowEdge },
+  { id: "operate-monitor", source: "operate", target: "monitor", ...flowEdge },
+  { id: "monitor-plan",    source: "monitor", target: "plan",    label: "feedback", ...flowEdge },
+
+  { id: "plan-g",    source: "plan",    target: "g-plan",    ...gateEdge },
+  { id: "code-g",    source: "code",    target: "g-code",    ...gateEdge },
+  { id: "build-g",   source: "build",   target: "g-build",   ...gateEdge },
+  { id: "test-g",    source: "test",    target: "g-test",    ...gateEdge },
+  { id: "release-g", source: "release", target: "g-release", ...gateEdge },
+  { id: "deploy-g",  source: "deploy",  target: "g-deploy",  ...gateEdge },
+  { id: "operate-g", source: "operate", target: "g-operate", ...gateEdge },
+  { id: "monitor-g", source: "monitor", target: "g-monitor", ...gateEdge },
+];
+
+Before you write a SAST rule or sign your first image, it helps to be clear about what DevSecOps actually changes and what it doesn't. This module sets the framing — the shift in mental model, the loop you'll spend the rest of the track populating, and the framework alphabet soup you'll meet whether you like it or not.
+
+## DevOps → DevSecOps — what changes
+
+DevOps integrated dev and ops into a continuous delivery loop. The win was speed: a commit could go from a developer's laptop to production in minutes, and the same team owned both the writing and the running of the service. Security wasn't *missing* from DevOps, but it was rarely *integrated* — it sat in a quarterly cycle with a separate team, a separate tool, and a separate set of findings that didn't show up in the developer's PR.
+
+DevSecOps adds security as a peer concern of the loop. Every CI run scans. Every dependency change is checked for known CVEs. Every image is signed. Every deploy passes an admission policy. Every runtime is monitored for behavioural drift. Security stops being a Q4 sprint and becomes a property of every commit — same way tests, linting, and code review became properties of every commit a decade earlier.
+
+The cultural shift is the harder half. The technical pieces — SAST, SCA, image signing, admission policy — all exist as well-supported tools. The hard parts are organisational: getting the security team to define controls as code instead of as policy documents, getting app teams to fix findings instead of suppressing them, and getting platform teams to expose security tooling as a paved path so it's easier to do the right thing than the wrong one.
+
+If you take one thing from this module: **DevSecOps is not security plus DevOps. It's security expressed in DevOps's idiom — as code, in CI, with feedback fast enough to act on at commit time.**
+
+## Shift-left vs shift-right
+
+Two complementary moves you'll hear about constantly:
+
+**Shift left.** Find security issues earlier in the SDLC, where they're cheapest to fix. SAST in CI catches an injection bug at PR time, where the developer's context is fresh and the fix is a one-line code change. Dependency / SCA scans flag a `log4j` 2.17 → 2.17.1 bump before merge. Threat modeling at design surfaces a missing trust boundary before any code is written. The wins are huge, the friction is real, and the catch is that shift-left tools only find what they're written to find — they can't catch a zero-day or a runtime configuration error.
+
+**Shift right.** Find security issues in production, where the real attackers live. Runtime detection — RHACS, Falco, Tetragon — watches for syscall patterns that indicate an exploit in progress. Behavioural baselining catches the moment a payment service starts shelling out to `/bin/sh`. DAST and fuzz testing in pre-prod hit the running app the way an attacker would. The wins are the catches that static analysis can't make; the cost is that the issue has already been built and shipped before you find it.
+
+The teams that get this right do **both** and don't argue about which one is *real* DevSecOps. Most teams over-rotate one way — usually shift-left, because shift-left tools are cheaper to buy than runtime tools to operate. The result is a pipeline that catches lint-level issues and misses a Server-Side Request Forgery (SSRF) the moment the service is live. Pick both. Wire both into the same backlog.
+
+## The DevSecOps loop
+
+The canonical DevSecOps loop is the DevOps infinity-loop with a security gate at every phase. Here it is:
+
+<Whiteboard client:load data={{ nodes: loopNodes, edges: loopEdges }} height={460} />
+
+Reading the diagram:
+
+- **Solid black** arrows are the **flow of the SDLC**: code moves from Plan → Code → Build → Test → Release → Deploy → Operate → Monitor → back to Plan.
+- **Dashed green** edges point at the **security gate** at each phase. The gate is the tool category that owns that step's security review. Modules 02-11 each go deep on one of these gates.
+
+The gates, briefly:
+
+- **Plan: threat modeling.** Before code, a structured exercise to find what can go wrong. Module 02 covers STRIDE + DFD.
+- **Code: pre-commit hooks + IDE plugins.** Secret detection, lint, SAST-as-you-type. Module 03 covers `gitleaks`, `pre-commit`, Semgrep's IDE integration.
+- **Build: SAST + SCA + SBOM.** Static analysis on source, software-composition analysis on dependencies, an SBOM generated from the build for downstream traceability. Modules 03-05.
+- **Test: DAST + fuzz + container scan.** Dynamic analysis on the running app in a test environment, fuzzers on protocol surfaces, container vulnerability scans on the built image. Module 04.
+- **Release: image signing + attestations.** cosign signs the image, in-toto attestations record how it was built, the SBOM is attached as an attestation too. Module 05.
+- **Deploy: admission policy.** OPA Gatekeeper, Kyverno, or Kubernetes' built-in Validating Admission Policy verifies the image is signed by the expected key, has an SBOM, passes container-security checks, and isn't asking for privileges it shouldn't get. Module 07.
+- **Operate: runtime detection.** RHACS, Falco, Tetragon watch syscalls and process events for anomalies. Behavioural baselines catch drift. Module 07.
+- **Monitor: SIEM + audit + SOC alerts.** Audit logs, runtime alerts, and policy violations stream to a SIEM where detection rules fire on attack patterns. Module 11.
+
+Each gate is a place where the pipeline can **fail closed** — the build doesn't pass, the image doesn't deploy, the pod doesn't start. Or it can **fail open** with a warning. The art is picking the right failure mode for each control given your risk appetite and your team's capacity to respond.
+
+## The frameworks you'll meet
+
+DevSecOps lives inside a thicket of acronyms. Here's the short tour — what each one is, when it matters, what to learn first.
+
+**NIST SSDF (SP 800-218)** — the *Secure Software Development Framework*. The US government's response to SolarWinds and Log4Shell: a catalogue of practices software vendors should adopt to reduce supply-chain risk. Required for federal-software vendors as of 2024 (per Executive Order 14028 and OMB memo M-22-18). Increasingly the de-facto baseline for any regulated industry, including BFSI. Organised into four practice groups: Prepare the Organisation (PO), Protect the Software (PS), Produce Well-Secured Software (PW), Respond to Vulnerabilities (RV). Read it once, map your pipeline to its practices, you're done.
+
+**SLSA (Supply-chain Levels for Software Artifacts)** — pronounced *"salsa"*. Google-led framework, now governed by OpenSSF, defining four levels of supply-chain integrity:
+
+| Level | What it requires |
+| --- | --- |
+| SLSA L1 | Documented build process; provenance generated (even if unsigned) |
+| SLSA L2 | Hosted build service; signed provenance |
+| SLSA L3 | Isolated, ephemeral build environment; non-falsifiable provenance |
+| SLSA L4 | Two-party review; hermetic, reproducible builds |
+
+**L3** is the practical target for most production pipelines today. L4 is aspirational — reproducible builds remain hard. L1 and L2 are easy and worth doing even if you stop there.
+
+**OWASP SAMM** — *Software Assurance Maturity Model*. A maturity-assessment framework for an organisation's security practices, scored across five business functions: Governance, Design, Implementation, Verification, Operations. Each function has three practices, each practice has three maturity levels. Use SAMM when you're being asked *"how mature is our AppSec practice?"* and need an answer that isn't *"pretty good?"*.
+
+**OWASP ASVS** — *Application Security Verification Standard*. A checklist of controls for verifying a web app's security. ~280 requirements across 14 categories, organised into three levels (L1 / L2 / L3). Useful as a test plan when you're verifying a service's security posture pre-launch.
+
+**CIS Benchmarks** — hardening guides for Linux, Kubernetes, AWS, GCP, Azure, Docker, and several dozen other targets. Auditors cite them constantly. The Kubernetes CIS Benchmark, in particular, is the baseline kube-bench tests against. If you only adopt one external framework, this is the one that produces the most concrete day-one improvements.
+
+**PCI-DSS v4.0** — Payment Card Industry Data Security Standard. Mandatory for anyone storing, processing, or transmitting cardholder data. The v4.0 update (effective March 2024 for new assessments, March 2025 for full transition) adds requirements around continuous authentication, multi-factor for all access to cardholder data environments, and more rigorous logging. The lab's [PCI-DSS profile baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline) is a tailored Compliance Operator profile against v4.
+
+**NIST 800-53 Rev. 5** — the comprehensive control catalogue used by US federal agencies and, by extension, by US financial regulators. ~1000 controls across 20 control families. You won't read all of it. You will see it cited in audits.
+
+**ISO 27001:2022** — international information-security management standard, the EU's primary point of reference and widely required by enterprise customers in any region. The 2022 update reorganised the controls and is what new certifications align to.
+
+Don't pick a framework — meet the ones that apply to your industry. For BFSI in 2026: **PCI-DSS v4.0** (if you touch card data) + **SOC 2** (US customer expectation) + **the local regulator's framework** (e.g. Bangladesh Bank Guideline on ICT Security in Bangladesh, RBI's Master Direction on IT Governance in India) + **NIST 800-53** often shows up by reference. For general enterprise SaaS: **SOC 2** + **ISO 27001** + opportunistic **NIST 800-218** and **SLSA L3** as differentiators. Pick the minimum set that satisfies your regulators and customers, and stop there.
+
+## The shared-responsibility honest version
+
+*"Security is everyone's responsibility"* is true but vapid. The practical division in a team that ships software on Kubernetes:
+
+| Team | What they own |
+| --- | --- |
+| **Platform team** | The substrate — cluster security, admission policy, secrets infrastructure, identity, runtime detection, audit-log pipeline |
+| **App teams** | The application surface — SAST/SCA findings on their code, image hygiene of their builds, threat-modeling their service |
+| **Security team** | Policy — what's blocking vs informational, audits the controls, owns incident response, runs the SOC |
+| **Compliance team** | Mapping controls to frameworks, generating evidence packs, facing auditors |
+
+The DevSecOps practices in this track sit at the **platform-team + app-team boundary**. Platform team provides the paved road; app teams walk it. Security team defines what's on it. Compliance team proves it works to outsiders.
+
+The failure mode you'll see: **security team owns DevSecOps end-to-end**. They become the bottleneck on every PR, the rate-limiter on every release. They burn out, leave, and the practice regresses six months. The fix is to distribute ownership before that happens.
+
+## The DevSecOps anti-patterns
+
+A frank list of what doesn't work, drawn from the visibly-broken implementations you'll see in the wild:
+
+- **Security as a separate pipeline.** A nightly scan job that runs disconnected from CI, generates a 400-page PDF, and nobody reads. The findings aren't tied to a PR, so nobody fixes them. Wire security into the same pipeline as everything else, or it's noise.
+- **Findings firehose.** Every commit triggers 200 SAST findings, 90% of which are false positives. The team adds an `ignore-all.yml`, ships anyway, and learns to mute the security channel. Tune your rules to your codebase. Block on severity high+ only. Move medium / low to a tracking dashboard, not a PR block.
+- **Block-everything admission policy.** First production incident, the team disables OPA / Kyverno to ship a fix. Six months later, nobody remembers it was disabled. Policies should be tested in audit mode first, rolled out in enforce mode gradually, and have an audited emergency-override path.
+- **Compliance theater.** Generate evidence into a folder, file it, never look at it between audits. The controls become disconnected from the operations. Evidence should be a byproduct of the controls running — audit logs, signed attestations, policy decisions — not a separate artifact built for the audit.
+- **One-person security gatekeeper.** A single SME owns all the security tooling. They become the bottleneck. They burn out. They leave. The practice regresses. Distribute ownership; document the runbooks; rotate the on-call.
+- **Tool sprawl.** Snyk for SCA, Trivy for container scans, Aqua for runtime, Wiz for cloud posture, Sysdig for forensics, RHACS for admission. Each has its own dashboard, its own ignore-list format, its own alert format. Pick one tool per category; integrate them through the SIEM if you must keep two.
+
+The patterns in this track are designed to avoid these. Modules 03-11 each end with the *common pitfalls* for that gate, drawn from teams who've already failed once.
+
+## The lab posture
+
+The lab this track was written against implements parts of the DevSecOps loop today:
+
+- **Build-time gating** — [Path A (Jenkins + Trivy + Nexus)](/docs/openshift-platform/application-delivery/build-paths/path-a-jenkins-trivy-nexus) runs Trivy scans on images at build, posts findings to DefectDojo, and pushes to Nexus on pass.
+- **Image promotion by digest** — [Build once, promote by digest](/docs/openshift-platform/application-delivery/build-paths/build-once-promote-by-digest) ensures the artifact passing through dev/staging/prod is byte-identical to the one that was scanned.
+- **Runtime security** — RHACS Central on the hub ([rhacs-central-on-hub](/docs/openshift-platform/openshift-platform/security/rhacs-central-on-hub)), Sensors on each managed cluster, scanner-v4 for in-cluster image scans, admission controller policies enforcing the no-critical-CVE rule.
+- **Compliance Operator** — running with a tailored PCI-DSS v4 baseline profile ([pci-dss-profile-baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline)) plus an evidence-collection pipeline writing to MinIO ([evidence-collection-and-storage](/docs/openshift-platform/openshift-platform/compliance/evidence-collection-and-storage)).
+- **Secrets** — Vault as the source of truth, ESO syncing into the cluster, the tenant SecretStore pattern keeping app teams' Vault paths isolated ([secrets-eso/architecture](/docs/openshift-platform/openshift-platform/secrets-eso/architecture), [tenant-secretstore-pattern](/docs/openshift-platform/openshift-platform/secrets-eso/tenant-secretstore-pattern)).
+
+The [BFSI readiness review](/docs/openshift-platform/foundations/bfsi-readiness-review) is the gap analysis. It's essentially a fleet-wide threat-and-gap assessment against the regulator's expected control set, and the work items it surfaces drove the prioritisation of most of the modules ahead. If you're operating in BFSI, that document is the *why* this track exists; the modules ahead are the *how*.
+
+Each module from here on flags **what the lab already covers** and **what gaps remain** so you can map the abstract patterns onto a concrete production posture.
+
+## What's next
+
+The DevSecOps loop starts at Plan, and Plan is where threat modeling lives. The earliest gate, the cheapest one to operate, and the most-underused one in practice. Module 02 takes you through a STRIDE-on-a-DFD exercise end-to-end on a real microservice, so you walk out with a backlog of mitigations, not a diagram in a folder.
+
+**Next:** [Module 02 — Threat modeling](/learn/devsecops/threat-modeling).
+
+## References
+
+- [NIST SP 800-218 — SSDF](https://csrc.nist.gov/publications/detail/sp/800-218/final)
+- [NIST SP 800-53 Rev. 5 — Security and Privacy Controls](https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final)
+- [SLSA — slsa.dev](https://slsa.dev/spec/v1.0/levels)
+- [OWASP SAMM — owaspsamm.org](https://owaspsamm.org/)
+- [OWASP ASVS — owasp.org/www-project-application-security-verification-standard](https://owasp.org/www-project-application-security-verification-standard/)
+- [CIS Benchmarks — cisecurity.org/cis-benchmarks](https://www.cisecurity.org/cis-benchmarks/)
+- [PCI Security Standards Council — PCI DSS v4.0](https://www.pcisecuritystandards.org/document_library/)
+- [ISO/IEC 27001:2022](https://www.iso.org/standard/27001)
+- [Executive Order 14028 — Improving the Nation's Cybersecurity](https://www.whitehouse.gov/briefing-room/presidential-actions/2021/05/12/executive-order-on-improving-the-nations-cybersecurity/)
+- [OMB Memorandum M-22-18 — Enhancing the Security of the Software Supply Chain](https://www.whitehouse.gov/wp-content/uploads/2022/09/M-22-18.pdf)

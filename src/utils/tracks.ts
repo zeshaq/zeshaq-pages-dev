@@ -17,6 +17,7 @@ export const TRACK_TITLES: Record<string, string> = {
   "cloudflare": "Cloudflare",
   "acm-multicluster": "ACM Multicluster",
   "kubeflow": "Kubeflow",
+  "devsecops": "DevSecOps",
 };
 
 export const TRACK_TAGLINES: Record<string, string> = {
@@ -28,6 +29,8 @@ export const TRACK_TAGLINES: Record<string, string> = {
     "Operate ten or fifty OpenShift clusters from one control plane. Red Hat Advanced Cluster Management end-to-end — registration, policies, GitOps, applications, observability, hosted control planes, and disaster recovery.",
   "kubeflow":
     "The platform layer for the ML workflow on Kubernetes. Upstream Kubeflow end-to-end — notebooks, KFP pipelines, distributed training, Katib HPO, KServe model serving, multi-tenancy with Profiles, and production-grade install patterns.",
+  "devsecops":
+    "Shift security left into the SDLC, automate the gates at every stage, and treat security as a property of every commit. Threat modeling, SAST/SCA, container and supply-chain security (SLSA, SBOM, cosign), IaC scanning, runtime detection (RHACS, Falco), secrets, zero trust, compliance, and SIEM — ending in a fully gated deployment pipeline.",
 };
 
 export function trackTitle(id: string): string {
