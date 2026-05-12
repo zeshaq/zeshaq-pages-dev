@@ -1,0 +1,141 @@
+---
+title: "ADR 0017 — Parallel worktree isolation policy"
+description: "When more than one writer works the same repository in parallel, each writer gets a dedicated Git worktree, branch, ownership boundary, and tracking issue. No two writers share a checkout."
+sidebar_label: "0017 — Parallel worktree isolation"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+**Date:** 2026-05-09
+**Status:** Accepted. Extends [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror) (workspace execution governance).
+
+## Context
+
+The operator workspace now coordinates more than one parallel writer against the same repository. Parallel work is useful for throughput, but two write-capable processes sharing a single checkout can corrupt state or silently overwrite each other's changes.
+
+The practical risks the policy fixes:
+
+- **Overlapping edits to the same file** with no merge conflict because both writers are in the same working tree.
+- **One writer committing another writer's incomplete work** when `git add .` sweeps unrelated dirty files.
+- **Dirty worktree state misread as owned by the current writer** when sessions interleave.
+- **Session memory and status files updated out of order** so the live record stops matching reality.
+- **GitHub issues closed before all parallel work is integrated**.
+- **Accidental access to deprecated paths** outside the assigned workspace.
+
+This ADR extends [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror). It does not replace the requirement for a tracked GitHub issue, milestone, phase or gate, and accepted ADR coverage before implementation. The governance objects for this decision were created before implementation: `zeshaq/opp-full-plat` milestone #29 (Workspace Governance) and phase issue #114 (`WG2: enforce parallel-agent worktree isolation`).
+
+## Decision
+
+Every write-capable parallel writer must work in a separate Git worktree and on a separate branch. The required setup pattern against the operator workspace is:
+
+```bash
+cd /home/ze/opp-full-plat
+git fetch origin
+git worktree add ../opp-full-plat-<slug> \
+  -b agent/<issue-or-phase>-<short-slug> origin/main
+```
+
+Each parallel writer must have:
+
+1. A dedicated worktree path.
+2. A dedicated branch.
+3. A governing GitHub issue with milestone and phase/gate.
+4. Accepted ADR coverage (either a new ADR or an existing one cited explicitly).
+5. An explicit file or path ownership boundary.
+6. A clear instruction not to read or write outside the assigned workspace except for approved read-only context.
+
+Two write-capable writers must not edit the same checkout at the same time. They must not own the same file set at the same time.
+
+The coordinator — normally the main operator session — owns final integration. The coordinator decides when to merge worker branches, reconcile conflicts, update shared session-state files, update GitHub, and close or advance issues.
+
+### File ownership rules
+
+Parallel writers may only edit files within their assigned ownership boundary. A good split looks like:
+
+```text
+Writer A owns:
+- developer-handbook/**
+- examples/apps/openliberty-readiness-probe/**
+
+Writer B owns:
+- scripts/rebuild/nexus/**
+- reports/sessions/*nexus*.md
+```
+
+Shared files are coordinator-owned unless explicitly delegated to one writer:
+
+```text
+CURRENT_STATE.md
+TODO.md
+SESSION_LOG.md
+AGENTS.md
+RUNBOOK.md
+ASSESSMENT.md
+adr/**
+plans/**
+```
+
+If multiple writers need to affect a shared file, each reports the required change in their final notes. The coordinator applies the final edit once.
+
+### Existing dirty-checkout rule
+
+Before assigning or accepting parallel work, the coordinator inspects:
+
+```bash
+git status --short --branch
+git diff --name-only
+```
+
+If two writers have already worked in the same checkout, pause both, identify changed files and owners, create separate worktrees, and move only path-scoped changes with patches:
+
+```bash
+git diff -- developer-handbook > /tmp/writer-a.patch
+git diff -- scripts/rebuild/nexus > /tmp/writer-b.patch
+
+cd ../opp-full-plat-writer-a
+git apply /tmp/writer-a.patch
+
+cd ../opp-full-plat-writer-b
+git apply /tmp/writer-b.patch
+```
+
+Do not use destructive cleanup commands such as `git reset --hard` or `git checkout --` to separate writer work unless the operator has explicitly approved that exact destructive action.
+
+### Branch and commit rules
+
+Each writer branch maps to one issue or one phase. Branch names should be predictable:
+
+```text
+agent/114-worktree-isolation
+agent/86-gitlab-structure-guide
+agent/93-spoke-dc-v6-boot
+```
+
+Writers should not commit unrelated dirty files. When committing from a shared integration checkout, the coordinator stages files explicitly by path. `git add .` is not used in a dirty workspace unless every changed and untracked file has been verified to belong to the current integration.
+
+### Path boundaries
+
+All current work remains inside the workspace root (`/home/ze/opp-full-plat`) or an explicitly created sibling worktree (for example `/home/ze/opp-full-plat-writer-a`). The deprecated `cloud-init/` path is off-limits for this workspace.
+
+## Alternatives considered
+
+**Trust writers to coordinate verbally inside one checkout.** Rejected. This is the pre-policy baseline and it produced exactly the failure modes the ADR is fixing: silent overwrites, mixed commits, and lost session state. The coordination cost grows non-linearly with the number of writers.
+
+**One branch per task in a single checkout, with `git stash` between switches.** Rejected. `git stash` is a poor isolation primitive — stashes get lost, applied to the wrong branch, or mixed with unrelated dirty files. Worktrees are the supported Git mechanism and are cheap.
+
+**Reset-and-restart between writer handoffs.** Rejected. `git reset --hard` is destructive and routinely throws away in-flight work when two writers' edits are present at the same time. The dirty-checkout rule above is the safer alternative.
+
+## Consequences
+
+- Parallel work has a small setup cost (one `git worktree add` per writer) and removes the silent-overwrite class of failure.
+- Shared status and memory files lag worker progress until the coordinator integrates; this is intentional and is what makes the final record consistent.
+- Worker branches can be discarded cleanly after integration.
+- Conflicts become explicit Git conflicts instead of silent dirty-worktree collisions.
+- [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror) remains the governing policy for task tracking; this ADR adds the required isolation model for parallel execution.
+
+## References
+
+- Source: `opp-full-plat/adr/0017-parallel-agent-worktree-isolation.md`
+- Parent execution-governance ADR: [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror)
+- Workspace governance milestone: `zeshaq/opp-full-plat` #29
+- Phase issue: `zeshaq/opp-full-plat` #114 (WG2)

@@ -1,0 +1,109 @@
+---
+title: "ADR 0024 — OpenShift-only platform GitOps repo boundary"
+description: "openshift-platform-gitops is OpenShift cluster state only. VM platform tools, application source, and per-release manifests are explicitly out. Boundary enforced by GitLab group access, branch protection, CODEOWNERS, and validation-only CI."
+sidebar_label: "0024 — Platform GitOps boundary"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+**Date:** 2026-05-10
+**Status:** Accepted. Scopes the platform-side repository named in [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) and constrained by [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull).
+
+## Context
+
+[ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) accepted the federated GitOps repository architecture and named `comptech-platform/openshift-ops/openshift-platform-gitops` as one of several ownership-scoped repositories under the GitLab top-level groups. ADR 0015 listed its intent at the architecture level: OpenShift cluster desired state, owned by the OpenShift/platform team, with no application-team write access.
+
+[ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull) then constrained how OpenShift platform operations inside that federated structure must run: the ACM plus OpenShift GitOps Basic pull pattern, with `hub-dc-v6` coordinating placement and ApplicationSet propagation and each managed workload cluster running its own OpenShift GitOps instance reconciling from the same internal GitLab repo. [ADR 0023](/docs/06-architecture-decisions/19-adr-0023-federated-gitlab-group-repo-ownership) locked the GitLab-side group layout, role groups, branch protection baseline, and code-owner boundaries.
+
+What did not yet exist was a single decision record specifically scoping the `openshift-platform-gitops` repository: what is in it, what is explicitly not in it, and how that boundary is enforced. Issue #69 under milestone #24 (Federated GitOps Architecture) asked for exactly that — the repo is OpenShift operations only, writable only by the OpenShift/platform team, and excludes VM tool operations and application team release ownership. This ADR records the boundary. It does not redefine the pull model, the federated layout, or the GitLab group model.
+
+## Decision
+
+`comptech-platform/openshift-ops/openshift-platform-gitops` is OpenShift operations only. Its scope, ownership, and enforcement are fixed below.
+
+### What IS in the repo
+
+The repo carries OpenShift cluster desired state and platform guardrails for the v6 fleet and any future OpenShift clusters that join the federation:
+
+- cluster bootstrap paths under `clusters/<cluster>/bootstrap/` and `clusters/<cluster>/platform/` per [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull);
+- ACM/MCE installation, configuration, `ManagedClusterSet`, `Placement`, and `GitOpsCluster` wiring on `hub-dc-v6`;
+- hub-local OpenShift GitOps configuration, AppProjects, and ApplicationSets that drive the pull model;
+- mirrored CatalogSources, ClusterCatalogs, IDMS/ITMS mirror configuration per [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops);
+- cluster-scoped platform operators that the OpenShift/platform team owns: MCO desired state, External Secrets Operator install and `ClusterSecretStore` config, RHACS Central/SecuredCluster install, OADP install and DataProtectionApplication configuration, ODF and Local Storage Operator desired state, LokiStack and TempoStack install and storage configuration, OpenShift Service Mesh control-plane install;
+- platform-wide network policies (default-deny baselines, allow-egress to Vault, internal GitLab, Nexus, MinIO);
+- cluster-admin and platform-team RBAC, AppProjects defining where Argo CD can deploy, and tenant-boundary registration (namespaces, quotas, limit ranges, baseline NetworkPolicies, service accounts) for each approved tenant.
+
+The repo is the single OpenShift desired-state source that the `hub-dc-v6-bootstrap` Application and the spoke-local `spoke-dc-v6-cluster-config` Application reconcile from.
+
+### What is NOT in the repo
+
+The repo does not carry, and merge requests must not land:
+
+- **VM-hosted platform tool configuration.** HAProxy, PowerDNS, GitLab itself, Jenkins, Nexus, MinIO, SigNoz, Trivy, the Docker runtime VM, GitLab Runner VMs, and the Vault VM are managed under `comptech-platform/infra-ops/` (`vm-platform-ops`, and the future `platform-services/platform-tools-iac` and `platform-tools-config` if split out). OpenShift GitOps is not the executor for VM Ansible/Terraform.
+- **Application source code.** Division `*-apps-monorepo` repositories under `divisions/<division>/` own Open Liberty, JBoss/EAP, Spring Boot, and Node.js source.
+- **Routine application release manifests.** Division `*-gitops` repositories own per-environment overlays (`dev`, `uat`, `staging`, `prod`) and digest promotion. The platform repo registers tenant boundaries only, not per-release object state.
+- **Tenant overlays beyond the boundary.** AppProjects, namespaces, quotas, and baseline policies belong here; per-application Deployment, Route, Service, HPA, and ConfigMap manifests belong in the tenant's `*-gitops` repo or a future `tenant-registry/<team>` repo.
+- **Rendered Secret manifests or any plaintext credential.** ESO references and `ExternalSecret` definitions are allowed; the materialized Kubernetes Secret is not committed, per the access-matrix secret-and-variable policy.
+
+The break-glass exception path is the one [ADR 0025](/docs/06-architecture-decisions/21-adr-0025-gitops-only-operations-break-glass) records: manual changes must be tracked, time-boxed, and either backported to Git or removed.
+
+### Boundary enforcement
+
+The boundary is enforced at four layers. Each layer is already named in [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) or [ADR 0023](/docs/06-architecture-decisions/19-adr-0023-federated-gitlab-group-repo-ownership)'s access matrix; this ADR fixes that they apply in combination for `openshift-platform-gitops`.
+
+1. **GitLab group and role access.** The repo lives under `comptech-platform/openshift-ops/`. Write access is granted only through `ct-openshift-platform-maintainers` (Maintainer). `ct-openshift-platform-reviewers` gets Developer or Reporter for review and read. `ct-security-reviewers` and `ct-auditors` get Reporter where the access matrix requires it. Every other group, including `ct-infra-platform-maintainers`, `ct-cicd-platform-maintainers`, and all `ct-<division>-*` application groups, is Reporter-by-request or no-access-by-default.
+2. **Branch protection.** `main` is the default and protected branch. Direct push disabled. Merge is merge-request only. Minimum one approval for non-production paths and two for production-impacting paths. Force push disabled.
+3. **CODEOWNERS code-owner review.** The path ownership from the access matrix applies as-is:
+
+   ```text
+   /clusters/    @ct-openshift-platform-maintainers
+   /components/  @ct-openshift-platform-maintainers
+   /policies/    @ct-openshift-platform-maintainers @ct-security-reviewers
+   /tenants/     @ct-openshift-platform-maintainers @ct-security-reviewers
+   /bootstrap/   @ct-openshift-platform-maintainers
+   ```
+
+   Cluster-scoped manifest paths require code-owner review before merge.
+4. **Validation gates.** The repo runs validation-only GitLab CI on its approved validation runner class. Validation covers `kustomize build` rendering, structural lint, RHACS policy check against rendered output, and the existing `ValidatingAdmissionPolicy`-based tenant guardrails. The validation runner does not run `oc apply`; spoke convergence is the spoke-local Argo CD's job per [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull).
+
+Break-glass write access remains scoped to the small named maintainer set defined in the access matrix; every break-glass action must record reason, approver, actor, timestamp, target, validation, and backport path or expiry (see [ADR 0025](/docs/06-architecture-decisions/21-adr-0025-gitops-only-operations-break-glass)).
+
+## Alternatives considered
+
+**Single OpenShift-and-VM monorepo.** Put cluster desired state, VM tool config, and application overlays into one repository with directory-level ownership. Rejected in [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) because ownership and blast radius do not align: VM-tool changes (HAProxy frontends, PDNS records, Jenkins JCasC, Nexus repositories) and OpenShift cluster-wide operator changes need different reviewer groups, different runner privileges, and different approval gates. A monorepo collapses those into one and weakens every guardrail.
+
+**Separate repo per operator.** Split ESO, RHACS, OADP, ODF, LokiStack, TempoStack, and mesh into individual repositories. Rejected because the operators share cluster-scoped baseline state (network policies, AppProjects, RBAC, ESO `ClusterSecretStore` references) that has to reconcile in a defined order. The pull model already routes convergence through spoke-local Argo CD; multiplying source repos multiplies AppProject and credential plumbing without changing who is authorized to write.
+
+**Keep tenant overlays in the platform repo permanently.** Rejected because it forces every application release MR through `ct-openshift-platform-maintainers` and makes the OpenShift team a bottleneck for routine application change. Tenant boundary registration stays in the platform repo; per-release object state belongs in the tenant `*-gitops` repo.
+
+## Consequences
+
+What this prevents:
+
+- Application teams cannot land namespaces, AppProjects, RBAC, or NetworkPolicies into the cluster by editing the platform repo. They go through tenant registration (today: a folder under `/tenants/<tenant>/` with platform-maintainer approval; future: a `tenant-registry/<team>` repo).
+- Infra/VM-ops maintainers cannot modify OpenShift operator subscriptions, CatalogSources, MCO desired state, or storage configuration by reusing their VM-tool privileges. Their Maintainer role lives in `infra-ops/vm-platform-ops`, not in `openshift-ops/*`.
+- CI/CD maintainers cannot push pipeline-side changes that mutate cluster state. Their CI templates and runner config live in their own repos; the platform repo's validation runner cannot apply to clusters.
+- Application repository CI cannot bypass Argo CD by writing to the platform repo. The promotion model and the digest overlay stay in the tenant `*-gitops` repo.
+
+What this requires:
+
+- A clean handoff path for any new application namespace. The path is: application team opens a tenant-onboarding MR against the platform repo's `/tenants/` (or, once available, the `tenant-registry/<team>` repo) with the namespace name, AppProject scope, quota class, and source-repo registration; OpenShift maintainers approve with required code-owners; the AppProject grants the tenant's own `*-gitops` repo write access to the namespace from that point on. After registration, application release manifests live in the tenant repo, not here.
+- A documented hand-back path for misplaced content. Anything that lands in the platform repo and belongs in `vm-platform-ops` or a `*-gitops` tenant repo is removed by the platform maintainers and re-opened against the correct repo. The platform repo does not become a catch-all because some other repo is not ready yet.
+- Continued maintenance of the access matrix and CODEOWNERS as new components are introduced. Adding a new cluster-scoped operator extends the "what IS in the repo" list; adding a workload that belongs to a tenant does not.
+
+This ADR does not change runtime behavior on any cluster. It records the contract that GitLab group access, CODEOWNERS, branch protection, and validation pipelines must continue to express.
+
+## References
+
+- Source: `opp-full-plat/adr/0024-openshift-only-platform-gitops-boundary.md`
+- Parent federated architecture: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- ACM + OpenShift GitOps pull model: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Nexus-only supply chain: [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)
+- GitLab group ownership model: [ADR 0023](/docs/06-architecture-decisions/19-adr-0023-federated-gitlab-group-repo-ownership)
+- GitOps-only operations + break-glass: [ADR 0025](/docs/06-architecture-decisions/21-adr-0025-gitops-only-operations-break-glass)
+- Access matrix: `opp-full-plat/plans/federated-gitops-gitlab-access-matrix.md`
+- Readiness gates: `opp-full-plat/plans/federated-gitops-readiness-gates.md` (FG-2)
+- Operator runbook: `opp-full-plat/connection-details/gitlab-operator-guide.md`
+- Hub-side Argo CD wiring: `opp-full-plat/connection-details/openshift-gitops-hub-dc-v6.md`
+- ValidatingAdmissionPolicy tenant guardrails: `opp-full-plat/connection-details/vap-tenant-exclusions.md`
+- GitHub issue #69 (closed by this ADR), milestone #24 (Federated GitOps Architecture)

@@ -1,0 +1,191 @@
+---
+title: "ADR 0023 — Federated GitLab group and repo ownership model"
+description: "The GitLab side of ADR 0015: two top-level group trees (comptech-platform/ and divisions/), eleven ct-* role groups, eight operational repos, code-owner-enforced protected branches, and a fixed review-approver table."
+sidebar_label: "0023 — GitLab ownership model"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+**Date:** 2026-05-10
+**Status:** Accepted. Implementation detail of [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops); enforces the OpenShift platform boundary that [ADR 0024](/docs/06-architecture-decisions/20-adr-0024-openshift-only-platform-gitops-boundary) locks in.
+
+## Context
+
+[ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops) accepted a federated GitOps repository architecture and named the ownership boundaries between OpenShift platform state, VM-hosted platform tools, and application delivery. What it deferred was the concrete GitLab side: group layout, role-group naming, project ownership, protected-branch rules, runner classes, and review expectations. Issue #68 under the `Federated GitOps Architecture` milestone required that those choices be formalized before more teams onboard.
+
+The live GitLab is GitLab CE `18.11.1` on internal endpoint `http://30.30.30.5`, with the human-browser route at `https://gitlab.apps.sub.comptech-lab.com`. The initial federated group skeleton, the eleven `ct-*` role groups, the first operational repository (`comptech-platform/openshift-ops/openshift-platform-gitops`, project ID `12`), and initial project shares are already in place; bootstrap implementation is tracked under readiness gate FG-1 (issue #83). This ADR locks the design choices behind that live state so future groups, repos, and teams are added against a documented baseline rather than ad-hoc operator judgement.
+
+The planning artifacts already exist and remain the source of mechanics:
+
+- `plans/federated-gitops-gitlab-access-matrix.md` — group layout, repository inventory, role groups, branch protection, CI/runner matrix, promotion access.
+- `plans/federated-gitops-gitlab-implementation-checklist.md` — the execution sequence used to bring the design live.
+- `connection-details/gitlab-operator-guide.md` — the operator runbook for the live instance.
+
+## Decision
+
+Adopt the federated GitLab group and repository model exactly as specified in the access matrix. The operator guide is the canonical source for live-state mechanics; this ADR locks the design choices behind it.
+
+### Group layout
+
+Two sibling top-level group trees:
+
+```text
+comptech-platform/
+  openshift-ops/
+  infra-ops/
+  platform-services/
+  tenant-registry/
+
+divisions/
+  <division>/
+```
+
+`comptech-platform/` contains platform-owned operational state. `divisions/` contains application-team state, organized one sub-group per division. The split prevents accidental write reach from application teams into platform repositories and gives the OpenShift/platform team a defensible namespace boundary.
+
+### Operational repositories
+
+| GitLab path | Write owner | Default readers |
+|---|---|---|
+| `comptech-platform/openshift-ops/openshift-platform-gitops` | OpenShift/platform team only | platform, security reviewers, auditors |
+| `comptech-platform/openshift-ops/openshift-cluster-build` | OpenShift/platform team only | platform, auditors |
+| `comptech-platform/infra-ops/vm-platform-ops` | Infra/platform tools team | OpenShift/platform read, security reviewers, auditors |
+| `comptech-platform/platform-services/platform-tools-iac` | Infra/platform tools team | platform read |
+| `comptech-platform/platform-services/platform-tools-config` | Infra/platform tools team | platform read |
+| `comptech-platform/tenant-registry/openshift-tenants` | OpenShift/platform team | tenant owners by approval |
+| `divisions/<division>/<division>-apps-monorepo` | Division app team | platform/CI/security as needed |
+| `divisions/<division>/<division>-gitops` | Division app team inside guardrails | OpenShift/platform retains maintainer for guardrails and emergency rollback |
+
+Application teams have no write access to `openshift-platform-gitops`, `openshift-cluster-build`, `vm-platform-ops`, `platform-tools-iac`, `platform-tools-config`, `openshift-tenants`, or any platform runner or admin configuration repository.
+
+### Creation order
+
+Not every repository must exist immediately. The accepted creation order is:
+
+1. `openshift-platform-gitops` (live, project ID `12`).
+2. `vm-platform-ops` when ownership and first service adoption are ready.
+3. `openshift-cluster-build` when cluster-build artifacts are ready to split out of planning docs.
+4. `platform-tools-iac`, `platform-tools-config`, and `openshift-tenants` only when their split proves useful — defer otherwise.
+5. Division repositories as teams onboard, one division pair per onboarding event.
+
+### Role groups
+
+Eleven `ct-*` GitLab groups are the unit of access. Individual users join role groups, not projects, except for tightly scoped temporary exceptions recorded against an issue.
+
+| Role group | GitLab role | Scope |
+|---|---|---|
+| `ct-gitlab-admins` | Owner | top-level operational groups; very small admin group |
+| `ct-openshift-platform-maintainers` | Maintainer | `openshift-ops/*`, tenant boundaries |
+| `ct-openshift-platform-reviewers` | Reporter or Developer | OpenShift platform review/read |
+| `ct-infra-platform-maintainers` | Maintainer | `infra-ops/*`, selected `platform-services/*` |
+| `ct-infra-platform-reviewers` | Reporter or Developer | infra review/read |
+| `ct-cicd-platform-maintainers` | Maintainer | CI templates, runner config, Jenkins shared libraries |
+| `ct-security-reviewers` | Reporter or Developer | platform and app GitOps policy/security review |
+| `ct-auditors` | Reporter | selected operational repos, read-only |
+| `ct-<division>-app-maintainers` | Maintainer | division source and app GitOps repos only |
+| `ct-<division>-developers` | Developer | division app source repos |
+| `ct-<division>-release-approvers` | Developer or Maintainer | division app GitOps promotion paths |
+
+The bootstrap sandbox already has `ct-sandbox-app-maintainers`, `ct-sandbox-developers`, and `ct-sandbox-release-approvers` instantiated under this pattern.
+
+### Initial project shares
+
+`openshift-platform-gitops` (project ID `12`) is shared with:
+
+- `ct-openshift-platform-maintainers`: Maintainer.
+- `ct-openshift-platform-reviewers`: Reporter.
+- `ct-security-reviewers`: Reporter.
+- `ct-auditors`: Reporter.
+
+`ct-sandbox-*` groups have no platform-GitOps access. The same share pattern is applied to each new operational repository at creation time.
+
+### Branch protection baseline
+
+Every operational repository runs with:
+
+- default branch `main`, protected;
+- force push disabled;
+- direct push to `main` disabled except for named break-glass maintainers;
+- merge-request flow required for normal changes;
+- one approval for non-production repos, two for production-impacting repos;
+- code-owner approval required for protected paths;
+- pipeline required before merge where validation jobs exist;
+- stale-approval dismissal enabled for production-impacting repos where the GitLab edition supports it;
+- MR templates for platform, infra, runner, and release repos.
+
+Production-impacting repositories are `openshift-platform-gitops`, `openshift-cluster-build`, `vm-platform-ops`, and production application GitOps paths.
+
+### Review rules
+
+Minimum approval expectations are fixed:
+
+| Change type | Required approvers |
+|---|---|
+| OpenShift cluster-wide operator/platform change | OpenShift maintainer + second platform reviewer |
+| Tenant onboarding or namespace policy change | OpenShift maintainer + tenant owner acknowledgement |
+| Production AppProject/RBAC/NetworkPolicy change | OpenShift maintainer + security reviewer |
+| VM platform tool change | Infra maintainer + service owner |
+| HAProxy or PowerDNS production-impacting change | Infra maintainer + affected service owner |
+| GitLab/Jenkins/Nexus admin/config change | Infra maintainer + CI/CD maintainer where relevant |
+| GitLab Runner privilege/tag change | Infra maintainer + CI/CD maintainer + security reviewer |
+| App build template change | CI/CD maintainer + app representative |
+| App production promotion | App release approver + required pipeline evidence |
+
+CODEOWNERS files express path-level review ownership and complement the project shares. The CODEOWNERS baselines for `openshift-platform-gitops`, future `vm-platform-ops`, and division app GitOps repositories are defined in the operator guide and the access matrix; this ADR locks them in by reference.
+
+### Endpoints
+
+The internal LAN endpoint `http://30.30.30.5` is the only endpoint used by automation, Argo CD, Jenkins, GitLab Runner, and platform tooling. The public route `https://gitlab.apps.sub.comptech-lab.com` is for human browser access only. This boundary is part of the ownership model because public-route use by automation breaks the network assumption the access controls rely on.
+
+## Alternatives considered
+
+**Single super-group.** Put every repository under one top-level GitLab group with role groups distinguishing ownership. Rejected — a single group makes it easy to accidentally grant a role group too broadly and removes the visual boundary between platform-owned and division-owned state. The two-tree split is cheap to operate and gives platform a defensible namespace.
+
+**Flat repo model.** Skip the `openshift-ops/`, `infra-ops/`, `platform-services/`, and `tenant-registry/` sub-groups and put every platform repository at the same level under `comptech-platform/`. Rejected — it forces every project share to be per-repository and removes the ability to apply a maintainer/reviewer group share at the sub-group level. The current sub-group structure makes the share model tractable.
+
+**Per-team ownership of everything.** Give each application division a maintainer role on platform repositories so their CI can perform direct cluster changes when needed. Rejected — it violates [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)'s core ownership boundary and would make the OpenShift GitOps pull model in [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull) unenforceable. Application changes flow through application GitOps repositories, constrained by Argo CD AppProjects and namespace policy owned by the platform team.
+
+**Defer the formal model until more divisions exist.** Operate the current single live division (`sandbox`) informally and only write the ADR when a second division onboards. Rejected — issue #68's acceptance criterion was explicit that repo/group names, owners, write permissions, protected branches, and review rules must be documented **before** more teams are onboarded.
+
+## Consequences
+
+### Easier
+
+- New divisions onboard against a fixed group/repo template rather than operator recollection.
+- Access reviews scan eleven `ct-*` groups instead of per-project user lists.
+- Application teams move independently inside their division repositories without touching platform state.
+- The OpenShift platform team retains a single defensible boundary for cluster, tenant, and policy state.
+- Audit and security review have a documented baseline to compare live GitLab state against, making drift detection straightforward.
+
+### Harder
+
+- More groups and repositories than a single monorepo. Initial setup for a new division is multi-step and must follow the onboarding sequence in the operator guide.
+- CODEOWNERS, project shares, and protected branches must be applied consistently at every repo's creation, or the model silently weakens.
+- GitLab CE may not support every approval-rule feature the review table assumes. Where a rule cannot be enforced natively, compensating controls (CODEOWNERS, protected branches, validation pipelines, MR evidence) must be recorded.
+
+### Residual decisions
+
+The access matrix records the following as open and they are not resolved here:
+
+- Final naming for the existing `ct-*` role groups if the eleven-group list proves too coarse or too fine in practice.
+- Whether `openshift-tenants` should be a separate repository or a folder inside `openshift-platform-gitops` for the first phase. The access matrix describes it as optional; this ADR does not force creation.
+- Whether `platform-tools-iac` and `platform-tools-config` should be separate repositories immediately or deferred until `vm-platform-ops` becomes too large.
+- Whether application GitOps repositories should be one per division or one per application for high-risk teams.
+- Whether production branches should require signed commits immediately or in a later hardening phase.
+
+The GitLab CE merge-control and CODEOWNERS-enforcement decision noted in the operator guide remains open under FG-1 and is required to fully close issue #83.
+
+The existing `gitlab-vm-docker` runner is not the future trusted platform runner. Until protected runner classes are created under the GitLab Runner Operating Model milestone, the runner side of this model is enforced by convention only.
+
+## References
+
+- Source: `opp-full-plat/adr/0023-federated-gitlab-group-repo-ownership.md`
+- Parent architecture decision: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
+- OpenShift platform GitOps boundary: [ADR 0024](/docs/06-architecture-decisions/20-adr-0024-openshift-only-platform-gitops-boundary)
+- ACM + OpenShift GitOps pull model: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
+- Nexus-only supply chain: [ADR 0019](/docs/06-architecture-decisions/15-adr-0019-pull-model-gitops)
+- Workspace execution governance: [ADR 0016](/docs/06-architecture-decisions/13-adr-0016-oc-mirror)
+- Access matrix: `opp-full-plat/plans/federated-gitops-gitlab-access-matrix.md`
+- Implementation checklist: `opp-full-plat/plans/federated-gitops-gitlab-implementation-checklist.md`
+- Operator runbook: `opp-full-plat/connection-details/gitlab-operator-guide.md`
+- Readiness gates: `opp-full-plat/plans/federated-gitops-readiness-gates.md`
+- GitHub issues: `zeshaq/opp-full-plat` #68 (closed by this ADR), #83 (FG-1 implementation)
