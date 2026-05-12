@@ -28,6 +28,7 @@ import InteractiveDiagram from "../../components/InteractiveDiagram.tsx";
 | **Login** | WSO2 Identity Server, tenant `bank-payment` |
 | **Browser-trusted TLS** | Public Let's Encrypt wildcard, auto-renewed |
 | **Internal TLS** | mTLS between the in-cluster proxy and the backends, certs issued by the lab CA |
+| **Observability** | Traces in Tempo · Metrics in user-workload Prometheus · Logs in LokiStack · curated **Perses** dashboard under console **Observe → Dashboards** |
 | **Delivery** | One Git repo → Jenkins → Nexus → Argo CD → OpenShift |
 
 ## What got built
@@ -72,6 +73,10 @@ vendor relationship to support.
 | Build pipeline | **Jenkins** | The bank's existing CI/CD. |
 | Image registry | **Nexus Repository** | The bank's existing artifact store. Same registry the rest of the platform pulls from. |
 | Deployment pipeline | **Argo CD** (GitOps) | One commit to the Git repository becomes one change on the cluster, automatically. No engineer logs in to the running environment to make a change. |
+| Tracing | **Red Hat build of OpenTelemetry + Tempo** | The OpenTelemetry collector receives spans over OTLP and stores them in Tempo. Every distributed payment flow is one trace. |
+| Metrics | **OpenShift user-workload Prometheus** | Scrapes Liberty's `/metrics` directly via a `ServiceMonitor`. |
+| Logs | **OpenShift Logging + LokiStack** | Vector collects pod stdout; Loki stores and indexes it. |
+| Dashboards | **Cluster Observability Operator + Perses** | Dashboards declared as YAML, rendered inside the console at **Observe → Dashboards**. |
 
 ## How the app was designed
 
@@ -371,18 +376,63 @@ The full set of NetworkPolicies for this tenant lives in the platform
 GitOps repository — adding a new outbound destination is a small Git
 commit, reviewed and audited like everything else.
 
-## Live health view
+## Observability — three signals
 
-`/obs/` shows two cards, one per backend service, refreshed every five
-seconds. The view itself goes through the mTLS hop above.
+Every request the app handles emits **three observability signals**.
+Each lands in a separate Red Hat OpenShift backend already operated
+by the bank's platform team. The bank's ops staff can see, query and
+alert on all three from the same OpenShift web console — no extra
+tool to learn.
 
-| Metric | What it tells you |
+| Signal | What it tells you | Where it lands | How the app produces it |
+| --- | --- | --- | --- |
+| **Traces** | The full lifecycle of one request across services — useful when "the payment is slow", to pinpoint which hop slowed down. | Tempo (`tracing` namespace) | Liberty's built-in MicroProfile Telemetry pushes spans via OTLP to the platform OpenTelemetry collector. Auto-instruments every API call and cross-service call. |
+| **Metrics** | Numbers over time — heap, threads, request rate, latency. Useful for dashboards and alerts. | OpenShift user-workload Prometheus | Liberty's MicroProfile Metrics exposes `/metrics`. A `ServiceMonitor` tells Prometheus to scrape it every 30 seconds. |
+| **Logs** | Every line of stdout/stderr from every pod. Useful for digging into a specific failure. | LokiStack (`openshift-logging`) | Pods write to stdout. OpenShift Logging's Vector collector ships the lines to Loki — no app-side change. |
+
+### Where to view each in the OpenShift console
+
+| Signal | Console path | Example query |
+| --- | --- | --- |
+| Traces | **Observe → Traces** | service name = `payment-client-svc` or `payment-approver-svc`. Each customer payment shows up as one trace, 4-6 spans deep. |
+| Metrics | **Observe → Metrics** | `thread_count{namespace="bank-payment"}`, `histogram_quantile(0.95, sum by (le)(rate(http_server_request_duration_seconds_bucket[5m])))` |
+| Logs | **Observe → Logs** | namespace = `bank-payment`, optional pod filter |
+
+### Curated dashboard (Perses)
+
+A pre-built **Perses dashboard** ships alongside the app and renders
+under **Observe → Dashboards → Bank Payment Overview** in the console.
+Three collapsible grids:
+
+| Grid | Panels |
 | --- | --- |
-| **Liveness** | Is the service process responding at all? Goes red if it isn't. |
-| **Readiness** | Is the service ready to take traffic? Goes red during a restart. |
-| **JVM thread count** | How busy is the service internally? A sudden spike is a useful early-warning signal. |
-| **Heap used (MB)** | How much memory the service is holding. |
+| **At a glance** | Running pods · Heap utilization (avg %) · JVM threads (avg) · HTTP request rate (req/s) |
+| **JVM resources** | Heap used (MB) per pod · Thread count per pod · Process CPU load (%) per pod · GC time rate |
+| **HTTP traffic** | Request rate by route × status code · p95 latency by route |
+
+The dashboard is delivered through the same GitOps pipeline as the
+app — its YAML manifest sits in the repo, the Cluster Observability
+Operator's Perses operator reconciles it into the console.
+
+### Quick-glance in-app status page
+
+Independent of the platform tooling, the app also serves a tiny
+status page at `/obs/` directly on the customer hostname. Two cards,
+one per backend, refreshed every five seconds. Convenient when
+you're on the customer page and want a one-click health check
+without leaving for the console.
+
+| Metric on `/obs/` | What it tells you |
+| --- | --- |
+| **Liveness** | Is the service process responding at all? Red if it isn't. |
+| **Readiness** | Is the service ready to take traffic? Red during a restart. |
+| **JVM thread count** | Snapshot of in-flight work. |
+| **Heap used (MB)** | Memory pressure. |
 | **CPU (recent %)** | Live CPU usage. |
+
+This in-app page goes through the **mTLS hop** described above; the
+console-side observability (Tempo / Prometheus / Loki) goes through
+the platform's own collectors which run in their own namespaces.
 
 ## Web hardening at the edge
 
@@ -406,7 +456,8 @@ in their referrer logs).
 | --- | --- |
 | Customer page | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | Approver page | `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` |
-| Health view | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com/obs/` |
+| In-app health view | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com/obs/` |
+| Console dashboard | OpenShift console → **Observe → Dashboards → Bank Payment Overview** |
 | Customer API | `https://client-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | Approver API | `https://approver-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | WSO2 IS console | `https://is.apps.sub.comptech-lab.com/t/bank-payment/console` |
@@ -424,4 +475,5 @@ in their referrer logs).
 - **Service mesh** for fleet-wide mTLS and a richer canary story
   beyond a single header rule.
 - **Audit event stream** — every approver decision emitted to Kafka
-  for downstream reconciliation.
+  for downstream reconciliation, plus the same event flowing through
+  the OpenTelemetry pipeline for correlation with the trace data.
