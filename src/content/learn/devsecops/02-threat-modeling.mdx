@@ -1,0 +1,239 @@
+---
+title: "Threat modeling: the four questions, STRIDE on a DFD, and a worked example you can copy"
+sidebar_label: "02 — Threat modeling"
+description: "Threat modeling as a recurring engineering exercise. The four-question framework, STRIDE, a DFD with trust boundaries, a worked example on a payment microservice, output integrated into the team's backlog, and the common pitfalls."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const store = { background: "#fafafa", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 140, textAlign: "center", fontSize: 12 };
+export const tb    = { background: "transparent", border: "1.5px dashed #b91c1c", borderRadius: 8, padding: 8, color: "#b91c1c", width: 220, textAlign: "center", fontWeight: 600, fontSize: 11, fontStyle: "italic" };
+
+export const flowEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const trustEdge = { style: { stroke: "#b91c1c", strokeDasharray: "6,4", strokeWidth: 1.2 }, label: "trust boundary", labelStyle: { fill: "#b91c1c", fontSize: 10 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const dfdNodes = [
+  { id: "client",   position: { x: 40,   y: 160 }, data: { label: "Mobile client\n(end user)" },           style: ext },
+  { id: "gw",       position: { x: 240,  y: 160 }, data: { label: "API gateway\n(Envoy / Kong)" },         style: ctrl },
+  { id: "auth",     position: { x: 460,  y: 60  }, data: { label: "Auth service\n(OIDC / JWT)" },          style: ctrl },
+  { id: "pay",      position: { x: 460,  y: 260 }, data: { label: "Payment service" },                     style: ctrl },
+  { id: "db",       position: { x: 700,  y: 260 }, data: { label: "Payments DB\n(Postgres)" },             style: store },
+  { id: "psp",      position: { x: 700,  y: 60  }, data: { label: "Payment processor\n(external)" },       style: ext },
+
+  { id: "tb1", position: { x: 130, y: 40 },  data: { label: "Internet → DMZ" },               style: tb },
+  { id: "tb2", position: { x: 340, y: 40 },  data: { label: "DMZ → cluster (mTLS)" },         style: tb },
+  { id: "tb3", position: { x: 580, y: 340 }, data: { label: "Service → datastore" },          style: tb },
+  { id: "tb4", position: { x: 580, y: 10 },  data: { label: "Cluster → external PSP (TLS)" }, style: tb },
+];
+
+export const dfdEdges = [
+  { id: "c-gw",   source: "client", target: "gw",   label: "HTTPS",         ...flowEdge },
+  { id: "gw-auth",source: "gw",     target: "auth", label: "verify JWT",    ...flowEdge },
+  { id: "gw-pay", source: "gw",     target: "pay",  label: "POST /charge",  ...flowEdge },
+  { id: "pay-db", source: "pay",    target: "db",   label: "SQL (mTLS)",    ...flowEdge },
+  { id: "pay-psp",source: "pay",    target: "psp",  label: "HTTPS + HMAC",  ...flowEdge },
+];
+
+Threat modeling is the gate at the very start of the DevSecOps loop, and it's the most-underused control in practice. It's also the cheapest one to operate — a whiteboard, an hour, the team that owns the service. No tooling required. This module walks you through running it end-to-end on a real example so you walk out with a backlog of mitigations, not a diagram in a folder.
+
+The goal by the end: you can run a threat-modeling session on a microservice, produce a documented list of threats and mitigations ranked by likelihood × impact, and integrate the output into your team's backlog as actionable tickets.
+
+## What threat modeling actually is
+
+Threat modeling is a **structured exercise to enumerate the ways a system can be attacked, ranked by likelihood × impact, with mitigations**. That's it. It is not a tool, not a certification, not a one-off. It's a recurring engineering activity at design time and at significant architectural changes.
+
+The mistake teams make is treating it as either too informal (*"the senior engineer thinks about security on the way to standup"*) or too formal (*"the threat-modeling team will be in touch in six weeks"*). Neither works. The first misses obvious threats; the second misses the design window when fixes are cheap.
+
+The pragmatic shape: an hour-long workshop, the team that owns the service, a data-flow diagram, a STRIDE walkthrough, a backlog. Run it before launch. Run it again on any major architectural change. Run it again after every incident that should have been caught at design time. Stop running it on the day nothing changes — which won't happen.
+
+## The four-question framework
+
+Adam Shostack's four questions — from his book *Threat Modeling: Designing for Security* — are the simplest framing that actually works:
+
+1. **What are we working on?** Draw the system. Data-flow diagram. Trust boundaries. Be specific about the components and the protocols between them.
+2. **What can go wrong?** Enumerate threats. STRIDE per element. Don't filter yet — write everything down.
+3. **What are we going to do about it?** For each threat: mitigation, owner, priority. Some threats you accept; that's also a valid answer.
+4. **Did we do a good job?** Retro. Did we miss a category? Did the diagram match reality? Are the mitigations testable?
+
+Don't over-engineer past this for most teams. The temptation to add a fifth question (*"what's the cost-benefit?"*, *"what's the residual risk?"*) usually produces analysis paralysis. The four questions, run honestly, catch most of what teams miss.
+
+## STRIDE — the categorisation model
+
+STRIDE was developed by two engineers at Microsoft (Loren Kohnfelder and Praerit Garg) in 1999 as a mnemonic for the six categories of threats a system can face. It has held up almost shockingly well.
+
+| Letter | Category | What it means | Defended by |
+| --- | --- | --- | --- |
+| **S** | Spoofing | Impersonating identity | Authentication |
+| **T** | Tampering | Modifying data or code in transit / at rest | Integrity (signatures, mTLS, hashing) |
+| **R** | Repudiation | Denying an action you took | Audit logs, non-repudiation signing |
+| **I** | Information disclosure | Leaking data to someone who shouldn't see it | Authorisation, encryption |
+| **D** | Denial of service | Making the system unavailable | Rate limiting, quotas, autoscaling |
+| **E** | Elevation of privilege | Gaining capabilities you shouldn't have | Authorisation, least privilege, sandboxing |
+
+One example per category for a payment microservice:
+
+- **S**poofing — an attacker forges a JWT and accesses another user's payment history.
+- **T**ampering — SQL injection modifies the ledger amount between submission and persist.
+- **R**epudiation — a customer disputes a charge; the service has no signed audit log to prove it ran.
+- **I**nformation disclosure — debug logs include the full PAN (Primary Account Number); a misconfigured log shipper exfiltrates them to a third-party SaaS.
+- **D**enial of service — the public `/api/payments/list` endpoint has no rate limit; 10k req/s exhausts the DB connection pool.
+- **E**levation of privilege — a service account meant for read-only telemetry has `payments:write` because a hurried developer copy-pasted a role binding.
+
+**STRIDE-per-element vs STRIDE-per-interaction.** Two flavours. Per-element walks each component in the diagram and asks *"can this component be spoofed? tampered with? ..."*. Per-interaction walks each edge in the diagram and asks the same six questions about the data flow across that edge. Per-interaction catches more (especially around trust boundaries) but takes longer. Most teams do **per-element on the data-flow diagram** and add per-interaction on edges that cross trust boundaries. That's the sweet spot.
+
+## The data-flow diagram (DFD)
+
+The diagram is the artifact the team will argue about, agree on, and use as the input to the STRIDE walkthrough. Here's a small payment service:
+
+<Whiteboard client:load data={{ nodes: dfdNodes, edges: dfdEdges }} height={420} />
+
+Reading the diagram:
+
+- The five **boxes** are the system components: mobile client, API gateway, auth service, payment service, payments DB, external payment processor. Solid green is the datastore; dashed grey is external; grey-bold is in-cluster service.
+- The **arrows** are the data flows, labelled with the protocol. HTTPS at the edge, JWT verification to auth, internal calls protected by mTLS via the service mesh, external call to the PSP over HTTPS with HMAC for non-repudiation.
+- The **red dashed boxes** are **trust boundaries** — the points where data crosses from one zone of trust to another. Internet → DMZ. DMZ → cluster. Service → datastore. Cluster → external third party.
+
+The trust boundaries are where STRIDE most often turns up real threats. Every component is somebody's responsibility, but every boundary is a question of *"do we trust the thing on the other side, and how do we know?"*. An attacker who can forge a JWT crosses three trust boundaries in one shot. An attacker who can spoof the PSP's HMAC bypasses the entire external-trust model.
+
+If you only do one thing right when threat-modeling, **draw the trust boundaries**.
+
+## A worked example — the payment service
+
+Take the payment service from the DFD. Walk STRIDE per element. Here's what a one-hour workshop produces:
+
+| # | Threat | Category | Likelihood | Impact | Mitigation | Owner |
+| --- | --- | --- | --- | --- | --- | --- |
+| T-01 | Forged JWT → access other users' payments | Spoofing | Medium | High | JWT signed by auth service's KMS key, short TTL (5 min), refresh-token rotation; gateway validates `iss`, `aud`, `exp` | App team |
+| T-02 | SQL injection in payment-search filter | Tampering | Low | High | Parameterised queries only; sqlmap test in CI; WAF rule as defence in depth | App team |
+| T-03 | Replay of a captured `POST /charge` | Tampering | Medium | High | Idempotency-key header required, server-side dedup window of 24h | App team |
+| T-04 | Debug logs include full PAN | Information disclosure | High | Critical | PAN tokenisation at gateway; logging library scrubs the `card.*` JSON path; CI test asserts no PAN in test logs | App team + Platform |
+| T-05 | Unauthenticated `/api/payments/list` floodable | Denial of service | Medium | Medium | Rate limit at gateway (10 req/s per IP, 100 req/min per user); circuit-breaker on DB pool | Platform |
+| T-06 | Compromised service account writes to ledger | Elevation of privilege | Low | Critical | Service accounts scoped to single namespace; ledger writes require explicit `payments:write` role; audit log on every write | Platform + App team |
+| T-07 | Customer disputes charge, no signed proof | Repudiation | Medium | Medium | Append-only audit log with per-event HMAC; daily Merkle-root signing; logs replicated to WORM bucket | App team + Compliance |
+| T-08 | Untrusted egress to PSP impersonator | Spoofing | Low | Critical | PSP TLS pinning on certificate fingerprint; NetworkPolicy locks egress to PSP IP range; HMAC verifies PSP responses | Platform + App team |
+| T-09 | Stolen DB credentials → bulk dump | Information disclosure | Low | Critical | DB credentials issued dynamically by Vault (TTL 1h); ESO syncs to the workload SA; rotation tested monthly | Platform |
+| T-10 | Worker pod compromised → lateral movement | Elevation of privilege | Low | Critical | NetworkPolicy default-deny; pod-level seccomp profile; runtime detection on `exec` syscalls (Falco / RHACS) | Platform |
+
+Ten threats, named concretely, ranked by likelihood × impact, each with a testable mitigation and a named owner. **That table is the artifact you keep.** Not a 20-page document. Not a diagram in Confluence with no follow-through. A list of threats that becomes a list of tickets.
+
+A workshop like the one above takes about an hour with three or four engineers who know the service. The diagram takes 15 minutes; the STRIDE walkthrough takes 30; the prioritisation takes 15. If you're spending more than two hours on a single service's threat model, you're over-thinking it.
+
+## PASTA, attack trees, kill chains — when to use which
+
+STRIDE + DFD is the right starting point for 90% of teams. The alternatives exist for specific cases:
+
+**PASTA** — *Process for Attack Simulation and Threat Analysis*. A heavier, seven-stage methodology that ties threats to business impact. Stages run from *Define Objectives* through *Define Technical Scope*, *Application Decomposition*, *Threat Analysis*, *Vulnerability Analysis*, *Attack Modeling*, and *Risk Analysis*. Use PASTA for **high-stakes systems** where threat modeling has to produce evidence for a regulator or executive — financial-clearing systems, healthcare records, critical infrastructure. PASTA's main contribution over STRIDE is connecting threats to *business* impact, not just *technical* impact.
+
+**Attack trees** — Bruce Schneier's model from the late '90s. Root is the attacker's goal (*"exfiltrate customer PII"*). Children are the steps to achieve it (*"compromise a worker pod"*, *"steal DB credentials"*, *"social-engineer an SRE"*). Each step decomposes further until leaves are concrete actions. Good for **adversary-thinking exercises** — *"how would I attack our system if I were the attacker?"*. Pair with red-team exercises.
+
+**MITRE ATT&CK** — a taxonomy of real-world adversary tactics and techniques. Not a threat-modeling method itself, but a catalogue you map *against*. For each tactic in the ATT&CK kill chain (Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Credential Access, Discovery, Lateral Movement, Collection, Command and Control, Exfiltration, Impact), ask: *"would we detect this?"*. This pairs with **detection engineering** — for each technique that matters to you, write a SIEM rule and test it.
+
+**Kill chains** — Lockheed Martin's seven-stage attack model (Reconnaissance, Weaponization, Delivery, Exploitation, Installation, Command and Control, Actions on Objectives). Mostly useful for SOCs reasoning about attacks in progress; less useful for design-time threat modeling.
+
+If you're starting: STRIDE + DFD. Add PASTA when the regulator demands the business-impact connection. Add attack trees and ATT&CK when you've matured the basics and want adversarial rigour.
+
+## Threat modeling on a recurring cadence
+
+The biggest mistake teams make: *"we did a threat model before launch."* That's the *first* threat model. There should be more. Triggers for re-modeling:
+
+- **Major architectural change.** New dependency that handles auth, new trust boundary (you started calling an external API), new component (a queue, a cache), a refactor that changes data flows. The threats change; the model has to change.
+- **New regulatory or audit context.** PCI-DSS scope expansion (you started taking card data). GDPR coverage (you opened in the EU). A new regulator asks for evidence.
+- **Post-incident retrospective.** Something happened that the threat model didn't catch. The retro should produce *"why did the threat model miss this, and what category of threat should we look for now?"*. Update the methodology, not just the diagram.
+- **Quarterly review for in-scope services.** A 15-minute *"is anything different?"* check on each critical service. If yes, schedule a re-model. If no, sign off and move on.
+
+The lab's threat-modeling rhythm lives at the platform-team level via the [BFSI readiness review](/docs/openshift-platform/foundations/bfsi-readiness-review), which is essentially a fleet-wide threat-and-gap assessment. Per-service threat modeling happens at app-team level and should be lighter-weight; the readiness review covers the substrate.
+
+## Output integration — making threats into work
+
+**A threat model that doesn't generate tickets is wallpaper.** This is the single most important point in this module.
+
+The pattern:
+
+- **High likelihood / high impact** → block the release until mitigated. The threat is named, the mitigation is named, the acceptance test is named. No deploy until it's done.
+- **Medium** → file a ticket, prioritise for the quarter. Put it in the team's backlog with the threat ID, the proposed mitigation, and the acceptance test. Track to completion.
+- **Low** → log to a known-issue register. Re-evaluate quarterly. If the likelihood goes up — for example a public exploit drops for a dependency you use — promote it.
+- **Accepted risks** → document the acceptance. *"We accept the residual risk of T-08 because PSP TLS pinning is implemented; we'll revisit if we add a second PSP."* Acceptance with reasoning is a valid outcome. Acceptance without reasoning is silently shipping a known issue.
+
+Each ticket has three required fields: **threat ID** (T-04 from the table above), **mitigation** (*"PAN tokenisation at gateway"*), and **acceptance test** (*"CI test asserts logs contain no value matching `\d{13,19}`"*). The threat ID makes the model traceable. The mitigation makes the work concrete. The acceptance test makes *done* unambiguous.
+
+Anti-pattern: a JIRA epic called *"Threat model findings, Q3"* with no ticket-by-ticket detail. That becomes an *implement-everything* ticket nobody can close. Break it into per-threat tickets.
+
+## Tooling — but don't lead with tools
+
+Threat-modeling tooling is the smallest part of the practice. The discipline of running the exercise is the load-bearing thing. The tools you'll see:
+
+| Tool | Shape | When it's the right pick |
+| --- | --- | --- |
+| **OWASP Threat Dragon** | Open-source, web-based, model-as-JSON | You want the model checked into Git alongside the service |
+| **Microsoft Threat Modeling Tool** | Desktop, STRIDE-focused, free | Windows shop, traditional engineering practice |
+| **IriusRisk** | Commercial, integrates with JIRA, generates mitigation suggestions from templates | Large org, multiple teams, needs the analyst workflow |
+| **draw.io / Excalidraw + Confluence page** | DIY | Most teams. Works fine. |
+| **Photo of a whiteboard + a markdown table** | DIY | Smaller teams running it in person. Equally fine. |
+
+Don't argue about tooling for a month before running your first threat-modeling session. Use the whiteboard, run the session, capture the output in whatever format your team uses for everything else (Confluence, GitHub wiki, a markdown file in the repo). If you graduate to a dedicated tool later, fine. If you never do, also fine.
+
+## AI/LLM-assisted threat modeling — the 2026 reality
+
+A practical note: LLMs can generate a plausible-looking STRIDE list from a system description, and increasingly from a system *diagram* via vision capabilities. They are useful as a **brainstorm partner** at the start of a session — *"here are 30 threats this kind of system typically has, walk through which ones apply to our specifics."*
+
+They are **not a replacement** for engineers who know the system. Two failure modes are consistent across every model family:
+
+- **Hallucinated threats** that don't apply to your architecture. The LLM has seen a million payment systems; it'll suggest threats from systems that use different protocols, different cloud providers, different trust models. You filter; it doesn't know your system.
+- **Missed domain threats** that only an engineer who knows the codebase will catch. *"The `idempotency-key` is only validated when present, and the default-when-missing logic was added in November"* is the kind of thing that's invisible to an LLM that has only seen the architecture diagram.
+
+The mature pattern: pair an LLM with a domain expert. The LLM does breadth (*"here are the 30 categories of threat this system class faces"*); the human does depth (*"these five apply to us, and here are the three we know we missed last quarter"*). Don't let the LLM run the session alone. Don't ignore it either — it's a useful coverage check.
+
+## The lab posture
+
+The platform team's threat models live at:
+
+- [Credential custody rules](/docs/openshift-platform/foundations/credential-custody-rules) — the per-credential threat model for every long-lived secret in the lab. Each entry names the threat, the protection, and the rotation contract.
+- [BFSI readiness review](/docs/openshift-platform/foundations/bfsi-readiness-review) — the fleet-wide threat-and-gap assessment against the regulator's expected control set. Drives most of the prioritisation across the modules ahead in this track.
+
+App teams own their own service-level threat models. The platform team owns the substrate-level ones. The pattern in this module is the pattern app teams should adopt; the BFSI document is what the platform team uses for the platform itself.
+
+## Try this
+
+Three exercises to do before moving to Module 03:
+
+1. **Pick a microservice you know.** Draw its DFD with components and trust boundaries. 15 minutes. Use a whiteboard, Excalidraw, or paper — not a fancy tool.
+2. **STRIDE-walk it.** Per element, for each of the six categories, ask *"can this happen here?"*. Write down 8-10 specific threats. Name them concretely — not *"DoS could happen"* but *"authenticated `/api/payments/list` with no rate limit → 10k req/s exhausts DB pool"*. 30 minutes.
+3. **Rank and file.** Score each threat as low/medium/high on likelihood and impact. Pick the top three (highest likelihood × impact). Specify a mitigation for each. Open issues in your tracker — one per threat — with the threat ID, the mitigation, and the acceptance test. 15 minutes.
+
+If the exercise produces no tickets, either the system is unusually secure or the threat model didn't go deep enough. Bet on the second.
+
+## Common pitfalls
+
+A few to watch for, drawn from threat-modeling sessions that produced nothing useful:
+
+- **Threats stated abstractly.** *"DoS could happen"* is not a threat; it's a category. *"Authenticated `/api/payments/list` with no rate limit → 10k req/s exhausts DB pool"* is a threat. The difference between a useful model and a useless one is concreteness.
+- **Mitigations that are aspirational.** *"Improve monitoring"*, *"better authentication"*, *"audit the code"* — none of these are tickets. *"Add rate limit of 10 req/s per IP at gateway; assert via load test"* is a ticket. If you can't write an acceptance test for the mitigation, it isn't a mitigation.
+- **Models that diagram only the happy path.** The mobile client → gateway → service → DB flow is the happy path. The attacker walks the unhappy paths — the error responses, the timeout paths, the retry logic, the cache invalidation. Draw those too.
+- **Models that stop at *the document is written*.** No tickets, no retros, no enforcement. Six months later the model is stale, the system has evolved, and the team has forgotten the model existed. Threat modeling is a recurring activity, not a one-off artifact.
+- **The senior-engineer-veto loop.** A senior engineer sits in the session and dismisses threats with *"that won't happen because [reason]"*. Sometimes the reason is right. Often it's wishful thinking. Document the dismissals so they can be revisited; don't let them silently kill items.
+- **No clear owner.** *"The team will fix this"* is not an owner. Name one engineer per ticket. The team can do the work; one person owns the closing.
+
+## What's next
+
+You can now run threat modeling end-to-end. The next gate in the loop is **source-code security** — the SAST and dependency / SCA scanning that catches issues at PR time, before they ever land in `main`. Module 03 covers the tooling (Semgrep, SonarQube, Snyk, Trivy, gitleaks), the pipeline integration, and the rules for not drowning in false positives.
+
+**Next:** [Module 03 — Source-code security](/learn/devsecops/source-code-security).
+
+## References
+
+- [Adam Shostack — *Threat Modeling: Designing for Security*](https://shostack.org/books/threat-modeling-book)
+- [Microsoft — STRIDE threat model](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats)
+- [OWASP — Threat Modeling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Threat_Modeling_Cheat_Sheet.html)
+- [OWASP — Threat Modeling Process](https://owasp.org/www-community/Threat_Modeling_Process)
+- [OWASP Threat Dragon](https://owasp.org/www-project-threat-dragon/)
+- [Microsoft Threat Modeling Tool](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool)
+- [PASTA — Risk Centric Threat Modeling (Tony UcedaVélez, Marco Morana)](https://owasp.org/www-pdf-archive/AppSecEU2012_PASTA.pdf)
+- [Bruce Schneier — Attack Trees](https://www.schneier.com/academic/archives/1999/12/attack_trees.html)
+- [MITRE ATT&CK — attack.mitre.org](https://attack.mitre.org/)
+- [Lockheed Martin — Cyber Kill Chain](https://www.lockheedmartin.com/en-us/capabilities/cyber/cyber-kill-chain.html)
+- [Threat Modeling Manifesto](https://www.threatmodelingmanifesto.org/)

@@ -1,0 +1,245 @@
+---
+title: "Source-code security: SAST, SCA, secrets, licenses"
+sidebar_label: "03 — Source-code security"
+description: "Wire up the four source-layer scanners — SAST, SCA, secrets, and license — into your CI with sensible thresholds, a baseline-and-only-new-findings pattern, and exit codes that actually block the build."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const mutedEdge= { style: { stroke: "#6b7280", strokeDasharray: "4,3" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const pillarNodes = [
+  { id: "dev",   position: { x: 60,  y: 0   }, data: { label: "Developer\n(IDE + git)" },                   style: stage },
+  { id: "pre",   position: { x: 360, y: 0   }, data: { label: "Pre-commit hook\n(gitleaks, hadolint,\nsemgrep --quick)" }, style: agent },
+  { id: "pr",    position: { x: 660, y: 0   }, data: { label: "PR / MR\n(merge gate)" },                    style: stage },
+
+  { id: "sast",  position: { x: 60,  y: 200 }, data: { label: "SAST\nSemgrep / CodeQL" },                   style: ctrl },
+  { id: "sca",   position: { x: 260, y: 200 }, data: { label: "SCA\nTrivy / Snyk /\nDependabot" },          style: ctrl },
+  { id: "sec",   position: { x: 460, y: 200 }, data: { label: "Secrets\nGitleaks / TruffleHog" },           style: ctrl },
+  { id: "lic",   position: { x: 660, y: 200 }, data: { label: "License\nFOSSA / Licensee" },                style: ctrl },
+
+  { id: "dd",    position: { x: 360, y: 380 }, data: { label: "DefectDojo\n(triage + SLAs)" },              style: ext },
+  { id: "merge", position: { x: 660, y: 380 }, data: { label: "Merge to main\n(only if gates pass)" },      style: stage },
+];
+
+export const pillarEdges = [
+  { id: "p1", source: "dev",  target: "pre",  label: "git commit",      ...reqEdge },
+  { id: "p2", source: "pre",  target: "pr",   label: "git push",        ...reqEdge },
+  { id: "p3", source: "pr",   target: "sast", label: "CI fan-out",      ...reqEdge },
+  { id: "p4", source: "pr",   target: "sca",                            ...reqEdge },
+  { id: "p5", source: "pr",   target: "sec",                            ...reqEdge },
+  { id: "p6", source: "pr",   target: "lic",                            ...reqEdge },
+  { id: "p7", source: "sast", target: "dd",   label: "findings",        ...mutedEdge },
+  { id: "p8", source: "sca",  target: "dd",                             ...mutedEdge },
+  { id: "p9", source: "sec",  target: "dd",                             ...mutedEdge },
+  { id: "p10", source: "lic", target: "dd",                             ...mutedEdge },
+  { id: "p11", source: "pr",  target: "merge", label: "gates pass",     ...reqEdge },
+];
+
+The source-code layer is where security has the most leverage and the fewest excuses. The developer is right there, the test feedback loop is seconds, and the cost of a fix is one line of code instead of an incident retrospective. Yet most teams plug in one scanner, get a thousand findings the first afternoon, declare it noise, and disable the gate by week two.
+
+This module is how to wire four scanners — SAST, SCA, secrets, license — into your CI without that outcome. The pattern: baseline once, only new findings fail the build, and the thresholds are calibrated so the team actually keeps the gate on.
+
+## The four pillars at the source layer
+
+Four distinct classes of scanner, each looking for something the others don't:
+
+- **SAST (Static Application Security Testing)** — pattern-matching on your source code without running it. SQL injection, XSS, hardcoded crypto, unsafe deserialization, dangerous `eval`. The questions are *"does this code do something dangerous?"* and *"is the dangerous input reachable from a user-controlled source?"*
+- **SCA (Software Composition Analysis)** — dependency scanning against CVE feeds (NVD, OSV, GHSA). Tells you that your direct dep `axios@0.21.1` has CVE-2021-3749, and that your transitive dep `lodash@4.17.20` has CVE-2021-23337. The question is *"do any of the things I'm shipping have a known vulnerability?"*
+- **Secrets scanning** — regex + entropy detection for API keys, private keys, passwords, tokens committed into the repo or its history. The question is *"did someone paste a credential where it doesn't belong?"*
+- **License scanning** — enumerate every dependency's license, flag GPL-incompatibilities, missing attributions, copyleft contamination. The question is *"can we legally ship this binary?"*
+
+These don't overlap. SAST won't find a CVE in `log4j`. SCA won't find your SQL injection. The secrets scanner won't catch a GPL violation. You need all four, or you need to be deliberate about which one you're skipping and why.
+
+<Whiteboard client:load data={{ nodes: pillarNodes, edges: pillarEdges }} height={500} />
+
+Reading the diagram: the developer runs cheap checks pre-commit, the PR fans out to all four scanners in CI, findings flow to DefectDojo for triage and SLA tracking, and the merge gate only flips green when the configured-as-blocking scanners pass. Pre-commit is for fast feedback; CI is the non-negotiable gate.
+
+## SAST tools that matter in 2026
+
+The 2026 landscape narrowed. The serious choices:
+
+| Tool | Strength | Cost | Best for |
+| --- | --- | --- | --- |
+| Semgrep | Fast, rule-based, polyglot, OSS community ruleset | OSS + paid tiers | The pragmatic default for most teams |
+| CodeQL | Deep data-flow analysis, language-specific | Free for public repos via GitHub | Complex taint analysis, security research |
+| SonarQube | Quality + security combined, long history | Community + commercial | Teams that already standardised on Sonar for quality |
+| Snyk Code | Bundled with their SCA, modern UX | Commercial | Teams already on Snyk for dependencies |
+| Checkmarx / Veracode | Thorough, regulatory checkbox | Enterprise licensing | Compliance-driven shops |
+
+For a new team starting today: Semgrep with the OWASP ruleset (`p/owasp-top-ten`) plus a per-language ruleset, run on every PR. The community ruleset is good, the false-positive rate is manageable, the cost is zero, and you can write your own custom rules in a YAML format that takes about ten minutes to learn.
+
+The Checkmarx/Veracode bucket is real but it's a different game — slow scans (hours, not minutes), licence fees that scale per developer, and reports formatted for auditors rather than engineers. If you have a regulator who asks for one of them by name, you ship it; otherwise pick something developers will tolerate.
+
+## SAST in CI — the pattern
+
+The shape is one stage in your pipeline that runs the scanner, parses the exit code, and decides whether to fail. A trimmed GitHub Actions step:
+
+```yaml
+- name: Semgrep
+  uses: returntocorp/semgrep-action@v1
+  with:
+    config: |
+      p/security-audit
+      p/owasp-top-ten
+      p/secrets
+  env:
+    SEMGREP_BASELINE_REF: origin/main
+```
+
+Three things make this work. The `SEMGREP_BASELINE_REF` tells Semgrep to diff against `main` and report only findings the PR introduces — pre-existing findings don't block the build. The two rulesets cover most of the OWASP top ten without piling on framework-specific noise. The action's exit code is non-zero on a new finding at severity ≥ ERROR, which fails the job, which blocks the merge if you've enabled branch protection.
+
+Exit-code convention: tools follow the Unix-y `0` = clean, non-zero = findings, with severity often encoded in the code. Semgrep: `0` = no findings, `1` = findings at the configured severity, `2` = scanner error. The opinionated default is **block on Critical only** at first; add High once the baseline is clean.
+
+## The findings-firehose problem
+
+Out of the box, a SAST scan of a multi-year-old codebase will surface hundreds of findings. Most are real-but-not-exploitable, low severity, or have a mitigation elsewhere in the stack. The team's natural reaction is to disable the gate within a week and never re-enable it. The pattern that survives:
+
+1. **Run once, save the baseline.** First scan on `main`. Commit a `.semgrepignore` (or your tool's equivalent) listing accepted findings with a rationale per line and an expiry date.
+2. **From baseline forward, only NEW findings fail.** The `SEMGREP_BASELINE_REF` env var (above) does this for Semgrep; SonarQube has "Sonar Way" quality gates with new-code thresholds; CodeQL surfaces deltas in the PR Checks UI.
+3. **Auto-close findings that age out.** Anything older than 90 days that nobody triaged gets auto-closed with a note. Forces decisions: either fix it, accept it (with rationale), or admit it was noise.
+
+This trades absolute coverage for a gate that stays on. A finding from 2019 you've ignored for six years is not going to start mattering on the day you add Semgrep — but the SQL injection a developer is about to merge tomorrow is.
+
+## SCA — dependency CVE scanning
+
+SCA is the highest-leverage scanner you'll run. Every dependency-graph compromise of the last five years (log4shell, ua-parser-js, codecov, XZ Utils) was an SCA problem in retrospect. The serious choices:
+
+| Tool | Strength | Notes |
+| --- | --- | --- |
+| Trivy | OSS, scans containers + filesystems + IaC + SBOMs | Lab uses this in both build paths |
+| Snyk | Commercial, deep dep-graph, fix-PR generation | Heavier UI, good for large monorepos |
+| OWASP Dependency-Check | OSS, language-specific (Java, Ruby, Node) | Older, narrower; still useful in Java shops |
+| GitHub Dependabot | Free for public repos, opens fix PRs automatically | Most teams' first SCA |
+| npm audit / pip-audit / cargo audit | Built into the language toolchain | Fast, no extra infra |
+
+Trivy is the workhorse — same binary scans your repo (`trivy fs .`), your built container (`trivy image registry/app:tag`), your IaC (`trivy config terraform/`), and your SBOM (`trivy sbom sbom.json`). One tool, one cache, one set of severity thresholds, four scan targets.
+
+## The transitive-dependency problem
+
+Your `package.json` lists `express`. `express` pulls `body-parser`. `body-parser` pulls `qs`. The CVE is in `qs`. None of your code touches `qs` directly; you didn't choose to depend on it; you can't easily change it because it's a transitive dep of a transitive dep. But it ships into your binary, and if it has a 9.8 CVSS, it is your problem.
+
+This is why SCA scanners traverse the full graph and humans can't. Two practical consequences:
+
+- **Lockfile matters more than manifest.** `package.json` says `express@^4.18.0`; `package-lock.json` pins exactly which version of every transitive dep got resolved. Always scan the lockfile. CI workflows that regenerate the lockfile (`npm install --no-package-lock`) silently change the scan result run-to-run — pin the lockfile and `npm ci` instead of `npm install`.
+- **Fixing transitives is harder than fixing directs.** When the CVE is two levels deep, you either bump the direct dep (and inherit whatever else changed), or use a resolution override (`resolutions` in package.json, `overrides` in npm 8.3+, `pnpm.overrides`) to force a patched version of the transitive. Document the override; future-you will not remember why it exists.
+
+## Severity thresholds — the practical bar
+
+Severity is CVSS-derived in most cases. The thresholds most healthy teams ship as:
+
+| CVSS band | Action | Override |
+| --- | --- | --- |
+| 9.0 – 10.0 (Critical) | Fail the build | None — must be fixed or upgraded |
+| 7.0 – 8.9 (High) | Fail the build | Team-lead exception, 90-day expiry, documented in DefectDojo |
+| 4.0 – 6.9 (Medium) | Pass; tracked | Quarterly review |
+| 0.1 – 3.9 (Low) | Pass; informational | Closed automatically after 180 days |
+
+Two opinionated calls. **One**: don't fail on Medium. You will accumulate them faster than you can fix them, and the build will be red constantly. Track them and burn them down on a slow cadence. **Two**: the override mechanism is non-negotiable. A High CVE in a base image you can't upgrade this sprint needs an escape valve, or the team will just remove the scanner.
+
+DefectDojo (or any equivalent vuln-tracking tool — the lab uses DefectDojo with Trivy in both build paths) is where the override lives. Issue, owner, expiry date, link to compensating control. When the 90 days run out, the build fails again automatically.
+
+## Secrets scanning
+
+Three tools, in order of how often we see them:
+
+- **Gitleaks** — OSS, Go binary, scans `git log` history plus the working tree, ~50 built-in regex rules with extensible config. The default for pre-commit.
+- **TruffleHog** — OSS, also scans history, adds **entropy-based detection** that catches secrets without a known format (random 40-char strings in unexpected places). Heavier than gitleaks but catches more.
+- **GitHub secret scanning** — built into GitHub, alerts on push to public repos for known-format secrets (AWS keys, GitHub tokens, Stripe keys, etc.), with **push-protection** that can block the push entirely. Free for public repos; paid for private.
+
+Run both layers: **pre-commit catches the developer before push**; **CI catches anyone who bypassed the hook**. The CI gate is non-negotiable — pre-commit can be skipped with `--no-verify`, deliberately or accidentally. CI is the floor.
+
+Run gitleaks in CI even if you have GitHub secret scanning enabled. GitHub's coverage is excellent for well-known formats but misses custom credentials (your internal service tokens, your bespoke API keys). Gitleaks with a `[[rules]]` block for your internal formats covers the gap.
+
+## The "secret committed to history" remediation
+
+When (not if) a credential lands in `git log`, the order of operations matters:
+
+1. **Rotate the credential immediately.** Assume it's compromised. Public repos are crawled by automated scanners within minutes; private repos still leak via forks, backups, and laptops. Rotation is non-optional and is the first step.
+2. **Open an incident retro.** Even a single developer commit is process feedback — was the pre-commit hook installed? Was it bypassed? Why?
+3. **Remove from history.** `git filter-repo --replace-text` or BFG Repo-Cleaner. Force-push and warn collaborators about the rewrite. This step is *third* in priority — useful for tidiness, but the secret is already compromised whether or not you scrub history.
+
+Most teams get this backwards: they panic about the git surgery and forget to rotate. The fix is the rotation; the git work is hygiene.
+
+## License scanning
+
+Necessary for anything you ship as a binary or distribute to customers. The compliance failure modes are real and concrete: a GPLv3 dependency in a closed-source product, a missing attribution that triggers an OSS-license audit, a "no commercial use" clause buried in a transitive that the team didn't notice.
+
+Tools: **FOSSA** (commercial, the de facto standard for medium+ orgs), **Snyk Open Source** (the same product that does SCA also does licenses), **Licensee** (OSS, GitHub-maintained, identifies the license of a single repo). FOSSA and Snyk Open Source produce policy reports per dependency; Licensee is more of a single-file identifier you'd plug into a custom gate.
+
+The license gate is almost always driven by Legal/Compliance, not Engineering. Engineering's job is to surface the data; Legal's job is to set the allowlist (MIT, Apache-2.0, BSD-2/3, MPL-2.0 usually fine; GPL variants need product-team review; "no commercial use" or "non-commercial" always block). Build a CI step that fails if a non-allowlisted licence appears; route exceptions through the legal team.
+
+## Pre-commit hooks
+
+[pre-commit.com](https://pre-commit.com/) is the de facto framework — a single `.pre-commit-config.yaml` declares hooks, `pre-commit install` wires them into `.git/hooks/pre-commit`, every `git commit` runs the configured checks before the commit is even created. A useful base config:
+
+```yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks: [{ id: gitleaks }]
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks: [{ id: hadolint-docker }]
+  - repo: https://github.com/returntocorp/semgrep
+    rev: v1.50.0
+    hooks: [{ id: semgrep, args: ["--config=p/secrets", "--error"] }]
+```
+
+This catches roughly 80% of the issues your CI would catch, with feedback in seconds instead of minutes. The hooks run only on changed files by default, so a `git commit` on a one-line change finishes in &lt;5 seconds. Make this the team's onboarding step — anyone who can't run `pre-commit install` shouldn't be pushing to the repo.
+
+## The lab posture
+
+The lab runs Trivy in both build paths — Path A (Jenkins) and Path B (Tekton) — with findings flowing to DefectDojo for triage. Severity thresholds match the table above: Critical fails, High fails with documented exception, Medium and below track without blocking.
+
+What the lab *doesn't* do centrally is SAST. Each application repo is responsible for wiring its own SAST scanner; there is no platform-mandated gate. Secrets scanning is gitleaks pre-commit only — there is no centralised CI gate enforcing it across repos. Both are flagged gaps in the BFSI readiness review and are tracked under that review's Tier 1 backlog.
+
+## Try this
+
+**1. Add Semgrep to a repo.** Wire `p/security-audit` + `p/owasp-top-ten` into your CI on PR. Run once. Count total findings, classify Critical/High/Medium. Commit a `.semgrepignore` for accepted ones. Re-run; verify the new run is clean.
+
+**2. Add gitleaks as a pre-commit hook.** Install `pre-commit`, add the gitleaks hook, run `pre-commit install`. Try to commit a file containing `AKIAIOSFODNN7EXAMPLE` (a fake AWS access key in the documented test pattern). Verify the commit is blocked. Now `git commit --no-verify` to confirm the hook can be bypassed — then add the same scan to CI as the backstop.
+
+**3. Run Trivy filesystem scan on a real project.** `trivy fs .` on a Java/Node/Python repo. Identify the top three Critical CVEs and their fix versions. For at least one, bump the dep, re-run, watch the finding disappear.
+
+## Common failure modes
+
+**SAST rules too strict; team disables the gate within a week.** The fix is the baseline + only-new-findings pattern from §4. Start with the gate off, surface the noise, agree what's signal, then turn the gate on for new findings only.
+
+**SCA scanner scans the wrong manifest.** `npm audit` reads `package.json` but the actual installed graph is in `package-lock.json` — the two can disagree if the lockfile was regenerated since the manifest changed. Always scan the lockfile, always `npm ci` (not `npm install`) in CI, always commit the lockfile to git.
+
+**Secrets scanner misses a custom-format credential.** Gitleaks ships with patterns for AWS, GCP, Stripe, GitHub, etc. — but not your internal `myco_token_*` format. Add a custom `[[rules]]` block with the regex; check it in with the rest of the config.
+
+**Findings reach 1000+ and nobody triages anything.** Paralysis. The fix is the auto-close-after-90-days policy from §4. It forces a decision: fix, accept (with rationale and an expiry), or admit it was noise.
+
+**Critical CVE that genuinely has no fix.** The upstream dep hasn't released a patched version yet, or the patched version has a breaking change you can't take this sprint. Document an exception in DefectDojo with a compensating control (WAF rule, network restriction, downgrade) and a 90-day expiry. Auto-fail the build when the exception expires.
+
+## Where this is heading
+
+The source layer is the cheapest place to catch a problem. The next layer up — the container — is where the source code, your team's deps, the base image's deps, and a hundred bundled tools meet for the first time. The same questions repeat (vulnerability, secret, license) against a different blast radius.
+
+**Next:** [Module 04 — Container security](/learn/devsecops/04-container-security) — minimal base images, scanning, signing with cosign, and admission gates that reject unsigned images.
+
+## References
+
+- OWASP Top 10: [owasp.org/Top10/](https://owasp.org/Top10/)
+- OWASP Cheat Sheet Series: [cheatsheetseries.owasp.org](https://cheatsheetseries.owasp.org/)
+- NIST SSDF (SP 800-218): [csrc.nist.gov/Projects/ssdf](https://csrc.nist.gov/Projects/ssdf)
+- Semgrep registry: [semgrep.dev/explore](https://semgrep.dev/explore)
+- CodeQL documentation: [codeql.github.com/docs/](https://codeql.github.com/docs/)
+- Trivy documentation: [trivy.dev](https://trivy.dev/)
+- Gitleaks: [github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
+- TruffleHog: [github.com/trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog)
+- pre-commit framework: [pre-commit.com](https://pre-commit.com/)
+- DefectDojo: [defectdojo.com](https://www.defectdojo.com/)
+- OSV vulnerability database: [osv.dev](https://osv.dev/)
+- GitHub Advisory Database (GHSA): [github.com/advisories](https://github.com/advisories)

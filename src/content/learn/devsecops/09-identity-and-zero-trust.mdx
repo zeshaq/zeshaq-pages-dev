@@ -1,0 +1,225 @@
+---
+title: "Identity and zero trust"
+sidebar_label: "09 — Identity + zero trust"
+description: "The perimeter is dead. Per-request authentication, workload identity with SPIFFE/SPIRE, mTLS via service mesh, cloud-IAM federation, and the gaps a real lab still has."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const ztNodes = [
+  { id: "user", data: { label: "User\n(human via browser/CLI)" }, position: { x: 40, y: 40 }, style: stage, type: "shape" },
+  { id: "idp", data: { label: "Identity Provider\n(Keycloak / Okta / Azure AD)" }, position: { x: 280, y: 40 }, style: ctrl, type: "shape" },
+  { id: "proxy", data: { label: "Authenticating proxy\n(Istio gateway + OIDC)" }, position: { x: 540, y: 40 }, style: ctrl, type: "shape" },
+  { id: "svcA", data: { label: "Service A\n(spiffe://prod/payments-api)" }, position: { x: 540, y: 200 }, style: agent, type: "shape" },
+  { id: "svcB", data: { label: "Service B\n(spiffe://prod/db-reader)" }, position: { x: 780, y: 200 }, style: agent, type: "shape" },
+  { id: "spire", data: { label: "SPIRE server\n(SVID issuer)" }, position: { x: 280, y: 200 }, style: ctrl, type: "shape" },
+  { id: "vault", data: { label: "Vault\n(workload secrets)" }, position: { x: 40, y: 200 }, style: ctrl, type: "shape" },
+  { id: "cloud", data: { label: "Cloud IAM\n(short-lived creds via OIDC)" }, position: { x: 780, y: 40 }, style: ext, type: "shape" },
+];
+
+export const ztEdges = [
+  { id: "e1", source: "user", target: "idp", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "OIDC login" },
+  { id: "e2", source: "idp", target: "proxy", style: { stroke: "#1f2937" }, label: "JWT" },
+  { id: "e3", source: "proxy", target: "svcA", style: { stroke: "#1f2937" }, label: "validated request" },
+  { id: "e4", source: "svcA", target: "svcB", style: { stroke: "#1f2937" }, label: "mTLS, SPIFFE-ID" },
+  { id: "e5", source: "spire", target: "svcA", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "SVID rotate" },
+  { id: "e6", source: "spire", target: "svcB", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "SVID rotate" },
+  { id: "e7", source: "svcA", target: "vault", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "k8s auth" },
+  { id: "e8", source: "svcB", target: "cloud", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "IRSA / WLI" },
+];
+
+The perimeter model said: build a moat, put the trusted servers inside, put the firewall on the edge. Once the request was past the firewall it was, by assumption, friendly. That assumption powered enterprise security for two decades and it is now broken in every direction at once.
+
+This module is the practical zero-trust playbook. It defines the model, names the standards, walks through workload identity, shows how a service mesh becomes the substrate that makes the model real, and finishes with what the lab actually has and what it is still missing. Zero trust is not a product you buy; it is a posture you build out of identity, mTLS, per-request authorization, and short-lived credentials.
+
+## The perimeter model is dead
+
+Network-zone trust — DMZ on the outside, internal LAN in the middle, management network at the core — made sense when servers lived in one datacenter, employees sat at desks inside that building, and the firewall was the only path in or out. None of those assumptions still hold. Workloads run in three clouds and an on-premise lab; employees connect from coffee shops; microservices call each other a hundred times to serve one user request; and the SaaS the business depends on lives entirely outside the perimeter by design.
+
+The failure modes are concrete. A laptop compromised at a coffee shop becomes "inside the network" the moment it joins the VPN. A misconfigured Kubernetes Service exposes a debug endpoint to every other pod in the cluster, because "the cluster is internal." A leaked API key gets weeks of free run because the call originates from a "trusted" CIDR. Equifax 2017 was an unpatched Struts vulnerability behind a perimeter that nobody was watching from the inside; Capital One 2019 was an SSRF that pivoted to over-permissioned IAM credentials assigned to an "internal" workload; MOVEit 2023 spread by exactly the kind of trust assumption a zero-trust posture would have refused.
+
+**Zero trust** is the inversion: trust nothing implicitly; verify every request based on identity, posture, and context. The network is just transport. Authentication and authorization happen at the application layer, on every request, for every caller — human or workload.
+
+## NIST SP 800-207 — the framework
+
+NIST SP 800-207 (Zero Trust Architecture, 2020) is the canonical specification. It is public domain and worth reading; the executive summary fits on one page. Three principles do the load-bearing work.
+
+**All resources are accessed in a secure manner.** No plaintext internal traffic. Every byte between services is encrypted and mutually authenticated — mTLS is the dominant mechanism. "It is inside the cluster" is not an excuse to skip TLS.
+
+**Access is granted on a per-session basis.** A single authentication event does not grant indefinite access. Each session is bounded — by time, by scope, by the resource it touches. The token a user receives from the IdP expires; the SPIFFE certificate a pod holds is rotated every hour; the cloud credential a workload assumes is short-lived.
+
+**Access decisions are dynamic and policy-driven.** The decision factors who is asking, what they are asking for, what device they are on, where they are located, what time it is, what posture their system is in. A policy engine combines those signals into an allow or deny. The decision is logged, replayable, and auditable.
+
+NIST publishes a reference data flow — Policy Decision Point, Policy Enforcement Point, Policy Information Points — that maps cleanly onto modern implementations. The PDP is your policy engine (OPA, Cedar, or a mesh's AuthorizationPolicy controller); the PEP is the proxy or sidecar that intercepts the request; the PIPs are the IdP, the device-management system, the threat-intel feed.
+
+## The BeyondCorp pattern
+
+Google published BeyondCorp in 2014 after a decade of practice. The thesis: every request, internal or external, traverses an authenticating proxy. There is no "trusted internal network" — there is the open internet, and there are authenticated sessions. An employee on a corporate laptop accesses an internal tool the same way they access Gmail: through a proxy that authenticates them, validates their device, and authorizes the specific request.
+
+Most modern zero-trust products implement some flavour of BeyondCorp. Cloudflare Access, Google IAP, AWS Verified Access, Tailscale's identity-aware fabric — they all converge on the same shape. The mistake to avoid is treating zero trust as a VPN replacement; a VPN moves the perimeter, while zero trust dissolves it.
+
+## Identity layers — user vs workload
+
+Two identity systems run side by side, and they are easy to confuse.
+
+**User identity** is humans accessing systems. The mature pattern is an Identity Provider — Keycloak, Okta, Azure AD, Google Workspace — speaking OIDC or SAML. Single sign-on, MFA, group membership, attribute claims. The IdP is the source of truth for "who is this person"; downstream systems check the IdP's signature on the token and read the claims.
+
+**Workload identity** is pods, services, batch jobs, lambdas. Historically the pattern was a shared API key stored in a config file. Modern practice is a cryptographic identity per workload — every pod has its own short-lived certificate, every Lambda has its own short-lived IAM role assumption. The point is that "the payments-api service" is a distinct identity from "the db-reader service" even when they run on the same node, and the platform can prove which one made any given request.
+
+Workload identity is the load-bearing innovation in this module. User identity is well-understood and most teams do it adequately; workload identity is where modern zero-trust implementations actually differ.
+
+## SPIFFE / SPIRE — the standard
+
+**SPIFFE** (Secure Production Identity Framework For Everyone) is a CNCF specification for workload identity. It defines a naming scheme (`spiffe://trust-domain/path`), a credential format, and a federation model. SPIFFE is the spec; **SPIRE** is the reference implementation.
+
+A **SVID** (SPIFFE Verifiable Identity Document) is the credential a workload presents. It comes in two flavours — an X.509 certificate (for mTLS) or a JWT (for tokens). The Subject Alternative Name of an X.509 SVID encodes the SPIFFE ID, e.g. `spiffe://prod.bank.example/payments/api`. Two services seeing each other's SVIDs know each other's identities cryptographically, with no shared secret.
+
+The mechanics: a SPIRE agent runs on every node, talks to the SPIRE server on the control plane, and uses node attestation (a cloud-instance-identity document, a Kubernetes ServiceAccount token, a TPM, etc.) to prove what node it is. When a workload starts, the agent attests it (process selectors — UID, container image, Kubernetes labels) and the SPIRE server issues an SVID. The certificate has a short TTL — typically one hour — and the agent rotates it automatically before expiry.
+
+The reader's takeaway: workload identity is not "set a long API key in a Secret"; it is "the platform proves which workload is making each call." Once that proof exists, every downstream check (mesh authorization, Vault access, cloud-IAM exchange) can rely on it.
+
+## Service mesh as a zero-trust substrate
+
+A service mesh is the practical way to deliver mTLS + workload identity + per-call authorization on Kubernetes without changing application code. Three options dominate.
+
+**Istio / Red Hat OpenShift Service Mesh 3** is the heaviest, most-featureful option. Every pod gets an Envoy sidecar (or, in ambient mode, a per-node ztunnel); the sidecars terminate inbound TLS, originate outbound TLS, present and validate workload identities, and enforce the mesh's policy CRDs. The lab uses OSSM 3 — see [`/docs/openshift-platform/platform-services/service-mesh-ossm3`](/docs/openshift-platform/platform-services/service-mesh-ossm3).
+
+**Linkerd** is the lightweight alternative. Rust micro-proxy instead of Envoy, narrower feature surface, faster to operate, automatic mTLS by default. If you do not need Istio's richer traffic-management features (rich VirtualService routing, fault injection, mirror), Linkerd is usually the better choice.
+
+**Cilium Service Mesh** drops the sidecar entirely; eBPF in the kernel does the policy enforcement. Promising for performance-sensitive workloads where Envoy's per-pod overhead is unwelcome. Less mature on the policy side.
+
+Two CRDs are doing the work in any mesh. **PeerAuthentication** sets the mTLS posture per namespace: `STRICT` rejects plaintext, `PERMISSIVE` accepts both (transition mode), `DISABLE` is plaintext-only. **AuthorizationPolicy** is the per-service ACL — "service A's ServiceAccount may call service B's `/v1/transactions` endpoint, with method POST, when the request has a valid OIDC token from the staff realm." Together, workload identity + mTLS + per-service authz is the practical zero-trust foundation on Kubernetes.
+
+## Cloud-IAM workload identity
+
+The cloud providers each have a federated-identity story for workloads, and the shape is the same on every cloud.
+
+**AWS IRSA** (IAM Roles for Service Accounts) maps a Kubernetes ServiceAccount to an IAM role via an OIDC trust relationship. The pod's projected SA token is presented to AWS STS, which exchanges it for short-lived AWS credentials. No long-lived AWS keys in the pod.
+
+**GCP Workload Identity** does the same on GCP — the ServiceAccount is bound to a Google service account, the kubelet handles the exchange, the pod gets short-lived Google credentials.
+
+**Azure AD Workload Identity** is the Azure equivalent, with the same OIDC trust pattern.
+
+For anything that calls a cloud API from a pod, this is the only correct pattern in 2026. The Capital One 2019 breach was a workload with overprivileged static credentials reachable via SSRF; workload identity makes that class of attack two orders of magnitude harder.
+
+## Just-in-time access
+
+Humans get standing access only to read-only resources. For write access — `kubectl exec` on a prod pod, a SQL session on the production DB, an SSH session to a bastion — the worker requests a time-bounded grant via a PAM (Privileged Access Management) tool.
+
+The pattern: request a session, optionally with a justification; an approval flow (sometimes human, sometimes automatic for low-risk grants); a session of 4 hours with the elevated grant; full audit logging of every command; for high-risk grants, full session recording (video) for after-the-fact review. CyberArk, Teleport, BeyondTrust, HashiCorp Boundary all play in this space. Teleport's open-source edition is the cheapest entry point.
+
+Without JIT, the standing "cluster-admin" role is the credential an attacker hunts for. With JIT, the worst an attacker steals is a session that already expired or expires in minutes.
+
+## The OIDC + Istio + Keycloak pattern
+
+Putting it together with the lab's Keycloak (see [`/docs/openshift-platform/lab-infrastructure/other-platform-vms/keycloak-oidc`](/docs/openshift-platform/lab-infrastructure/other-platform-vms/keycloak-oidc)):
+
+```
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: keycloak-jwt
+  namespace: payments
+spec:
+  jwtRules:
+    - issuer: "https://keycloak.apps.sub.comptech-lab.com/realms/staff"
+      jwksUri: "https://keycloak.apps.sub.comptech-lab.com/realms/staff/protocol/openid-connect/certs"
+```
+
+Pair it with an AuthorizationPolicy that requires a validated principal:
+
+```
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: require-jwt
+  namespace: payments
+spec:
+  action: ALLOW
+  rules:
+    - from: [{ source: { requestPrincipals: ["*"] } }]
+```
+
+The sidecar validates the JWT against Keycloak's JWKS, populates `request.auth.principal`, and the policy admits only requests that carry a valid principal. Add a `to:` block that scopes by path/method, or a `when:` block that requires a specific group claim, and you have per-route authorization driven entirely by the IdP.
+
+<Whiteboard client:load data={{ nodes: ztNodes, edges: ztEdges }} height={400} />
+
+Reading the diagram:
+
+- **Solid black** edges are validated request paths — user-to-proxy through OIDC, proxy-to-service after JWT validation, service-to-service over mTLS with SPIFFE-ID checks.
+- **Dashed green animated** edges are spoke-initiated control: OIDC login flow, SVID rotation from SPIRE, Vault Kubernetes-auth, cloud-IAM credential exchange. The workload reaches outward; the controllers do not push secrets inward.
+- Every component shown is one of the three primitives: an issuer (IdP, SPIRE, cloud IAM, Vault), a proxy that validates (Istio gateway, sidecars), or a workload that holds an identity (service A, service B).
+
+## Lab posture
+
+What the lab has today:
+
+- **OSSM 3 ambient mesh** with `PeerAuthentication` mode `STRICT` on the `bank-employees-jboss-chat` tenant. Sidecarless mode, ztunnel per node, automatic mTLS between every workload in the mesh. See [`/docs/openshift-platform/platform-services/service-mesh-ossm3`](/docs/openshift-platform/platform-services/service-mesh-ossm3).
+- **Keycloak OIDC** as the IdP for human users. Realms per audience (staff, customers, ops). The lab's Keycloak doc is the operator reference; the realm config is managed via the Keycloak Operator's `KeycloakRealmImport` CRs in `platform-gitops`.
+- **Vault Kubernetes auth method** is the workload-identity story for everything that reaches Vault — ESO uses it transparently, custom workloads can use it directly. The pod's projected SA token is exchanged for a Vault token scoped to the right policies.
+- **IRSA-style federation** is not in scope (the lab is on-prem) but Vault's Kubernetes auth fills the same niche.
+
+What the lab is missing:
+
+- **SPIFFE/SPIRE** is not installed. Workload identity exists only inside the mesh; outside the mesh (batch jobs, CronJobs, the brac-poc BFF), the identity story falls back to ServiceAccount tokens and Vault. This is a Tier-2 gap in the BFSI readiness review.
+- **PAM** is not deployed. SSH and `oc exec` access to production is governed by RBAC and audit log, not by JIT grants. Teleport Open Source is on the roadmap.
+- **Device posture checks** are absent. The mesh authenticates the user but does not know whether the user's laptop is encrypted, patched, or jailbroken. BeyondCorp-grade device trust requires an MDM signal, which the lab does not collect.
+
+## Try this
+
+**Exercise 1.** Stand up SPIRE on a `kind` cluster. Install the SPIRE server + a SPIRE agent DaemonSet via the upstream Helm chart. Register a workload entry for a sample deployment, then exec into a pod and run `spire-agent api fetch x509 -socketPath /run/spire/sockets/agent.sock`. You should see an X.509 SVID with a SPIFFE ID in the SAN, valid for one hour. Watch the rotation happen on the second hour.
+
+**Exercise 2.** Configure Istio `PeerAuthentication` mode `STRICT` on a namespace. Deploy two pods, one in the mesh (sidecar-injected) and one not. Curl the first pod's Service from inside each and confirm the non-mesh pod's request is refused. Then add an `AuthorizationPolicy` that allows only one specific ServiceAccount to call the in-mesh service; verify the second ServiceAccount's call is denied with a 403.
+
+**Exercise 3.** Write an AuthorizationPolicy that says "only the `payments-api` ServiceAccount may call the `db-reader` ServiceAccount, only on the path `/v1/accounts/*`, only with HTTP GET, and only when the request carries a valid JWT from the staff realm with the group claim `db-reader-callers`." That single policy combines workload identity, path-and-method scoping, OIDC-claim filtering, and the mTLS substrate underneath. It is the practical "least privilege between services" rule.
+
+## Common failure modes
+
+**mTLS works for sidecar-injected pods but breaks for headless services or pods without sidecars.** During a migration, flip the namespace to `PeerAuthentication` mode `PERMISSIVE` so both plaintext and mTLS callers work, finish migrating, then flip to `STRICT`. Skipping the `PERMISSIVE` phase causes a brownout when half the callers cannot speak mTLS yet.
+
+**SPIRE agent cannot reach the SPIRE server.** A NetworkPolicy or firewall rule blocks the outbound. Symptoms: workloads come up but cannot fetch an SVID, mesh handshakes fail. Check the agent logs first; the error is usually obvious.
+
+**OIDC token expires faster than the longest pod operation.** A pod with a 5-minute token but a 15-minute job will silently fail mid-task. Increase the token's lifetime, or have the application refresh the token; do not pretend the problem does not exist.
+
+**Keycloak realm config drifts from git.** A human edits the realm in the Keycloak admin UI, the change is not in git, the next GitOps sync reverts it, the team blames "Argo CD." Fix: manage realms through the Keycloak Operator's `KeycloakRealm` / `KeycloakRealmImport` CRs, make the admin UI read-only for the realm-config audience.
+
+**Cloud-IAM trust policy too broad.** An IRSA trust policy that accepts any ServiceAccount in any namespace becomes the new shared secret. Scope the trust policy to a specific namespace + SA pair; if you cannot, the role is over-trusted.
+
+## References
+
+- NIST SP 800-207, Zero Trust Architecture: `https://csrc.nist.gov/publications/detail/sp/800-207/final`
+- BeyondCorp papers (Google Research): `https://research.google/pubs/?area=security-privacy-and-abuse-prevention`
+- SPIFFE specification: `https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/`
+- SPIRE documentation: `https://spiffe.io/docs/latest/spire-about/`
+- Keycloak documentation: `https://www.keycloak.org/documentation`
+- OpenID Connect Core 1.0: `https://openid.net/specs/openid-connect-core-1_0.html`
+- Istio security concepts: `https://istio.io/latest/docs/concepts/security/`
+- Red Hat OpenShift Service Mesh 3: `https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/`
+- AWS IRSA: `https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html`
+- GCP Workload Identity: `https://cloud.google.com/kubernetes-engine/docs/concepts/workload-identity`
+- Azure AD Workload Identity: `https://azure.github.io/azure-workload-identity/docs/`
+
+**Next:** [Module 10 — Compliance and audit](/learn/devsecops/compliance-and-audit).

@@ -1,0 +1,231 @@
+---
+title: "Compliance and audit"
+sidebar_label: "10 — Compliance + audit"
+description: "Mapping technical controls to PCI-DSS, SOC 2, ISO 27001, NIST 800-53 and local banking guidelines. Compliance-as-code, change-record discipline, tailoring profiles, and what an auditor actually wants to see."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const controlNodes = [
+  { id: "ctrl", data: { label: "PCI-DSS Req 6.4.3\n(prod change control)" }, position: { x: 40, y: 40 }, style: ctrl, type: "shape" },
+  { id: "gitops", data: { label: "GitOps + signed commits\n(source integrity)" }, position: { x: 320, y: 40 }, style: agent, type: "shape" },
+  { id: "review", data: { label: "Branch protection +\nCODEOWNERS review" }, position: { x: 320, y: 140 }, style: agent, type: "shape" },
+  { id: "sast", data: { label: "SAST + SCA in CI\n(build verification)" }, position: { x: 320, y: 240 }, style: agent, type: "shape" },
+  { id: "sign", data: { label: "Image signing +\nadmission verify" }, position: { x: 320, y: 340 }, style: agent, type: "shape" },
+  { id: "audit", data: { label: "Audit log of\nevery deploy event" }, position: { x: 320, y: 440 }, style: agent, type: "shape" },
+  { id: "ev", data: { label: "Evidence pack\n(continuously collected)" }, position: { x: 620, y: 240 }, style: ext, type: "shape" },
+];
+
+export const controlEdges = [
+  { id: "c1", source: "ctrl", target: "gitops", style: { stroke: "#1f2937" }, label: "satisfied by" },
+  { id: "c2", source: "ctrl", target: "review", style: { stroke: "#1f2937" }, label: "satisfied by" },
+  { id: "c3", source: "ctrl", target: "sast", style: { stroke: "#1f2937" }, label: "satisfied by" },
+  { id: "c4", source: "ctrl", target: "sign", style: { stroke: "#1f2937" }, label: "satisfied by" },
+  { id: "c5", source: "ctrl", target: "audit", style: { stroke: "#1f2937" }, label: "satisfied by" },
+  { id: "c6", source: "gitops", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "commit logs" },
+  { id: "c7", source: "review", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "PR records" },
+  { id: "c8", source: "sast", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "scan results" },
+  { id: "c9", source: "sign", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "signatures" },
+  { id: "c10", source: "audit", target: "ev", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "deploy log" },
+];
+
+Module 01 introduced the frameworks at a survey level. This module is the practitioner's view: how compliance actually gets done, what the auditor wants to see, how to make every control produce its own evidence, and why "compliant" and "secure" are not the same thing.
+
+The track's earlier modules built the technical pipeline. Compliance is the management overlay on top — the discipline of proving, in a way a stranger can audit, that the pipeline does what it claims. Without that proof you have security through assertion, and the regulator does not accept assertions.
+
+## What compliance is — and isn't
+
+Compliance is **proof that a control is implemented and operating effectively**. It is a measurable, documented, repeatable demonstration that "passwords expire in 90 days" or "every production image is signed" is actually true on the day a stranger looks.
+
+It is not the same as security. **Compliant ≠ secure**: an organisation that meets every PCI-DSS sub-requirement can still be breached by a novel attack the standard does not cover. **Secure ≠ compliant**: a startup with great security practices but no written policies, no evidence collection, and no audit trail will fail SOC 2 even when its actual risk posture is excellent.
+
+The two overlap heavily — most compliance controls are reasonable security practices — but they are scored against different rubrics. Security is judged by outcomes (did you get breached?), compliance is judged by process (can you show that you do what you say?). A mature organisation runs both programs in parallel and accepts the small overhead of evidence collection because it converts security work into business-defensible artifacts.
+
+## The frameworks you'll meet
+
+A practitioner in banking will see two to four of these simultaneously. Most controls overlap; the trick is to map once and satisfy many.
+
+**PCI-DSS v4.0** — 12 requirement areas with roughly 200 sub-requirements, mandatory for any merchant or service provider that handles cardholder data. Version 4.0 became effective in Q1 2024 with a phase-in for some changes through March 2025. Requirement areas span network segmentation, vulnerability management, access control, monitoring, and incident response. The lab maintains a tailored profile at [`/docs/openshift-platform/compliance/pci-dss-profile-baseline`](/docs/openshift-platform/compliance/pci-dss-profile-baseline).
+
+**SOC 2 Type II** — AICPA's U.S. service-organisation audit standard. "Type II" means the controls operate effectively over a period (typically 6 to 12 months), not just at a snapshot. The five **Trust Services Criteria** are Security (always in scope), Availability, Processing Integrity, Confidentiality, and Privacy. Most SaaS customers ask for Security plus Availability and Confidentiality; the rest you opt into when they apply.
+
+**ISO 27001:2022** — the international Information Security Management System standard. The 2022 revision restructured Annex A into four themes — Organisational, People, Physical, Technological — with 93 controls. EU enterprise customers ask for ISO 27001 the way U.S. customers ask for SOC 2; the underlying control set is similar.
+
+**NIST 800-53 r5** — the U.S. federal control catalogue. Seventeen control families, around a thousand individual controls, deliberately exhaustive. It is the basis for FedRAMP, which is how SaaS vendors sell to the U.S. government. Most enterprise security programs use 800-53 as a reference library even when they are not contracting with the federal government.
+
+**Local banking regulators** — examples differ by country: the Bangladesh Bank ICT Security Guideline for BFSI work in Bangladesh (the BRAC POC context); the RBI Cyber Security Framework for Indian banks; MAS TRMG for Singapore; EBA Guidelines on ICT and Security Risk Management for the EU; the OCC and FFIEC handbooks in the U.S. Local regulators usually map onto a subset of PCI/SOC2/ISO with country-specific additions (cross-border data flow, government-access provisions, local reporting timelines).
+
+The mapping is hierarchical. Most of NIST 800-53 covers what PCI-DSS covers; SOC 2's Security TSC overlaps about 70% with ISO 27001's Annex A; PCI-DSS adds card-specific controls on top. A single control implementation — say, "image signing with cosign + admission policy" — can satisfy NIST SC-15, PCI-DSS Req 6.3.3, SOC 2 CC8.1, ISO 27001 A.8.28, and the relevant local-bank rule simultaneously.
+
+## Compliance-as-code
+
+Pre-cloud compliance was a binder of policies and a once-a-year audit by humans. Modern compliance is **every control has a corresponding automated check that produces evidence continuously**. The auditor's question — "show me that this is happening" — has an automated answer.
+
+Tools to know:
+
+- **OpenShift Compliance Operator** runs OpenSCAP scans against PCI-DSS, CIS, NIST 800-53, and ISO 27001 profiles. Results land in `ComplianceCheckResult` CRs you can dashboard. See [`/docs/openshift-platform/compliance/`](/docs/openshift-platform/compliance/).
+- **OPA Gatekeeper and Kyverno** enforce policies at the admission controller; every admission decision is auditable and every policy is a compliance artifact in its own right.
+- **RHACS Compliance** dashboards the RHACS-detected findings against control families — useful for PCI-DSS and CIS Kubernetes Benchmark mappings.
+- **AWS Config / GCP Security Command Center / Azure Defender for Cloud** are the cloud-native equivalents. They scan resource configuration against built-in conformance packs.
+- **Wiz, Lacework, Drata, Vanta** are commercial compliance automation platforms; they collect evidence from a hundred SaaS surfaces and map it to controls.
+
+The right answer is some mix. Compliance Operator + Gatekeeper covers the OpenShift surface; a Drata-style platform covers the SaaS surface (Okta, GitHub, AWS, the engineering laptops); the SIEM (Module 11) ties them together.
+
+## The control-mapping exercise
+
+Pick a single control and walk it through. PCI-DSS Req 6.4.3 says, in summary, that you must manage changes to the production environment — review them, test them, and record them. Map that requirement to what the lab actually does:
+
+<Whiteboard client:load data={{ nodes: controlNodes, edges: controlEdges }} height={520} />
+
+Reading the diagram:
+
+- **One control** — Req 6.4.3 — is **satisfied by five distinct technical controls** in the lab.
+- Each technical control **emits its evidence** to a continuously updated evidence pack. Dashed grey edges are the telemetry — commit logs, PR records, scan results, signatures, deploy logs.
+- The auditor's question "show me how 6.4.3 is met" becomes a single query against the evidence pack rather than a five-hour scramble.
+
+The five technical controls that satisfy 6.4.3:
+
+- **GitOps with signed commits** — source integrity. Every change to production starts as a commit, signed with the author's GPG/SSH key, in a branch off `main`.
+- **Branch protection with CODEOWNERS review** — change control. Nobody merges to `main` without a peer review by a code-owner; the GitHub/GitLab UI records the reviewer, the timestamp, and the diff.
+- **SAST and SCA passing in CI** — build verification. The pipeline runs Semgrep + Trivy on every PR; the run logs are linked from the PR and retained.
+- **Image signing + admission policy** — release verification. Cosign signs every image at build time; the cluster admission controller rejects unsigned images at deploy time.
+- **Audit logs of every deploy event** — change record. Argo CD's sync events, the cluster's audit log, and the registry's push events all land in the SIEM with timestamps and actors.
+
+Build the matrix once. The same five technical controls also satisfy ISO 27001 A.8.32, SOC 2 CC8.1, and NIST 800-53 CM-3. Evidence-collection effort is paid once and reused across audits.
+
+## Tailoring profiles
+
+Compliance profiles ship as one-size-fits-all rule sets. Some rules will not apply to your environment, and applying them anyway either fails (false negative) or forces a workaround that makes the posture worse. The right move is to **tailor**: document the rules you accept and the rules you exclude, with rationale.
+
+OpenShift Compliance Operator supports tailoring via the `TailoredProfile` CR. You extend a base profile (`upstream-pci-dss-v4`), then add `disableRules:` for the rules that do not apply, `enableRules:` for any you want to bring in from another profile, and `manualRules:` for rules that have to be verified outside the scanner.
+
+The lab does this for PCI-DSS v4 on `spoke-dc-v6`. Examples of exclusions:
+
+- **etcd-encryption-with-HW-HSM** — the lab uses envelope encryption with KMS, not a dedicated HSM. The tailored variant accepts envelope KMS as equivalent and documents the rationale.
+- **CSO-recommended-cipher-suites** — superseded by the OpenShift platform's ingress controller settings; the cluster operator's own values are stricter than the SCAP rule's check. Rule disabled, with a pointer to the ingress controller config that proves the actual posture.
+
+The complete list lives at [`/docs/openshift-platform/operations/incidents-and-runbooks/pci-dss-remediation-and-evidence`](/docs/openshift-platform/operations/incidents-and-runbooks/pci-dss-remediation-and-evidence). The trap to avoid is **undocumented tailoring**: a rule disabled in Slack instead of in the `TailoredProfile` CR is invisible to the auditor and forces a hard conversation about why the rule "passed" when the cluster does not implement it.
+
+## The auditor relationship
+
+An auditor's job is to be skeptical, and a skeptical auditor finds more findings than a cooperative one. The way to compress the audit cycle is to make the auditor's life easy.
+
+Three habits matter:
+
+- **Evidence pack** — every control has a pre-collected screenshot, log export, or policy YAML, ideally with the date and the system that produced it. The auditor never has to ask "please send me proof of X"; they open the pack and search.
+- **Sampling plan** — auditors do not check every change record; they pick N at random and read them. Have a process that can deliver any change record within an hour, including the diff, the reviewer, the test evidence, and the deploy timestamp.
+- **Continuous evidence** — collect the evidence continuously rather than scrambling once a quarter. The Compliance Operator scans nightly; the SIEM retains 12 months of audit logs; the registry retains every signing event indefinitely. The annual audit becomes a sampling exercise on data you already have.
+
+The team that does this well finishes a SOC 2 audit in two weeks of part-time engineering effort. The team that does not spends two months scrambling for screenshots and answers ad-hoc questions in real time.
+
+## The change-record discipline
+
+PCI-DSS, SOC 2, and ISO 27001 all expect a record of every change to production. In a GitOps world, the **pull request is your unit of change** and the unit of evidence. Required metadata:
+
+- **What changed** — the diff, automatically captured by Git.
+- **Why** — a link to an issue, threat model, or ticket. Free-form "fix bug" is not enough; "fixes #1234, resolves CVE-2026-1234" is.
+- **Who approved** — the code-owner who reviewed and merged. Two reviewers for high-risk paths, encoded in CODEOWNERS.
+- **Test evidence** — link to the CI run, including the SAST/SCA/scan results.
+- **Time of change** — the merge timestamp; for production rollouts, the Argo CD sync timestamp.
+- **Rollback procedure** — in the PR description or linked runbook. "Revert this PR and resync" is acceptable for most workload changes; platform changes need a documented rollback.
+
+Embed these as the PR template. The five extra lines per PR look annoying on day one and pay back at every audit, every incident postmortem, every "who broke prod" conversation.
+
+## Privacy and data protection
+
+Privacy compliance lives one layer above the technical security controls. It is about what data you collect, how long you keep it, who you share it with, and what rights individuals have over their own records. The platform team enables the controls; the legal and product teams own the choices.
+
+The frameworks:
+
+- **GDPR** (EU) — strong data-subject rights (access, rectification, erasure, portability), 72-hour breach notification, a Data Protection Officer requirement for high-risk processors, and a lawful-basis requirement for any processing. Penalties up to 4% of global revenue.
+- **CCPA / CPRA** (California) — consumer access and deletion rights, opt-out for sale of personal information, sensitive-data categories. The de facto U.S. floor; many states have adopted similar laws.
+- **DPDP** (India, 2023) — newer act, enforcement still evolving. Roughly GDPR-shaped with India-specific notification timelines and a sectoral regulator for the financial industry.
+- **Bangladesh Data Protection Act** — in draft as of 2026; track the consultation. BFSI work in-country is currently governed by the Bangladesh Bank ICT Security Guideline and contract-level data-handling commitments.
+
+What the platform actually provides: encrypted transport, encrypted storage, retention-policy-driven deletion, deletion-on-request workflows, audit logs that prove deletions happened. What it does not provide: the decision of whether to collect a particular field in the first place. That conversation belongs in product + legal, with platform consulting on feasibility.
+
+## Continuous compliance — what it looks like
+
+The end-state posture, regardless of which frameworks you map:
+
+- **Daily Compliance Operator scans** push results to a central dashboard. Failures generate tickets to the responsible team. Trend charts at the executive level.
+- **RHACS continuous monitoring** alerts on drift the moment it appears; the SIEM correlates and forwards to the on-call.
+- **Quarterly executive review** of the control posture — fail count by severity, MTTR for control failures, trend over the last four quarters. Not a security review; a compliance-posture review.
+- **Annual auditor engagement** is a sampling exercise on already-collected evidence. Two weeks of engineering time, not two months.
+- **A continuous improvement loop** — every postmortem and every audit finding generates a remediation that ends up as an automation, so the next audit is cleaner than the last.
+
+The compliance team becomes an enabler rather than a blocker. They write the controls in the language of the framework, but the controls are implemented and evidenced by automation that the platform team already runs.
+
+## Lab posture
+
+What the lab has today:
+
+- **Compliance Operator** runs nightly on `spoke-dc-v6` against the tailored PCI-DSS v4 profile. Current fail counts hover around 8 Critical / 3 High / 0 Medium; remediation playbooks at [`/docs/openshift-platform/operations/incidents-and-runbooks/pci-dss-remediation-and-evidence`](/docs/openshift-platform/operations/incidents-and-runbooks/pci-dss-remediation-and-evidence).
+- **RHACS Compliance** dashboard mapped to PCI-DSS and CIS Kubernetes Benchmark.
+- **GitOps with required PR review** on every `platform-gitops` change; protected `main`, CODEOWNERS for every directory of consequence.
+- **Image signing** via cosign for every internally-built image; Sigstore Policy Controller admission policy in front of production namespaces.
+- **Audit log retention** of 30 days hot in Loki; the BFSI extension to 12 months is in progress (Module 11 covers the retention strategy).
+
+What the lab is still missing:
+
+- **SOC 2 and ISO 27001 control mapping** — Tier-3 gap in the BFSI readiness review. The Compliance Operator output is PCI-DSS-shaped; the SOC 2 and ISO 27001 mappings are spreadsheet exercises not yet automated.
+- **Evidence pack collection** — currently per-control runbooks; not yet a single continuously-updated artifact. Tier-2 gap.
+- **Privacy data-subject workflows** — Bangladesh DPA is still draft; the platform supports retention and deletion but the user-facing request workflow is not built.
+
+## Try this
+
+**Exercise 1.** Pick a single PCI-DSS requirement — Req 8.3.7 (rotate user credentials at least every 90 days) is a good one — and identify every lab control that satisfies it. Likely candidates: Keycloak's password policy, Vault's KV v2 max-versions, the ESO refresh interval for short-lived secrets, the operating-system PAM config. Write the evidence-pack template: for each control, name the system, the configuration file or CR that proves it, and the query that retrieves the current value.
+
+**Exercise 2.** Run a Compliance Operator scan against `xccdf_org.ssgproject.content_profile_pci-dss`. Identify one failing rule that does not apply to your environment. Write the `TailoredProfile` CR that excludes the rule, including a `description:` field that records the rationale a future auditor can read. Re-run the scan and confirm the count dropped by one.
+
+**Exercise 3.** Open RHACS Compliance, pick the PCI-DSS profile, and map the dashboard's MITRE ATT&CK coverage. Identify the one ATT&CK technique with the most uncovered detections. That is your security-detection backlog item for the quarter — feed it into Module 11.
+
+## Common failure modes
+
+**Pass the audit, fail at incident response.** The control was "implemented" — there is a policy document, a screenshot, a signed-off form — but the team cannot actually execute it under pressure at 3am. The audit signed off because the artifact existed; the reality is that the runbook is six months stale and the on-call has never run it. Tabletop exercises (Module 11) close this gap.
+
+**Tailored profile exclusions documented in Slack instead of in the `TailoredProfile` CR.** The exclusion is invisible to the auditor; the audit fails or surfaces an awkward "why did this rule pass?" conversation. Always encode the rationale in the CR itself.
+
+**Compliance Operator scan results stored only in a per-cluster log.** Each cluster has its scans; nobody aggregates. An auditor's "show me the fleet-wide posture" question takes a day to answer. Aggregate to a central dashboard from day one — Loki + Grafana, or RHACS Compliance, or a SIEM index.
+
+**Evidence pack stored on a personal laptop.** The laptop dies, the engineer leaves, the audit recovery is a nightmare. Evidence belongs in the same kind of durable storage as production logs — object store with retention policy, indexed search, role-based access.
+
+**Compliance as a "security team" project rather than an "engineering" practice.** The security team writes policies; the engineering team builds systems that do not produce the evidence the policies require. The fix is to embed compliance into the platform — every Helm chart ships with the metadata, every GitOps PR template has the audit fields, every Application produces structured deploy events.
+
+## References
+
+- PCI-DSS v4.0 (PCI Security Standards Council): `https://www.pcisecuritystandards.org/`
+- SOC 2 Trust Services Criteria (AICPA): `https://www.aicpa-cima.com/topic/audit-assurance/audit-and-assurance-greater-than-soc-2`
+- ISO 27001:2022 overview (ISO): `https://www.iso.org/standard/27001`
+- NIST 800-53 r5: `https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final`
+- OpenShift Compliance Operator: `https://docs.redhat.com/en/documentation/openshift_container_platform/latest/html/security_and_compliance/`
+- OPA Gatekeeper: `https://open-policy-agent.github.io/gatekeeper/`
+- Kyverno: `https://kyverno.io/`
+- Bangladesh Bank ICT Security Guideline: `https://www.bb.org.bd/`
+- RBI Cyber Security Framework (Reserve Bank of India): `https://www.rbi.org.in/`
+- MAS Technology Risk Management Guidelines (Singapore): `https://www.mas.gov.sg/`
+
+**Next:** [Module 11 — Security observability and SIEM](/learn/devsecops/security-observability-and-siem).

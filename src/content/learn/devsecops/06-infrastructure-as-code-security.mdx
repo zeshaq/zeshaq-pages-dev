@@ -1,0 +1,298 @@
+---
+title: "Infrastructure-as-Code security — scanning, admission, and the two-layer model"
+sidebar_label: "06 — IaC security"
+description: "Treat Terraform, Helm, and raw YAML like application code. Scan it in CI, gate it at admission, and pick between OPA/Gatekeeper, Kyverno, and the new Kubernetes-native ValidatingAdmissionPolicy."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const denyEdge = { style: { stroke: "#b91c1c", strokeDasharray: "5,5", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const mutedEdge = { style: { stroke: "#6b7280", strokeDasharray: "3,3" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const iacNodes = [
+  { id: "dev",     position: { x: 40,  y: 140 }, data: { label: "developer\n(git push)" },              style: stage },
+  { id: "ci",      position: { x: 240, y: 140 }, data: { label: "CI pipeline\n(Tekton / Jenkins)" },     style: ctrl },
+  { id: "scan",    position: { x: 240, y: 30  }, data: { label: "Pre-deploy scan\n(Trivy / Checkov)" },  style: ctrl },
+  { id: "registry",position: { x: 440, y: 140 }, data: { label: "Helm chart / manifest\nbundle in repo" }, style: stage },
+  { id: "argo",    position: { x: 640, y: 140 }, data: { label: "Argo CD on spoke\n(applies manifests)" }, style: ctrl },
+  { id: "api",     position: { x: 840, y: 140 }, data: { label: "kube-apiserver\nadmission chain" },     style: ctrl },
+  { id: "vap",     position: { x: 840, y: 30  }, data: { label: "ValidatingAdmissionPolicy\n(CEL, in-process)" }, style: agent },
+  { id: "gk",      position: { x: 840, y: 260 }, data: { label: "Gatekeeper / Kyverno\nadmission webhook" }, style: agent },
+  { id: "etcd",    position: { x: 1040,y: 140 }, data: { label: "etcd\n(stored object)" },               style: stage },
+  { id: "rej",     position: { x: 640, y: 30  }, data: { label: "rejected in CI\n(exit 1)" },            style: ext },
+  { id: "rej2",    position: { x: 1040,y: 260 }, data: { label: "rejected at admission\n(deny + reason)" }, style: ext },
+];
+
+export const iacEdges = [
+  { id: "e1", source: "dev",      target: "ci",        ...reqEdge },
+  { id: "e2", source: "ci",       target: "scan",      label: "trivy config", ...reqEdge },
+  { id: "e3", source: "scan",     target: "rej",       label: "HIGH/CRITICAL", ...denyEdge },
+  { id: "e4", source: "ci",       target: "registry",  label: "publish",      ...reqEdge },
+  { id: "e5", source: "registry", target: "argo",      label: "sync",         ...reqEdge },
+  { id: "e6", source: "argo",     target: "api",       label: "apply",        ...reqEdge },
+  { id: "e7", source: "api",      target: "vap",       label: "CEL eval",     ...mutedEdge },
+  { id: "e8", source: "api",      target: "gk",        label: "webhook call", ...mutedEdge },
+  { id: "e9", source: "gk",       target: "rej2",      label: "deny",         ...denyEdge },
+  { id: "e10",source: "api",      target: "etcd",      label: "stored",       ...reqEdge },
+];
+
+Module 05 covered software-supply-chain attestation — what's *in* an image and whether you can trust it. This module is one layer up. The thing you're about to deploy isn't an image; it's a Helm chart, a Terraform module, a Kustomize overlay, a raw `Deployment.yaml`. That configuration is now the most common attack surface in cloud. Misconfigure the bucket and the data is public; misconfigure the Pod and a tenant becomes root on the node.
+
+The argument of this module is that **configuration is code**, and code gets scanned, reviewed, and gated. You'll see two layers — pre-deploy scanning in CI, and at-deploy admission control — and the three engines that compete for the second layer: OPA/Gatekeeper, Kyverno, and the new in-tree ValidatingAdmissionPolicy.
+
+## The IaC security problem
+
+The 2025-era cloud-breach pattern is no longer the dramatic zero-day. It's a public S3 bucket nobody noticed, an IAM role with `*:*` on every resource, a Kubernetes Pod with `hostPath: /` mounted by accident, a Helm chart shipping `privileged: true` because the upstream maintainer added it as a "convenience." Verizon's annual breach report has spent five years now putting misconfiguration in the top three causes — usually number one for cloud-native environments.
+
+The reason is structural. Cloud and Kubernetes config is *executable*. A Terraform `aws_s3_bucket` with `acl = "public-read"` is a working configuration; the cloud accepts it and the bucket is public the moment `terraform apply` finishes. There's no compiler to reject it, no type system to flag it, and human review catches maybe 60% of the obvious cases. The fix is the same fix the application world figured out fifteen years ago: scan the code, fail the build, gate the deploy.
+
+Treat IaC the way you treat application source. Lint it, scan it for known bad patterns, run unit tests if your framework supports them, and never deploy unscanned config to production. The tools and patterns below are the ones that make this possible.
+
+## The two-layer model
+
+<Whiteboard client:load data={{ nodes: iacNodes, edges: iacEdges }} height={420} />
+
+Reading the diagram: a developer pushes config; CI runs a pre-deploy scanner; HIGH/CRITICAL findings fail the build. Surviving config is published to a chart repo and synced by Argo CD onto the spoke. The kube-apiserver hands every incoming object to the admission chain — VAP (in-process CEL) plus a webhook engine like Gatekeeper or Kyverno — and either persists it to etcd or rejects it with a reason.
+
+You need both layers. **Pre-deploy** catches almost everything if your CI is the only path to production; nothing is cheaper than a build that fails in 30 seconds before any cluster has seen the change. **At-deploy** catches the rest — the manual `kubectl apply` from a workstation, the operator that reconciles its own CR into a sub-resource the CI never saw, the dependency chart that re-renders a privileged container at install time. The two are complementary; either alone has holes.
+
+The mistake to avoid is shipping only admission control. Admission is the last line of defence; if every deploy bounces at admission, your platform becomes the thing developers route around, not through. Pre-deploy scanning is the line that gives developers fast feedback in the place they expect it (CI), with admission as the backstop for the configurations CI never saw.
+
+## Pre-deploy IaC scanners
+
+The pre-deploy market is crowded. The choices that matter today:
+
+| Tool | Coverage | License | When |
+| --- | --- | --- | --- |
+| **Checkov** | Terraform, CloudFormation, Helm, K8s YAML, ARM, Bicep, Dockerfile | Apache 2.0 | Pragmatic default; broadest framework support. |
+| **Trivy config** (folded-in `tfsec`) | Terraform, K8s YAML, Helm, Dockerfile, CloudFormation | Apache 2.0 | If you already run Trivy on container images — same binary. |
+| **Terrascan** | Terraform, K8s, Helm, Kustomize, ARM | Apache 2.0 | Tenable-backed; integrates with their stack. |
+| **kubesec.io** | Kubernetes YAML | Apache 2.0 | Single-shot score; old but still useful as a sanity check. |
+| **kubeaudit** | Kubernetes YAML | Apache 2.0 | Focused; good for one-off audits. |
+| **Polaris** (Fairwinds) | Kubernetes manifests + RBAC | Apache 2.0 | Opinionated defaults; nice dashboard. |
+| **Snyk IaC** | Terraform, K8s, Helm, CloudFormation | Commercial | If you already pay for Snyk on app dependencies. |
+
+The pragmatic recommendation for a team that already runs Trivy on container images is **`trivy config`**. Same binary, same `.trivyignore`, same CI integration story. `tfsec` was folded into Trivy in 2023 and the standalone tool is now in maintenance mode; the Terraform-specific rules live inside Trivy's config-scan path.
+
+Checkov is the alternative if you want the broadest coverage in one tool — its rule library is the largest in the open-source IaC-scanning space, and it understands more frameworks than any other open-source scanner. Some teams run both: Trivy for the fast every-PR scan, Checkov for the deeper nightly job. There's no harm in overlap.
+
+## A Trivy-config CI snippet
+
+```bash
+# Run before any helm install / argo apply / terraform apply
+trivy config \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  --ignorefile .trivyignore \
+  --skip-dirs vendor,.git \
+  ./terraform/ ./helm/ ./k8s/
+```
+
+Three flags carry the load. `--severity HIGH,CRITICAL` is the gate — MEDIUM and LOW findings are reported but don't fail the build (most teams have hundreds of MEDIUM findings on day one, and failing on them would block every merge). `--exit-code 1` is what makes the CI job red on findings. `--ignorefile` points at `.trivyignore`, which is the workflow for accepted exceptions.
+
+Every exception in `.trivyignore` should carry a date, a reason, and an expiry. The convention is `AVD-AWS-0086 # 2026-04-15 / public bucket, see ticket SEC-1042 / expires 2026-07-15`. Without an expiry, exceptions become permanent — the original tenant moves on, the CVE is still suppressed two years later, and nobody can explain why. Run a monthly job that lists expired entries and fails the build until they're renewed or removed.
+
+The false-positive rate on a fresh repo is usually 20-40% in the first week and drops to under 5% once you've tuned the rule set for your environment. The teams that give up on IaC scanning give up in week one, when every PR has 30 findings; the teams that succeed take a week to triage the baseline and never look back.
+
+## At-deploy policy — OPA / Gatekeeper
+
+**Open Policy Agent (OPA)** is a general-purpose policy engine. You write rules in **Rego**, a small declarative query language, and the engine evaluates them against arbitrary JSON input. OPA itself is framework-agnostic — it runs in Envoy filters, in Terraform Cloud's Sentinel-alternative, in CI gates, anywhere you can feed it JSON.
+
+**Gatekeeper** is the Kubernetes admission webhook that wraps OPA. The kube-apiserver calls Gatekeeper on every create/update; Gatekeeper evaluates every `Constraint` whose `match` clause selects the request; if any constraint rejects, the apiserver returns 403 with a reason. Constraints reference reusable `ConstraintTemplate` CRDs — the template defines the Rego, the constraint provides parameters.
+
+A `ConstraintTemplate` that requires every Namespace to carry a `cost-center` label:
+
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names: { kind: K8sRequiredLabels }
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels: { type: array, items: { type: string } }
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+        violation[{"msg": msg}] {
+          required := input.parameters.labels
+          missing := required[_]
+          not input.review.object.metadata.labels[missing]
+          msg := sprintf("missing label: %v", [missing])
+        }
+```
+
+And the matching `Constraint`:
+
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: ns-cost-center
+spec:
+  match:
+    kinds: [{ apiGroups: [""], kinds: ["Namespace"] }]
+  parameters:
+    labels: ["cost-center"]
+```
+
+The template is reusable — you write it once, then create one Constraint per labelled resource type. Gatekeeper ships a community policy library with dozens of pre-written templates: `K8sRequiredLabels`, `K8sBlockNodePort`, `K8sPSPAllowedRepos`, `K8sUniqueIngressHost`, and many more. Most teams write zero Rego in the first six months — they just constrain the library templates with their own parameters.
+
+## Kyverno — the policy-engine alternative
+
+**Kyverno** is the other major Kubernetes-native admission engine. It does the same job as Gatekeeper — validates admission requests, rejects bad ones — but with a different design philosophy: **policies are written in YAML, not Rego**. There's no separate template-and-constraint split; one CR (`ClusterPolicy` or namespace-scoped `Policy`) holds the rule.
+
+The same "require cost-center label" rule in Kyverno:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cost-center-label
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: ns-must-have-cost-center
+      match:
+        any:
+          - resources: { kinds: [Namespace] }
+      validate:
+        message: "Namespace must carry a 'cost-center' label"
+        pattern:
+          metadata:
+            labels:
+              cost-center: "?*"
+```
+
+Half the lines and no new language to learn. Kyverno does more than validation, too — it has first-class **mutation** (auto-inject sidecars, default labels, imagePullSecrets) and **generation** (create a default-deny NetworkPolicy whenever a new Namespace appears). Gatekeeper added mutation support later as a separate feature, but Kyverno designed for it from day one.
+
+You run **one** of these, not both. They sit in the same admission slot; running both is duplicate webhook overhead and twice the operator surface for no policy benefit. Pick one, commit, and stick with it.
+
+## When to pick which
+
+| Engine | Strong at | Weak at |
+| --- | --- | --- |
+| **Gatekeeper** | Complex data-flow rules, large existing Rego library, CNCF Graduated, maturity | Mutation is a separate feature; Rego is a learning curve. |
+| **Kyverno** | YAML-only policies, mutation + generation built in, fast on-ramp | Smaller community policy library; less expressive for edge cases. |
+| **VAP** (CEL) | In-process, no extra controller pods, fast | Per-resource only; no mutation; smaller rule surface. |
+
+Gatekeeper has the older installed base and the Rego-driven heritage; Kyverno has the momentum with newer teams. Both are production-ready and both are CNCF projects (Gatekeeper Graduated, Kyverno Incubating). The choice today is largely about how much Rego your team wants to learn and whether you need mutation/generation.
+
+For a team starting fresh in 2026 with no existing Rego investment, Kyverno's on-ramp is shorter. For a team already running Gatekeeper with a tuned policy set, switching is rarely worth it. The lab runs Gatekeeper on `spoke-dc-v6` for historical reasons — see [`/docs/openshift-platform/platform-services/gatekeeper`](/docs/openshift-platform/platform-services/gatekeeper).
+
+## The Kubernetes Pod Security Standards
+
+Before you reach for a policy engine, check whether the built-in **Pod Security Standards (PSS)** cover the rule. PSS is the CNCF-blessed baseline, shipped in every Kubernetes 1.25+ cluster, and it costs zero — no extra controller, no extra CRDs, no webhook latency.
+
+PSS defines three profiles, applied per Namespace via labels:
+
+- **Privileged** — anything goes. Use for `kube-system`, `openshift-*`, and other infrastructure namespaces.
+- **Baseline** — blocks the worst patterns: `hostPath`, `privileged: true`, `hostPID`, `hostNetwork`, `hostIPC`, `hostProcess`. The bare minimum.
+- **Restricted** — strong defaults: non-root containers, `runAsNonRoot: true`, drop all capabilities, `seccompProfile: RuntimeDefault`, no `allowPrivilegeEscalation`. The sane default for tenant namespaces.
+
+Apply by labelling the namespace:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app-payments
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+The three modes — `enforce`, `audit`, `warn` — let you stage the rollout. Start `audit`/`warn` to surface violations without blocking; promote to `enforce` once the namespace is clean. The lab's tenant template sets `restricted` by default on new tenant namespaces; opt-out requires explicit justification.
+
+PSS covers maybe 70% of what a typical "no privileged pods" policy set would do. Reach for Gatekeeper or Kyverno for the other 30% — rules that PSS doesn't express (required labels, allowed image registries, network-policy presence, cross-resource invariants).
+
+## ValidatingAdmissionPolicy
+
+Kubernetes 1.30 added **ValidatingAdmissionPolicy (VAP)** as a built-in admission engine. Rules are written in **CEL** (Common Expression Language — the same language used in Kubernetes API field validation, Istio AuthorizationPolicy, and gRPC). VAP runs in-process inside the kube-apiserver — no extra controller pods, no webhook latency, no operator to babysit.
+
+A VAP that does the cost-center-label check:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: require-cost-center
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+  validations:
+    - expression: "has(object.metadata.labels) && 'cost-center' in object.metadata.labels"
+      message: "Namespace must carry a 'cost-center' label"
+```
+
+VAP is best for simple per-resource constraints. CEL is less expressive than Rego for cross-resource invariants ("count of Services with label X must be less than Y"), and there's no native mutation. But for the common case — "this resource must have this shape" — it's lighter than Gatekeeper or Kyverno and runs without any extra workload.
+
+The lab uses VAP for the routes-CRD guardrail — see [`/docs/openshift-platform/gitops-operating-model/routes-crd-guardrail-vap`](/docs/openshift-platform/gitops-operating-model/routes-crd-guardrail-vap). The rule blocks anyone from creating a `routes.route.openshift.io` CRD on the cluster (the rogue gitops-addon issue from ACM Module 04). It's a single VAP; it would have been a ConstraintTemplate + Constraint in Gatekeeper. VAP wins for that kind of small, surgical rule.
+
+## Lab posture
+
+The lab's current IaC-security stack:
+
+- **Pre-deploy** — `trivy config` runs on every PR in `opp-full-plat` and `platform-gitops`. HIGH/CRITICAL fail the build. Exceptions go in `.trivyignore` with mandatory expiry comments.
+- **Admission engine** — Red Hat Gatekeeper Operator on `spoke-dc-v6`. The hub doesn't run app workloads so Gatekeeper isn't installed there. See [`/docs/openshift-platform/platform-services/gatekeeper`](/docs/openshift-platform/platform-services/gatekeeper).
+- **VAP** — used for the routes-CRD guardrail and a small number of in-tree-cheap rules. See the cross-link above.
+- **RHACS app-team policy set** — runtime + admission policies fanned out via the SecuredCluster's policy engine. See [`/docs/openshift-platform/security/app-team-policy-set`](/docs/openshift-platform/security/app-team-policy-set).
+- **PSS `restricted`** — the default for every tenant namespace, applied by the tenant onboarding template. See [`/docs/application-delivery/tenant-onboarding/tenant-template`](/docs/application-delivery/tenant-onboarding/tenant-template).
+
+The pattern is defence-in-depth, not single-tool. Trivy catches misconfig in CI; PSS provides the baseline that costs nothing; Gatekeeper covers the rules PSS doesn't express; VAP handles the surgical cases; RHACS adds the runtime layer (Module 07). Each layer has a hole the next one fills.
+
+## Try this
+
+1. **Run `trivy config` on a Helm chart you maintain.** Identify the top five findings. For each, decide whether it's a real fix, a tunable parameter, or a genuine exception (and if so, write the `.trivyignore` line with an expiry).
+2. **Write a Gatekeeper `ConstraintTemplate`** that requires every `Deployment` to have a `team` label. Apply it; create a Deployment without the label; observe the rejection message.
+3. **Rewrite the same rule in Kyverno.** Compare line counts and reading effort. Decide which feels more maintainable for your team.
+4. **Apply PSS `restricted` to a namespace.** Deploy a Pod with `privileged: true`. Observe the rejection — the message names the offending field, which is the operational gold of PSS.
+
+## Common failure modes
+
+**Pre-deploy scan passes but at-deploy rejects.** The two layers are configured with different rule sets. Trivy ships its own rule library; Gatekeeper has yours. Reconcile them — either keep both rule sets in sync by deriving them from a single source, or accept the drift and document which layer is canonical for which class of rule.
+
+**Gatekeeper policies pass on the spoke but the hub keeps NonCompliant.** The hub doesn't run app workloads; policies meant for app-shaped namespaces shouldn't target the hub. Scope your Constraints with a `namespaceSelector` or your ACM Placement's cluster selector. The lab's pattern is `cluster-role=spoke` on the Placement.
+
+**Kyverno mutation conflicts with cert-manager.** Both are admission webhooks; if Kyverno mutates the resource after cert-manager has injected its own field, you get fight-loops. The fix is the `failurePolicy` and `reinvocationPolicy` on the Kyverno webhook — set `reinvocationPolicy: IfNeeded` and order matters via webhook-name lexical order. Document the ordering decision; it's load-bearing and not obvious.
+
+**VAP rule "passes" but the resource is still wrong.** CEL doesn't have side effects; if your `validations.expression` is malformed, the engine reports a CEL evaluation error and the request defaults to allow (`failurePolicy: Fail` to flip that). Always test VAP rules with a known-bad input before trusting them; the silent-allow case is the bug everyone hits once.
+
+**The .trivyignore became a graveyard.** Six months in, half your suppressions are orphaned — original tenant gone, original justification forgotten, CVE long since fixed upstream. The discipline is a quarterly review of every line, plus a CI job that fails the build when an expiry has passed without renewal. The expiry is what makes the file useful.
+
+## References
+
+- Checkov: [checkov.io](https://www.checkov.io/)
+- Trivy config scanning: [aquasecurity.github.io/trivy](https://aquasecurity.github.io/trivy/latest/docs/scanner/misconfiguration/)
+- Terrascan: [runterrascan.io](https://runterrascan.io/)
+- kubesec.io: [kubesec.io](https://kubesec.io/)
+- Polaris (Fairwinds): [polaris.docs.fairwinds.com](https://polaris.docs.fairwinds.com/)
+- Open Policy Agent: [openpolicyagent.org](https://www.openpolicyagent.org/)
+- Gatekeeper: [open-policy-agent.github.io/gatekeeper](https://open-policy-agent.github.io/gatekeeper/website/)
+- Gatekeeper community policy library: [open-policy-agent.github.io/gatekeeper-library](https://open-policy-agent.github.io/gatekeeper-library/website/)
+- Kyverno: [kyverno.io](https://kyverno.io/)
+- Pod Security Standards: [kubernetes.io/docs/concepts/security/pod-security-standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+- ValidatingAdmissionPolicy: [kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)
+- CEL spec: [github.com/google/cel-spec](https://github.com/google/cel-spec)
+
+**Next:** [Module 07 — Runtime security](/learn/devsecops/runtime-security) — what scanning can't see, and the tools that watch for it after the deploy.
