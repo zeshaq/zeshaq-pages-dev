@@ -1,0 +1,415 @@
+---
+title: "Build a project (capstone)"
+sidebar_label: "12 — Capstone"
+description: "End-to-end walkthrough: a credit-card-fraud classifier from a CSV in object storage to a KServe InferenceService with HPO, canary rollout, drift monitoring, and per-tenant audit — the whole track in one BFSI-shaped project."
+estimated_minutes: 120
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 170, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const capNodes = [
+  { id: "raw", data: { label: "Raw CSV\n(MinIO bucket: fraud-raw)" }, position: { x: 40, y: 30 }, style: ext, type: "shape" },
+  { id: "nb", data: { label: "Jupyter notebook\n(EDA, class balance)" }, position: { x: 240, y: 30 }, style: agent, type: "shape" },
+  { id: "prep", data: { label: "prepare_data\n(features, 80/20 split)" }, position: { x: 460, y: 30 }, style: agent, type: "shape" },
+  { id: "base", data: { label: "train_baseline\n(default XGBoost)" }, position: { x: 680, y: 30 }, style: agent, type: "shape" },
+  { id: "katib", data: { label: "Katib Experiment\n(TPE, 30 trials)" }, position: { x: 680, y: 150 }, style: agent, type: "shape" },
+  { id: "hpo", data: { label: "train_with_hpo\n(best params from Katib)" }, position: { x: 460, y: 150 }, style: agent, type: "shape" },
+  { id: "eval", data: { label: "eval_and_deploy\n(PR-AUC compare → canary)" }, position: { x: 240, y: 150 }, style: agent, type: "shape" },
+  { id: "reg", data: { label: "Model registry\n(MinIO + MLMD)" }, position: { x: 40, y: 150 }, style: ext, type: "shape" },
+  { id: "kserve", data: { label: "KServe InferenceService\n(canary 10% → 50% → 100%)" }, position: { x: 40, y: 280 }, style: agent, type: "shape" },
+  { id: "client", data: { label: "Inference client\n(payments tx scoring)" }, position: { x: 240, y: 280 }, style: stage, type: "shape" },
+  { id: "obs", data: { label: "Prometheus + Grafana\n(latency, error, drift)" }, position: { x: 460, y: 280 }, style: ctrl, type: "shape" },
+  { id: "audit", data: { label: "Per-tenant audit log\n(deploy + inference)" }, position: { x: 680, y: 280 }, style: ext, type: "shape" },
+];
+
+export const capEdges = [
+  { id: "e1", source: "raw", target: "nb", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "nb", target: "prep", style: { stroke: "#1f2937" } },
+  { id: "e3", source: "prep", target: "base", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "prep", target: "hpo", style: { stroke: "#1f2937" } },
+  { id: "e5", source: "katib", target: "hpo", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "best params" },
+  { id: "e6", source: "base", target: "eval", style: { stroke: "#1f2937" } },
+  { id: "e7", source: "hpo", target: "eval", style: { stroke: "#1f2937" } },
+  { id: "e8", source: "eval", target: "reg", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "upload model" },
+  { id: "e9", source: "reg", target: "kserve", style: { stroke: "#1f2937" }, label: "model URI" },
+  { id: "e10", source: "client", target: "kserve", style: { stroke: "#1f2937" }, label: "predict" },
+  { id: "e11", source: "kserve", target: "obs", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "metrics" },
+  { id: "e12", source: "kserve", target: "audit", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "deploy + req" },
+];
+
+The previous eleven modules each covered one slice of Kubeflow. This one stitches them into a single concrete project — a credit-card-fraud classifier — so you can finish the track with something you have actually built, not just read about. BFSI-shaped on purpose: severe class imbalance, regulator-relevant lineage, real autoscaling concerns, an audit story.
+
+The project: a 4-step KFP pipeline that prepares data, trains a baseline, trains an HPO-tuned variant via a Katib Experiment, and deploys the better model as a KServe InferenceService with a canary rollout. Plus a Grafana dashboard for inference latency and a basic data-drift indicator. By the end you should be able to point at every box on the diagram and say what command produced it.
+
+Most of this walkthrough assumes you have access to a Kubeflow cluster (any distribution — vanilla manifests, RHOAI, ODH, Charmed all work). If you do not, you can shape the steps as a thought experiment using the lab's `spoke-dc-v6` posture — the manifests and `kubectl` invocations are real either way.
+
+## What you will build
+
+<Whiteboard client:load data={{ nodes: capNodes, edges: capEdges }} height={500} />
+
+Reading the diagram:
+
+- **MinIO** holds the raw CSV, the prepared parquet, the trained models. One bucket, three prefixes (`fraud-raw/`, `fraud-prepared/`, `fraud-models/`).
+- The **Jupyter notebook** does the EDA — load the data, look at class balance, write a summary.
+- The **4-step KFP pipeline** is the green path: prepare → baseline + HPO (in parallel after Katib runs) → eval and deploy.
+- **Katib** runs a 30-trial TPE study; the best parameters feed into the `train_with_hpo` step. Dashed green animated edges show this control-plane data flow.
+- The **KServe InferenceService** serves the winning model. It scales between 1 and 4 replicas, exposes a Prometheus metrics endpoint, and emits per-tenant audit events.
+- Dashed grey edges are telemetry — to Prometheus/Grafana for SLOs and to the per-tenant audit index for compliance.
+
+Solid black is artifact and data path; dashed green animated is cross-component control plane; dashed grey is observability.
+
+## Prerequisites
+
+- **A Kubeflow cluster** (any distribution). The Profile Controller, Pipelines, Katib, KServe all need to be installed. Module 10 covers the install.
+- **A Profile namespace with quota.** Per Module 09 — a Profile with at least 4 vCPU / 16 GiB memory / 0 GPU (this project is CPU-friendly). If you want to use GPU for the XGBoost training step, add 1 GPU to the quota.
+- **MinIO or S3 access** for the artifact bucket. The Profile's default ServiceAccount must have credentials.
+- **A dataset.** The public Kaggle "Credit Card Fraud Detection" dataset is the example — 284k anonymised transactions, 0.17% labelled as fraud. Synthetic data with the same shape works equally well; the point is the class imbalance, not the specific schema.
+
+Budget: 60-90 minutes if everything works, double that on a first run.
+
+## Step 1: Notebook and EDA
+
+Spin up a Jupyter notebook from the Kubeflow Central Dashboard. Pick the `jupyter-pytorch-cuda` image (or `jupyter-scipy` if you want a slimmer notebook); request 2 CPU and 4 GiB. Add the Profile's MinIO credentials as a Secret mounted at `/opt/minio`.
+
+Inside the notebook:
+
+```
+import pandas as pd
+import boto3
+
+s3 = boto3.client("s3", endpoint_url="http://minio.kubeflow:9000",
+                  aws_access_key_id="...", aws_secret_access_key="...")
+s3.download_file("fraud-raw", "creditcard.csv", "/tmp/creditcard.csv")
+df = pd.read_csv("/tmp/creditcard.csv")
+print(df.shape, df["Class"].value_counts(normalize=True))
+```
+
+You should see something like `(284807, 31)` and a `Class` distribution of `0: 0.9983, 1: 0.0017`. **That class balance is the load-bearing fact for the rest of the project.** A model that predicts "not fraud" 100% of the time has 99.83% accuracy and is useless. From here forward, accuracy is the wrong metric — precision, recall, F1, and PR-AUC are what matter.
+
+Spend ten minutes on EDA. Plot the distribution of transaction amounts (heavy right tail), the hour-of-day distribution (fraud is not uniform; nights and weekends are over-represented), and the correlation matrix of the principal-component features (the Kaggle dataset is pre-PCA-transformed for privacy). Save the plots to MinIO as a "EDA summary" artifact — your future self will want them when an auditor asks why you picked the features you did.
+
+**Try this:** before you move on, run a baseline-of-the-baseline. `from sklearn.dummy import DummyClassifier; DummyClassifier(strategy="most_frequent").fit(X, y).score(X, y)` should land at 0.9983. If you forget this number you will be tempted by your first XGBoost run scoring "99.8%."
+
+## Step 2: Author the pipeline
+
+KFP v2 SDK. Four steps. Each step is a Python function decorated with `@dsl.component`; the decorator captures the inputs, outputs, and a base image.
+
+```
+from kfp import dsl, compiler
+
+@dsl.component(base_image="quay.io/internal/python:3.11-xgb")
+def prepare_data(raw: str, prepared: dsl.Output[dsl.Dataset]):
+    import pandas as pd
+    df = pd.read_csv(raw)
+    df["hour"] = (df["Time"] // 3600) % 24
+    df.to_parquet(prepared.path)
+
+@dsl.component(base_image="quay.io/internal/python:3.11-xgb")
+def train_baseline(data: dsl.Input[dsl.Dataset],
+                   model: dsl.Output[dsl.Model]) -> float:
+    import pandas as pd, xgboost as xgb
+    from sklearn.metrics import average_precision_score
+    df = pd.read_parquet(data.path)
+    y = df.pop("Class"); X = df
+    clf = xgb.XGBClassifier(scale_pos_weight=580).fit(X, y)
+    clf.save_model(model.path)
+    return average_precision_score(y, clf.predict_proba(X)[:, 1])
+```
+
+`train_with_hpo` is similar but accepts the best hyperparameters from Katib (a JSON blob, passed in as a parameter). `eval_and_deploy` takes both models' PR-AUC, picks the better one, uploads it to MinIO at a versioned path, and creates / patches a KServe InferenceService.
+
+The pipeline glue:
+
+```
+@dsl.pipeline(name="fraud-train-deploy")
+def fraud_pipeline(raw: str, best_params: str):
+    prep = prepare_data(raw=raw)
+    base = train_baseline(data=prep.outputs["prepared"])
+    hpo  = train_with_hpo(data=prep.outputs["prepared"], params=best_params)
+    eval_and_deploy(baseline=base.outputs["model"],
+                    candidate=hpo.outputs["model"],
+                    baseline_metric=base.output,
+                    candidate_metric=hpo.output)
+
+compiler.Compiler().compile(fraud_pipeline, "fraud.yaml")
+```
+
+Keep each component small. If a function is getting longer than ~30 lines, split it. The pipeline YAML is committed to `platform-gitops/tenants/fraud-modeling/pipelines/`; the actual run is human-driven for development, scheduled via `ScheduledWorkflow` for production.
+
+**Try this:** before submitting the pipeline, run each component as a plain Python function locally. KFP components are designed to be unit-testable; if `train_baseline(df)` does not give you a reasonable PR-AUC against a local sample, the pipeline will not save you.
+
+## Step 3: Run the pipeline
+
+Submit and watch:
+
+```
+from kfp import Client
+client = Client(host="http://ml-pipeline-ui.kubeflow:80")
+run = client.create_run_from_pipeline_package(
+    pipeline_file="fraud.yaml",
+    arguments={"raw": "s3://fraud-raw/creditcard.csv",
+               "best_params": '{"max_depth": 6, "eta": 0.1}'})
+print(run.run_id)
+```
+
+Open the Central Dashboard → Pipelines → Runs and follow the run. Each step is a Pod; failures are usually visible in the Pod logs (`oc -n <profile> logs <pod>`). The first run is the slow one — image pulls, MinIO connectivity probes, MariaDB writes for the metadata. Subsequent runs are faster because the images are cached.
+
+The HPO step in this pipeline is **synthetic** in the sense that we pass `best_params` as a literal JSON. In a production pipeline you would either kick off the Katib study, block on its completion, and read the best trial via the Katib API; or you would run Katib asynchronously, write the best params to a Secret/Artifact when the study finishes, and let the next pipeline run pick them up. Async is the right answer in production because HPO can take hours and blocking a pipeline run that long is wasteful.
+
+**Try this:** what happens if you change `compiler.Compiler().compile(...)` to produce a `.json` instead of a `.yaml`? KFP v2 supports both; pick the one your team can review more easily in a merge request. (YAML is usually the answer; reviewers can diff it.)
+
+## Step 4: Run a Katib Experiment
+
+A Katib Experiment is a CR that defines the search space, the objective, the algorithm, and the trial template. The trial template is a Job that runs your training code and emits a metric.
+
+```
+apiVersion: kubeflow.org/v1beta1
+kind: Experiment
+metadata:
+  name: fraud-xgb-hpo
+  namespace: fraud-modeling
+spec:
+  objective:
+    type: maximize
+    goal: 0.85
+    objectiveMetricName: validation_pr_auc
+  algorithm:
+    algorithmName: tpe
+  parallelTrialCount: 4
+  maxTrialCount: 30
+  earlyStopping:
+    algorithmName: medianstop
+  parameters:
+    - name: max_depth
+      parameterType: int
+      feasibleSpace: { min: "3", max: "10" }
+    - name: eta
+      parameterType: double
+      feasibleSpace: { min: "0.01", max: "0.3" }
+    - name: n_estimators
+      parameterType: int
+      feasibleSpace: { min: "100", max: "1000" }
+  trialTemplate:
+    primaryContainerName: training-container
+    trialParameters:
+      - name: maxDepth
+        reference: max_depth
+      - name: eta
+        reference: eta
+      - name: nEstimators
+        reference: n_estimators
+    trialSpec:
+      apiVersion: batch/v1
+      kind: Job
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: training-container
+                image: quay.io/internal/fraud-trainer:v1
+                args:
+                  - --max-depth=${trialParameters.maxDepth}
+                  - --eta=${trialParameters.eta}
+                  - --n-estimators=${trialParameters.nEstimators}
+```
+
+Apply it and Katib creates 4 Trial CRs at a time, schedules a Pod per trial, watches the Pod logs for the `validation_pr_auc=...` line, and feeds the results back into the TPE algorithm. After 30 trials (or earlier if `medianstop` early-stops poor branches), the Experiment moves to `Succeeded` and `oc get experiment fraud-xgb-hpo -o jsonpath='{.status.currentOptimalTrial}'` returns the best parameters.
+
+The training container is the same code as `train_with_hpo` in the pipeline, packaged as a CLI. Sharing the code between Katib trials and the pipeline step is the discipline that keeps the HPO results meaningful: if the trial container and the pipeline component drift apart, the "best parameters" optimise for something the pipeline does not use.
+
+**Try this:** start with `parallelTrialCount: 1` for the first run, watch one trial complete, then scale up. The first run is where you discover that your container does not write the metric in the format Katib expects, or that the image is missing a dependency. Catch it on trial one, not trial twenty-nine.
+
+## Step 5: Deploy the model with KServe
+
+The `eval_and_deploy` pipeline step uploads the winning model to MinIO and either creates a new InferenceService or patches an existing one. The InferenceService:
+
+```
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fraud-classifier
+  namespace: fraud-modeling
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 4
+    xgboost:
+      storageUri: s3://fraud-models/fraud-classifier/v3/
+      resources:
+        limits: { cpu: "2", memory: 4Gi }
+        requests: { cpu: "500m", memory: 1Gi }
+```
+
+`minReplicas: 1` keeps one Pod warm — important for latency-sensitive inference. `maxReplicas: 4` is the autoscaling ceiling. KServe's HPA uses the `request_concurrency` target (default 1) — if requests-per-replica exceeds the target, the controller scales out.
+
+Apply and wait. After 2-3 minutes:
+
+```
+oc -n fraud-modeling get inferenceservice fraud-classifier
+NAME               URL                                          READY
+fraud-classifier   http://fraud-classifier.fraud-modeling...    True
+```
+
+Test:
+
+```
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"instances": [[0, -1.359, -0.072, ...]]}' \
+  http://fraud-classifier-predictor.fraud-modeling/v1/models/fraud-classifier:predict
+```
+
+The response is a per-instance fraud probability. If you used the production-grade scaffolding from Module 11, the inference request also lands in your per-tenant log index and the latency histogram on the KServe predictor Pod's `/metrics` endpoint.
+
+**Try this:** kill one of the predictor Pods (`oc delete pod ...`). KServe should bring it back in under 30 seconds and your requests should not see errors (Knative buffers during the swap). If they do see errors, your `minReplicas` is too low or your readiness probe is too lax.
+
+## Step 6: Canary the new model
+
+The eval-and-deploy step does not flip 100% of traffic to the new model. It deploys as a **canary** — a separate InferenceService revision serving 10% of traffic:
+
+```
+spec:
+  predictor:
+    canaryTrafficPercent: 10
+    xgboost:
+      storageUri: s3://fraud-models/fraud-classifier/v4/
+```
+
+Watch the metrics for the canary alongside the stable version. If the canary's error rate stays below baseline and its latency does not regress, ramp up — 10% → 50% → 100% over a few hours, or longer for high-stakes deploys. If it regresses, set `canaryTrafficPercent: 0` and the canary becomes a no-op.
+
+For BFSI specifically, the canary stays at a low percentage for **a full business cycle** — a day, a week, a month, depending on how rare the production-data shape variations are. The bank that runs payments knows that Mondays look different from Fridays; the canary must survive both.
+
+**Try this:** instrument a small set of "shadow traffic" requests — replay last week's traffic against both stable and canary, compare predictions, look for disagreements. The disagreements are the signal that the new model behaves differently; whether that is good or bad depends on whether you trust the new model more. Shadow traffic is non-production, so disagreements do not affect customers.
+
+## Step 7: Observability and SLOs
+
+Three observability streams.
+
+**Inference latency.** KServe's `request_duration_seconds` histogram. Grafana panel:
+
+```
+histogram_quantile(0.95,
+  sum by (le) (
+    rate(request_duration_seconds_bucket{
+      namespace="fraud-modeling", name="fraud-classifier"
+    }[5m])
+  )
+)
+```
+
+P95 target: under 200ms for this model. Alert at 250ms for 5 minutes. The model itself is cheap (XGBoost inference on 30 features); P95 should be dominated by the Istio sidecar's network overhead.
+
+**Inference accuracy on labelled-after-the-fact data.** Fraud labels arrive late (a chargeback comes 30-60 days after the transaction). A daily backfill pipeline reads yesterday's inferences from the log index, joins with the new chargeback labels, computes precision/recall/F1 on the joined set, and emits a metric. This is the only "is the model still right" signal you get, and it is the one auditors care about most.
+
+**Data drift.** Track the distribution of incoming features:
+
+- Mean transaction amount.
+- Hour-of-day distribution.
+- Distribution of the principal-component features (KL divergence or population stability index versus the training distribution).
+
+When drift exceeds a threshold, alert the model owner. Drift does not mean the model is wrong (the data could legitimately have changed); it means somebody should look. The threshold is set by experimentation — too tight and you alert on noise, too loose and you miss real shifts.
+
+**Try this:** add one more metric — **calibration**. A well-calibrated model that predicts 0.7 should be correct 70% of the time. Bin the predictions, compute the empirical correct-rate per bin, plot the reliability diagram. A model that is well calibrated today and badly calibrated tomorrow is signalling drift before any other metric catches it.
+
+## Step 8: Wire into GitOps
+
+Commit everything:
+
+- `platform-gitops/tenants/fraud-modeling/profile.yaml` — the Profile CR (Module 09).
+- `platform-gitops/tenants/fraud-modeling/pipelines/fraud-train-deploy.yaml` — the compiled pipeline.
+- `platform-gitops/tenants/fraud-modeling/katib/fraud-xgb-hpo.yaml` — the Katib Experiment.
+- `platform-gitops/tenants/fraud-modeling/serving/fraud-classifier.yaml` — the InferenceService.
+- `platform-gitops/tenants/fraud-modeling/observability/dashboards/fraud-classifier.json` — the Grafana dashboard.
+- `platform-gitops/tenants/fraud-modeling/observability/alerts/fraud-classifier.yaml` — the Alertmanager rules.
+
+Argo CD on the hub picks all of this up via the existing ApplicationSet pattern. The pipeline run itself is human-driven for development; in production, a `ScheduledWorkflow` triggers it on a cron or an upstream event (a new partition in the data lake).
+
+The discipline that pays off: separate the **install-time** objects (Profile, RBAC, AuthorizationPolicy) from the **workload** objects (pipeline, Experiment, InferenceService) in distinct Argo CD Applications. The install-time Application syncs rarely and is reviewed by the platform team; the workload Application syncs on every merge and is reviewed by the model owners. Different blast radii, different reviewers.
+
+**Try this:** rebase your branch on `main`, simulate a conflict by changing both the Profile quota and the InferenceService image at the same time. Whose review wins? The answer should be encoded in your branch-protection rules — platform reviewers gate Profile changes, model owners gate InferenceService changes.
+
+## Wrap-up: a single dashboard
+
+Open the Kubeflow Central Dashboard:
+
+- **Notebooks tab.** Your EDA notebook, running on a 2-CPU 4-GiB pod.
+- **Pipelines → Runs.** The latest `fraud-train-deploy` run, green.
+- **Experiments (KFP).** A run group for the pipeline.
+- **Experiments (Katib).** `fraud-xgb-hpo` at status Succeeded, best trial showing `validation_pr_auc ≈ 0.86`.
+- **Models / InferenceServices.** `fraud-classifier` Ready, serving 1 replica, ready to scale to 4.
+
+In Grafana:
+
+- **Inference latency dashboard.** P50 around 8ms, P95 around 30ms (well under SLO), zero errors in the last hour.
+- **Drift dashboard.** The hour-of-day distribution overlaid against the training-time distribution. Green.
+
+Every green light is a piece of infrastructure that one team owns. Adding a second model is a second `Profile` (or a second InferenceService within the same Profile) and a second pipeline — everything else follows the same pattern.
+
+## Where to go from here
+
+Stretch goals, in roughly increasing complexity:
+
+- **Add a Transformer in front of the predictor** that does feature scaling so the callers do not need to do it. KServe's two-stage pattern: a Transformer Pod normalises the input, the Predictor Pod runs the model. Useful when the model's training-time feature engineering is complex and you do not want every caller to reproduce it.
+- **Wire drift alerts into PagerDuty / Opsgenie.** Alertmanager already routes; the work is mapping the right alert to the right rotation. Drift alerts go to the model owner; latency alerts go to the platform team. Do not mix them.
+- **Sign the model artifact with cosign** and add an admission policy (Kyverno or Gatekeeper) that rejects unsigned models from being served. This is the supply-chain story from Module 11 turned into a load-bearing control.
+- **Add a second model.** A deep neural network (TensorFlow/PyTorch) trained on the same data, deployed as a second InferenceService. A/B test the two over a week — XGBoost is the baseline; the DNN has to beat the baseline on both PR-AUC and inference latency to deserve traffic.
+- **Profile-level audit-log forwarding.** Wire the Kubernetes audit log + the KFP audit log + the KServe access log into a per-tenant log index. Map every "who deployed what" to a single query. The lab's BFSI readiness review ([`/docs/openshift-platform/foundations/bfsi-readiness-review`](/docs/openshift-platform/foundations/bfsi-readiness-review)) is the spec.
+- **Federated training across two clusters.** The Training Operator supports PyTorchJob across multiple clusters; combine with Submariner ([Module 13 of the ACM track](/learn/acm-multicluster/multicluster-networking-submariner)) for the east-west connectivity. Useful when training data has residency constraints — a model that learns from EU + US data without the EU data leaving Frankfurt.
+- **Replace XGBoost with a real fraud model.** The Kaggle dataset is a toy. A real fraud model uses sequence features (the last N transactions of the same card), graph features (the merchant's network), and temporal patterns (time since last transaction). The pipeline shape does not change; the `prepare_data` and `train_*` steps get richer.
+
+## Closing
+
+Thirteen modules in:
+
+- You know what Kubeflow is and what it is not (Module 00).
+- You can name every component of the Kubeflow control plane (Modules 01-02).
+- You can author a Jupyter notebook, a KFP pipeline, a Katib Experiment, a KServe InferenceService (Modules 03-08).
+- You can stand up a multi-tenant Kubeflow with Profiles, quotas, and per-tenant credentials (Module 09).
+- You can pick a Kubeflow distribution and bring up a working install (Module 10).
+- You understand the operational patterns that distinguish a sandbox install from a production one (Module 11).
+- You have built an end-to-end project — data to model to serving to dashboard — and you know how to GitOps the whole thing (this module).
+
+The fleet you built in this capstone is one Profile, one model, one Inference SLO. The fleet a real platform team runs is dozens of Profiles, dozens of models, hundreds of SLOs, the long tail of upgrades and DR drills and audit-log questions. But the shape is the same. Kubeflow gives you one place to manage notebooks, pipelines, HPO, and serving; the work after this is filling that shape with the specifics of your domain.
+
+**Where to go next:**
+
+- [The Agentic AI track](/learn/agentic-ai/) for the LLM-agent angle — agents on top of models, MCP servers, evaluation, the production touches that turn a demo into a product.
+- [The ACM multicluster track](/learn/acm-multicluster/) if you want to fleet-manage Kubeflow across 10 clusters — Profiles fanning out via ApplicationSets, observability federating to a hub Thanos, DR drills across DCs.
+- Send back what you built or what blocked you — the feedback shapes future revisions of the track.
+
+## References
+
+- Kubeflow pipelines SDK v2: `https://www.kubeflow.org/docs/components/pipelines/v2/`
+- Katib documentation: `https://www.kubeflow.org/docs/components/katib/`
+- KServe documentation: `https://kserve.github.io/website/`
+- XGBoost: `https://xgboost.readthedocs.io/`
+- Public Credit Card Fraud Detection dataset: `https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud`
+- ML Metadata (MLMD): `https://www.tensorflow.org/tfx/guide/mlmd`
+- Knative Serving autoscaling: `https://knative.dev/docs/serving/autoscaling/`
+- Evidently (drift and quality monitoring): `https://docs.evidentlyai.com/`
+- cosign (Sigstore): `https://docs.sigstore.dev/cosign/overview/`
+
+**That is the end of the track.** If you completed the capstone, you are now operating a working Kubeflow install with a real model in production. The work that comes after is the same shape, at greater scale.

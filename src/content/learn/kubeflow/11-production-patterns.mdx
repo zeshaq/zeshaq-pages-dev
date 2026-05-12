@@ -1,0 +1,270 @@
+---
+title: "Production patterns"
+sidebar_label: "11 — Production patterns"
+description: "Operating Kubeflow for 50 people doing real work — GitOps, HA control plane, GPU capacity planning, image supply chain, network policies, inference SLOs, compliance, and the Day-2 runbook that gets you off the page at 3am."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const prodNodes = [
+  { id: "git", data: { label: "platform-gitops\n(manifests + Profiles)" }, position: { x: 40, y: 40 }, style: ctrl, type: "shape" },
+  { id: "argo", data: { label: "Argo CD\n(per-spoke ApplicationSet)" }, position: { x: 260, y: 40 }, style: ctrl, type: "shape" },
+  { id: "vault", data: { label: "Vault + ESO\n(IdP, DB, S3, registry, git)" }, position: { x: 40, y: 160 }, style: ctrl, type: "shape" },
+  { id: "cp", data: { label: "Kubeflow control plane\n(KFP, Profiles, dashboard)" }, position: { x: 500, y: 40 }, style: agent, type: "shape" },
+  { id: "db", data: { label: "MariaDB Galera\n(metadata + Katib)" }, position: { x: 500, y: 160 }, style: ext, type: "shape" },
+  { id: "obj", data: { label: "MinIO / NooBaa\n(artifact bucket)" }, position: { x: 720, y: 160 }, style: ext, type: "shape" },
+  { id: "gpu", data: { label: "GPU node pool\n(MIG / time-slice / dedicated)" }, position: { x: 500, y: 280 }, style: agent, type: "shape" },
+  { id: "reg", data: { label: "Nexus / Quay\n(digest-pinned images)" }, position: { x: 720, y: 280 }, style: ext, type: "shape" },
+  { id: "kserve", data: { label: "KServe InferenceService\n(canary + autoscale)" }, position: { x: 500, y: 400 }, style: agent, type: "shape" },
+  { id: "obs", data: { label: "Prometheus / Loki / Tempo\n(infra + KFP + ML)" }, position: { x: 260, y: 400 }, style: ctrl, type: "shape" },
+  { id: "oncall", data: { label: "Alertmanager / PagerDuty\n(SLO breaches)" }, position: { x: 40, y: 400 }, style: ctrl, type: "shape" },
+];
+
+export const prodEdges = [
+  { id: "e1", source: "git", target: "argo", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "argo", target: "cp", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "sync" },
+  { id: "e3", source: "vault", target: "cp", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "ESO" },
+  { id: "e4", source: "cp", target: "db", style: { stroke: "#1f2937" } },
+  { id: "e5", source: "cp", target: "obj", style: { stroke: "#1f2937" } },
+  { id: "e6", source: "gpu", target: "cp", style: { stroke: "#1f2937" }, label: "schedule" },
+  { id: "e7", source: "reg", target: "cp", style: { stroke: "#1f2937" }, label: "image pull" },
+  { id: "e8", source: "kserve", target: "gpu", style: { stroke: "#1f2937" } },
+  { id: "e9", source: "cp", target: "obs", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "metrics" },
+  { id: "e10", source: "kserve", target: "obs", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "SLO" },
+  { id: "e11", source: "obs", target: "oncall", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "page" },
+];
+
+A `kubectl apply -f manifests/example` install works fine for one person. For 50 people doing real work, you need a different posture: highly available databases, replicated object storage, GitOps for everything, secrets that rotate, observability that distinguishes ML failures from infra failures, capacity planning that survives a Katib study, upgrades that don't drop traffic, and an on-call runbook that gets the third engineer off the page at 3am.
+
+This module is the gap between the upstream tutorial and a production install. None of it is Kubeflow-specific genius — it is the same operational discipline you would apply to any stateful, multi-tenant, latency-sensitive platform. But ML platforms have one twist: half the failure modes are not infrastructure, they are model behaviour, and your monitoring has to tell them apart.
+
+## The dev-vs-prod chasm
+
+A sandbox install has one user, ephemeral state, and no SLO. A production install has dozens of tenants, durable state, and an SLO every team agreed to but nobody wants to be on the hook for. The differences that matter:
+
+- **Storage** is no longer single-Pod MinIO and emptyDir MariaDB. It is replicated, backed up, and tested-for-restore.
+- **Identity** is no longer Dex with two static users. It is your real IdP, with group-based access, with the test runbook for "this person changed teams."
+- **GitOps** is no longer "I forget what `kubectl apply` I ran last." It is `platform-gitops`, with every change reviewed in a merge request.
+- **Secrets** are no longer in YAML you `oc apply`-ed. They are in Vault, rendered by ESO, scoped per tenant.
+- **Observability** is no longer "the dashboard says it is up." It is multi-tier — infra, Kubeflow components, and ML-specific drift / accuracy metrics.
+- **Capacity** is no longer "we have a few GPUs." It is a plan that survives a hyperparameter sweep without paging the on-call.
+
+The diagram below is the production posture. Everything in this module is one of these boxes.
+
+<Whiteboard client:load data={{ nodes: prodNodes, edges: prodEdges }} height={500} />
+
+Reading the diagram:
+
+- **platform-gitops** is the source of truth. Argo CD pulls and reconciles per spoke; nothing is `kubectl apply`-ed by hand in production.
+- The **Kubeflow control plane** depends on three external systems — MariaDB Galera for metadata, MinIO/NooBaa for artifacts, Nexus/Quay for digest-pinned images. None of those are in `kubeflow/manifests`; you bring them.
+- **KServe InferenceService** is the runtime path that has SLOs the rest of the business cares about. It pulls from the GPU node pool and emits the metrics that determine on-call.
+- **Observability** is three tiers fanning into one Alertmanager → PagerDuty pipeline. Dashed grey edges are telemetry.
+- Dashed green animated is cross-trust-boundary pull (GitOps sync, secret materialisation). Solid black is data path.
+
+## GitOps the Kubeflow install
+
+Manifests live in `platform-gitops` per the [pull-model overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview). Argo CD on the hub fans them out to the spoke via ApplicationSet. **Profile CRs** live in tenant subdirectories — `platform-gitops/tenants/<team>/profile.yaml` — and the same ApplicationSet picks them up.
+
+Pin everything. Digests on operator images, tags on the manifest version, hashes on the Helm charts you bring. The reason is not pedantry — it is that an unpinned upgrade lands during your worst week and nobody can tell what changed. The lab's pattern of digest-pinned operators ([the digest-pinning ADR](/docs/openshift-platform/architecture-decisions)) applies here verbatim.
+
+A small but useful pattern: separate `platform-gitops` paths for the **install** (kubeflow components), the **tenants** (Profile CRs), and the **workloads** (pipelines, InferenceServices, Katib Experiments). The install changes monthly, the tenants change weekly, the workloads change daily. Different blast radii deserve different review processes.
+
+## Secrets management
+
+Five categories of secret end up in a production Kubeflow:
+
+- Object-storage credentials (S3 access keys per tenant bucket prefix).
+- IdP client secrets (oauth2-proxy / Dex).
+- DB passwords (MariaDB Galera root + app users).
+- Image-pull secrets (Quay/Nexus robot tokens).
+- Per-tenant git-clone credentials (notebook PVC init from a repo).
+
+None of them belong in YAML. All of them go in Vault, materialised via **External Secrets Operator** into the appropriate namespaces. The lab's ESO architecture ([`/docs/openshift-platform/secrets-eso/architecture`](/docs/openshift-platform/secrets-eso/architecture)) is the template; the per-tenant pattern ([the tenant SecretStore pattern](/docs/openshift-platform/secrets-eso/tenant-secretstore-pattern)) is what makes it scale to 30 Profiles.
+
+Two specifics for ML. First, **rotate the S3 keys regularly** — six months is the upper bound, three is better. The blast radius of a leaked artifact-bucket key is "every model your org has ever trained." Second, **scope keys per Profile** (per-Profile bucket prefix, per-Profile IAM policy, per-Profile MinIO user) so a leak affects one team's history, not all of them.
+
+## Observability for Kubeflow
+
+Three tiers. Skip any of them and you will not be able to tell why something failed.
+
+**Tier 1: infrastructure.** kube-state-metrics, node-exporter, cluster monitoring. Covered already in the platform's general monitoring stack — see [`/docs/openshift-platform/platform-services/`](/docs/openshift-platform/platform-services/). This tier tells you the cluster is up, the nodes are healthy, the GPUs are not throttling, the storage is not full.
+
+**Tier 2: Kubeflow components.** Prometheus scrapes the KFP API server (`/metrics`), the Katib controllers, the KServe predictor pods, the Notebook controller. The KServe pod metrics are the load-bearing ones — `request_duration_seconds_*`, `request_total`, `request_failure_total` — because they are what your inference SLOs are computed from. The KFP API server's metrics tell you pipeline-throughput health: queue depth, run-success rate, average run duration.
+
+**Tier 3: ML-specific.** This is where MLOps observability lives, and it is not in Kubeflow. **Data drift** (the distribution of incoming features changed), **prediction drift** (the model's outputs changed), **accuracy drift** (the model is wrong more often, measured against labels that arrive after the fact). Tools: **Evidently** for offline drift reports, **Arize** / **WhyLabs** for managed online monitoring, custom Prometheus exporters for the bespoke cases. Pick one and wire it in from day one — adding it after a production incident is harder than installing it on day zero.
+
+## High availability of the control plane
+
+The Kubeflow components that need HA, in order of impact:
+
+- **KFP API server**: 2+ replicas, sticky sessions disabled, fronted by an Istio VirtualService. The default manifest is one Pod; replace it.
+- **ML Metadata gRPC service**: stateless, scale out. Two replicas is the floor.
+- **Pipelines DB**: replace the single-Pod MariaDB with a real cluster — Galera 3-node, ProxySQL in front, regular binlog backups. The MariaDB Operator handles this declaratively.
+- **MinIO** / NooBaa: distributed mode, minimum 4 Pods erasure-coded across N nodes. Single-Pod MinIO loses every pipeline artifact when its node reboots.
+- **Profile Controller**: single Pod is acceptable (control-plane object reconcile is rare), but the Pod's PV (if any) must survive node reboots.
+- **Istio gateway**: 2+ replicas. Single-Pod gateway is a single point of failure for every login.
+
+The pattern that does not work: relying on Kubernetes Pod restarts as your HA strategy. A 60-second restart during a regulator demo is not HA; it is "we got lucky."
+
+## Capacity planning for GPUs
+
+Two patterns dominate.
+
+**Dedicated GPU pool.** Reserve a node pool for Kubeflow training/inference. Data scientists request via namespace ResourceQuota (Module 09). The scheduler keeps GPU workloads on those nodes via nodeSelector + a taint that non-GPU Pods don't tolerate. Simpler to reason about, simpler to bill, often cheaper at scale because you can buy the right hardware once.
+
+**Shared GPU pool.** Kubeflow workloads coexist with other GPU workloads (rendering, scientific computing, third-party). Use Kubernetes priority classes so Kubeflow training Pods can be preempted by higher-priority workloads (or vice versa). Cheaper in absolute hardware terms; more complex on every other axis. Most regulated industries pick dedicated even when shared would be cheaper, because the auditor's question "who else can read this data" has a simpler answer with dedicated pools.
+
+For **MIG-capable GPUs** (A100, H100), split the cards. A single A100 split into 7×1g.5gb slices serves seven concurrent inference workloads cheaper than seven A10s. Configure MIG via the GPU Operator; expose the slices as distinct extended resources (`nvidia.com/mig-1g.5gb`) so the scheduler can place them precisely. Set per-Profile quota on each slice type independently.
+
+The signal that capacity planning is broken: a Katib study at parallelism 16 blocks every other team's notebook for an hour. Either the per-Profile GPU quota is too high, or the cluster is under-provisioned. Fix it before it becomes a culture problem.
+
+## Image supply chain
+
+Mirror every Kubeflow component image to an internal registry — Nexus, Quay, or Harbor. Pin manifests to digests, not tags. The reason is not security theatre; it is reproducibility. A `latest` tag changes; a digest does not. When you debug a regression six months from now, the digest tells you exactly which image was running.
+
+The trickier piece is **Python-function pipeline components**. KFP can build images on the fly from a user-supplied Python function — convenient for prototyping, a supply-chain hole in production. The auto-builder pulls a base image (`python:3.11-slim` by default), installs the function's dependencies via pip from the public PyPI, and pushes the result to your image registry. Two problems: the base image is not in your internal registry by default, and the pip install reaches public PyPI.
+
+The fix is two settings. Override `default_base_image` in your `kfp.Client` config to point at a mirrored base in your registry. Configure pip to use an internal PyPI mirror (Nexus has this as a `pypi-group`). Then the auto-built component images come from images and packages your supply-chain team has scanned.
+
+For BFSI, take one more step: **sign every model artifact with cosign** before deploy, and have an admission policy that rejects unsigned models from being served. That is the audit story for "every model in production has a verifiable provenance."
+
+## Network policies
+
+Default-deny ingress and egress in every tenant namespace. Then explicit allow-lists:
+
+- **Profile namespace → KFP API server** (control-plane writes, run submissions).
+- **Profile namespace → MinIO** (artifact upload, model registry pulls).
+- **Profile namespace → IdP** (token refresh for long-running notebooks).
+- **Profile namespace → log aggregator** (Loki/Fluent Bit stdout/stderr collection).
+- **Profile namespace → metrics scrape source** (Prometheus reaching the workload, if applicable).
+
+Restrict everything else. Egress to the public internet should be off by default for tenant namespaces; if a team needs to reach a model registry or feature store, that goes through an egress proxy with an explicit allow-list.
+
+The lab's NetworkPolicy patterns ([Module 08 of the agentic-ai track on egress control](/learn/agentic-ai/) and the platform's own egress-proxy docs) transfer directly.
+
+## Pipelines for production training
+
+A production training pipeline is not the demo pipeline. It has five properties.
+
+**Triggered by data arrival**, not by a human. An upstream event (a new partition in a data lake, a Kafka message, a scheduled refresh) starts the run. Manual triggers are for development; production trains on a schedule or on a signal.
+
+**Reads from a versioned dataset.** LakeFS, DVC, or S3 versioning — pick one. The pipeline reads a specific dataset version, recorded in the run's metadata. A run that cannot tell you which dataset version it trained on is a run that cannot be audited.
+
+**Writes the model to a registry.** MLflow Model Registry or KFP's built-in model registry. The model artifact gets a version, a stage (`Staging` / `Production`), and a lineage record pointing back to the dataset version and the training run.
+
+**Emits metadata to MLMD.** Every artifact (dataset, model, evaluation report) is tracked. MLMD is the "what got trained from what" database; if you do not write to it, you lose the auditability story.
+
+**On success, kicks off a KServe canary deploy.** Not a full rollout — a 10% traffic split with the existing production model. The pipeline does not own the rollout decision; it presents the new model and lets the deploy machinery (or a human, for high-stakes domains) decide.
+
+## Inference SLOs
+
+Define per-InferenceService. Typical numbers for a real-time prediction model:
+
+- **P50 latency**: under 50ms.
+- **P95 latency**: under 200ms.
+- **P99 latency**: under 500ms.
+- **Error rate**: under 0.1%.
+- **Cold-start frequency**: under 10 events per hour (for scale-to-zero services).
+
+KServe ships a Prometheus histogram (`request_duration_seconds`) that gives you the percentiles directly. Grafana dashboards consume the histogram; Alertmanager rules fire on the breach. The PromQL is straightforward:
+
+```
+histogram_quantile(0.95,
+  sum by (le, name) (
+    rate(request_duration_seconds_bucket{
+      namespace=~".+", name="payments-fraud-v3"
+    }[5m])
+  )
+) > 0.2
+```
+
+Per-tenant SLO budgets and error budget burn rates belong to the team owning the model, not the platform team. Wire the alerts to the right team's on-call rotation, not to a central pager.
+
+## Compliance and audit
+
+For regulated industries — banking, healthcare, anything with a regulator that audits ML decisions — five things have to be true.
+
+**Every model has a trained-data lineage record in MLMD.** The dataset version, the pipeline run, the resulting model — all linked. An auditor's first question is "what data was this model trained on" and you need a single SQL query to answer it.
+
+**Every InferenceService deploy generates an audit-log entry.** The deploy event, the model version deployed, the user who triggered it, the time. This goes into a tamper-evident log (immutable storage, write-once-read-many).
+
+**Model artifacts are signed.** cosign / Sigstore, signed by the platform's signing service at deploy time. An admission policy rejects unsigned artifacts.
+
+**Inference requests/responses are logged for replay.** A KServe Transformer logs every (request, response) pair to a per-tenant log index, with the model version that served it. The log is the basis for after-the-fact audit ("show me the prediction for customer X on date Y").
+
+**Per-tenant audit scope.** The Kubernetes audit log is filtered per namespace (Module 09); the KFP and KServe audit events are joined and shipped to the same per-tenant index. One auditor question, one query, one answer.
+
+The lab's BFSI readiness review ([`/docs/openshift-platform/foundations/bfsi-readiness-review`](/docs/openshift-platform/foundations/bfsi-readiness-review)) is the framework. Map each control to a Kubeflow surface; the gaps are your backlog.
+
+## Day-2 operations runbook
+
+What goes in the on-call playbook, by frequency.
+
+**GPU node down.** Drain workloads (`kubectl drain --ignore-daemonsets`), wait for the Pods to reschedule elsewhere, replace the node. If the cluster has insufficient GPU capacity, page capacity planning — the cluster is over-subscribed.
+
+**Pipeline run stuck.** Check Argo Workflows controller (or Tekton, depending on the KFP backend version). Usual causes: a Pod stuck `Pending` (PVC bound? GPU available?); a workflow step in a retry loop (image pull failure?); a metadata write failing (DB connection issue?). The diagnosis ladder is in the playbook.
+
+**KServe predictor flapping.** Check Knative Serving's Pod Autoscaler (KPA) metrics. Cold-starts hammering the scale-to-zero path? Set `minReplicas: 1`. Memory limits too tight, OOMKilling? Bump the request. Concurrency target wrong for the model's actual latency? Recalibrate.
+
+**Profile Controller CrashLoopBackOff.** Usually a CRD upgrade issue — the controller is on an old schema and a new CR has fields it does not understand. The fix is one of: roll back the CR change, or upgrade the controller. Do not skip.
+
+**MariaDB schema migration failed mid-upgrade.** Restore from the last good backup, retry with a clean migration job. This is the worst day; it is also why you take backups and rehearse the restore drill quarterly. The lab's backup pattern ([Module 10 of the ACM track](/learn/acm-multicluster/backup-and-disaster-recovery)) applies directly.
+
+**Inference SLO breached.** Page the model owner. Determine if it is a model regression (new version deployed, latency up — roll back), an infra issue (node congestion, network latency — fix), or a data issue (the request shape changed — coordinate with the data team).
+
+## The lab posture
+
+Kubeflow is not deployed in the lab today. If it were, the production posture would reuse every existing pattern.
+
+- **GitOps**: vendored manifests in `platform-gitops`, Argo CD ApplicationSet on hub-dc-v6 fanning to spoke-dc-v6.
+- **Secrets**: Vault on the lab's vault VMs, materialised via ESO with per-tenant SecretStores.
+- **Observability**: Prometheus → Thanos on hub, Loki for logs, Tempo for traces — the existing stack, with Kubeflow components added as scrape targets.
+- **Image supply chain**: Nexus app-registry for Kubeflow component mirrors and built pipeline-component images. Trivy and RHACS scan on push.
+- **Backup**: OADP / Velero for cluster state, MinIO replication for the artifact bucket, MariaDB binlog backups to NooBaa.
+- **DR**: same drill as the rest of the platform — backup, restore-dry-run, document RTO.
+
+None of this is Kubeflow-special. That is the point — the platform's operational discipline does the heavy lifting, and Kubeflow is one more workload pattern on top.
+
+## Try this
+
+**Exercise 1.** Write the Alertmanager rules for the five inference SLOs in the section above. Each rule has a PromQL expression, a `for:` duration (avoid flapping), a severity label, and an annotation pointing at the runbook. Test by `promtool test rules` against a sample series.
+
+**Exercise 2.** Sketch the Argo CD ApplicationSet structure for the three Kubeflow paths: install, tenants, workloads. Each gets a separate Application (or set) with a separate review process. The install path syncs from a tag-pinned vendored copy; the tenants path syncs on every merge; the workloads path syncs on every merge but with `prune: false` on InferenceService resources (you do not want a sync to delete a serving model).
+
+**Exercise 3.** Plan a quarterly restore drill for the KFP metadata DB. The plan must include: when (calendar date), where (sandbox cluster), what (a recent backup), success criteria (the dashboard loads, recent run history is visible, a new pipeline run succeeds against the restored DB). Document what fails the first time; the second drill should be 30 minutes shorter.
+
+## References
+
+- Kubeflow upstream operating guide: `https://www.kubeflow.org/docs/`
+- Argo CD ApplicationSet: `https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/`
+- External Secrets Operator: `https://external-secrets.io/`
+- KServe documentation: `https://kserve.github.io/website/`
+- Prometheus operator: `https://prometheus-operator.dev/`
+- cosign (Sigstore): `https://docs.sigstore.dev/cosign/overview/`
+- Evidently (model + data drift): `https://docs.evidentlyai.com/`
+- NVIDIA GPU Operator: `https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/`
+
+**Next:** [Module 12 — Build a project (capstone)](/learn/kubeflow/build-a-project).

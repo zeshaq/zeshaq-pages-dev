@@ -1,0 +1,221 @@
+---
+title: "Multi-tenancy and Profiles"
+sidebar_label: "09 — Multi-tenancy & Profiles"
+description: "Stand up a multi-team Kubeflow with hard quotas, namespace isolation, and per-tenant credentials — the Profile CR, the Profile Controller, identity, authorization, GPU quotas, and the operational gaps Kubeflow leaves you to close."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const tenancyNodes = [
+  { id: "idp", data: { label: "Identity provider\n(Dex / Keycloak / OIDC)" }, position: { x: 40, y: 40 }, style: ext, type: "shape" },
+  { id: "gw", data: { label: "Istio ingress gateway\n(authservice, kubeflow-userid header)" }, position: { x: 260, y: 40 }, style: ctrl, type: "shape" },
+  { id: "pc", data: { label: "Profile Controller\n(watches Profile CRs)" }, position: { x: 520, y: 40 }, style: ctrl, type: "shape" },
+  { id: "pcr", data: { label: "Profile CR\nowner = alice@example.com" }, position: { x: 520, y: 170 }, style: ctrl, type: "shape" },
+  { id: "ns", data: { label: "Namespace alice-research\n(per-Profile)" }, position: { x: 260, y: 280 }, style: stage, type: "shape" },
+  { id: "rbac", data: { label: "RBAC + AuthorizationPolicy\nns-owner-access-istio" }, position: { x: 40, y: 280 }, style: agent, type: "shape" },
+  { id: "quota", data: { label: "ResourceQuota + LimitRange\n50 CPU / 200 GiB / 8 GPU" }, position: { x: 520, y: 280 }, style: agent, type: "shape" },
+  { id: "vault", data: { label: "Vault + ESO\n(per-tenant Secrets)" }, position: { x: 740, y: 170 }, style: ext, type: "shape" },
+  { id: "secrets", data: { label: "S3 keys, registry pull,\ngit-clone creds" }, position: { x: 740, y: 280 }, style: agent, type: "shape" },
+  { id: "audit", data: { label: "Audit log\n(filter on objectRef.namespace)" }, position: { x: 260, y: 410 }, style: ext, type: "shape" },
+];
+
+export const tenancyEdges = [
+  { id: "e1", source: "idp", target: "gw", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "OIDC" },
+  { id: "e2", source: "gw", target: "pc", style: { stroke: "#1f2937" }, label: "userid header" },
+  { id: "e3", source: "pcr", target: "pc", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "pc", target: "ns", style: { stroke: "#1f2937" }, label: "create" },
+  { id: "e5", source: "pc", target: "rbac", style: { stroke: "#1f2937" }, label: "create" },
+  { id: "e6", source: "pc", target: "quota", style: { stroke: "#1f2937" }, label: "create" },
+  { id: "e7", source: "vault", target: "secrets", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "materialise" },
+  { id: "e8", source: "secrets", target: "ns", style: { stroke: "#1f2937" } },
+  { id: "e9", source: "ns", target: "audit", style: { stroke: "#6b7280", strokeDasharray: "4,3" }, label: "scope" },
+];
+
+A small team of two data scientists can share one namespace, swap credentials over Slack, and trust each other not to fill the disk. A 50-person ML org cannot. Once enough teams share a cluster, isolation becomes a hard requirement — not because the people changed, but because the failure modes did: one team's hyperparameter sweep can starve another team's notebooks, any namespace that can read any PersistentVolumeClaim is a data-exfiltration path, and "who deployed that model serving the wrong region's customers" stops having a clean answer.
+
+This module is the operational layer of Kubeflow on a shared cluster. The unit of tenancy is the **Profile** — a custom resource that creates one namespace, the RBAC, the Istio AuthorizationPolicies, and the resource quotas to go with it. The Profile Controller reconciles them. The gaps Kubeflow doesn't fill — nested quotas, per-tenant audit-log separation, cross-namespace artifact handoff — are where the work is.
+
+## The multi-tenancy problem
+
+Without isolation, three failure modes are inevitable. **Noisy neighbour**: one team's Katib study at parallelism 8 saturates every GPU; the other teams' notebooks scheduler-evict and the data scientists assume the cluster is "down." **Data exfiltration**: a curious user (or a compromised pipeline) lists PersistentVolumeClaims cluster-wide and mounts another team's training data into a notebook. **Credentials sprawl**: each team copies the same S3 access key into a half-dozen Secrets, none of them rotated when an engineer leaves.
+
+Kubeflow's Profile primitive solves the common cases of all three. It is not a complete answer — it doesn't enforce nested quotas, it doesn't ship audit-log filtering, and the default AuthorizationPolicies are permissive enough that you should expect to customise them. But the bones are right: every tenant gets a namespace, a default ServiceAccount with the Kubeflow-component RBAC, an Istio policy that locks the namespace to its owner and invitees, and an optional ResourceQuota. Everything else builds on those four objects.
+
+## Profiles in one diagram
+
+<Whiteboard client:load data={{ nodes: tenancyNodes, edges: tenancyEdges }} height={520} />
+
+Reading the diagram:
+
+- The **identity provider** authenticates the user and hands the Istio gateway an OIDC token. The gateway turns that into a `kubeflow-userid` header (typically email) and forwards it to every downstream Kubeflow component.
+- The **Profile Controller** watches `Profile` CRs and reconciles, per Profile, the namespace, the RBAC, the AuthorizationPolicy, the ResourceQuota and LimitRange.
+- A **Profile** owns one namespace. The owner has full access; invitees have whatever scope you grant them via the AuthorizationPolicy.
+- Secrets are not in the Profile CR. They are materialised per-namespace from Vault via External Secrets Operator — same pattern as the lab uses elsewhere ([the tenant SecretStore pattern](/docs/openshift-platform/secrets-eso/tenant-secretstore-pattern)).
+- The Kubernetes audit log is cluster-wide; you scope it per tenant by filtering on `objectRef.namespace`. That is the dashed grey edge — telemetry, not control.
+
+Solid black is local intra-cluster relationships. Dashed green animated is identity + secret-pull traffic that crosses a trust boundary. Dashed grey is observability.
+
+## The `Profile` CR
+
+A Profile is a small, opinionated object. Twelve lines for a real one:
+
+```
+apiVersion: kubeflow.org/v1
+kind: Profile
+metadata:
+  name: alice-research
+spec:
+  owner:
+    kind: User
+    name: alice@example.com
+  resourceQuotaSpec:
+    hard:
+      requests.cpu: "50"
+      requests.memory: 200Gi
+      requests.nvidia.com/gpu: "8"
+```
+
+Apply it and four things happen, in order: a Namespace `alice-research` appears; a default ServiceAccount in that namespace gets the RBAC that Kubeflow components need to read it (Notebook controller, KFP runner, KServe predictor); two namespace-scoped Istio AuthorizationPolicies are created (`ns-owner-access-istio` for the owner, `ns-access-istio` as the template for invitees); and a `ResourceQuota` matching `spec.resourceQuotaSpec` is created.
+
+The Profile is the unit of CRUD. Delete it and the Profile Controller cleans up the namespace and the associated objects. Create it via GitOps and you have a declarative, auditable, revertible tenant. Two patterns to avoid: hand-editing the namespace's labels (the controller reconciles them back), and giving the Profile a name different from its intended namespace (they are coupled — the namespace is always named after the Profile).
+
+## Profile Controller responsibilities
+
+The Profile Controller is a single Deployment in `kubeflow` namespace. Its job is narrow: watch `Profile` CRs and reconcile the four objects listed above. It does not provision storage, it does not configure the IdP, it does not push Secrets — those are explicit non-responsibilities and the design is better for it.
+
+What goes wrong: the controller's Pod CrashLoopBackOff means new Profiles get stuck in `Pending`; existing Profiles continue to work because their namespace already exists. The first thing to check after any control-plane upgrade is `oc -n kubeflow logs deploy/profiles-deployment`. The second is a Profile-namespace state drift — somebody ran `kubectl apply` on the namespace's RBAC outside the controller's view, and now the controller wants to overwrite. The fix is one of: delete the namespace and let the controller recreate, or annotate the namespace so the controller adopts it as-is (the annotation key is `kubeflow-resource-management/owner` in current builds; check your Profile Controller version).
+
+The controller is also the one place where you can wire **policy** as code into the tenancy model. The controller is configurable to run a webhook against each Profile create — useful for enforcing a naming convention (lowercase, no shared prefixes), a label policy (every Profile must have `team`, `cost-centre`, `compliance-tier`), or a quota policy (no Profile may exceed the team's allocation). Most installs don't bother with the webhook and end up regretting it after the first reorg.
+
+## Identity layer
+
+Kubeflow does not ship an identity provider. You bring one. The default for vanilla installs is **Dex**, a small Go IdP that can federate to an upstream OIDC, SAML, LDAP, or GitHub. Real organisations replace Dex with their existing IdP — **Keycloak** if you are running self-hosted SSO, **Okta** or **Azure AD** or **Google Workspace** if you are not.
+
+The mechanics are the same regardless: the user hits the Kubeflow dashboard, the Istio gateway redirects to the IdP, the IdP authenticates and returns a token, the gateway extracts the email claim and forwards it as a `kubeflow-userid` header (and a `kubeflow-groups` header for group memberships). Every Kubeflow component trusts the header because the only path into the mesh is via the gateway, and the gateway's AuthorizationPolicy refuses to forward requests without a valid token.
+
+Two things break this. First, **header-spoofing protection**: an attacker who can reach a Kubeflow service directly (bypassing the gateway) can set `kubeflow-userid: admin@example.com` and impersonate any user. The defence is a strict default-deny NetworkPolicy + Istio mTLS — the user identity is only trusted on traffic that came through the gateway. Second, **the email-as-identity assumption**: emails change when people change jobs; if Profiles are owned by `firstname.lastname@oldcompany.com` the user loses access on day one of the new job. Either use stable subject IDs from the IdP, or have a runbook for re-keying Profile ownership.
+
+## Authorization layer
+
+Authorization in Kubeflow is two stacked layers. The first is **Kubernetes RBAC** — the default ServiceAccount in each Profile namespace gets RoleBindings for the Kubeflow component CRDs (Notebook, PipelineRun, InferenceService, Experiment). The Profile owner's User account gets a RoleBinding granting `admin` on the namespace. Invitees get a `view` or `edit` RoleBinding depending on how you configure the contributor mechanism.
+
+The second layer is **Istio AuthorizationPolicies**. Kubeflow ships two templates per Profile. `ns-owner-access-istio` allows the owner full HTTP access to every service in the namespace; `ns-access-istio` is the (initially empty) template for invitees. The templates use the `kubeflow-userid` header as the source identity. You customise them per use case — for example, a team-admin role that can create InferenceServices, a team-member role that can run notebooks but not deploy models, an auditor role that can read everything but write nothing.
+
+The sharp edge: AuthorizationPolicies are **additive**. If your custom policy adds a permissive rule and forgets to scope it, you have just opened the namespace to a wider audience. Test every policy with a `kubectl auth can-i --as` rehearsal before committing.
+
+## Resource quotas at scale
+
+A `ResourceQuota` per Profile is the floor. For a small org that is enough — every team gets a quota, the cluster's total quotas sum to roughly the cluster's capacity, and the kube-scheduler enforces the rest.
+
+For a real ML org you want **nested quotas**: a per-team quota (50 GPUs for the fraud team) with per-user-within-team sub-quotas (Alice gets 8, Bob gets 8, the rest shared). Kubernetes only supports one ResourceQuota per namespace, so you cannot express that natively. The standard workarounds: a third-party policy engine like **Kyverno** or **Gatekeeper** that injects a validating webhook checking per-Pod requests against the user's effective quota, or a custom controller that watches Pod creates and maintains a per-user spend table.
+
+Mention this gap in your tenant onboarding doc. The first time an org has 10 users in one Profile and one of them runs a 32-GPU sweep, the answer is going to be "Kubernetes can't do that, here is what we use instead" — and you want that answer ready, not improvised.
+
+## Cross-namespace access
+
+The handoff scenario: `team-a` trains a model in `team-a-research`, and `team-b-production` needs to deploy it. The wrong reflex is to grant `team-b`'s ServiceAccount cluster-wide read on `inferenceservices` — auditors hate it, and the next request will be the same shape for a different object.
+
+The right pattern is one `RoleBinding` per direction, in the target namespace, granting the minimum verbs:
+
+```
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: team-b-read-models
+  namespace: team-a-research
+subjects:
+  - kind: ServiceAccount
+    name: default-editor
+    namespace: team-b-production
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+That gives `team-b-production`'s default ServiceAccount `view` on every resource in `team-a-research`, scoped to that one namespace. For a tighter scope, define a Role with `verbs: ["get","list"]` on `inferenceservices.serving.kserve.io` only, and bind that instead.
+
+## GPU quotas
+
+Without an explicit GPU quota, the first team to run a Katib study at parallelism 32 consumes every GPU in the cluster. The minimum is `requests.nvidia.com/gpu: "16"` on the ResourceQuota — substitute the actual extended resource name your device plugin exposes (`amd.com/gpu` for AMD, `gpu.intel.com/i915` for Intel).
+
+For **MIG-partitioned GPUs** (A100/H100 split into 1g.5gb, 2g.10gb, 3g.20gb, 7g.40gb slices), set quota per partitioned type — `nvidia.com/mig-1g.5gb: "4"`. Same for **time-sliced** sharing: the device plugin exposes a multiple of physical GPUs, and the quota is on the multiplied count. The shared-GPU patterns get you cheaper inference at the cost of unpredictable latency under load; for training you almost always want dedicated GPUs because gradient computation does not tolerate noisy neighbours.
+
+## Credentials per Profile
+
+A real ML Profile needs four secrets, every time: **S3 access keys** for the artifact bucket; **container-registry pull secrets** for the cluster's image mirror; **git-clone credentials** for the user's notebooks to pull their own repos; and **upstream API keys** (model registries, feature stores, vector DBs).
+
+The wrong reflex is `kubectl create secret`. Once you have 30 Profiles, that becomes 120 Secrets nobody is rotating. The right answer is **External Secrets Operator pulling from Vault**, materialised per Profile namespace by a SecretStore the Profile Controller (or its companion webhook) creates as part of Profile reconciliation. The lab's tenant pattern lives at [`/docs/openshift-platform/secrets-eso/tenant-secretstore-pattern`](/docs/openshift-platform/secrets-eso/tenant-secretstore-pattern); the shape transfers directly to Kubeflow Profiles.
+
+Two practical notes. The S3 keys should be scoped to the Profile's MinIO bucket prefix only — `arn:aws:s3:::ml-artifacts/<profile-name>/*` — so an exfiltration from one Profile cannot read another's data. The registry pull secret should be a per-tenant robot account on Quay/Harbor/Nexus, not a shared service account; revoke individually when a team is wound down.
+
+## Audit log scope
+
+Compliance (SOC2, PCI-DSS for ML on financial data, banking regulations for credit-decision models) wants per-tenant audit logs. Kubernetes audit logs are **cluster-wide**: every API call against the apiserver gets logged into one stream. You scope them per tenant by filtering on `objectRef.namespace` — every Profile maps to one namespace, so the filter is straightforward.
+
+The work is wiring the filtered stream into the right downstream system. The pattern that scales is a Vector / Fluent Bit collector that reads the apiserver audit log, splits per-namespace, and ships to per-tenant log indexes. For Kubeflow specifically, you also want to capture the audit-relevant component logs — the KFP API server, the Profile Controller, the KServe activator — and merge them into the same per-tenant stream, because half the regulator questions are "who deployed this model" and that information lives in the KFP audit log, not the apiserver one.
+
+The lab's BFSI readiness review ([`/docs/openshift-platform/foundations/bfsi-readiness-review`](/docs/openshift-platform/foundations/bfsi-readiness-review)) calls out per-tenant audit-log separation as a medium-severity gap. Same gap applies to Kubeflow.
+
+## Multi-tenant pipelines
+
+KFP enforces the Profile boundary at the pipeline level. Each pipeline run lives in a Profile namespace; the `pipeline-runner` ServiceAccount in `team-a-research` can only read artifacts in `team-a-research`'s MinIO bucket (assuming you scoped the S3 credentials correctly above). The Argo Workflow that backs the pipeline is annotated with the Profile's `kubeflow-userid`, and the metadata writes to the MLMD database are tagged with that identifier — so when you query "every pipeline run by Alice in the last quarter" the answer is one SQL query.
+
+Cross-namespace **artifact sharing** is the exception that proves the rule. If `team-b-production` needs to pull a trained model from `team-a-research`'s pipeline output, the path is: an S3 bucket policy that explicitly grants `team-b-production`'s SA `s3:GetObject` on the specific prefix; a `kfp-launcher` ServiceAccount RoleBinding in `team-a-research` letting `team-b-production` read the relevant `Artifact` MLMD records; and an explicit reference in the consuming pipeline (no implicit cross-namespace reads). Cross-namespace artifact access is opt-in, by design.
+
+## Try this
+
+Three exercises. They are designed to be small enough to do in a sandbox cluster and concrete enough to surface the gotchas.
+
+**Exercise 1.** Write a Profile CR for a fraud-modelling team with a 50 vCPU / 200 GiB memory / 8 GPU quota. Add a `LimitRange` that caps any single Pod at 8 CPU / 32 GiB / 1 GPU so a single bad notebook can't exhaust the namespace. Apply it. Observe what the Profile Controller creates. Try to violate the LimitRange by submitting a Pod with `resources.requests.cpu: "16"` — observe the admission rejection.
+
+**Exercise 2.** Add a RoleBinding so the `payments-engineering` team's default ServiceAccount can read InferenceServices (and only InferenceServices) in the `risk-modeling` namespace. Verify with `kubectl auth can-i get inferenceservices -n risk-modeling --as=system:serviceaccount:payments-engineering:default`. Verify the negative case too: the same SA must not be able to `list secrets` in `risk-modeling`.
+
+**Exercise 3.** Sketch the Istio `AuthorizationPolicy` that allows `alice@example.com` full HTTP access to every service in the `alice-research` namespace, and read-only access to `bob@example.com`. The Policy uses `request.headers[kubeflow-userid]` as the source principal. Test it with a curl against the Kubeflow dashboard using a token for each user.
+
+## Common failure modes
+
+**Profile created but namespace missing.** The Profile Controller Pod is failing — check `oc -n kubeflow logs deploy/profiles-deployment`. Usual cause: an RBAC change that removed the controller's ability to create namespaces, or a stale ServiceAccount token after a Kubernetes upgrade.
+
+**User logs in but sees no namespaces.** The `kubeflow-userid` header is not propagating. Trace path: user → Istio gateway → oidc-authservice → KFP UI. Check the gateway's AuthorizationPolicy, and check that the authservice is configured with the correct OIDC discovery URL. The most common cause is a hostname mismatch between the IdP's `redirectURIs` and the gateway's external hostname.
+
+**Pipeline succeeds but artifacts can't be downloaded from the UI.** The MinIO bucket policy doesn't include the Profile's SA — fix the bucket policy. Verify by `kubectl exec` into the `ml-pipeline-ui` pod and running an AWS CLI against the bucket.
+
+**Quota looks right but Pods are stuck `Pending`.** ResourceQuota requires `LimitRange` to be present for the `request` quotas to take effect on pods that don't set their own requests. Add a `LimitRange` with default requests, or set requests explicitly on every Pod template.
+
+**Profile deletion stuck.** A namespace finalizer is blocking the delete — usually because a CRD whose finalizer is still present can't reconcile (operator down). The fix is the boring one: bring the operator back up; do not edit the finalizer by hand unless you are certain there is nothing to clean up.
+
+## References
+
+- Kubeflow multi-tenancy overview: `https://www.kubeflow.org/docs/components/central-dash/profiles/`
+- Kubeflow Profiles Controller upstream: `https://github.com/kubeflow/kubeflow/tree/master/components/profile-controller`
+- Istio AuthorizationPolicy: `https://istio.io/latest/docs/reference/config/security/authorization-policy/`
+- Kubernetes ResourceQuota: `https://kubernetes.io/docs/concepts/policy/resource-quotas/`
+- Kubernetes auditing: `https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/`
+- Dex IdP: `https://dexidp.io/docs/`
+- External Secrets Operator: `https://external-secrets.io/`
+
+**Next:** [Module 10 — Installation and Manifests](/learn/kubeflow/installation-and-manifests).

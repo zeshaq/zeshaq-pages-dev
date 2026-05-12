@@ -1,0 +1,211 @@
+---
+title: "Installation and Manifests"
+sidebar_label: "10 — Install & Manifests"
+description: "Pick a Kubeflow distribution and bring up a working install — the kubeflow/manifests repo, the distro landscape, prerequisites for storage / identity / GPUs / networking, GitOps the install, and the failure modes that bite every first-time installer."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const installNodes = [
+  { id: "repo", data: { label: "github.com/kubeflow/manifests\n(kustomize overlays)" }, position: { x: 40, y: 40 }, style: ext, type: "shape" },
+  { id: "gitops", data: { label: "platform-gitops repo\n(pinned tag, kustomize)" }, position: { x: 260, y: 40 }, style: ctrl, type: "shape" },
+  { id: "argo", data: { label: "Argo CD ApplicationSet\n(per-spoke fan-out)" }, position: { x: 500, y: 40 }, style: ctrl, type: "shape" },
+  { id: "spoke", data: { label: "Spoke cluster" }, position: { x: 740, y: 40 }, style: stage, type: "shape" },
+  { id: "wave0", data: { label: "Wave 0\nCRDs + cert-manager + Istio CRDs" }, position: { x: 740, y: 160 }, style: agent, type: "shape" },
+  { id: "wave2", data: { label: "Wave 2\nIstio + cert-manager + Dex" }, position: { x: 740, y: 270 }, style: agent, type: "shape" },
+  { id: "wave5", data: { label: "Wave 5\nKubeflow components" }, position: { x: 740, y: 380 }, style: agent, type: "shape" },
+  { id: "vault", data: { label: "Vault + ESO\n(IdP secret, DB pw, S3 keys)" }, position: { x: 260, y: 270 }, style: ext, type: "shape" },
+  { id: "nexus", data: { label: "Internal registry\n(Nexus / Quay / Harbor)" }, position: { x: 260, y: 380 }, style: ext, type: "shape" },
+  { id: "obj", data: { label: "S3-compatible object store\n(MinIO / NooBaa / external)" }, position: { x: 500, y: 270 }, style: ext, type: "shape" },
+  { id: "db", data: { label: "External MySQL / MariaDB\n(replace in-cluster default)" }, position: { x: 500, y: 380 }, style: ext, type: "shape" },
+];
+
+export const installEdges = [
+  { id: "e1", source: "repo", target: "gitops", style: { stroke: "#1f2937" }, label: "vendor + pin tag" },
+  { id: "e2", source: "gitops", target: "argo", style: { stroke: "#1f2937" } },
+  { id: "e3", source: "argo", target: "spoke", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "sync" },
+  { id: "e4", source: "spoke", target: "wave0", style: { stroke: "#1f2937" } },
+  { id: "e5", source: "wave0", target: "wave2", style: { stroke: "#1f2937" }, label: "then" },
+  { id: "e6", source: "wave2", target: "wave5", style: { stroke: "#1f2937" }, label: "then" },
+  { id: "e7", source: "vault", target: "wave5", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "ESO materialise" },
+  { id: "e8", source: "nexus", target: "spoke", style: { stroke: "#1f2937" }, label: "image pull" },
+  { id: "e9", source: "obj", target: "wave5", style: { stroke: "#1f2937" }, label: "artifact store" },
+  { id: "e10", source: "db", target: "wave5", style: { stroke: "#1f2937" }, label: "metadata" },
+];
+
+The first hard decision in a Kubeflow project is not which model framework to standardise on; it is which Kubeflow you are going to run. The upstream is a kustomize repo, the distributions on top of it disagree about packaging and life-cycle, and the install itself has a long list of prerequisites that the README does not lead with. This module is the map.
+
+By the end you should be able to (a) pick a distribution for your situation, (b) name the storage / identity / GPU / network prerequisites and decide each one before you `kustomize build`, and (c) drive the install via GitOps with the same patterns the lab uses elsewhere. None of this is exotic; all of it is the work that separates "I ran the README" from "Kubeflow is in production."
+
+## The upstream: `kubeflow/manifests`
+
+The canonical reference is the `kubeflow/manifests` GitHub repo. It is a kustomize-based hierarchy of overlays — one per component (notebooks, pipelines, training-operator, katib, kserve, central-dashboard, profile-controller) plus the shared services Kubeflow depends on (Dex, cert-manager, Istio). The README ships an `example` overlay that wires the whole thing together; in practice that overlay is a starting point, not a destination.
+
+A few things to know about the repo before you depend on it. **Tagged releases** correspond to Kubeflow versions (`v1.10.0`, `v1.11.0`); the `master` branch is in flux and pinning to it is asking for a midweek outage. **The example overlay is opinionated** — it picks an in-cluster MariaDB, a single-Pod MinIO, Dex with a static-user config, and a self-signed Istio gateway cert; every one of those choices needs to be replaced before production. **Kustomize is the only supported templating layer**; there is no Helm chart blessed by the upstream, although several distros ship one.
+
+A small but important quirk: the README's `kustomize build example | kubectl apply -f -` does not always succeed on the first pass. Some workloads reference CRDs that are also being applied in the same build; `kubectl` evaluates one big batch, and the workload's webhook validation fires before the CRD it depends on has registered. The standard workaround is to apply twice — `kubectl` will succeed on the second pass, when the CRDs have settled. GitOps engines fix this for you with sync waves; see below.
+
+## The all-in-one example overlay
+
+It is worth running the example overlay once on a sandbox cluster, before you start replacing parts. The exercise teaches you the topology: which Pods land where, which Services the dashboard front-ends, where the Profile Controller lives, what the default Dex login looks like. Twenty minutes of `kustomize build example | kubectl apply -f -` followed by half an hour of `oc get all -n kubeflow` reading is the cheapest Kubeflow tutorial you will get.
+
+Three things to expect from that walk. First, you will hit the apply-twice problem on a fresh cluster — that is normal. Second, the default Dex login is `user@example.com` / `12341234`; do not let that escape the sandbox. Third, the in-cluster MariaDB Pod has no persistent volume in the default example; everything you do in the dashboard disappears on restart. Treat the example as a tour, not a foundation.
+
+## The distros you will actually meet
+
+There are more Kubeflow distributions than there are Kubernetes ones. Here is the short list with opinions.
+
+| Distro | Owner | Lifecycle managed by | When to pick |
+| --- | --- | --- | --- |
+| **Vanilla manifests** | kubeflow/manifests upstream | You (via GitOps) | Maximum control, minimum support. Lab installs, research clusters, anywhere a vendor relationship is unwelcome |
+| **Red Hat OpenShift AI (RHOAI)** | Red Hat | DataScienceCluster operator | OpenShift shops with a Red Hat support contract; bundled scanning + signing + Authorino |
+| **Open Data Hub (ODH)** | Red Hat / community | DataScienceCluster operator | Same surface as RHOAI but community-supported; what RHOAI is built from |
+| **Charmed Kubeflow** | Canonical | Juju charm bundle | Bare metal + Ubuntu shops; works on EKS/AKS/GKE too |
+| **Arrikto Enterprise Kubeflow** | Arrikto (acq. by Nutanix 2023) | Vendor operator | Largest historic contributor; the dashboard and Profile Controller upstream came from here |
+| **HPE Ezmeral** | HPE | HPE platform | HPE Ezmeral customers; bundled with HPE storage |
+| **Vertex AI Pipelines (GCP)** | Google Cloud | Fully managed | KFP-compatible only; you give up notebooks/Katib/KServe but get a managed pipelines runtime |
+| **AWS SageMaker Operators for K8s** | AWS | Operator | Partial KFP-compatible; useful if your training is already on SageMaker |
+| **Google Cloud Kubeflow Distribution** | Google Cloud | (deprecated 2023) | Do not start here; was the original GCP-managed distro |
+
+Two patterns drive the choice. If you are on OpenShift, RHOAI is the path of least resistance — it bundles a tested set of components, you get scanning and Authorino wired in, and Red Hat will answer the phone. If you are not on OpenShift, the vanilla manifests + GitOps path is more work upfront but leaves you with a transparent install you can debug; "managed" distros (Vertex, SageMaker Operators) are not full Kubeflow and you should know which components you are giving up before you adopt one.
+
+For BFSI and regulated industries specifically, the questions are: who supports it when it breaks at 3am, who signs the SBOM for compliance, and what is the upgrade cadence. Vanilla loses on the first two; managed distros often lose on the third.
+
+## GitOps the install
+
+The manifests are kustomize-based and idempotent, which is exactly the shape GitOps engines want. The lab's pattern ([the pull-model overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview)) extends cleanly to Kubeflow: commit a vendored copy of the manifests (pinned to a tag) into `platform-gitops`, write an Argo CD ApplicationSet that fans the overlays out to the right cluster, let Argo do the reconciliation.
+
+Two ordering gotchas matter. **CRDs must apply before workloads that reference them.** Use Argo CD's `argocd.argoproj.io/sync-wave` annotation — CRDs and admission webhooks in Wave 0, foundational services (cert-manager, Istio, Dex) in Wave 2, Kubeflow components in Wave 5. The waves are a single integer; the actual numbers don't matter as long as the order does. **Istio sidecar injection** is per-namespace: every Kubeflow namespace needs `istio-injection=enabled` as a label, and the controller adopts existing Pods only after a restart, so apply the label before the Pods are scheduled.
+
+A small but useful pattern: pin the manifests version in two places. Once in your GitOps repo as the vendored copy (so a `git diff` reveals an upgrade), and once as an Argo CD Application target revision (so a runaway sync cannot pull a different version than the repo states). Belt and braces.
+
+## The install at a glance
+
+<Whiteboard client:load data={{ nodes: installNodes, edges: installEdges }} height={520} />
+
+Reading the diagram:
+
+- The **kubeflow/manifests** repo is the upstream truth. You vendor it (or submodule it) into `platform-gitops`, pinned to a release tag.
+- An **Argo CD ApplicationSet** on the hub fans the manifests out to the target spoke. The destination cluster is selected by a label generator the same way Module 06 of the ACM track describes for any other workload.
+- On the spoke, **sync waves** sequence the install: CRDs first, foundational services second, Kubeflow components last. The diagram shows three waves; in practice the upstream README assumes one big apply and you add the wave annotations yourself.
+- **Vault + ESO** materialise the per-cluster Secrets — IdP client secret, DB password, S3 keys for the artifact bucket. The dashed green animated edge is that secret-pull traffic.
+- The **internal registry**, **S3 object store**, and **external metadata DB** are not in `kubeflow/manifests`; you provision them out of band and point the manifests at them.
+
+Solid black is local dependency / data path. Dashed green animated is cross-trust-boundary pull (GitOps sync, secret materialisation). The diagram is the *install* — runtime traffic patterns belong in Module 11.
+
+## Storage prerequisites
+
+Three storage decisions need to be made before you `kubectl apply`.
+
+**S3-compatible object store** for pipeline artifacts. The default example ships an in-cluster MinIO with a single Pod and an emptyDir volume — fine for the tour, useless for anything else. The real options are MinIO distributed (4+ Pods, erasure-coded across nodes), NooBaa on top of S3-compatible storage, or an external S3 (AWS S3, Azure Blob with the S3 compatibility shim, Cloudflare R2, on-prem Ceph RGW). The lab uses MinIO for staging and NooBaa as the ESO-mediated bridge to per-tenant bucket credentials — pattern is in the [OBC → operand Secret bridge](/docs/openshift-platform/secrets-eso/obc-to-operand-secret-bridge) doc.
+
+**MySQL / MariaDB** for KFP metadata, Katib, and the Pipeline UI's run history. The default in-cluster MariaDB is a single Pod, no replication, no backup. Replace with a real cluster — Galera + ProxySQL, MariaDB Operator with binlog replication, or a managed RDS / Cloud SQL / Azure Database for MySQL. The schema is small (megabytes for a small team, gigabytes after a year of pipelines for a large org) but it is the source of truth for "did this pipeline run succeed" and losing it is unrecoverable.
+
+**PVC StorageClass** for notebook home directories. Each Jupyter notebook spawns with a PVC; that PVC needs to survive notebook restarts and ideally be backed by a CSI driver that supports RWO with reasonable IOPS. For a 50-data-scientist install, plan for 50 PVCs of 20–100 GiB each. Slow storage here is the most common cause of "my notebook is hanging" tickets — the notebook is fine; it is waiting on the home directory.
+
+## Identity prerequisites
+
+Pick an IdP before you start. The choices, in increasing complexity: **Dex** (default, simple, federates upstream OIDC/SAML/LDAP), **Keycloak** (enterprise self-hosted SSO with realm-per-tenant), **upstream OIDC direct** (Okta, Azure AD, Google Workspace — skip Dex entirely if your IdP is already cloud-managed).
+
+The wiring point in Kubeflow is the **oidc-authservice** (or its replacement, **oauth2-proxy** in newer manifests). It sits behind the Istio gateway, redirects unauthenticated requests to the IdP, validates the returned token, and forwards the user identity to downstream services as headers. The fiddly bits are: the `redirectURIs` registered with the IdP must exactly match the gateway hostname; the OIDC discovery URL must be reachable from the cluster; and the `userid-claim` config must match whatever stable identifier your IdP issues (email, sub, oid — vary by provider).
+
+Test the OIDC flow end-to-end in a sandbox before going to production. The hardest debugging session you can have is "the Kubeflow login loop on a Friday evening at the start of a regulator demo."
+
+## GPU prerequisites
+
+Install the **GPU Operator** (Nvidia, AMD, Intel — pick the one matching your hardware) before Kubeflow. Verify it works with a small GPU Pod outside Kubeflow first:
+
+```
+apiVersion: v1
+kind: Pod
+metadata: { name: gpu-test }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cuda
+      image: nvidia/cuda:12.4.0-base-ubuntu22.04
+      command: ["nvidia-smi"]
+      resources: { limits: { "nvidia.com/gpu": 1 } }
+```
+
+If `oc logs gpu-test` shows the GPU, you are good. If it does not, the operator install is broken and no amount of Kubeflow troubleshooting will fix it.
+
+**Label your GPU nodes** for scheduling. `node.kubernetes.io/instance-type=a100-80g`, `gpu-type=h100`, `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB` — pick a label scheme and stick to it. Kubeflow workloads that need a specific GPU type use nodeSelector or affinity rules against these labels. For shared GPUs (MIG, time-slicing), the operator's config maps physical GPU types to the slice types it advertises; configure that before you go to production or you will get unpredictable resource accounting.
+
+## Network prerequisites
+
+Istio installs its ingress gateway in `istio-system`. Wire **External-DNS** (or your manual DNS) to point your Kubeflow hostname at that gateway's external IP / LoadBalancer. Wire **cert-manager** to issue a TLS cert for that hostname — typically via an ACME ClusterIssuer pointing at Let's Encrypt or your private CA.
+
+**NetworkPolicies**: install a default-deny baseline before Kubeflow goes in. The Kubeflow components need to talk to each other (notebook controller ↔ apiserver, KFP ↔ MinIO, KServe ↔ Istio); the policies that allow those flows ship in the manifests, but they only work if you have a baseline default-deny to layer them on. If you skip default-deny, the policies appear to work because everything is open by default, and you ship to production with a NetworkPolicy posture that is "we wrote policies but they are not load-bearing."
+
+For BFSI specifically, the network team will want **explicit egress controls** — Kubeflow Pods reaching upstream model registries, vector DBs, or external feature stores. Wire those through an egress proxy / explicit NetworkPolicy egress rules; do not rely on cluster-wide egress being open.
+
+## Upgrades
+
+Pin to a tag. `v1.10.0`, `v1.11.0`, never `master`. Upgrades between minor versions of Kubeflow are major events: there are CRD schema changes, API deprecations (`v1alpha1` → `v1beta1` → `v1`), DB schema migrations for KFP and Katib, and occasional Istio version bumps that need the Istio operator to do its own work first.
+
+The upgrade discipline that survives: cut a new branch in `platform-gitops`, bump the manifests version in the vendored copy, run `kustomize build` on a sandbox cluster, fix what breaks, commit, sync to staging, then production. Do not run `kustomize build HEAD` in production. Do not skip the staging cluster — the regressions are real and worth catching before they reach the team's notebooks.
+
+## The lab posture
+
+The lab does not currently run Kubeflow. If we did install it on `spoke-dc-v6`, the shape would mirror the existing operating model exactly. Vendored manifests pinned to a tag in `platform-gitops`. Argo CD ApplicationSet on hub-dc-v6 fanning to the spoke. Vault + ESO for the IdP client secret, the DB password, the S3 keys, the per-tenant credentials. Internal Nexus registry as the image source for all Kubeflow components. Observability via the existing stack — Prometheus on the spoke scrapes Kubeflow components, Loki collects logs, Tempo traces the Istio mesh.
+
+The only Kubeflow-specific decisions on top of that pattern are: which IdP backs Dex (Keycloak on the lab IdP VM is the obvious choice), which object store backs pipelines (NooBaa with OBC-to-operand secret bridging, same as Loki and Tempo), and which MySQL backs metadata (MariaDB Operator with the lab's Vault-rendered creds). See [`/docs/openshift-platform/cluster-topology/spoke-dc-v6`](/docs/openshift-platform/cluster-topology/spoke-dc-v6) for the cluster context.
+
+## Try this
+
+**Exercise 1.** Clone `github.com/kubeflow/manifests` at a recent tag. Identify the prerequisites in the `common` directory — cert-manager, Istio, Dex, oidc-authservice. Read each component's README. Compare with the example overlay's order of apply.
+
+**Exercise 2.** Write an Argo CD ApplicationSet that fans the kubeflow manifests out to `spoke-dc-v6` via the lab's pull-model GitOps. The generator is a `clusters` generator with `matchLabels: { kubeflow: enabled }`. The template should reference the vendored manifests path and set sync-wave annotations on the components. Argo CD's `serverSideApply: true` is recommended for the CRD-heavy paths.
+
+**Exercise 3.** Sketch the storage decisions for a 20-data-scientist deployment. Plan a MinIO topology (replicated across N nodes, total capacity, erasure-coding choice), a MariaDB topology (Galera 3-node, ProxySQL in front), and a notebook PVC StorageClass (CSI driver, IOPS budget per Pod). Estimate the total resource bill — you should land somewhere around 20 vCPU and 60 GiB of memory for the storage infra alone.
+
+## Common failure modes
+
+**Install hangs on Istio sidecar injection.** Almost always an Istio version mismatch with cert-manager's webhook, or cert-manager not yet ready when Istio's mutating webhook fires. Apply twice usually fixes; sync waves fix permanently.
+
+**Dex login loop.** The `redirectURIs` in Dex's config doesn't match the gateway hostname. Check the Dex ConfigMap. Check the actual URL the browser is redirecting to. They must match exactly, including scheme, port if non-default, and trailing slash.
+
+**Kubeflow Pipelines UI 502.** The `ml-pipeline-ui` Pod can't reach the `ml-pipeline` API server. Usually a NetworkPolicy that is too strict — the UI's namespace egress allow doesn't include the API server's namespace. Read the NetworkPolicy, add the allow.
+
+**Training Operator CRDs apply but Pods stay `Pending`.** Gang scheduling (Volcano or Kueue) is not installed. Distributed training Pods need all-or-nothing scheduling — partial scheduling deadlocks. Install Volcano or Kueue and configure the Training Operator to use it.
+
+**Notebook server creates but never becomes Ready.** Usually the PVC for the home directory is stuck `Pending` because the StorageClass has no available capacity, or the CSI driver is unhealthy. `oc get pvc -A | grep Pending` and chase from there.
+
+**Profile Controller can't watch namespaces.** ClusterRole missing the `namespaces` verb. Check the controller's ServiceAccount and RoleBindings; the manifests ship the right RBAC but a partial install can leave this gap.
+
+## References
+
+- Kubeflow manifests repo: `https://github.com/kubeflow/manifests`
+- Kubeflow installing guide: `https://www.kubeflow.org/docs/started/installing-kubeflow/`
+- Kubeflow distributions page: `https://www.kubeflow.org/docs/started/installing-kubeflow/#packaged-distributions`
+- Red Hat OpenShift AI: `https://www.redhat.com/en/technologies/cloud-computing/openshift/openshift-ai`
+- Open Data Hub: `https://opendatahub.io/`
+- Charmed Kubeflow: `https://charmed-kubeflow.io/`
+- Dex IdP: `https://dexidp.io/docs/`
+- Istio ambient + sidecar reference: `https://istio.io/latest/docs/setup/install/`
+
+**Next:** [Module 11 — Production patterns](/learn/kubeflow/production-patterns).
