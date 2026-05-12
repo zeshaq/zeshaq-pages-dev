@@ -1,0 +1,400 @@
+---
+title: "OpenShift Virtualization on Managed Clusters"
+sidebar_label: "12 — OpenShift Virtualization"
+description: "Deploy and manage virtual machines across the fleet — CNV operator via RHACM Policies, VirtualMachine CRs across clusters, and the observability story for VM workloads."
+estimated_minutes: 90
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const stage = {
+  background: "#fafafa", border: "1px solid #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ctrl = {
+  background: "#e5e7eb", border: "1px solid #6b7280",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 180, textAlign: "center", fontWeight: 600, fontSize: 12,
+};
+export const agent = {
+  background: "#fafafa", border: "1.5px dashed #15803d",
+  borderRadius: 8, padding: 10, color: "#1f2937",
+  width: 160, textAlign: "center", fontSize: 12,
+};
+export const ext = {
+  background: "#fafafa", border: "1.5px dashed #9ca3af",
+  borderRadius: 8, padding: 8, color: "#1f2937",
+  width: 150, textAlign: "center", fontSize: 12,
+};
+
+export const cnvNodes = [
+  { id: "cluster", data: { label: "Managed cluster\n(OpenShift)" }, position: { x: 60, y: 40 }, style: stage, type: "shape" },
+  { id: "hco", data: { label: "kubevirt-hyperconverged\noperator" }, position: { x: 60, y: 150 }, style: ctrl, type: "shape" },
+  { id: "kvcm", data: { label: "kubevirt-controller-manager" }, position: { x: 60, y: 260 }, style: ctrl, type: "shape" },
+  { id: "cdi", data: { label: "CDI controller\n(disk imports)" }, position: { x: 60, y: 370 }, style: ctrl, type: "shape" },
+  { id: "handler", data: { label: "virt-handler\n(DaemonSet, per node)" }, position: { x: 420, y: 150 }, style: agent, type: "shape" },
+  { id: "launcher", data: { label: "virt-launcher pod\n(one per running VM)" }, position: { x: 420, y: 260 }, style: agent, type: "shape" },
+  { id: "libvirt", data: { label: "libvirt + qemu-kvm\n(inside the pod)" }, position: { x: 420, y: 370 }, style: agent, type: "shape" },
+  { id: "guest", data: { label: "Guest OS\n(RHEL / Windows / etc.)" }, position: { x: 420, y: 480 }, style: stage, type: "shape" },
+  { id: "pvc", data: { label: "PVC\n(disk image)" }, position: { x: 760, y: 260 }, style: ext, type: "shape" },
+  { id: "source", data: { label: "Disk source\n(registry / PVC / S3 / URL)" }, position: { x: 760, y: 380 }, style: ext, type: "shape" },
+];
+
+export const cnvEdges = [
+  { id: "e1", source: "cluster", target: "hco", style: { stroke: "#1f2937" } },
+  { id: "e2", source: "hco", target: "kvcm", style: { stroke: "#1f2937" } },
+  { id: "e3", source: "hco", target: "cdi", style: { stroke: "#1f2937" } },
+  { id: "e4", source: "kvcm", target: "handler", style: { stroke: "#1f2937" }, label: "schedule" },
+  { id: "e5", source: "handler", target: "launcher", style: { stroke: "#1f2937" }, label: "spawn" },
+  { id: "e6", source: "launcher", target: "libvirt", style: { stroke: "#1f2937" } },
+  { id: "e7", source: "libvirt", target: "guest", style: { stroke: "#1f2937" } },
+  { id: "e8", source: "launcher", target: "pvc", style: { stroke: "#1f2937" }, label: "attach" },
+  { id: "e9", source: "cdi", target: "pvc", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "populate" },
+  { id: "e10", source: "cdi", target: "source", animated: true, style: { stroke: "#15803d", strokeDasharray: "5,5" }, label: "pull" },
+];
+
+Containers are the right answer for most of the workloads a platform team will ever ship. They are not the right answer for *all* of them. Windows guest apps, kernel-module-dependent appliances, vendor-shipped VMs that arrive as `.qcow2` files with a support contract attached, and legacy DB servers whose maintainers retired in 2018 — none of those are becoming Kubernetes-native this quarter.
+
+**OpenShift Virtualization** — the productised name for KubeVirt with a Red Hat support badge, abbreviated **CNV** in most lab notes — is the answer for that tail. It runs KVM-based VMs as first-class Kubernetes objects, on the same cluster that runs your container workloads, scheduled through the same kube-scheduler, networked through the same CNI, storage through the same CSI. One substrate instead of two; one GitOps repo shipping a database VM and a microservice side by side.
+
+ACM is what makes that work at fleet scale. The CNV operator is installed by Policy; VM definitions fan out via ApplicationSet; observability rolls up VirtualMachineInstance metrics next to the Pod metrics you already collect. This module covers that fan-out — not "how to install CNV on one cluster" (the OpenShift docs do that), but **how to run a VM fleet from a hub**.
+
+## Why VMs on Kubernetes still matter
+
+The containerisation wave that started around 2015 predicted VMs were on the way out. Eleven years later, the headcount of enterprise VMs is *up*, not down. The reasons are concrete:
+
+- **Windows guests.** A meaningful fraction of every BFSI estate runs on Windows Server — domain controllers, .NET internal apps, SQL Server estates the bank wrote in 2009 and now cannot rewrite. Containers do not run those workloads in any practical sense.
+- **Kernel-module workloads.** Storage appliances, monitoring agents, hardware drivers — anything that wants to load a kernel module needs a real kernel, not a shared host kernel.
+- **Vendor-shipped VMs.** A surprising number of B2B products are still delivered as a hardened OVA or `.qcow2`, with the vendor refusing to support anything else.
+- **Legacy DB servers.** Oracle, SQL Server, niche RDBMS — the licence model and the operator maturity have not caught up.
+
+The historical answer was a separate virtualisation platform — vSphere, RHEV, Hyper-V — sitting alongside the container platform, with two operational teams, two backup stacks, two monitoring stories, two upgrade cycles. CNV collapses that into one platform. The same hub ships your Deployments and your VirtualMachines; the same Policy framework enforces network baselines on Pods and VMs; the same Argo CD fans out Helm charts and VM definitions.
+
+ACM is the multiplier. On a single cluster CNV is a useful integration. On twenty managed clusters that each need a consistent install plus a fleet of VMs, CNV without ACM is the same toil you avoided by adopting ACM in the first place.
+
+## The architecture in one diagram
+
+<Whiteboard client:load data={{ nodes: cnvNodes, edges: cnvEdges }} height={620} />
+
+Reading the diagram:
+
+- The **kubevirt-hyperconverged operator** (HCO) is the single entry point. Install it once per managed cluster and it brings up the rest of the stack as a unit: the KubeVirt operator, the **Containerized Data Importer** (CDI), the hostpath provisioner if you ask for it, and the network attachment definition controller.
+- **kubevirt-controller-manager** is the control loop. It watches VirtualMachine and VirtualMachineInstance objects and decides which node should host each running VM.
+- **virt-handler** is a DaemonSet — one pod per node. It is the agent that actually creates and manages **virt-launcher** pods on its node when the controller signals a VM should run there.
+- **virt-launcher** is the pod that wraps a running VM. Inside it: a libvirt daemon and a qemu-kvm process running the guest OS. From Kubernetes' perspective it is an ordinary Pod with elevated privileges; from the VM's perspective it is a hypervisor.
+- **CDI** is the disk-import machinery. When a VM specs `DataVolume`, CDI materialises that into a PVC by pulling from a registry image, copying from another PVC, downloading from HTTPS, or accepting a streamed upload.
+- **Solid black** edges are intra-cluster control flow. **Dashed green** edges are data movement (disk imports from external sources).
+
+The footprint is heavier than RHACS or observability but not unreasonable. Expect ~2 GiB of memory for the HCO + controllers on the cluster control plane, plus the per-VM overhead — typically a few hundred MiB on top of whatever the guest OS itself uses.
+
+## CNV operator deployment via RHACM
+
+The recommended pattern for a fleet is a **Policy** (or a PolicySet) that ensures both the operator and the `HyperConverged` CR exist on every cluster that should run VMs. Two policies, two sync waves: the operator first, the CR after, so the CRDs the CR depends on are registered before the CR is applied.
+
+The shape of the operator-install Policy:
+
+```
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: cnv-operator
+  namespace: policies-virt
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1beta1
+        kind: OperatorPolicy
+        metadata:
+          name: cnv-operator
+        spec:
+          remediationAction: enforce
+          complianceType: musthave
+          subscription:
+            name: kubevirt-hyperconverged
+            namespace: openshift-cnv
+            channel: stable
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+          operatorGroup:
+            name: openshift-cnv-og
+            targetNamespaces: [ "openshift-cnv" ]
+          upgradeApproval: Automatic
+```
+
+Bind that Policy to a `Placement` selecting clusters with a label like `virt=enabled`, and every cluster that wears the label installs the operator without anyone touching it.
+
+The second Policy creates the `HyperConverged` CR — the object that tells the operator to actually deploy the virtualization workloads. A minimal version:
+
+```
+apiVersion: hco.kubevirt.io/v1beta1
+kind: HyperConverged
+metadata:
+  name: kubevirt-hyperconverged
+  namespace: openshift-cnv
+spec:
+  featureGates:
+    enableCommonBootImageImport: true
+  liveMigrationConfig:
+    parallelMigrationsPerCluster: 5
+    parallelOutboundMigrationsPerNode: 2
+```
+
+The CR is small because the operator defaults are reasonable for most clusters. Worth thinking about when you write it:
+
+- **`featureGates`** — turn on previews you want, leave off the ones you don't. `enableCommonBootImageImport` is the one most labs enable so Red Hat's golden images appear in the cluster automatically.
+- **`liveMigrationConfig`** — how many migrations the cluster will run in parallel, and the bandwidth cap per migration. Defaults are conservative; bump them up for clusters with a fast spine.
+- **`vmTrack`** — which VM Telemetry the cluster reports back. Leave on; it is what feeds the observability dashboards.
+- **`network`** — defaults to using the cluster's default CNI for VM pods. Override here if you want a non-default bridge or to configure Multus globally.
+
+Wrap both Policies in a `PolicySet` named something like `cnv-baseline`, bind it to the `virt-enabled` cluster set, and the operator-plus-CR install is one declarative bundle.
+
+## VirtualMachine CRs and DataVolumes
+
+A `VirtualMachine` is the long-lived spec for a VM. A `VirtualMachineInstance` (VMI) is the running pod incarnation, created by the kubevirt-controller from the VirtualMachine when it should be on. The relationship is similar to Deployment → ReplicaSet → Pod, except a VirtualMachine usually has exactly one VMI at a time (you can think of a VM as a single-replica StatefulSet).
+
+The `DataVolume` is the disk. Under the hood it is a PVC plus the import metadata that tells CDI where to pull the disk image from. Sources supported:
+
+- **`pvc`** — clone an existing PVC (typically a golden-image PVC sitting in `openshift-virtualization-os-images`).
+- **`registry`** — pull a disk image packaged as a container image from any OCI registry.
+- **`http(s)`** — download a `.qcow2` or `.iso` from a URL.
+- **`s3`** — pull from an S3 bucket.
+- **`upload`** — accept a streamed upload from `virtctl image-upload`.
+
+A small VirtualMachine for a RHEL 9 instance with 4 vCPU, 8 GiB memory, a cloned golden image, and cloud-init from a Secret:
+
+```
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: rhel9-app
+  namespace: tenant-app
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - metadata:
+        name: rhel9-app-root
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: rhel9
+          namespace: openshift-virtualization-os-images
+        storage:
+          accessModes: [ "ReadWriteMany" ]
+          resources: { requests: { storage: 40Gi } }
+          storageClassName: ocs-storagecluster-ceph-rbd
+  template:
+    spec:
+      domain:
+        cpu: { cores: 4 }
+        memory: { guest: 8Gi }
+        devices:
+          disks:
+            - name: rootdisk
+              disk: { bus: virtio }
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          dataVolume: { name: rhel9-app-root }
+        - name: cloudinit
+          cloudInitNoCloud:
+            secretRef: { name: rhel9-app-cloudinit }
+```
+
+The `runStrategy` field is the small detail that surprises people. `Always` means the controller keeps the VMI running (restart on failure, like a Deployment). `Manual` means you start, stop, and restart it explicitly through `virtctl` or the console — used for VMs that should not auto-restart after a graceful shutdown. `RerunOnFailure` and `Halted` round out the set.
+
+The cloud-init `Secret` referenced at the bottom is the standard mechanism for first-boot configuration. Put your SSH keys, hostname, package installs, and the like into a `user-data` field, base64-encode, and ship it as a Secret. The guest reads it on first boot and applies.
+
+## Cross-cluster VM placement
+
+ACM's value-add for VMs is the same as for containerised workloads: **one definition, fanned out**. The pattern uses an `ApplicationSet` with a cluster generator and (usually) a Kustomize overlay per cluster for the small differences that matter — StorageClass name, NetworkAttachmentDefinition name, number of replicas.
+
+A sketch of that ApplicationSet:
+
+```
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tenant-app-vm
+  namespace: openshift-gitops
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            virt: enabled
+            tenant: app-team
+  template:
+    metadata:
+      name: 'tenant-app-vm-{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://gitlab.lab/platform/platform-gitops
+        targetRevision: main
+        path: 'tenants/app-team/vms/overlays/{{name}}'
+      destination:
+        server: '{{server}}'
+        namespace: tenant-app
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+```
+
+The `overlays/{{name}}` path is the wiring that lets each cluster customise the base VirtualMachine. The shared base in the GitOps repo defines the VM; the per-cluster overlay patches the `storageClassName` on the DataVolume, the `multus` network attachment name, the `nodeSelector` labels, anything else that differs between clusters.
+
+The important constraint to absorb: **a VirtualMachine has a single home cluster**. A VM cannot live-migrate from one cluster to another. Live migration *within* a cluster is supported and routine; *across* clusters is not. If you need multi-cluster HA, the pattern is **two VirtualMachine objects**, one on each of two clusters, with an external load balancer in front and (for stateful workloads) application-level replication or a shared storage backend.
+
+That mental model is closer to "two VMs in two datacenters that replicate to each other" than to "one VM that floats." The good news is that ACM makes the *deployment* of those two VMs identical — you declare two clusters in the ApplicationSet's match labels, two Applications appear, two VMs come up.
+
+## Networking
+
+CNV uses the cluster's default CNI for the VM's primary interface — what you see as `pod: {}` in the VirtualMachine spec. The VM's eth0 gets a pod IP, routes through the cluster network, talks to Services normally. For most workloads this is enough.
+
+The interesting case is **secondary interfaces**. A bank's payment-processing VM might need to sit on an internal-only VLAN that the rest of the cluster pods cannot reach. Or a legacy application might insist on a static IP outside the cluster's pod CIDR. Or you might be migrating a VM from vSphere where it had two NICs and the application expects both to be present.
+
+The mechanism is **Multus + NetworkAttachmentDefinition** (NAD). You define a NAD as a CR on each cluster that should have the secondary network available:
+
+```
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: payments-vlan
+  namespace: tenant-payments
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "bridge",
+      "bridge": "br-payments",
+      "vlan": 142,
+      "ipam": { "type": "whereabouts", "range": "10.42.0.0/24" }
+    }
+```
+
+Then the VirtualMachine references it as a secondary network alongside the pod network. RHACM can deploy the NAD across every cluster in a cluster-set via a `ConfigurationPolicy`, which means the same VM YAML works on every cluster because the named NAD exists everywhere.
+
+The typical pattern for a banking workload is **pod network primary, internal-VLAN secondary** — control-plane traffic (SSH, kubectl exec, the observability scrape) over the pod network; the actual payment traffic over the bridged VLAN. Keeping the two on different interfaces makes NetworkPolicy on the pod network meaningful without forcing the VLAN traffic through the cluster CNI.
+
+## Storage
+
+Three storage modes show up for VMs, and the choice has knock-on effects:
+
+- **ReadWriteOnce (RWO) PVCs** are the default. Simple, fast, supported by every CSI driver. The catch: the PVC is bound to a single node. That means **the VM cannot live-migrate** — a live migration moves the VMI to a different node, which would need the PVC there, which RWO does not allow. RWO is fine for stateless VMs and for stateful VMs that tolerate the brief downtime of a planned reschedule.
+- **ReadWriteMany (RWX) via CSI** is required for live migration. The PVC can attach to multiple nodes simultaneously, so the new virt-launcher pod can mount the disk before the old one releases it. Supported by Ceph RBD with the `rbd-mirror`-flavoured volumeMode, by CephFS, by NFS-backed CSI, and by a handful of others.
+- **Ephemeral storage** is for stateless VMs that are populated from a known-good image on boot and have no state worth preserving. Faster boot, no PV bookkeeping, but everything inside the VM is lost on shutdown.
+
+CNV also requires snapshot-capable CSI for VM-snapshot operations. The `VirtualMachineSnapshot` CR takes a point-in-time image of the VM's disks; restore is via `VirtualMachineRestore`. Both depend on the underlying CSI driver having `VolumeSnapshot` support — which most modern drivers do, including ODF Ceph and most cloud providers' CSI implementations.
+
+For the lab, the relevant storage is **spoke-dc-v6's ODF** — see [`/docs/openshift-platform/storage/odf-on-spoke`](/docs/openshift-platform/storage/odf-on-spoke) for the configuration. ODF's `ocs-storagecluster-ceph-rbd` storage class supports RWX (via the block-mirror volume mode) and snapshots, so it would be a viable backend for CNV if the operator were installed. Today it is not — see "The lab's posture" below.
+
+## Live migration
+
+Within a single cluster, virt-handler can live-migrate a running VM between nodes without observable interruption to the guest. The mechanism is the standard KVM live-migration protocol: the source virt-launcher streams the guest's memory pages and CPU state over a TCP connection to the destination virt-launcher; once enough pages are transferred and the dirty rate is low, the source pauses the guest briefly, ships the final delta, and the destination resumes execution.
+
+Required for live migration to work:
+
+- **RWX storage** on the VM's disks. (RWO blocks migration outright.)
+- **A network path** between the two nodes for the migration traffic. CNV uses TCP/49152 by default; a tight NetworkPolicy environment needs an explicit allow for that port between virt-launcher pods on different nodes.
+- **Compatible CPU models**. If the source node has a newer CPU with instructions the destination does not, the migration may fail. The conservative approach is to set the VM's CPU model to a common baseline (`host-model` or a named QEMU model like `Haswell-noTSX`) so any node in the cluster can host it.
+
+Live migration is what makes node-drain workflows possible. When the Machine Config Operator wants to reboot a node for a kernel update, virt-handler live-migrates the VMs off first, the node reboots, and the VMs migrate back (or to other nodes — there is no node affinity by default).
+
+The boundary remains: **live migration does not cross clusters**. There is no story where a VM on spoke-dc-v6 floats to spoke-dc-v7 because the first cluster is degraded. For that, you build two VMs on two clusters and let the workload itself replicate. The Migration Toolkit for Virtualization (MTV) handles the *first* hop — vSphere or RHV → CNV — but day-to-day cross-cluster migration is not a CNV feature.
+
+## Observability for VMs
+
+VM observability has two layers, and you need both.
+
+**Layer 1 — the platform's view.** VirtualMachineInstance metrics come from virt-handler's `/metrics` endpoint. CPU steal, memory ballooning, NUMA placement, disk-I/O wait, migration progress — the kind of numbers a platform team cares about. ACM's `MultiClusterObservability` does not pick up these series automatically; the default allowlist is tuned for Pod metrics. You extend the allowlist by patching the `observability-metrics-custom-allowlist` ConfigMap on the hub:
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observability-metrics-custom-allowlist
+  namespace: open-cluster-management-observability
+data:
+  metrics_list.yaml: |
+    names:
+      - kubevirt_vmi_cpu_usage_seconds_total
+      - kubevirt_vmi_memory_used_bytes
+      - kubevirt_vmi_memory_resident_bytes
+      - kubevirt_vmi_network_receive_bytes_total
+      - kubevirt_vmi_network_transmit_bytes_total
+      - kubevirt_vmi_storage_iops_read_total
+      - kubevirt_vmi_storage_iops_write_total
+      - kubevirt_vmi_phase_count
+    matches:
+      - '__name__="kubevirt_.*"'
+```
+
+Once the ConfigMap propagates, the observability-addon on each spoke starts shipping those series back. Grafana on the hub picks them up; the ACM-bundled OpenShift Virtualization dashboards light up.
+
+**Layer 2 — the guest's view.** The platform sees how much CPU the VM is using on the hypervisor; it does not see what the VM is doing with that CPU. "Is the database server actually responding to queries?" is a guest-level question that needs an in-guest agent — typically **node_exporter** or the application's own Prometheus exporter — running inside the VM, scraped by the spoke's user-workload-monitoring Prometheus, and then shipped back to the hub by the observability-addon like any other metric.
+
+The pattern: configure cloud-init to install node_exporter, expose it on a port reachable from the spoke's monitoring Pods, create a Service and ServiceMonitor for it. Now the spoke's Prometheus scrapes the guest's `:9100` and the hub's Thanos sees the series. If you have a database VM, add the database's own Prometheus exporter the same way and you get application-level metrics in the same pipeline.
+
+The ACM-bundled dashboards are not exhaustive — they cover the platform's view of VM health, not the application's. For "the VM as seen by the user," wire in your existing application observability the way you would for any workload.
+
+## The lab's posture
+
+Plain truth: **CNV is not deployed in the lab today**. The user has formally deferred CNV and OpenShift Virtualization work to a future iteration — the BFSI POC ahead of us, the migration of containerised workloads, and the GitLab-based application delivery stack all rank higher in the current roadmap.
+
+This module is therefore forward-looking. Every YAML you see here would work on the lab's spoke-dc-v6 if the operator were installed; the storage on ODF supports it; the network on the cluster supports it; the ApplicationSet pattern is identical to the one the lab uses for container apps. But the CNV operator is not installed, no `HyperConverged` CR exists on any cluster, and no VirtualMachine has ever been scheduled. The lab-grounded examples in the other modules of this track do not include CNV; the capstone walkthrough does not stand a VM up.
+
+That gap is intentional, and it is documented as one of the deferred items on the platform roadmap. If you read this module and want a CNV-aware lab, the work to get there is roughly:
+
+1. Add a Policy that installs `kubevirt-hyperconverged` on clusters labelled `virt=enabled`.
+2. Label spoke-dc-v6 with `virt=enabled` and let the Policy reconcile.
+3. Apply a `HyperConverged` CR (via a second Policy).
+4. Stand up one small VM as a smoke test.
+5. Extend the observability allowlist for `kubevirt_*` series.
+
+A weekend, maybe a Monday morning. The bulk of the work is testing rather than configuring — making sure live migration works on the cluster's CSI, making sure the VMs can reach the lab's internal DNS, making sure the spoke's NetworkPolicy does not block the migration port.
+
+## Try this
+
+CNV is not running in the lab, so these are thought experiments and sandbox-cluster exercises rather than commands to type on hub-dc-v6.
+
+1. **On a sandbox OpenShift cluster, install CNV via OperatorHub.** Pick a 16 GiB-of-RAM-or-more single-node OpenShift, install the `kubevirt-hyperconverged` operator from the web console, accept the defaults on the `HyperConverged` CR. Wait for the `openshift-cnv` namespace to settle. Then create one VirtualMachine running a CentOS Stream image from the bundled DataSources — the smallest preconfigured template the operator ships. Observe the virt-launcher pod that appears, the PVC the CDI creates, and the VirtualMachineInstance object reaching the `Running` phase.
+
+2. **Write the operator-install Policy.** Without applying it: in your scratch GitOps directory, write a `Policy` containing an `OperatorPolicy` that installs `kubevirt-hyperconverged` from the `redhat-operators` catalogue on the `stable` channel, scoped to the namespace `openshift-cnv`. Pair it with a `Placement` that selects clusters with label `virt=enabled` and a `PlacementBinding` that ties the two together. Run it through a YAML linter and walk through the fields against the OperatorPolicy schema. The exercise here is to learn the shape — actually applying it is for a sandbox hub.
+
+3. **Sketch the ApplicationSet for a fan-out.** Draft an ApplicationSet on the hub that selects clusters with `virt=enabled, env=staging`, with a Kustomize overlay per cluster at `tenants/app/vms/overlays/{{name}}`. The base in the repo defines a single VirtualMachine running a RHEL 9 image; the overlays patch the `storageClassName` (RWX on cluster A, RWO on cluster B) and the network attachment name. Walk through what would land on each cluster.
+
+## Common failure modes
+
+**VM stuck in `Scheduling` for minutes.** Almost always a CDI issue. CDI is trying to materialise the DataVolume — pulling the disk image from a registry, downloading from HTTPS, copying from a source PVC — and cannot reach the source. In a disconnected lab this typically means the source registry is not mirrored or the cluster's `ImageDigestMirrorSet` / `ImageTagMirrorSet` (IDMS / ITMS) do not list it. The fix is to check the `DataVolume` CR's conditions (`oc describe dv ...`) and confirm CDI is hitting an actual mirror, not the upstream Red Hat registry.
+
+**Live migration fails with `network unreachable`.** The spoke has a default-deny NetworkPolicy in the namespace, and virt-handler's migration traffic is being blocked. The migration goes pod-to-pod on TCP/49152 by default — the policy needs an allow rule for that port between virt-launcher pods, or (cleaner) an allow rule scoped to traffic with the `kubevirt.io/schedulable=true` node label. The Pods will retry the migration on every reschedule attempt, so the symptoms can be misleading — it looks like an intermittent flake rather than a deterministic block.
+
+**VirtualMachine shows `Succeeded` but the VM is gone.** This is not an error; it is the terminal state for `runStrategy: Manual` when the guest shuts down gracefully. The semantics: `Manual` means *you* control the VMI lifecycle. The guest's `shutdown -h now` exits cleanly, the VirtualMachineInstance reaches `Succeeded`, the kubevirt-controller does not start it back up. To get it back you `virtctl start <vm>` (or change `runStrategy` to `Always` and let the controller do it). It surprises people the first time because they expect `Always`-style behaviour by default.
+
+**HyperConverged stays `Reconciling` forever.** One of the underlying operators that HCO orchestrates is unhealthy — usually CDI, sometimes the hostpath-provisioner, occasionally KubeVirt itself if there is a CRD mismatch. The diagnostic is to look at each operator's deployment individually in `openshift-cnv`: `oc get deploy -n openshift-cnv` and check which ones are not `Available`. The pod logs of the unhealthy operator usually point at the actual problem — a missing CRD, a permissions denial, a webhook timeout.
+
+**Disk import is unusably slow.** CDI's default import is a streaming download with no parallelism. For a 40 GiB disk image over a slow link, this is hours. Mitigation: stage the source images in the cluster's internal registry (a separate one-time job that pulls upstream and pushes to the local mirror), then have CDI pull from the local mirror at gigabit speed. Or use the `cdi-importer-pod`'s resource-request annotations to give it more CPU.
+
+## References
+
+- Red Hat OpenShift Virtualization documentation: `https://docs.redhat.com/en/documentation/openshift_container_platform/latest/html-single/virtualization/index`
+- Red Hat ACM virtualization documentation: `https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/latest/html-single/virtualization/index`
+- KubeVirt upstream project: `https://kubevirt.io/`
+- Containerized Data Importer (CDI) on GitHub: `https://github.com/kubevirt/containerized-data-importer`
+- KubeVirt user guide: `https://kubevirt.io/user-guide/`
+- Migration Toolkit for Virtualization (MTV): `https://docs.redhat.com/en/documentation/migration_toolkit_for_virtualization/`
+
+## Cross-link to the capstone
+
+This is the last content module before the capstone. If you have walked the track this far, you have built a one-spoke fleet with a Policy baseline, an ApplicationSet rollout, observability, RHACS, and a backup — see [Module 11 — Build a project](/learn/acm-multicluster/build-a-project) for that walkthrough.
+
+A reasonable stretch goal for the capstone, once the rest is green: add a single VirtualMachine to the spoke. Install CNV via Policy from the hub, apply a small RHEL 9 VirtualMachine via ApplicationSet, extend the observability allowlist for `kubevirt_*` metrics, and watch the VM appear under the ACM Infrastructure › Virtual machines view next to the Pods you shipped earlier. That moment — one fleet view that includes both Pods and VMs — is the point of OpenShift Virtualization on ACM.
+
+**End of the content modules.** Continue to [Module 11 — Build a project (capstone)](/learn/acm-multicluster/build-a-project) for the end-to-end walkthrough.

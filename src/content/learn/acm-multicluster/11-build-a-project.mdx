@@ -418,10 +418,61 @@ You have a one-spoke fleet doing the right things. Stretch goals, in roughly inc
 - **Federate the GitOps repo across tenant groups.** The lab's pattern lives at [`/docs/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership/`](/docs/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership) — each tenant team owns its own subdirectory and its own Argo CD AppProject. The hub still does fan-out, but ownership is decentralised.
 - **Run a real DR drill.** Build a sandbox cluster. Restore the latest hub backup into it. Time how long it takes. Find the steps that are not in your runbook. Update the runbook. Repeat next quarter.
 - **Tighten the RHACS posture.** Move a policy to admission-control enforce mode. Watch the first deploy that gets blocked, understand why, exempt the openshift- namespaces, repeat.
+- **Add a VM to the fleet.** Module 12 covers OpenShift Virtualization on managed clusters. The stretch is to install CNV via a Policy on the spoke, deploy one small RHEL 9 VirtualMachine via the same ApplicationSet pattern this capstone uses for Pods, and watch a unified fleet view that includes both. See [Module 12 — OpenShift Virtualization](/learn/acm-multicluster/openshift-virtualization).
+
+## Appendix — Console-first walkthrough
+
+Most of the steps above are CLI-shaped because the CLI is what survives. Once a runbook stops being read in real time and becomes a Git-committed Kustomize overlay, the YAML is the source of truth and the buttons in a web console become a distraction. That is the operational reality for any fleet of more than two clusters.
+
+The console is still useful — for an ad-hoc inspection at three in the morning, for an audit conversation where the security lead wants to see the compliance dashboard, for a first-week engineer who needs to find their bearings before they have a kubeconfig context. This appendix walks the same Step 1–7 capstone through the RHACM web console, so you know what the buttons do when you eventually need them.
+
+### Reaching the console
+
+The RHACM console is a **plug-in to the OpenShift web console on the hub**. There are two ways into it:
+
+- **The OpenShift console with the perspective switcher.** Log in to `https://console-openshift-console.apps.<hub-domain>`. At the top-left of the navigation is a dropdown that defaults to **local-cluster**. Open it, choose **All Clusters**. The left navigation rewrites itself to show the multicluster views — Home, Infrastructure, Applications, Governance, Credentials, Search.
+- **The direct multicluster console route.** A second Route, `multicloud-console.apps.<hub-domain>`, drops you straight into the All-Clusters view. Same UI, slightly faster path. The route lives in the `open-cluster-management` namespace on the hub.
+
+The first time you switch from local-cluster to All Clusters, the URL changes and so does the sidebar. The OpenShift "Workloads" and "Networking" menus disappear; the multicluster menus appear in their place. The cluster switcher is the only persistent affordance — flip it back to a specific cluster to drop into that cluster's local console (which is exactly what the ACM hub's own console is, when local-cluster is selected).
+
+### The five views worth knowing
+
+Once you are in All Clusters, the navigation panel exposes five sections that matter:
+
+1. **Infrastructure › Clusters.** The fleet inventory. Each row is a ManagedCluster — name, status, version, distribution, labels, age. Buttons on the page let you import an existing cluster, provision a new one through a Hive cluster pool, or view cluster sets and their bindings. Clicking a row drills into per-cluster details: nodes, addons, the actual `oc` command line to log in, and a YAML editor for the ManagedCluster CR itself. The **Import cluster** wizard is the most useful entry point here for a one-off — it generates the import YAML for you instead of making you hand-write the ManagedCluster CR.
+
+2. **Applications.** The GitOps and Subscription dashboard. Each row is an Application, an ApplicationSet, or a (legacy) Subscription. The view shows sync state, last-sync time, and the cluster the workload is running on. Topology pages render the workloads visually — handy for understanding *why* an Application is degraded, less handy for actually fixing anything. ApplicationSet status is the row most teams watch: if the generator produces an Application that fails to sync, this is where the red dot appears.
+
+3. **Governance.** The Policy framework dashboard — the one auditors care about. The default view is a compliance matrix: Policies on the rows, clusters on the columns, green or red cells for compliance status. PolicySet view shows policies grouped by intent (the PCI-DSS bundle, the platform-baseline bundle). The **Findings** panel surfaces violations across the fleet with a severity score. This is the dashboard you screenshot for a compliance review; it is also the screen that surfaces "the Policy that worked yesterday is failing today on three clusters" before anyone files a ticket.
+
+4. **Search.** A fleet-wide query interface backed by an indexer that scrapes Kubernetes objects from every managed cluster into a PostgreSQL database on the hub. Type `kind:Pod cluster:dc-spoke-1 namespace:demo-nginx` and the result is every nginx pod on dc-spoke-1, with hyperlinks into per-object detail pages. Filters auto-complete; numeric filters (`cpu`, `memory`, `replicas`) support arithmetic comparators. The search index respects RBAC — you only see objects you would be allowed to see via `oc get` on the relevant cluster.
+
+5. **Infrastructure › Credentials, Automation, Host inventory.** The provisioning side of the console. Credentials stores the cloud-provider or bare-metal account secrets that Hive uses; Automation wires Ansible templates to cluster-lifecycle events; Host inventory tracks physical or virtual machines you can claim into a cluster. Less day-to-day, more first-week setup, but worth knowing where they live.
+
+### Mapping the capstone steps to console panes
+
+Each step of the walkthrough above corresponds to a place in the console:
+
+- **Step 1 (Import the managed cluster)** — Infrastructure › Clusters › *Import cluster*. The wizard does what the YAML in Step 1 does, with a friendlier form.
+- **Step 2 (Label and bind)** — Infrastructure › Clusters › click the cluster › Labels panel. ManagedClusterSet binding is on the cluster-set page elsewhere in the same section.
+- **Step 3 (Apply a policy)** — Governance › Policies › *Create Policy*. The wizard walks the same fields you would put in a Policy YAML, including the OperatorPolicy and ConfigurationPolicy templates.
+- **Step 4 (ApplicationSet)** — Applications › *Create application* › Argo CD ApplicationSet. The wizard handles the template, generator, and placement; the result is a YAML object you can also commit to GitOps and lose the wizard from your workflow.
+- **Step 5 (Observability)** — Infrastructure › Clusters has a **Grafana** link in the upper-right once MultiClusterObservability is running. The Grafana itself is the same one you would expose via Route.
+- **Step 6 (RHACS SecuredCluster)** — separate Central UI, not the ACM console; reachable from a link in the Governance section if Central is integrated.
+- **Step 7 (Backup)** — currently no first-class console pane; the cluster-backup CRs are managed via Search and the YAML editor.
+
+### When to use the console vs the CLI
+
+A useful rule:
+
+- **Console** is for ad-hoc inspection of one cluster, for compliance screenshots, for showing a stakeholder what the fleet looks like, and for the first week of someone's life on the team.
+- **CLI plus GitOps** is the only sustainable path for fleet-scale change. A button click on the console is an imperative mutation; the Argo CD reconciliation loop will revert it the next time it syncs against the repo. Anything you want to *persist* belongs in YAML, in Git, behind a merge request.
+
+The mistake to avoid is **using the console to fix a drift symptom**. If the dashboard shows the Policy NonCompliant on three clusters, the right reaction is to look at the Policy in Git, understand why those three clusters drifted, and fix the cause. Clicking *Remediate* in the UI works once, but the next reconciliation undoes it — and now the audit trail is murkier because the actual change was a button press that nobody records.
 
 ## Closing
 
-Twelve modules in:
+Thirteen modules in:
 
 - You know what ACM is and what it is not (Module 00).
 - You can name every component of the hub-and-spoke topology (Module 01).
@@ -434,6 +485,7 @@ Twelve modules in:
 - You have wired RHACS Central + SecuredCluster across the fleet (Module 09).
 - You have a backup strategy for the hub and the workloads, with an RPO and RTO target you actually believe (Module 10).
 - You have done the whole stack end-to-end on one spoke (this module).
+- You know how to extend the same fleet to virtual-machine workloads when the BFSI estate hands you Windows guests or vendor-shipped VMs (Module 12, optional).
 
 This track is the foundation. The operational depth — the on-call runbooks, the GitOps repository conventions, the per-tenant onboarding workflows — lives in the lab's own platform docs. Start at [`/docs/openshift-platform/acm-multicluster/`](/docs/openshift-platform/acm-multicluster) and work outward.
 
@@ -447,5 +499,7 @@ The fleet you built in this capstone is a sandbox. The fleet a real platform tea
 - Argo CD ApplicationSet: `https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/`
 - OADP project: `https://www.oadp-operator.com/`
 - Velero upstream: `https://velero.io/`
+
+**Optional next module:** [Module 12 — OpenShift Virtualization](/learn/acm-multicluster/openshift-virtualization), for readers who want to extend the capstone with VM workloads — Windows guests, legacy DB servers, vendor-shipped appliances that arrive as `.qcow2` files. CNV is forward-looking in this lab (not yet deployed), but the patterns travel.
 
 **That is the end of the track.** If you completed the capstone, you are now operating a working multicluster control plane. Send back what you built or what blocked you — the feedback shapes future revisions of the track.
