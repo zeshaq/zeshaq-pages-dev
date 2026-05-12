@@ -1,0 +1,70 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import DocsTocNode from "../../../components/DocsTocNode.astro";
+import { getCollection } from "astro:content";
+import { buildModuleTree } from "../../../utils/navTree";
+import { MODULE_TITLES, MODULE_TAGLINES } from "../../../utils/docModules";
+
+// Module landing for the BRAC POC docs. Mirrors openshift-platform/index.astro.
+const moduleId = "brac-poc";
+
+const all = await getCollection("docs", ({ data }) => !data.draft);
+const entries = all.filter((e) => e.id.startsWith(`${moduleId}/`));
+
+const tree = buildModuleTree(all, moduleId, "/docs");
+
+const reviewed = entries
+  .map((e) => e.data.last_reviewed)
+  .filter((d): d is Date => !!d)
+  .sort((a, b) => b.valueOf() - a.valueOf());
+const lastReviewed = reviewed[0]
+  ? reviewed[0].toISOString().slice(0, 10)
+  : undefined;
+
+function firstLeaf(nodes: { href?: string; children?: any[] }[]): string | undefined {
+  for (const n of nodes) {
+    if (n.href) return n.href;
+    const h = n.children ? firstLeaf(n.children as any) : undefined;
+    if (h) return h;
+  }
+  return undefined;
+}
+const overview = entries.find((e) => e.id.endsWith("/00-overview"));
+const startHref = overview
+  ? `/docs/${moduleId}/${overview.id.split("/").slice(1).map((s) => s.replace(/^\d+[-_]/, "")).join("/")}`
+  : firstLeaf(tree);
+
+const title = MODULE_TITLES[moduleId];
+const tagline = MODULE_TAGLINES[moduleId];
+---
+
+<DocsLayout title={`${title} — Documentation · Zahid`} description={tagline}>
+  <nav class="track-breadcrumb">
+    <a href="/docs/">← All documentation</a>
+  </nav>
+
+  <section class="mb-8">
+    <h1 class="text-2xl font-semibold mb-2">{title}</h1>
+    <p class="text-[var(--color-muted)] mb-3">{tagline}</p>
+    <p class="text-[var(--color-muted)] text-sm mb-4">
+      <strong>{entries.length}</strong> {entries.length === 1 ? "page" : "pages"}
+      {lastReviewed && (
+        <>
+          {" · "}last reviewed {lastReviewed}
+        </>
+      )}
+    </p>
+    {startHref && (
+      <a href={startHref} class="track-start-btn">Start here →</a>
+    )}
+  </section>
+
+  <section class="toc">
+    <h2 class="track-toc-heading">Pages</h2>
+    {tree.map((node) => (
+      <div class="toc-section">
+        <DocsTocNode node={node} depth={0} />
+      </div>
+    ))}
+  </section>
+</DocsLayout>

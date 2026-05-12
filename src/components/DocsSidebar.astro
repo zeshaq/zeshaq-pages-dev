@@ -3,7 +3,8 @@ import { getCollection } from "astro:content";
 import NavNode from "./NavNode.astro";
 import SectionNav from "./SectionNav.astro";
 import Search from "./Search.astro";
-import { buildDocsTree, type NavNode as NavNodeT } from "../utils/navTree";
+import { buildDocsTree, buildModuleTree, type NavNode as NavNodeT } from "../utils/navTree";
+import { parseDocsPath, moduleTitle, MODULE_TITLES } from "../utils/docModules";
 
 interface Props {
   currentPath: string;
@@ -13,7 +14,21 @@ const { currentPath } = Astro.props;
 
 const docs = await getCollection("docs", ({ data }) => !data.draft);
 
-const tree: NavNodeT[] = buildDocsTree(docs, "/docs");
+// Decide which sub-tree to render. Inside a module (`/docs/<module>/...`)
+// the sidebar scopes to that module so the reader isn't drowned in
+// cross-module pages; on the master `/docs/` landing it shows all modules
+// grouped (the existing buildDocsTree gives us that for free, with module
+// folders as the first-level groups).
+const ctx = parseDocsPath(currentPath);
+const inModule = (ctx.isModuleHome || ctx.isModulePage) && !!ctx.moduleId && ctx.moduleId in MODULE_TITLES;
+const moduleId = inModule ? ctx.moduleId! : undefined;
+
+const tree: NavNodeT[] = moduleId
+  ? buildModuleTree(docs, moduleId, "/docs")
+  : buildDocsTree(docs, "/docs");
+
+const brand = moduleId ? moduleTitle(moduleId) : "Documentation";
+const brandHref = moduleId ? `/docs/${moduleId}/` : "/docs";
 ---
 
 <aside class="sidebar">
@@ -26,7 +41,7 @@ const tree: NavNodeT[] = buildDocsTree(docs, "/docs");
             <polyline points="9 22 9 12 15 12 15 22" />
           </svg>
         </a>
-        <a href="/docs" class="sidebar-brand" onclick="event.stopPropagation()">Full Platform Docs</a>
+        <a href={brandHref} class="sidebar-brand" onclick="event.stopPropagation()">{brand}</a>
       </div>
       <span class="sidebar-hamburger" aria-hidden="true">≡</span>
     </summary>
@@ -34,6 +49,14 @@ const tree: NavNodeT[] = buildDocsTree(docs, "/docs");
     <SectionNav currentPath={currentPath} />
 
     <Search />
+
+    {moduleId && (
+      <div class="sidebar-contextual">
+        <a href="/docs/" class="sidebar-context-link">
+          ← back to all documentation
+        </a>
+      </div>
+    )}
 
     <div class="sidebar-filter-wrap">
       <input
