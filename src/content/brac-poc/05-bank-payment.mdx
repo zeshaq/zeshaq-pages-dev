@@ -1,18 +1,20 @@
 ---
 title: "Brac POC — bank-payment app"
 sidebar_label: "Bank Payment app"
-description: "Two-microservice payment app with two web frontends, single sign-on through WSO2, an in-cluster canary release, a live health view, and standard web hardening — delivered onto OpenShift via GitOps."
-last_reviewed: 2026-05-11
+description: "End-to-end payment workflow on OpenShift — designed, built and shipped with the bank's existing pipeline. Single sign-on, canary release, browser-trusted TLS at the edge, mTLS in the cluster, live health view, and standard web hardening — all delivered through GitOps."
+last_reviewed: 2026-05-12
 draft: false
 ---
 
 import Whiteboard from "../../components/Whiteboard.tsx";
 
-> Demo asset for the BRAC engagement. A working bank-payment workflow
-> with customer and approver roles, single sign-on, a canary release of
-> the customer page, a real-time health view of the backend services,
-> and three of the standard web-hardening controls every audit asks
-> for.
+> Demo asset for the BRAC engagement. A working payment workflow with
+> customer and approver roles, single sign-on, a canary release of the
+> customer page, browser-trusted TLS at the edge, mutual TLS between
+> the internal components, a real-time health view of the backend
+> services, and three of the standard web-hardening controls every
+> audit asks for. Built end-to-end on top of the bank's existing
+> platform — no new vendor, no new toolchain.
 
 ## At a glance
 
@@ -23,19 +25,20 @@ import Whiteboard from "../../components/Whiteboard.tsx";
 | **Approver page** | `https://approver.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | **Health view** | `https://payments.apps.spoke-dc-v6.sub.comptech-lab.com/obs/` |
 | **Login** | WSO2 Identity Server, tenant `bank-payment` |
-| **TLS** | Public Let's Encrypt wildcard — trusted by every browser, no setup |
-| **Delivery** | One Git repo, one Argo CD application, automatic sync |
+| **Browser-trusted TLS** | Public Let's Encrypt wildcard, auto-renewed |
+| **Internal TLS** | mTLS between the in-cluster proxy and the backends, certs issued by the lab CA |
+| **Delivery** | One Git repo → Jenkins → Nexus → Argo CD → OpenShift |
 
 ## What got built
 
-Four pieces, one namespace:
+Four pieces in one namespace:
 
 | Piece | Role | Who uses it |
 | --- | --- | --- |
-| **payment-client-svc** | Customer payment service. Owns the accounts and the transfer history. | All users (under the hood) |
-| **payment-approver-svc** | Admin service. Reviews and decides on pending transfers. | Admin only |
-| **client-frontend** | Customer web page. Shows balance, send-payment form, transaction history. | `zahid`, `shaikat` |
-| **approver-frontend** | Admin web page. Shows the queue, approve / decline buttons, audit log. | `admin` |
+| **payment-client-svc** | Customer payment API. Owns the accounts and the transfer history. | All users (under the hood) |
+| **payment-approver-svc** | Admin API. Reviews and decides on pending transfers. | Admin only |
+| **client-frontend** | Customer web page. Balance, send-payment form, transaction history. | `zahid`, `shaikat` |
+| **approver-frontend** | Admin web page. Pending queue, approve / decline, audit log. | `admin` |
 
 ## Who logs in
 
@@ -47,40 +50,103 @@ All three users share one demo password: **`Hkj38djf&&&`**.
 | `shaikat` | `5005-0004-56` | 75,000 BDT | customer |
 | `admin` | — | — | approver |
 
-Login is single sign-on through WSO2 — the bank doesn't manage usernames
-or passwords inside the app itself.
+Login is single sign-on through WSO2 — the bank doesn't manage usernames or passwords inside the app itself.
 
 ## Technology choices
 
-Every layer of this app uses something the bank's operations team
-already runs in production elsewhere — nothing exotic, nothing that
-needs a new vendor relationship to support. The two backend services
-are built on **Open Liberty**, IBM / Red Hat's enterprise Java
-application server, which is the same runtime the bank uses for the
-existing payment platform. The reverse proxy is plain **NGINX**, the
-most widely deployed web server in the world. Identity is handled by
-**WSO2 Identity Server**, which the bank already operates as part of
-its identity strategy.
+Every layer of the app uses something the bank's operations team
+already runs in production. Nothing exotic, nothing that needs a new
+vendor relationship to support.
 
 | Layer | What it uses | Why this choice |
 | --- | --- | --- |
-| Backend services | **Open Liberty** (Java application server, MicroProfile 6.1) | Same runtime the bank's existing platform already runs. Long-term enterprise support from Red Hat. Built-in health and metrics endpoints — no extra agent required. |
-| Web frontends | **React** (single-page apps), built with Vite, styled with Tailwind CSS | Industry-standard frontend stack. Light, fast to load, easy to hand off to any frontend team. |
-| Reverse proxy / canary / hardening | **NGINX** | The de-facto edge proxy. Used here for header-based canary routing, rate limiting, branded error pages, and the security headers. Zero learning curve for ops teams. |
-| Identity & single sign-on | **WSO2 Identity Server** | The bank's existing identity platform. Two service-provider entries, one tenant, regular OpenID Connect — no custom auth code in the apps. |
-| Container runtime | **OpenShift** (Kubernetes-based, by Red Hat) | The bank's existing container platform. Standard images, standard deployment objects. |
-| Public TLS certificate | **Let's Encrypt** (issued automatically by cert-manager) | A globally-trusted certificate, refreshed automatically — no procurement cycle, no manual cert rotation. |
-| Source control & build | **GitLab** for source, **Nexus** for the image registry | The bank's existing development pipeline. The same Git repository the developers push to is the same source Argo CD reads to keep the cluster in sync. |
-| Deployment pipeline | **Argo CD** (GitOps) | One commit to the Git repository becomes one change on the cluster, automatically. No engineer ever logs in to the running environment to make a change. |
+| Backend services | **Open Liberty** (Java application server, MicroProfile 6.1) | Same runtime the bank's existing platform already runs. Long-term enterprise support from IBM / Red Hat. Built-in health and metrics endpoints — no extra agent required. |
+| Web frontends | **React** (single-page apps), built with Vite, styled with Tailwind | Industry-standard frontend stack. Light, fast to load, easy to hand off to any frontend team. |
+| Reverse proxy + canary + hardening | **NGINX** | The de-facto edge proxy. Used here for header-based canary routing, rate limiting, branded error pages, and the security headers. Zero learning curve for ops teams. |
+| Identity & SSO | **WSO2 Identity Server** | The bank's existing identity platform. Two service-provider entries, one tenant, regular OpenID Connect — no custom auth code in the apps. |
+| Container platform | **OpenShift** (Kubernetes-based, by Red Hat) | The bank's existing container platform. Standard images, standard deployment objects. |
+| Public TLS certificate | **Let's Encrypt** via cert-manager | Globally-trusted certificate, refreshed automatically — no procurement cycle, no manual rotation. |
+| Internal TLS | **Lab Certificate Authority** via cert-manager | Signs the in-cluster mTLS certs. The CA root is already trusted by every Java pod and every node. |
+| Source control | **GitLab** | The bank's existing development pipeline. |
+| Build pipeline | **Jenkins** | The bank's existing CI/CD. |
+| Image registry | **Nexus Repository** | The bank's existing artifact store. Same registry the rest of the platform pulls from. |
+| Deployment pipeline | **Argo CD** (GitOps) | One commit to the Git repository becomes one change on the cluster, automatically. No engineer logs in to the running environment to make a change. |
 
-## How a payment moves
+## How the app was designed
 
-1. **Zahid logs in** on the customer page (gets redirected to WSO2, signs in, comes back signed in).
-2. **He picks a recipient** from the dropdown — accounts are listed by name and account number, no balances exposed across customers.
-3. **He submits a payment** for an amount — the funds are *reserved* against his balance immediately so he can't double-spend during review.
-4. **Admin logs in** on the approver page. The pending queue auto-refreshes every five seconds.
-5. **Admin clicks Approve** — funds move into the recipient's balance and the transfer is logged with the admin's name on the audit trail.
-6. *Decline* refunds the sender. Either decision is one-shot — the app won't let the same transfer be settled twice.
+A small set of decisions, made up front, that the rest of the
+implementation followed:
+
+| Decision | What it means in practice |
+| --- | --- |
+| **Two backend services**, one customer, one approver | The customer service is the system of record for accounts and transfers. The approver service is a thin admin facade — it reviews and decides, but doesn't own data. Separation makes auditing simpler: every approver decision is recorded on the customer service with the admin's identity. |
+| **Two separate web frontends**, one per role | The customer and admin experiences are different products with different audiences, different navigation, different theming. Splitting them eliminates accidental cross-exposure of admin features to customers. |
+| **Reserve-on-create, complete-on-approve** | When a customer submits a payment, the funds leave their visible balance immediately. The transfer can't be double-spent during review. On Approve the funds land in the recipient; on Decline they're refunded. |
+| **No service can speak for the user** | Every API call carries the user's own bearer token. When the approver service calls the customer service to settle a transfer, it forwards the admin's token, not a service account. The audit trail captures the actual deciding human. |
+| **No new vendor, no new toolchain** | Every layer (runtime, build, identity, registry, ingress) maps to something the bank already runs. |
+
+## How the app is built
+
+A single push to GitLab triggers everything else.
+
+| Step | What happens | Where |
+| --- | --- | --- |
+| 1. Developer pushes to `main` | GitLab webhook fires | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
+| 2. Jenkins runs the pipeline | Defined in `Jenkinsfile` at the root of the repo | Jenkins (lab VM) |
+| 3. Four container images built in parallel | One per app — backend services and frontends | Jenkins build agent (`ct-shared-build`) |
+| 4. Each image scanned for high / critical vulnerabilities | Trivy. Build fails if any HIGH or CRITICAL CVE is found. | Same agent |
+| 5. Images tagged twice and pushed | `:latest` and `:<short-commit-sha>` | Nexus (`app-registry.apps.sub.comptech-lab.com`) |
+| 6. GitOps repo updated with the new digest | A small script writes the immutable digest into the Argo overlay and commits back | Same pipeline |
+| 7. Argo CD reconciles the new digest onto the cluster | Picks up the commit, rolls the deployment | OpenShift |
+
+The whole sequence is **four to six minutes** end-to-end. The build
+fails closed — a single critical CVE blocks the push to Nexus, which
+blocks the deployment. No image ever lands on the cluster without
+having been scanned.
+
+## GitOps deployment
+
+The cluster's state is a **rendered copy of two Git repositories**.
+No engineer ever runs `oc apply` against the running environment.
+
+| Repo | What lives there | Who can write to it |
+| --- | --- | --- |
+| `divisions/payment/bank-payment` | The four app sources, the Containerfiles, the kustomize manifests (Deployments, Services, Routes, NGINX config, mTLS Certificates), the Jenkinsfile | The payment-division developers |
+| `comptech-platform/openshift-ops/openshift-platform-gitops` | Tenant scaffolding (namespace, quotas, RBAC, network policy, Argo Application) | Platform admins |
+
+On the cluster, **Argo CD** watches both repositories and continuously
+reconciles their contents onto OpenShift. Two important properties
+fall out of this:
+
+- **Self-healing.** If anything drifts from what's in Git — someone
+  patches a Service directly, a resource gets deleted by mistake —
+  Argo reverts it within seconds.
+- **Auditable.** Every change to the running app is a Git commit, with
+  an author, a timestamp, and a diff. Compliance gets the audit trail
+  for free.
+
+The deployment itself uses two-side reconciliation: the cluster
+declares it wants the image at digest `sha256:abc…`, the image already
+exists in Nexus, OpenShift pulls it, and rolls the deployment. The
+whole sequence after a Jenkins build is **typically under a minute**.
+
+## Traffic flow — browser to pod
+
+A request from `zahid`'s browser passes through **six** named layers
+before it reaches an application pod:
+
+| Hop | What it does | Where it lives |
+| --- | --- | --- |
+| **1. Cloudflare DNS** | Authoritative DNS for `comptech-lab.com`. Returns NS records that delegate the `sub.comptech-lab.com` subdomain to the lab's own DNS server. | Public, managed by Cloudflare |
+| **2. PowerDNS** | Authoritative DNS for the `sub.comptech-lab.com` zone. Returns the public IP of the lab's edge load balancer for any `*.apps.spoke-dc-v6.sub.comptech-lab.com` query. | Lab VM (`pdns`) |
+| **3. HAProxy** | Edge TCP / SNI load balancer for the whole lab. Reads the SNI hostname from the inbound TLS ClientHello and forwards the connection to the right backend — the spoke OpenShift cluster's ingress in this case. TLS is passed through end-to-end. | Lab VM (`haproxy` at `30.30.30.1`) |
+| **4. OpenShift Router** | The cluster's ingress. Terminates the public Let's Encrypt TLS, looks up the matching Route, forwards the request as plain HTTP to the in-cluster Service. | Cluster (`openshift-ingress` namespace) |
+| **5. NGINX reverse proxy** | The in-cluster gateway for the customer page. Applies header-based canary routing, per-IP rate limiting, branded error pages, and the security response headers. For the live health view, also presents a client certificate over mutual TLS to the backend. | Cluster (`bank-payment` namespace) |
+| **6. App pod** | The actual web frontend or backend service — Open Liberty for the APIs, httpd for the static SPA bundles. | Cluster (`bank-payment` namespace) |
+
+The public TLS terminates at step 4. From step 5 onward, the
+in-cluster hop between the proxy and the backend service is **also**
+encrypted, using mTLS — see [Internal mTLS](#internal-mtls) below.
 
 ## System view
 
@@ -111,33 +177,49 @@ export const ext = {
 };
 
 export const flowNodes = [
-  { id: "users",   data: { label: "zahid · shaikat" },                  position: { x:   0, y:  10 }, style: stage },
-  { id: "admin",   data: { label: "admin" },                            position: { x: 720, y:  10 }, style: stage },
-  { id: "wso2",    data: { label: "WSO2 IS\nbank-payment tenant" },     position: { x: 360, y:  60 }, style: ext },
-  { id: "proxy",   data: { label: "NGINX reverse proxy\n(canary + hardening + obs)" }, position: { x:   0, y: 170 }, style: ctrl },
-  { id: "aspa",    data: { label: "approver-frontend" },                position: { x: 720, y: 170 }, style: ctrl },
-  { id: "v1",      data: { label: "client-frontend\nv1 (stable)" },     position: { x:-160, y: 320 }, style: ctrl },
-  { id: "v2",      data: { label: "client-frontend\nv2 (canary)" },     position: { x: 160, y: 320 }, style: canary },
-  { id: "csvc",    data: { label: "payment-client-svc" },               position: { x:   0, y: 470 }, style: agent },
-  { id: "asvc",    data: { label: "payment-approver-svc" },             position: { x: 720, y: 470 }, style: agent },
-  { id: "ledger",  data: { label: "in-memory ledger\nzahid 50k · shaikat 75k" }, position: { x: 360, y: 600 }, style: stage },
+  { id: "user",    data: { label: "zahid · shaikat · admin" }, position: { x: 340, y:  10 }, style: stage },
+  { id: "cf",      data: { label: "Cloudflare DNS\ncomptech-lab.com" }, position: { x:   0, y: 110 }, style: ext },
+  { id: "pdns",    data: { label: "PowerDNS\nsub.comptech-lab.com" }, position: { x: 220, y: 110 }, style: ext },
+  { id: "haproxy", data: { label: "HAProxy\nedge SNI LB" }, position: { x: 440, y: 110 }, style: ctrl },
+  { id: "router",  data: { label: "OpenShift Router\n(LE wildcard terminate)" }, position: { x: 660, y: 110 }, style: ctrl },
+  { id: "wso2",    data: { label: "WSO2 IS\nbank-payment tenant" }, position: { x: 340, y: 240 }, style: ext },
+  { id: "proxy",   data: { label: "NGINX reverse proxy\n(canary · hardening · obs)" }, position: { x:   0, y: 350 }, style: ctrl },
+  { id: "aspa",    data: { label: "approver-frontend" }, position: { x: 720, y: 350 }, style: ctrl },
+  { id: "v1",      data: { label: "client-frontend\nv1 (stable)" }, position: { x:-160, y: 480 }, style: ctrl },
+  { id: "v2",      data: { label: "client-frontend\nv2 (canary)" }, position: { x: 160, y: 480 }, style: canary },
+  { id: "csvc",    data: { label: "payment-client-svc\n(Liberty)" }, position: { x:   0, y: 620 }, style: agent },
+  { id: "asvc",    data: { label: "payment-approver-svc\n(Liberty)" }, position: { x: 720, y: 620 }, style: agent },
+  { id: "ledger",  data: { label: "in-memory ledger\nzahid 50k · shaikat 75k" }, position: { x: 360, y: 760 }, style: stage },
 ];
 
 export const flowEdges = [
-  { id: "u-proxy", source: "users", target: "proxy", style: { stroke: "#1f2937" } },
-  { id: "a-aspa",  source: "admin", target: "aspa",  style: { stroke: "#1f2937" } },
-  { id: "u-wso2",  source: "users", target: "wso2",  label: "sign in", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "a-wso2",  source: "admin", target: "wso2",  label: "sign in", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "px-v1",   source: "proxy", target: "v1",    label: "default", style: { stroke: "#1f2937" } },
-  { id: "px-v2",   source: "proxy", target: "v2",    label: "X-Canary: v2", style: { stroke: "#ca8a04" }, animated: true },
-  { id: "v1-csvc", source: "v1",    target: "csvc",  style: { stroke: "#1f2937" } },
-  { id: "v2-csvc", source: "v2",    target: "csvc",  style: { stroke: "#1f2937" } },
-  { id: "as-asvc", source: "aspa",  target: "asvc",  style: { stroke: "#1f2937" } },
-  { id: "asvc-csvc", source: "asvc", target: "csvc", label: "internal\n(admin's session forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
-  { id: "csvc-ledger", source: "csvc", target: "ledger", style: { stroke: "#1f2937" } },
+  { id: "u-cf",      source: "user",  target: "cf",     label: "DNS", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "cf-pdns",   source: "cf",    target: "pdns",   label: "NS delegation", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "u-haproxy", source: "user",  target: "haproxy", label: "TLS SNI", style: { stroke: "#1f2937" } },
+  { id: "ha-router", source: "haproxy", target: "router", style: { stroke: "#1f2937" } },
+  { id: "r-proxy",   source: "router", target: "proxy",  label: "customer page",  style: { stroke: "#1f2937" } },
+  { id: "r-aspa",    source: "router", target: "aspa",   label: "approver page",  style: { stroke: "#1f2937" } },
+  { id: "u-wso2",    source: "user",   target: "wso2",   label: "sign in", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "px-v1",     source: "proxy",  target: "v1",     label: "default", style: { stroke: "#1f2937" } },
+  { id: "px-v2",     source: "proxy",  target: "v2",     label: "X-Canary: v2", style: { stroke: "#ca8a04" }, animated: true },
+  { id: "px-csvc",   source: "proxy",  target: "csvc",   label: "/obs/* (mTLS)", style: { stroke: "#b45309" }, animated: true },
+  { id: "v1-csvc",   source: "v1",     target: "csvc",   style: { stroke: "#1f2937" } },
+  { id: "v2-csvc",   source: "v2",     target: "csvc",   style: { stroke: "#1f2937" } },
+  { id: "as-asvc",   source: "aspa",   target: "asvc",   style: { stroke: "#1f2937" } },
+  { id: "asvc-csvc", source: "asvc",   target: "csvc",   label: "internal\n(admin's token forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
+  { id: "csvc-led",  source: "csvc",   target: "ledger", style: { stroke: "#1f2937" } },
 ];
 
-<Whiteboard nodes={flowNodes} edges={flowEdges} height={760} client:only="react" />
+<Whiteboard nodes={flowNodes} edges={flowEdges} height={900} client:only="react" />
+
+## How a payment moves
+
+1. **Zahid logs in** on the customer page. Browser is redirected to WSO2, signs in, comes back signed in.
+2. **He picks a recipient** from the dropdown — accounts are listed by name and account number; balances are not exposed across customers.
+3. **He submits a payment** for an amount. Funds are *reserved* against his balance immediately.
+4. **Admin logs in** on the approver page. The pending queue auto-refreshes every five seconds.
+5. **Admin clicks Approve.** Funds move into the recipient's balance, the transfer is logged with the admin's name on the audit trail.
+6. **Decline** would refund the sender. Either decision is one-shot — the app won't let the same transfer be settled twice.
 
 ## Canary release of the customer page
 
@@ -151,18 +233,53 @@ stable v1 unless they explicitly ask for v2.
 | Replicas | 2 | 1 |
 | Switching is | Instant on the next page load, no redeploy | Instant on the next page load |
 
-**To show v2 in a demo:** install the **ModHeader** browser extension,
+To show v2 in a demo: install the **ModHeader** browser extension,
 add a single rule (`Name: X-Canary`, `Value: v2`), reload. Disable the
 rule to flip back to v1.
 
 The routing decision is visible in the **`x-served-by`** response
 header — open Chrome's dev tools → Network → click the page request →
-Headers → Response Headers, and you'll see which version served you.
+Headers → Response Headers — to see which version served you.
+
+## Internal mTLS
+
+Public traffic to the app uses a browser-trusted Let's Encrypt
+certificate; that part is unchanged. The hop *inside* the cluster
+between the NGINX reverse proxy and the health-view endpoints on the
+backend services now uses **mutual TLS** — both sides authenticate
+with certificates, both sides verify each other's certificate against
+the lab certificate authority.
+
+| | Client (NGINX proxy) | Server (Liberty backend) |
+| --- | --- | --- |
+| Identity | Cert issued by the lab CA, CN = `client-frontend-canary-proxy.bank-payment.svc.cluster.local` | Cert issued by the lab CA, CN = `payment-client-svc.bank-payment.svc.cluster.local` |
+| Cert lifetime | 90 days, rotated automatically 30 days before expiry by cert-manager | Same |
+| What happens without a cert | The Liberty backend refuses the connection at the TLS handshake | — |
+
+To prove mTLS is doing its job, two commands from a terminal:
+
+```bash
+# 1. Without the client cert — handshake rejected
+oc -n bank-payment exec deploy/client-frontend-canary-proxy -- \
+  curl -k --max-time 5 https://payment-client-svc:9445/health/live
+# → SSL_ERROR_ZERO_RETURN
+
+# 2. With the client cert — accepted, returns 200 + JSON
+oc -n bank-payment exec deploy/client-frontend-canary-proxy -- \
+  curl --cert /etc/nginx-mtls/tls.crt --key /etc/nginx-mtls/tls.key \
+       --cacert /etc/nginx-mtls/ca.crt \
+       https://payment-client-svc.bank-payment.svc.cluster.local:9445/health/live
+# → {"status":"UP",...}
+```
+
+The plain-HTTP port on the backend (`9080`) stays open for the
+OpenShift platform's own probes and for the public-facing API Routes,
+which are already protected by the bearer token from WSO2.
 
 ## Live health view
 
 `/obs/` shows two cards, one per backend service, refreshed every five
-seconds.
+seconds. The view itself goes through the mTLS hop above.
 
 | Metric | What it tells you |
 | --- | --- |
@@ -172,9 +289,6 @@ seconds.
 | **Heap used (MB)** | How much memory the service is holding. |
 | **CPU (recent %)** | Live CPU usage. |
 
-The view is unauthenticated for the demo — in production it would sit
-behind the same login wall as the rest of the bank's internal tooling.
-
 ## Web hardening at the edge
 
 Three controls applied in front of every request, configured in one
@@ -182,11 +296,11 @@ NGINX file:
 
 | Control | What it does | How to verify in 10 seconds |
 | --- | --- | --- |
-| **HSTS** (Strict-Transport-Security) | Browser remembers for 1 year that this site is HTTPS-only. Even typing `http://` won't downgrade. | F12 → Network → reload → click request → Headers → look for `strict-transport-security`. |
+| **HSTS** (Strict-Transport-Security) | Browser remembers for 1 year that this site is HTTPS-only. Even typing `http://` won't downgrade. | Dev tools → Network → reload → click request → Headers → look for `strict-transport-security`. |
 | **Branded error pages** | 404 / 429 / 5xx all return a bank-branded page instead of nginx's grey default. | Fire 30 rapid requests at the health view — the 429 page renders. |
-| **Per-source rate limiting** | Caps how fast one source can hit a path. Stops dictionary attacks on login forms and stops scrapers hammering the health view. | Run `for i in {1..30}; do curl -sS -o /dev/null -w '%{http_code} ' …/obs/client/metrics; done` — you'll see a mix of `200`s and `429`s. |
+| **Per-source rate limiting** | Caps how fast one source can hit a path. Stops dictionary attacks on login forms and stops scrapers hammering the health view. | `for i in {1..30}; do curl -sS -o /dev/null -w '%{http_code} ' …/obs/client/metrics; done` — you'll see a mix of `200`s and `429`s. |
 
-Two additional headers ship alongside HSTS: **X-Content-Type-Options:
+Two additional headers travel alongside HSTS: **X-Content-Type-Options:
 nosniff** (browsers can't misinterpret file types) and **Referrer-Policy:
 strict-origin-when-cross-origin** (other sites don't see internal paths
 in their referrer logs).
@@ -201,16 +315,18 @@ in their referrer logs).
 | Customer API | `https://client-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | Approver API | `https://approver-api.apps.spoke-dc-v6.sub.comptech-lab.com` |
 | WSO2 IS console | `https://is.apps.sub.comptech-lab.com/t/bank-payment/console` |
-| Git repo | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
+| Git repo (app) | `gitlab.apps.sub.comptech-lab.com/divisions/payment/bank-payment` |
+| Git repo (platform / Argo) | `gitlab.apps.sub.comptech-lab.com/comptech-platform/openshift-ops/openshift-platform-gitops` |
+| Image registry | `app-registry.apps.sub.comptech-lab.com/bank-payment/*` |
 
 ## Roadmap (intentionally not yet built)
 
 - **Persistent storage** for accounts + transfer history. The demo uses
-  in-memory state, so a service restart wipes the ledger.
+  in-memory state; a service restart wipes the ledger. JDBC +
+  PostgreSQL or a PVC-backed JSON snapshot is the obvious next step.
 - **API Gateway** in front of the two services — the gateway
   definitions are already in the repo, waiting on WSO2 APIM.
-- **Service mesh with mTLS** for the canary story end-to-end (the
-  in-cluster traffic between services would be encrypted and identity-
-  verified, not just edge-encrypted).
-- **Audit event stream** — every approver decision emitted to Kafka for
-  downstream reconciliation.
+- **Service mesh** for fleet-wide mTLS and a richer canary story
+  beyond a single header rule.
+- **Audit event stream** — every approver decision emitted to Kafka
+  for downstream reconciliation.
