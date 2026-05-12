@@ -1,0 +1,172 @@
+---
+title: "Brac POC — jboss-chat app"
+sidebar_label: "JBoss Chat app"
+description: "Two-user chat application for the bank-employees division, delivered through GitLab, Jenkins, Trivy, Nexus, and OpenShift GitOps. It uses WSO2 Identity Server and API Manager, a BFF, VM Kafka and Redis, canary frontends, and a JBoss/WildFly managed-domain backend topology."
+last_reviewed: 2026-05-12
+draft: false
+---
+
+> Delivered-state page for the `jboss-chat` proof-of-concept. The app is a
+> small bank-employees chat service for `shaikat` and `zahid`, built to show
+> how a regulated Java workload can move through the existing bank toolchain
+> and land on OpenShift with identity, API gateway enforcement, observability,
+> and GitOps control.
+
+## At a glance
+
+| | |
+| --- | --- |
+| **Application** | `jboss-chat` |
+| **Division / namespace** | `bank-employees` / `bank-employees-jboss-chat` |
+| **Cluster** | `spoke-dc-v6` |
+| **Frontend route** | `https://jboss-chat.apps.sub.comptech-lab.com` |
+| **WSO2 API route** | `https://gateway.apps.sub.comptech-lab.com/jboss-chat/1.0.0` |
+| **Users** | `shaikat`, `zahid` |
+| **Login** | WSO2 Identity Server, OpenID Connect authorization code + PKCE |
+| **API protection** | WSO2 API Manager gateway plus BFF JWT validation through WSO2 JWKS |
+| **Backend pattern** | Browser -> frontend canary -> BFF -> JBoss/WildFly managed domain |
+| **Messaging** | VM Kafka topic for message events; VM Redis Sentinel for notifications |
+| **Observability** | OpenShift Logging, user-workload monitoring, OpenTelemetry to the platform collector |
+| **Delivery** | GitLab -> Jenkins -> Trivy -> Nexus app-registry -> Argo CD -> OpenShift |
+
+## What got built
+
+| Component | Runtime | Role |
+| --- | --- | --- |
+| **frontend-v1** | React static frontend | Blue login page, one half of the 50/50 canary route. |
+| **frontend-v2** | React static frontend | Red login page, the other half of the 50/50 canary route. |
+| **bff** | Node.js / Fastify | Browser-facing API. Validates WSO2 JWTs, enforces allowed users, calls the backend, and publishes notifications. |
+| **chat-backend** | Java / Open Liberty | Compatibility backend and health endpoint. Kept as a fallback during the transition to the managed-domain backend. |
+| **eap-domain** | WildFly managed domain image | Lab implementation of the requested JBoss EAP shape: one Domain Controller, one Host Controller, and two server groups exposed on separate ports. |
+
+The main runtime path now prefers the managed-domain service:
+
+```text
+Browser
+  -> frontend-v1 or frontend-v2
+  -> same-origin /api route
+  -> BFF
+  -> eap-domain group A on 8080
+  -> eap-domain group B on 8230
+  -> chat-backend fallback on 9080
+```
+
+## Identity and API gateway
+
+The login flow uses WSO2 Identity Server as the identity provider. The SPA is
+registered as a public OIDC client with PKCE enabled, and the redirect URI is
+the production callback route:
+
+```text
+https://jboss-chat.apps.sub.comptech-lab.com/callback
+```
+
+The frontend calls the WSO2 API Manager gateway base path:
+
+```text
+https://gateway.apps.sub.comptech-lab.com/jboss-chat/1.0.0
+```
+
+The BFF validates bearer tokens again by loading the WSO2 JWKS endpoint. It
+allows only the expected demo users and group:
+
+| Control | Value |
+| --- | --- |
+| Allowed users | `shaikat`, `zahid` |
+| Required group | `bank-employees-chat-users` |
+| Gateway behavior without token | HTTP `401` from WSO2 API Manager |
+| BFF behavior without token | HTTP `401` with `Unauthorized` |
+
+## JBoss managed-domain topology
+
+The app includes a managed-domain backend image to match the requested JBoss
+EAP operational model. In the lab it runs as a single OpenShift pod containing:
+
+| Piece | Purpose |
+| --- | --- |
+| **Domain Controller** | Owns the domain configuration and deploys the chat WAR. |
+| **Host Controller** | Starts and manages the server instances inside the domain. |
+| **Server group A** | Exposes the app on port `8080`. |
+| **Server group B** | Exposes the app on port `8230`. |
+
+This is intentionally a lab-sized implementation of the domain pattern. A
+production HA version should split controllers and hosts across pods or nodes,
+then add backup domain-controller behavior and persistent management state.
+
+## Kafka and Redis
+
+The app uses the existing VM middleware rather than deploying new Kafka or
+Redis inside OpenShift.
+
+| Dependency | Endpoint |
+| --- | --- |
+| Kafka | `kafka-bootstrap.sub.comptech-lab.com:9092` |
+| Redis | `redis.sub.comptech-lab.com:6379` |
+| Redis Sentinel | `redis-sentinel.sub.comptech-lab.com:26379` |
+
+Kafka receives message events. Redis is used for notification fan-out. Both
+are allowed by the tenant NetworkPolicy only on the required VM ports.
+
+## Observability
+
+The app follows the cluster's OpenShift observability model:
+
+| Signal | Current path |
+| --- | --- |
+| Logs | Pod stdout collected by OpenShift Logging. |
+| Metrics | BFF `/metrics` and backend `/metrics` exposed through ServiceMonitor resources. |
+| Traces | OpenTelemetry auto-instrumentation sends OTLP to `otelcol-platform-collector.tracing.svc:4317`. |
+| External forwarding | The platform collector is the live in-cluster handoff point; direct SigNoz forwarding remains a platform follow-up if SigNoz is required as the final sink. |
+
+The tenant NetworkPolicy allows the app to reach the platform OpenTelemetry
+collector in the `tracing` namespace and allows user-workload monitoring to
+scrape the metrics endpoints.
+
+## Pipeline and controls
+
+The delivery flow is deliberately plain:
+
+| Step | Control |
+| --- | --- |
+| GitLab | Source repository in `divisions/bank-employees/jboss-chat`. |
+| Jenkins | Pipeline builds backend, BFF, frontends, and the managed-domain image. |
+| Trivy | Critical CVE gate; the build fails before push if a critical finding is present. |
+| Nexus | Images are pushed to `app-registry.apps.sub.comptech-lab.com/bank-employees-jboss-chat`. |
+| Argo CD | `Application/jboss-chat` deploys the app repo; `spoke-dc-v6-cluster-config` owns tenant guardrails. |
+| OpenShift | Routes, Deployments, Services, ExternalSecrets, NetworkPolicies, and ServiceMonitors run the app. |
+
+The managed-domain image was updated to a current WildFly base and the unused
+Artemis server module was removed from that image so the Trivy critical scan
+passes while preserving the domain-controller and server-group topology.
+
+## Current live status
+
+As of the last review:
+
+| Check | Result |
+| --- | --- |
+| `Application/jboss-chat` | `Synced` / `Healthy` |
+| `Application/spoke-dc-v6-cluster-config` | `Synced` / `Healthy` |
+| Frontend route | HTTP `200` |
+| Callback route | HTTP `200` |
+| Same-origin protected API without token | HTTP `401` |
+| WSO2 gateway without token | HTTP `401` from API Manager |
+| BFF health | HTTP `200` |
+| JBoss server group A health | HTTP `200` |
+| JBoss server group B health | HTTP `200` |
+| Jenkins image build | Passed through Trivy and pushed to Nexus |
+
+## Residual work
+
+The core app is live, but these items should be treated as follow-up hardening:
+
+- Split the JBoss managed-domain controllers and host controllers into a more
+  production-like HA shape.
+- Replace the shared `app-default` Redis ACL user with a workload-specific
+  `jboss-chat` Redis ACL user.
+- Add Kafka TLS/SASL and app-specific Kafka ACLs.
+- Decide whether SigNoz must be the terminal store for traces and metrics, or
+  whether the OpenShift platform collector and Tempo/User Workload Monitoring
+  path is the accepted OpenShift-native endpoint.
+- Add an automated browser login smoke test for `shaikat` and `zahid` once the
+  demo credentials are promoted into a test-runner secret.
