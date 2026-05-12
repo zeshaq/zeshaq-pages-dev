@@ -6,11 +6,119 @@ estimated_minutes: 10
 last_updated: 2026-05-12
 ---
 
+import Whiteboard from "../../../components/Whiteboard.tsx";
+
+export const phaseStyle = {
+  background: "#e5e7eb",
+  border: "1px solid #6b7280",
+  borderRadius: 8,
+  padding: 8,
+  color: "#1f2937",
+  width: 105,
+  textAlign: "center",
+  fontWeight: 600,
+  fontSize: 12,
+};
+export const practiceStyle = {
+  background: "#fafafa",
+  border: "1.5px dashed #15803d",
+  borderRadius: 8,
+  padding: 8,
+  color: "#1f2937",
+  width: 120,
+  textAlign: "center",
+  fontSize: 11,
+  lineHeight: 1.3,
+};
+export const zoneLabelStyle = {
+  background: "transparent",
+  border: "none",
+  color: "#6b7280",
+  fontSize: 11,
+  fontWeight: 700,
+  letterSpacing: "0.08em",
+  textAlign: "center",
+  width: 200,
+};
+
+export const overviewNodes = [
+  /* zone headers */
+  { id: "z-left",  position: { x: 60,  y: 0 }, data: { label: "SHIFT LEFT — BUILD-TIME" },  style: zoneLabelStyle },
+  { id: "z-mid",   position: { x: 525, y: 0 }, data: { label: "RELEASE GATE" },             style: zoneLabelStyle },
+  { id: "z-right", position: { x: 830, y: 0 }, data: { label: "SHIFT RIGHT — RUNTIME" },    style: zoneLabelStyle },
+  /* 8 SDLC phases */
+  { id: "plan",    position: { x: 30,   y: 50 }, data: { label: "Plan" },    style: phaseStyle },
+  { id: "code",    position: { x: 170,  y: 50 }, data: { label: "Code" },    style: phaseStyle },
+  { id: "build",   position: { x: 310,  y: 50 }, data: { label: "Build" },   style: phaseStyle },
+  { id: "test",    position: { x: 450,  y: 50 }, data: { label: "Test" },    style: phaseStyle },
+  { id: "release", position: { x: 590,  y: 50 }, data: { label: "Release" }, style: phaseStyle },
+  { id: "deploy",  position: { x: 730,  y: 50 }, data: { label: "Deploy" },  style: phaseStyle },
+  { id: "operate", position: { x: 870,  y: 50 }, data: { label: "Operate" }, style: phaseStyle },
+  { id: "monitor", position: { x: 1010, y: 50 }, data: { label: "Monitor" }, style: phaseStyle },
+  /* security practice for each phase */
+  { id: "g-plan",    position: { x: 25,   y: 160 }, data: { label: "Threat\nmodel" },             style: practiceStyle },
+  { id: "g-code",    position: { x: 165,  y: 160 }, data: { label: "Pre-commit +\nsecret scan" }, style: practiceStyle },
+  { id: "g-build",   position: { x: 305,  y: 160 }, data: { label: "SAST + SCA +\nSBOM" },        style: practiceStyle },
+  { id: "g-test",    position: { x: 445,  y: 160 }, data: { label: "DAST + Fuzz +\nContainer scan" }, style: practiceStyle },
+  { id: "g-release", position: { x: 585,  y: 160 }, data: { label: "Sign +\nAttest" },            style: practiceStyle },
+  { id: "g-deploy",  position: { x: 725,  y: 160 }, data: { label: "Admission\npolicy" },         style: practiceStyle },
+  { id: "g-operate", position: { x: 865,  y: 160 }, data: { label: "Runtime\ndetection" },        style: practiceStyle },
+  { id: "g-monitor", position: { x: 1005, y: 160 }, data: { label: "SIEM +\naudit logs" },        style: practiceStyle },
+];
+
+export const sdlcEdge  = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" } };
+export const gateEdge  = { style: { stroke: "#6b7280", strokeWidth: 1, strokeDasharray: "4,3" }, markerEnd: { type: "arrowclosed", color: "#6b7280" } };
+export const loopEdge  = {
+  style: { stroke: "#15803d", strokeWidth: 1.5, strokeDasharray: "5,5" },
+  animated: true,
+  type: "smoothstep",
+  markerEnd: { type: "arrowclosed", color: "#15803d" },
+  label: "feedback loop",
+  labelStyle: { fill: "#15803d", fontSize: 11, fontWeight: 600 },
+  labelBgStyle: { fill: "#fafafa" },
+};
+
+export const overviewEdges = [
+  /* SDLC phase chain */
+  { id: "e1", source: "plan",    target: "code",    ...sdlcEdge },
+  { id: "e2", source: "code",    target: "build",   ...sdlcEdge },
+  { id: "e3", source: "build",   target: "test",    ...sdlcEdge },
+  { id: "e4", source: "test",    target: "release", ...sdlcEdge },
+  { id: "e5", source: "release", target: "deploy",  ...sdlcEdge },
+  { id: "e6", source: "deploy",  target: "operate", ...sdlcEdge },
+  { id: "e7", source: "operate", target: "monitor", ...sdlcEdge },
+  /* phase to its security practice */
+  { id: "g1", source: "plan",    target: "g-plan",    ...gateEdge },
+  { id: "g2", source: "code",    target: "g-code",    ...gateEdge },
+  { id: "g3", source: "build",   target: "g-build",   ...gateEdge },
+  { id: "g4", source: "test",    target: "g-test",    ...gateEdge },
+  { id: "g5", source: "release", target: "g-release", ...gateEdge },
+  { id: "g6", source: "deploy",  target: "g-deploy",  ...gateEdge },
+  { id: "g7", source: "operate", target: "g-operate", ...gateEdge },
+  { id: "g8", source: "monitor", target: "g-monitor", ...gateEdge },
+  /* feedback loop monitor → plan */
+  { id: "loop", source: "monitor", target: "plan", ...loopEdge },
+];
+
 This is a self-paced track on **DevSecOps** — the practice of pushing security into every stage of the software delivery lifecycle, automating the gates, and treating security as a property of every commit instead of a quarterly audit. By the end you'll have a pipeline that fails the build on a critical CVE, signs every image with cosign and verifies signatures at admission, runs RHACS / Falco in production for runtime detection, manages secrets through Vault and ESO, and produces the evidence pack an auditor will actually accept.
 
 The track is opinionated. It teaches the patterns most platform and application teams ship in production as of 2026, not every option in every vendor's catalogue. Where DevSecOps gives you four ways to do something — Snyk vs Trivy vs Aqua vs Anchore, OPA vs Kyverno vs VAP, Falco vs Tetragon vs Tracee — I'll name the dominant choice for each pattern and call out the alternatives where they actually matter.
 
 The angle is specific: **security as code, evaluated by automation, owned by the team that ships.** Not security-as-PDFs, not security-as-quarterly-sprints, not security-as-gatekeeper-bottleneck. The teams that get this right have a security control catalogue checked into Git, applied by CI, enforced at admission, monitored at runtime, and audited against evidence the controls themselves produce.
+
+## The DevSecOps loop at a glance
+
+The whole practice fits on one diagram: eight SDLC phases moving left to right, a security gate at every phase, and a feedback loop from runtime monitoring back into planning. The track teaches each of the bottom-row controls — that's the substance.
+
+<Whiteboard client:load data={{ nodes: overviewNodes, edges: overviewEdges }} height={360} />
+
+**Reading the diagram:**
+
+- **Top row (grey):** the eight phases of the software delivery lifecycle. The arrows are the normal Dev/Ops flow — Plan → Code → Build → Test → Release → Deploy → Operate → Monitor.
+- **Bottom row (dashed green):** the security practice that sits at each phase. **Shift left** (Plan-Test) catches issues cheaply during build. **Verify** (Release-Deploy) is the cryptographic + admission gate at the boundary. **Shift right** (Operate-Monitor) catches what static analysis missed — zero-days, behavioural drift, insider misuse.
+- **Green animated arrow at the bottom:** the **feedback loop**. Findings from runtime detection and the SIEM flow back to planning — a new threat model, a new SAST rule, a new admission constraint. The loop is what separates a security *program* from a security *checklist*.
+
+The rest of this track is a tour through every gate, one module per row.
 
 ## Who this is for
 
