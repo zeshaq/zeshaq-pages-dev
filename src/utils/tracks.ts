@@ -15,6 +15,7 @@
 export const TRACK_TITLES: Record<string, string> = {
   "agentic-ai": "Agentic AI",
   "cloudflare": "Cloudflare",
+  "acm-multicluster": "ACM Multicluster",
 };
 
 export const TRACK_TAGLINES: Record<string, string> = {
@@ -22,6 +23,8 @@ export const TRACK_TAGLINES: Record<string, string> = {
     "Build agents that loop, use tools, and produce results. From the agent loop and MCP to planning, evaluation, and production.",
   "cloudflare":
     "The unified network + edge + security + AI platform. Tunnels, Zero Trust, Magic networking, Workers, Pages, and the rest.",
+  "acm-multicluster":
+    "Operate ten or fifty OpenShift clusters from one control plane. Red Hat Advanced Cluster Management end-to-end — registration, policies, GitOps, applications, observability, hosted control planes, and disaster recovery.",
 };
 
 export function trackTitle(id: string): string {

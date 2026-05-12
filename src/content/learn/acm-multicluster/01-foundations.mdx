@@ -1,0 +1,144 @@
+---
+title: "Foundations: why multicluster, where ACM fits"
+sidebar_label: "01 — Foundations"
+description: "The single-cluster ceiling, the six categories of fleet work, the hub-and-spoke control plane, push vs pull, and where ACM sits in the Red Hat portfolio."
+estimated_minutes: 40
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agentN = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const hubEdge = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const pullEdge = { style: { stroke: "#15803d", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const hubNodes = [
+  { id: "hub",    position: { x: 320, y: 60 },  data: { label: "Hub cluster\n(RHACM operator)" }, style: ctrl },
+  { id: "spoke1", position: { x: 80,  y: 260 }, data: { label: "Managed cluster A" },             style: stage },
+  { id: "spoke2", position: { x: 320, y: 260 }, data: { label: "Managed cluster B" },             style: stage },
+  { id: "spoke3", position: { x: 560, y: 260 }, data: { label: "Managed cluster C" },             style: stage },
+  { id: "kl1",    position: { x: 80,  y: 380 }, data: { label: "klusterlet" },                    style: agentN },
+  { id: "kl2",    position: { x: 320, y: 380 }, data: { label: "klusterlet" },                    style: agentN },
+  { id: "kl3",    position: { x: 560, y: 380 }, data: { label: "klusterlet" },                    style: agentN },
+];
+
+export const hubEdges = [
+  { id: "s1-h", source: "kl1", target: "hub", label: "pull work", ...pullEdge },
+  { id: "s2-h", source: "kl2", target: "hub", label: "pull work", ...pullEdge },
+  { id: "s3-h", source: "kl3", target: "hub", label: "pull work", ...pullEdge },
+  { id: "kl1-c", source: "kl1", target: "spoke1", ...hubEdge },
+  { id: "kl2-c", source: "kl2", target: "spoke2", ...hubEdge },
+  { id: "kl3-c", source: "kl3", target: "spoke3", ...hubEdge },
+];
+
+Most teams reach a point where they cannot pretend one cluster is the whole world. This module is about the moment that happens, the six kinds of work that suddenly need a solution, and where ACM fits among the alternatives.
+
+## The single-cluster ceiling
+
+The case for "just one cluster" is real: simpler operations, no cross-cluster networking, no fleet management overhead. Most teams should defer their second cluster as long as possible — even a moderately-sized cluster is cheaper to run than the operational tax of going multi-cluster.
+
+The case breaks for specific, named reasons:
+
+- **Blast radius.** A misbehaving Helm chart, a runaway operator, or a CRD upgrade gone wrong is a per-cluster incident. Once you have two big tenants on one cluster, the production conversation is *"how do we stop tenant A's incident from taking tenant B down?"* — and the honest answer is *"different clusters."*
+- **Geography.** Users in Singapore should not be served from a Virginia control plane. Once latency-sensitive workloads exist in two regions, a cluster per region is the path of least surprise.
+- **Regulatory boundaries.** PCI-DSS scope, HIPAA, GDPR data-residency, FedRAMP boundaries — all of them are easier to defend with a hard cluster boundary than with namespace-level controls and a long compliance argument.
+- **Environment separation.** Dev/stg/prd on one cluster works exactly until a developer breaks etcd or an operator update lands in the wrong order. Most mature platform teams end up with at least dev and prod as separate clusters; many split staging out as well.
+- **Capacity.** A single OpenShift cluster scales to a few hundred nodes in practice. Past that, etcd performance, kube-apiserver memory, and the size of the routes/services table become real problems. The fleet pattern is to grow horizontally — more clusters — rather than try to push one cluster past its sweet spot.
+- **Upgrade cadence mismatch.** Different tenants want different OpenShift minor versions on different schedules. One cluster forces one cadence; many clusters let you stagger.
+
+The point isn't that one cluster is bad; it's that the *first* cluster solves a different problem than the tenth. Multicluster management is the answer to *the tenth*.
+
+## What "managing many clusters" actually means
+
+Six categories of work show up the moment you cross the cluster boundary:
+
+| Category | The problem |
+| --- | --- |
+| **Cluster lifecycle** | Provision a cluster, upgrade it, retire it. Repeatably. From a button or YAML. |
+| **Config drift** | Every cluster must look like its spec. When `oc edit` happens at 2am, drift gets corrected automatically. |
+| **Policy enforcement (GRC)** | "All worker nodes must have FIPS enabled" / "no privileged Pods outside `kube-*`" enforced everywhere, reported back centrally. |
+| **Application rollout** | One Helm chart or kustomize overlay, rolled out to N clusters chosen by labels, not hand-listed. |
+| **Observability** | Metrics, logs, search, and alerts viewed across the fleet, not by SSHing into each cluster's console. |
+| **Security** | Runtime security policy (workloads, network, vulnerabilities) with one source of truth, enforced everywhere. |
+
+A multicluster management product is one that answers most of these. ACM answers all of them. So do a couple of competitors; we'll get to those below.
+
+## The control plane
+
+<Whiteboard client:load data={{ nodes: hubNodes, edges: hubEdges }} height={460} />
+
+The hub-and-spoke pattern is the durable shape of every multicluster control plane that has shipped in production:
+
+- The **hub** is itself an OpenShift cluster. It runs the ACM operator and a set of controllers that own the fleet's view of the world.
+- Each **managed cluster** (also called a spoke) runs a small agent — the **klusterlet** — that registers with the hub, pulls work the hub has assigned to it, and reports status back.
+- The **hub holds desired state**; managed clusters hold runtime state. Drift between them is the central concern.
+
+The dashed green edges in the diagram are the load-bearing detail: in the pull model, **the spoke reaches out to the hub**, not the other way around. The hub does not need direct connectivity to every managed cluster's API. This matters for clusters behind NAT, in air-gapped environments, or across regulatory boundaries where opening inbound ports is not on the table.
+
+## ACM in the Red Hat portfolio
+
+ACM is the productised, supported form of the **[open-cluster-management.io](https://open-cluster-management.io)** upstream — a Red Hat-led CNCF-adjacent project. If you read the upstream docs you'll see the same CRDs and controllers we'll use here; ACM adds Red Hat support, a console, the application-lifecycle layer, and integration with the rest of the OpenShift portfolio.
+
+Things ACM ties into:
+
+- **OpenShift GitOps** (Argo CD). ACM provides the `Placement` decision; OpenShift GitOps's `ApplicationSet` consumes it via the `clusterDecisionResource` generator. The combination is how most teams ship apps to a fleet today.
+- **Red Hat Advanced Cluster Security (RHACS)**. Runtime security, image scanning, network policy. Lives alongside ACM, not inside it.
+- **OpenShift Container Platform Plus** bundle — ACM + RHACS + Quay + OpenShift Data Foundation as a single SKU. Most enterprise customers buying ACM are on this bundle.
+- **MultiClusterEngine (MCE)**. The cluster-lifecycle subset of ACM. You can install MCE alone (registration + Hive + HyperShift, no policy/observability/search) on a hub that doesn't need the full ACM stack.
+
+## Alternatives
+
+You will be asked "why ACM and not X?" by someone. The short version:
+
+| Tool | One-line description | Why pick it over ACM |
+| --- | --- | --- |
+| **Anthos Config Management** | Google's GitOps-driven fleet manager for GKE + on-prem. | You're a GCP shop with a GKE-heavy fleet. |
+| **Rancher Fleet** | SUSE Rancher's fleet GitOps controller. | You run Rancher / RKE / K3s, not OpenShift. |
+| **EKS Anywhere + AWS Controllers** | AWS's hybrid story for EKS clusters. | You're an AWS shop standardising on EKS everywhere. |
+| **Karmada** | CNCF multi-cluster orchestration with cross-cluster scheduling. | You want active workload scheduling across clusters, not just rollout. |
+| **KubeFed (deprecated)** | First-generation Kubernetes federation. | You shouldn't; it's deprecated. Migrate away. |
+
+The decision usually isn't about technical superiority — it's about **what your underlying clusters are**. If they're OpenShift, ACM is the obvious choice. If they're EKS, EKS Anywhere is. If they're a mixed pile, ACM is still a strong pick because it can manage non-OpenShift Kubernetes clusters; the inverse isn't always true.
+
+## Push vs pull model
+
+ACM has supported two communication models over its life:
+
+- **Push model.** The hub holds kubeconfigs (or a service-account token) for every managed cluster and reaches *into* them to apply work. This was the original pattern.
+- **Pull model.** The managed cluster runs `klusterlet` and `work-agent`, which *pull* `ManifestWork` resources from the hub and apply them locally. Status flows back the same way.
+
+Pull is the current best practice and the lab's choice. The reasons:
+
+- **No inbound from the hub.** Managed clusters behind NAT, in different networks, in compliance-segregated environments — they all work, because the hub doesn't need to dial them.
+- **Hub-side scale is easier.** With pull, the hub mostly stores state and answers list/watch calls. With push, the hub holds a long-running connection to every spoke.
+- **Drift-resilient.** A spoke that's been offline for a week catches up cleanly the next time `klusterlet` reconnects.
+- **GitOps-shaped.** The pull pattern matches the way Argo CD on each spoke can reconcile from internal Git. ACM places work; Argo CD applies it. The two patterns compose cleanly.
+
+The lab uses the pull model for OpenShift GitOps fan-out — see [ADR 0018 — ACM + OpenShift GitOps pull model](/docs/architecture-decisions/adr-0018-acm-gitops-pull) and the broader [pull-model GitOps decision in ADR 0019](/docs/architecture-decisions/adr-0019-pull-model-gitops). Almost every example in this track assumes pull.
+
+## A real-world failure mode worth knowing up front
+
+On 2026-05-10, this lab hit an incident worth memorising before you go further. The ACM `gitops-addon` — the component that installs OpenShift GitOps onto managed clusters automatically — shipped a `routes.route.openshift.io` CustomResourceDefinition as part of its bundle. That CRD is fine on a vanilla Kubernetes cluster where you'd want Route support. On an **actual OpenShift cluster** where Route is already an aggregated APIService served by the openshift-apiserver, installing a CRD with the same name created a duplicate API registration.
+
+The effect was specific and silent: `kube-apiserver` started returning 503 on `/openapi/v2`. The newer `/openapi/v3` endpoint still worked. The OpenAPI v2 endpoint is what **Argo CD's discovery code uses** to learn what types are available — so every Argo CD `Application` on every cluster stalled with discovery errors. Nothing crashed; the GitOps pipeline just stopped reconciling. Discovery failures don't page anyone.
+
+The fix was a one-liner: `oc delete crd routes.route.openshift.io` on each affected cluster. The permanent fix is making `gitops-addon` skip the CRD on OpenShift hubs.
+
+The full incident is at [/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd). The reason it's worth reading **at the start of this track**: ACM ships with assumptions. Some of those assumptions are about Kubernetes-the-upstream that don't hold on OpenShift-the-product. Most of the time this is fine. The day it isn't, the failure mode is silent stalling, not an obvious crash. **Verify ACM's assumptions match your environment whenever you onboard a new cluster type.**
+
+## What's next
+
+You now have the *why*. The next module gets into the *what runs where* — the actual components on the hub and the managed clusters, the controllers, the addons, and the failure points you'll be debugging.
+
+**Next:** [Module 02 — Architecture](/learn/acm-multicluster/architecture).
+
+## References
+
+- ACM official documentation: [docs.redhat.com — Red Hat Advanced Cluster Management for Kubernetes](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/)
+- Upstream project: [open-cluster-management.io](https://open-cluster-management.io)
+- ACM concepts overview: [docs.redhat.com — About cluster lifecycle](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/clusters/cluster_mce_overview)
+- Governance, Risk, and Compliance: [docs.redhat.com — Governance](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/governance/governance)
+- Karmada comparison reference: [karmada.io documentation](https://karmada.io/docs/)
