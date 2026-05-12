@@ -7,6 +7,7 @@ draft: false
 ---
 
 import Whiteboard from "../../components/Whiteboard.tsx";
+import InteractiveDiagram from "../../components/InteractiveDiagram.tsx";
 
 > Demo asset for the BRAC engagement. A working payment workflow with
 > customer and approver roles, single sign-on, a canary release of the
@@ -148,69 +149,140 @@ The public TLS terminates at step 4. From step 5 onward, the
 in-cluster hop between the proxy and the backend service is **also**
 encrypted, using mTLS — see [Internal mTLS](#internal-mtls) below.
 
-## System view
+## System view — interactive
 
-export const stage = {
-  background: "#fafafa", border: "1px solid #9ca3af",
-  borderRadius: 8, padding: 8, color: "#1f2937",
-  width: 150, textAlign: "center", fontSize: 12,
-};
-export const ctrl = {
-  background: "#e5e7eb", border: "1px solid #6b7280",
-  borderRadius: 8, padding: 10, color: "#1f2937",
-  width: 170, textAlign: "center", fontWeight: 600, fontSize: 12,
-};
-export const canary = {
-  background: "#fefce8", border: "1.5px solid #ca8a04",
-  borderRadius: 8, padding: 10, color: "#1f2937",
-  width: 170, textAlign: "center", fontWeight: 600, fontSize: 12,
-};
-export const agent = {
-  background: "#fafafa", border: "1.5px dashed #15803d",
-  borderRadius: 8, padding: 10, color: "#1f2937",
-  width: 150, textAlign: "center", fontSize: 12,
-};
-export const ext = {
-  background: "#fafafa", border: "1.5px dashed #9ca3af",
-  borderRadius: 8, padding: 8, color: "#1f2937",
-  width: 150, textAlign: "center", fontSize: 12,
-};
+**Hint:** drag any box to rearrange. **Click a box to flip its colors**
+(useful for highlighting a path you're walking through). The lines are
+live — the animation shows the direction traffic flows.
 
-export const flowNodes = [
-  { id: "user",    data: { label: "zahid · shaikat · admin" }, position: { x: 340, y:  10 }, style: stage },
-  { id: "cf",      data: { label: "Cloudflare DNS\ncomptech-lab.com" }, position: { x:   0, y: 110 }, style: ext },
-  { id: "pdns",    data: { label: "PowerDNS\nsub.comptech-lab.com" }, position: { x: 220, y: 110 }, style: ext },
-  { id: "haproxy", data: { label: "HAProxy\nedge SNI LB" }, position: { x: 440, y: 110 }, style: ctrl },
-  { id: "router",  data: { label: "OpenShift Router\n(LE wildcard terminate)" }, position: { x: 660, y: 110 }, style: ctrl },
-  { id: "wso2",    data: { label: "WSO2 IS\nbank-payment tenant" }, position: { x: 340, y: 240 }, style: ext },
-  { id: "proxy",   data: { label: "NGINX reverse proxy\n(canary · hardening · obs)" }, position: { x:   0, y: 350 }, style: ctrl },
-  { id: "aspa",    data: { label: "approver-frontend" }, position: { x: 720, y: 350 }, style: ctrl },
-  { id: "v1",      data: { label: "client-frontend\nv1 (stable)" }, position: { x:-160, y: 480 }, style: ctrl },
-  { id: "v2",      data: { label: "client-frontend\nv2 (canary)" }, position: { x: 160, y: 480 }, style: canary },
-  { id: "csvc",    data: { label: "payment-client-svc\n(Liberty)" }, position: { x:   0, y: 620 }, style: agent },
-  { id: "asvc",    data: { label: "payment-approver-svc\n(Liberty)" }, position: { x: 720, y: 620 }, style: agent },
-  { id: "ledger",  data: { label: "in-memory ledger\nzahid 50k · shaikat 75k" }, position: { x: 360, y: 760 }, style: stage },
+export const sUser    = { background: "#fafafa", border: "1px solid #9ca3af",   borderRadius: 8, padding: 8,  color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const sExt     = { background: "#fafafa", border: "1.5px dashed #9ca3af",borderRadius: 8, padding: 8,  color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const sEdge    = { background: "#dbeafe", border: "1px solid #1d4ed8",   borderRadius: 8, padding: 10, color: "#1e3a8a", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const sGateway = { background: "#ecfccb", border: "1px solid #4d7c0f",   borderRadius: 8, padding: 10, color: "#365314", width: 190, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const sSpa     = { background: "#e5e7eb", border: "1px solid #6b7280",   borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const sCanary  = { background: "#fefce8", border: "1.5px solid #ca8a04", borderRadius: 8, padding: 10, color: "#854d0e", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const sBackend = { background: "#fafafa", border: "1.5px dashed #15803d",borderRadius: 8, padding: 10, color: "#14532d", width: 180, textAlign: "center", fontSize: 12 };
+export const sIdent   = { background: "#fae8ff", border: "1.5px dashed #a21caf",borderRadius: 8, padding: 10, color: "#581c87", width: 170, textAlign: "center", fontSize: 12 };
+export const sCi      = { background: "#fef3c7", border: "1px solid #b45309",   borderRadius: 8, padding: 10, color: "#78350f", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const sStore   = { background: "#fafafa", border: "1px solid #9ca3af",   borderRadius: 8, padding: 8,  color: "#1f2937", width: 200, textAlign: "center", fontSize: 12 };
+
+export const archNodes = [
+  /* People + identity ------------------------------------------------ */
+  { id: "user",   data: { label: "zahid · shaikat" },          position: { x:  60,  y:   0 }, style: sUser },
+  { id: "admin",  data: { label: "admin" },                    position: { x: 280,  y:   0 }, style: sUser },
+  { id: "dev",    data: { label: "developer" },                position: { x: 1100, y:   0 }, style: sUser },
+
+  /* DNS chain --------------------------------------------------------- */
+  { id: "cf",     data: { label: "Cloudflare DNS\ncomptech-lab.com" }, position: { x:  60,  y: 110 }, style: sExt },
+  { id: "pdns",   data: { label: "PowerDNS\nsub.comptech-lab.com" },   position: { x: 280,  y: 110 }, style: sExt },
+
+  /* Edge ingress chain ----------------------------------------------- */
+  { id: "ha",     data: { label: "HAProxy\nedge SNI LB · 30.30.30.1" }, position: { x: 500,  y:  60 }, style: sEdge },
+  { id: "rt",     data: { label: "OpenShift Router\nterminates LE wildcard" }, position: { x: 500, y: 170 }, style: sEdge },
+
+  /* In-cluster gateway ----------------------------------------------- */
+  { id: "ngx",    data: { label: "NGINX reverse proxy\ncanary · hardening · obs · mTLS client" }, position: { x: 130, y: 320 }, style: sGateway },
+
+  /* SPAs ------------------------------------------------------------- */
+  { id: "v1",     data: { label: "client-frontend v1\n(stable, white)" },   position: { x:  -60, y: 440 }, style: sSpa },
+  { id: "v2",     data: { label: "client-frontend v2\n(canary, yellow)" },  position: { x: 170,  y: 440 }, style: sCanary },
+  { id: "aspa",   data: { label: "approver-frontend\n(admin SPA)" },        position: { x: 480,  y: 320 }, style: sSpa },
+
+  /* Backends + state ------------------------------------------------- */
+  { id: "csvc",   data: { label: "payment-client-svc\nLiberty · MP-JWT 2.1\nports 9080 + 9445 (mTLS)" }, position: { x: 130, y: 600 }, style: sBackend },
+  { id: "asvc",   data: { label: "payment-approver-svc\nLiberty · MP REST Client\nports 9081 + 9446 (mTLS)" }, position: { x: 480, y: 600 }, style: sBackend },
+  { id: "ledger", data: { label: "in-memory ledger\nzahid 50,000 · shaikat 75,000\nApproved / Pending / Declined" }, position: { x: 280, y: 770 }, style: sStore },
+
+  /* Identity --------------------------------------------------------- */
+  { id: "wso2",   data: { label: "WSO2 Identity Server\nbank-payment tenant\nOIDC: code + PKCE" }, position: { x: 760, y: 170 }, style: sIdent },
+
+  /* Cluster control plane (off to the right) ------------------------ */
+  { id: "cm",     data: { label: "cert-manager\nissues LE wildcard + lab-CA mTLS certs" }, position: { x: 760, y: 320 }, style: sIdent },
+  { id: "argo",   data: { label: "Argo CD\nGitOps reconcile · self-heal" }, position: { x: 760, y: 440 }, style: sCi },
+
+  /* Build pipeline (off to the right) -------------------------------- */
+  { id: "gitlab", data: { label: "GitLab\n/divisions/payment/bank-payment" }, position: { x: 1100, y: 110 }, style: sCi },
+  { id: "jenkins",data: { label: "Jenkins\n4× buildah · parallel" }, position: { x: 1100, y: 220 }, style: sCi },
+  { id: "trivy",  data: { label: "Trivy\nblocks HIGH / CRITICAL CVEs" }, position: { x: 1100, y: 330 }, style: sCi },
+  { id: "nexus",  data: { label: "Nexus app-registry\nimage tags :latest + :sha" }, position: { x: 1100, y: 440 }, style: sCi },
+  { id: "pgops",  data: { label: "platform-gitops\ntenant scaffold + Argo Application" }, position: { x: 1100, y: 560 }, style: sCi },
 ];
 
-export const flowEdges = [
-  { id: "u-cf",      source: "user",  target: "cf",     label: "DNS", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "cf-pdns",   source: "cf",    target: "pdns",   label: "NS delegation", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "u-haproxy", source: "user",  target: "haproxy", label: "TLS SNI", style: { stroke: "#1f2937" } },
-  { id: "ha-router", source: "haproxy", target: "router", style: { stroke: "#1f2937" } },
-  { id: "r-proxy",   source: "router", target: "proxy",  label: "customer page",  style: { stroke: "#1f2937" } },
-  { id: "r-aspa",    source: "router", target: "aspa",   label: "approver page",  style: { stroke: "#1f2937" } },
-  { id: "u-wso2",    source: "user",   target: "wso2",   label: "sign in", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
-  { id: "px-v1",     source: "proxy",  target: "v1",     label: "default", style: { stroke: "#1f2937" } },
-  { id: "px-v2",     source: "proxy",  target: "v2",     label: "X-Canary: v2", style: { stroke: "#ca8a04" }, animated: true },
-  { id: "px-csvc",   source: "proxy",  target: "csvc",   label: "/obs/* (mTLS)", style: { stroke: "#b45309" }, animated: true },
-  { id: "v1-csvc",   source: "v1",     target: "csvc",   style: { stroke: "#1f2937" } },
-  { id: "v2-csvc",   source: "v2",     target: "csvc",   style: { stroke: "#1f2937" } },
-  { id: "as-asvc",   source: "aspa",   target: "asvc",   style: { stroke: "#1f2937" } },
-  { id: "asvc-csvc", source: "asvc",   target: "csvc",   label: "internal\n(admin's token forwarded)", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
-  { id: "csvc-led",  source: "csvc",   target: "ledger", style: { stroke: "#1f2937" } },
+export const archEdges = [
+  /* DNS resolution (dashed grey) ------------------------------------- */
+  { id: "u-cf",    source: "user",  target: "cf",   label: "1. DNS lookup", style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+  { id: "cf-pdns", source: "cf",    target: "pdns", label: "delegation",    style: { stroke: "#6b7280", strokeDasharray: "5,5" } },
+
+  /* TLS path to edge --------------------------------------------------*/
+  { id: "u-ha",    source: "user",  target: "ha",   label: "2. TLS · SNI",        style: { stroke: "#1f2937" } },
+  { id: "a-ha",    source: "admin", target: "ha",   label: "TLS · SNI",           style: { stroke: "#1f2937" } },
+  { id: "ha-rt",   source: "ha",    target: "rt",   label: "passthrough",         style: { stroke: "#1f2937" } },
+
+  /* Router fan-out --------------------------------------------------- */
+  { id: "rt-ngx",  source: "rt",    target: "ngx",  label: "customer page",       style: { stroke: "#1f2937" } },
+  { id: "rt-aspa", source: "rt",    target: "aspa", label: "approver page",       style: { stroke: "#1f2937" } },
+
+  /* SSO (dashed magenta) --------------------------------------------- */
+  { id: "u-wso2",  source: "user",  target: "wso2", label: "OIDC sign in", style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+  { id: "a-wso2",  source: "admin", target: "wso2", label: "OIDC sign in", style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+
+  /* NGINX -> SPA versions (canary) ---------------------------------- */
+  { id: "ngx-v1",  source: "ngx",   target: "v1",   label: "default",            style: { stroke: "#1f2937" } },
+  { id: "ngx-v2",  source: "ngx",   target: "v2",   label: "X-Canary: v2",       style: { stroke: "#ca8a04", strokeWidth: 2 } },
+
+  /* SPA -> API ------------------------------------------------------- */
+  { id: "v1-csvc", source: "v1",    target: "csvc", label: "REST",               style: { stroke: "#1f2937" } },
+  { id: "v2-csvc", source: "v2",    target: "csvc", label: "REST",               style: { stroke: "#1f2937" } },
+  { id: "as-asvc", source: "aspa",  target: "asvc", label: "REST",               style: { stroke: "#1f2937" } },
+
+  /* Backends ↔ each other (admin token forwarded) ------------------- */
+  { id: "asvc-csvc", source: "asvc", target: "csvc", label: "internal — admin's token forwarded", style: { stroke: "#15803d", strokeWidth: 2 } },
+
+  /* NGINX -> backend obs hop (mTLS) --------------------------------- */
+  { id: "ngx-csvc", source: "ngx",  target: "csvc", label: "/obs/* · mTLS · 9445", style: { stroke: "#b45309", strokeWidth: 2 } },
+  { id: "ngx-asvc", source: "ngx",  target: "asvc", label: "/obs/* · mTLS · 9446", style: { stroke: "#b45309", strokeWidth: 2 } },
+
+  /* JWT verification ------------------------------------------------- */
+  { id: "csvc-wso2", source: "csvc", target: "wso2", label: "JWKS verify", style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+  { id: "asvc-wso2", source: "asvc", target: "wso2", label: "JWKS verify", style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+
+  /* Ledger ----------------------------------------------------------- */
+  { id: "csvc-led", source: "csvc", target: "ledger", style: { stroke: "#1f2937" } },
+
+  /* Cert distribution (dashed purple) -------------------------------- */
+  { id: "cm-rt",   source: "cm",    target: "rt",   label: "LE wildcard cert",   style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+  { id: "cm-ngx",  source: "cm",    target: "ngx",  label: "mTLS client cert",   style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+  { id: "cm-csvc", source: "cm",    target: "csvc", label: "mTLS server cert",   style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+  { id: "cm-asvc", source: "cm",    target: "asvc", label: "mTLS server cert",   style: { stroke: "#a21caf", strokeDasharray: "5,5" } },
+
+  /* Build / GitOps pipeline (dashed amber) -------------------------- */
+  { id: "dev-gl",  source: "dev",     target: "gitlab",  label: "git push",        style: { stroke: "#b45309", strokeDasharray: "5,5" } },
+  { id: "gl-jk",   source: "gitlab",  target: "jenkins", label: "webhook",         style: { stroke: "#b45309", strokeDasharray: "5,5" } },
+  { id: "jk-trivy",source: "jenkins", target: "trivy",   label: "scan",            style: { stroke: "#b45309", strokeDasharray: "5,5" } },
+  { id: "trivy-nx",source: "trivy",   target: "nexus",   label: "push :sha + :latest", style: { stroke: "#b45309", strokeDasharray: "5,5" } },
+  { id: "jk-pg",   source: "jenkins", target: "pgops",   label: "digest pin",      style: { stroke: "#b45309", strokeDasharray: "5,5" } },
+
+  /* Argo reconcile (dashed green) ----------------------------------- */
+  { id: "gl-arg",  source: "gitlab", target: "argo",   label: "watch manifests", style: { stroke: "#15803d", strokeDasharray: "5,5" } },
+  { id: "pg-arg",  source: "pgops",  target: "argo",   label: "watch tenant",    style: { stroke: "#15803d", strokeDasharray: "5,5" } },
+  { id: "arg-csvc",source: "argo",   target: "csvc",   label: "reconcile",       style: { stroke: "#15803d", strokeDasharray: "5,5" } },
+  { id: "arg-ngx", source: "argo",   target: "ngx",    label: "reconcile",       style: { stroke: "#15803d", strokeDasharray: "5,5" } },
+  { id: "nx-csvc", source: "nexus",  target: "csvc",   label: "image pull",      style: { stroke: "#15803d", strokeDasharray: "5,5" } },
 ];
 
-<Whiteboard nodes={flowNodes} edges={flowEdges} height={900} client:only="react" />
+<InteractiveDiagram nodes={archNodes} edges={archEdges} height={1000} client:only="react" />
+
+**Reading the diagram:**
+
+| Line colour | What it means |
+| --- | --- |
+| Solid **black** | User traffic (HTTPS) — DNS → edge → in-cluster |
+| Solid **amber** | The canary hop (header-triggered) and the mTLS hop (`/obs/*` from NGINX to Liberty) |
+| Solid **green** | Cross-service call (approver-svc → client-svc with the admin's bearer forwarded) |
+| Dashed **grey** | DNS resolution |
+| Dashed **magenta** | Identity-related — sign-in redirect, JWKS verify, cert distribution from cert-manager |
+| Dashed **amber** | Build pipeline (GitLab → Jenkins → Trivy → Nexus → digest pin) |
+| Dashed **green** | GitOps reconcile (Argo watching the repos, pulling images, rolling Deployments) |
 
 ## How a payment moves
 
