@@ -1,0 +1,216 @@
+---
+title: "Runtime security — eBPF, behavioural baselines, and the alert-fatigue tax"
+sidebar_label: "07 — Runtime security"
+description: "What scanners can't see — zero-days, behavioural drift, side-channel events — and the runtime-detection toolset (Falco, Tetragon, Tracee, RHACS) that watches for it after the deploy."
+estimated_minutes: 60
+last_updated: 2026-05-12
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const stage = { background: "#fafafa", border: "1px solid #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 160, textAlign: "center", fontSize: 12 };
+export const ctrl  = { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const agent = { background: "#fafafa", border: "1.5px dashed #15803d", borderRadius: 8, padding: 10, color: "#1f2937", width: 170, textAlign: "center", fontSize: 12 };
+export const ext   = { background: "#fafafa", border: "1.5px dashed #9ca3af", borderRadius: 8, padding: 8, color: "#1f2937", width: 150, textAlign: "center", fontSize: 12 };
+
+export const reqEdge   = { style: { stroke: "#1f2937", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#1f2937" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const telmEdge  = { style: { stroke: "#6b7280", strokeDasharray: "3,3" }, markerEnd: { type: "arrowclosed", color: "#6b7280" }, labelStyle: { fill: "#1f2937", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+export const attackEdge= { style: { stroke: "#b91c1c", strokeDasharray: "5,5", strokeWidth: 1.5 }, animated: true, markerEnd: { type: "arrowclosed", color: "#b91c1c" }, labelStyle: { fill: "#b91c1c", fontSize: 11 }, labelBgStyle: { fill: "#fafafa" } };
+
+export const rtNodes = [
+  { id: "kernel",   position: { x: 40,  y: 200 }, data: { label: "Linux kernel\n(syscalls, eBPF hooks)" },     style: ctrl },
+  { id: "pod",      position: { x: 240, y: 80  }, data: { label: "tenant Pod\n(payments-api)" },              style: stage },
+  { id: "shell",    position: { x: 240, y: 200 }, data: { label: "/bin/bash spawned\n(attacker)" },           style: ext },
+  { id: "egress",   position: { x: 240, y: 320 }, data: { label: "outbound conn\n185.x.y.z:443" },             style: ext },
+  { id: "collector",position: { x: 480, y: 200 }, data: { label: "Collector / Falco / Tetragon\n(DaemonSet, eBPF)" }, style: agent },
+  { id: "engine",   position: { x: 720, y: 80  }, data: { label: "Detection engine\n(rule + behavioural)" },    style: ctrl },
+  { id: "siem",     position: { x: 720, y: 200 }, data: { label: "SIEM / Splunk\n/ Elasticsearch" },           style: ext },
+  { id: "page",     position: { x: 720, y: 320 }, data: { label: "PagerDuty\n+ Slack" },                       style: ext },
+  { id: "response", position: { x: 940, y: 200 }, data: { label: "Auto-response\n(kill pod / NP isolate)" },   style: ctrl },
+];
+
+export const rtEdges = [
+  { id: "e1", source: "pod",       target: "shell",    label: "exec",  ...attackEdge },
+  { id: "e2", source: "shell",     target: "egress",   label: "exfil", ...attackEdge },
+  { id: "e3", source: "kernel",    target: "collector",label: "events", ...reqEdge },
+  { id: "e4", source: "shell",     target: "kernel",   label: "syscall", ...telmEdge },
+  { id: "e5", source: "egress",    target: "kernel",   label: "connect", ...telmEdge },
+  { id: "e6", source: "collector", target: "engine",   label: "stream", ...reqEdge },
+  { id: "e7", source: "engine",    target: "siem",     label: "violation", ...telmEdge },
+  { id: "e8", source: "engine",    target: "page",     label: "alert", ...telmEdge },
+  { id: "e9", source: "engine",    target: "response", label: "rule match → action", ...reqEdge },
+];
+
+Module 06 covered what scanners and admission policies catch *before* the workload runs. This module is about what neither one can see: the live process, the syscall, the outbound connection that fires three weeks after the image was scanned and the chart was reviewed. Build-time is necessary; it isn't sufficient.
+
+The thing runtime security actually does is **watch the kernel**. Every process spawn, every network connection, every file open is a syscall the kernel observes; a runtime tool taps those observation points and decides whether what just happened looks like an attacker or a developer at lunch. The argument of this module is that you need that layer, that the modern substrate for it is eBPF, and that the hard part isn't getting alerts — it's not drowning in them.
+
+## What "runtime" catches that "build-time" doesn't
+
+Four classes of event live below the build-time horizon.
+
+**Zero-days.** The vulnerability was disclosed last Thursday; your scanner DB updates Monday; in between, you shipped 200 image rebuilds and none of them flagged anything. Runtime catches the *exploitation* of the CVE — the malformed payload, the unexpected syscall pattern, the connection out — even when the signature isn't in any scanner yet. The XZ Utils backdoor of early 2024 is the canonical case: every static scanner missed it for weeks; a behavioural baseline would have flagged the suddenly-different sshd connection pattern.
+
+**Behavioural drift.** The image was fine on the day you scanned it. An attacker compromised the running container two weeks later — credential theft, sidecar injection, kubectl exec from a stolen kubeconfig — and is now exfiltrating data. The image's bytes are still the same; only the live behaviour has changed.
+
+**Misuse of legitimate tools.** `kubectl exec` is a legitimate operation; it's also how an attacker with a stolen token spawns a shell in your production payments pod. `curl` is a normal utility; it's also how the implant reaches its command-and-control. The tool isn't the signal; the *context* is — and runtime detection is the only layer that has context.
+
+**Side-channel events.** A pod that suddenly starts touching files it never touched before. A process that opens a UDP socket to a port it never used. A container that starts spawning `nc` listeners. None of this shows up in static analysis because the image's source code might genuinely contain `nc` for a legitimate reason; what makes it suspicious is the run-time pattern, not the binary's presence.
+
+Runtime is the safety net. You ship build-time gates because they're cheap and catch most of what matters; you ship runtime because the gates have holes by design.
+
+## The 2026 tool landscape
+
+| Tool | License | Substrate | Best at |
+| --- | --- | --- | --- |
+| **RHACS** (Stackrox) | Commercial | eBPF or kernel module | Full-stack — scan + admission + runtime + compliance, single product. |
+| **Falco** | Apache 2.0 | eBPF (modern-bpf), kernel module (legacy) | CNCF Graduated; signature rules in YAML; the open-source default. |
+| **Cilium Tetragon** | Apache 2.0 | eBPF | Process + network observability; tight Cilium integration. |
+| **Aqua Tracee** | Apache 2.0 | eBPF | Signatures + behavioural detection; strong on container forensics. |
+| **Sysdig Secure** | Commercial | Falco engine | Falco at the core plus commercial UI, dashboards, vuln management. |
+| **Wazuh** | GPLv2 | HIDS agent | Broader than containers — endpoint, file integrity, SIEM functions. |
+
+The lab's choice is **RHACS**, because it's already deployed and it covers admission + runtime + image scanning in one product. For an open-source-only stack, the dominant pattern is **Falco** for runtime detection and **Tetragon** (or Cilium itself) for network observability. Aqua Tracee is the third runner — fewer deployments but strong on container-forensics use cases.
+
+Don't run three runtime-detection tools on the same fleet. Two is the maximum, and the only honest reason to run two is defence-in-depth against tool-specific evasion. The cost is real: every additional tool means another eBPF program loaded on every node, another daemon to maintain, another set of alerts to triage. Most teams that try three are running one because they bought it, one because it ships with their platform, and one because someone forgot to uninstall it. Pick one as the system of record; everything else gets removed or runs in shadow mode.
+
+## What rules look like
+
+A Falco rule that detects a shell spawning inside a container:
+
+```yaml
+- rule: Terminal shell in container
+  desc: A shell was spawned in a container (possible attacker shell)
+  condition: >
+    spawned_process and container
+    and shell_procs and proc.tty != 0
+    and container_entrypoint
+    and not user_expected_terminal_shell_in_container_conditions
+  output: >
+    A shell was spawned in a container with an attached terminal
+    (user=%user.name container_id=%container.id image=%container.image.repository
+    proc=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+  priority: NOTICE
+  tags: [container, shell, mitre_execution, T1059]
+```
+
+Three things to notice. **`condition:`** is Falco's expression language — fields like `proc.name`, `container.id`, `evt.type` come from the kernel event stream, joined with Kubernetes metadata from the Falco-K8s collector. **`output:`** is the human-readable line that lands in your SIEM; it carries the fields you'll grep later. **`tags: [..., T1059]`** is the MITRE ATT&CK mapping — `T1059 — Command and Scripting Interpreter` — which auditors and SOC dashboards key off.
+
+## The MITRE ATT&CK alignment
+
+Every serious runtime tool maps its rules to the **MITRE ATT&CK** matrix — the public taxonomy of adversary tactics and techniques. ATT&CK is the lingua franca between detection engineers, SOC analysts, threat intelligence teams, and auditors; if you can't say which technique your tool covers, you can't say what it doesn't.
+
+Tools usually ship an **ATT&CK heatmap** showing rule coverage by technique. The heatmap is the audit-ready evidence that your detection programme covers, say, all of *Execution* (T1059, T1610, T1611), most of *Defense Evasion* (T1611, T1078.001, T1622), and the high-value pieces of *Exfiltration* (T1041, T1048). The gaps in the heatmap are the work plan.
+
+The mistake to avoid is treating ATT&CK as the goal. Coverage of every technique is impossible (T1078 — Valid Accounts — is genuinely hard to detect at runtime), and chasing 100% coverage produces rule sprawl and alert fatigue. The goal is coverage of techniques *relevant to your threat model*: container escape, credential theft from pods, lateral movement via SA tokens, and outbound C2. That's maybe 40 of the 600+ techniques; pick those and tune them well.
+
+## eBPF — the new substrate
+
+For the last decade, runtime tools collected kernel events through **kernel modules**: loadable `.ko` files that hooked into syscall entry/exit points. Kernel modules are powerful and dangerous — they run in kernel space, they're tied to specific kernel versions, and a bug in one can panic the host.
+
+**eBPF** is the modern substrate. Programs are written in a restricted C subset, compiled to eBPF bytecode, and verified by the kernel before they run. They get most of the kernel-module power (syscall hooks, network observability, file events) without the panic risk; the verifier rejects programs that could loop or wander outside their sandbox. Falco, Tetragon, and Tracee all use eBPF as the primary substrate; RHACS Collector defaults to eBPF and falls back to a kernel module on older RHEL.
+
+**BTF/CO-RE** (BPF Type Format / Compile Once, Run Everywhere) is what makes eBPF portable across kernel versions. Older eBPF tools had to be compiled per kernel; modern ones ship one binary that adapts to any 4.18+ kernel with BTF data. RHEL 8.6+ and RHEL 9 ship BTF in `/sys/kernel/btf/vmlinux`; older kernels need a BTF backport or a kernel-module fallback.
+
+The caveats. **Debugging is hard** — when an eBPF program silently drops events because the verifier rejected a code path at load, the failure mode is "no alerts" not "loud error." **Kernel version dependencies still bite** — `proc.name` works one way on 5.10 and another on 5.14; field maps need maintenance. **Performance overhead** is real but small (1-3% CPU on typical workloads, more on syscall-heavy ones); it's almost always cheaper than a kernel module's overhead, but it isn't free.
+
+## Behavioural baselines
+
+Signature rules say "alert if I see X." Behavioural rules say "alert if I see X *that I've never seen here before*." The difference is the difference between catching what you already know is bad and catching what you've never seen.
+
+Modern runtime tools build a **per-pod behavioural baseline** — typically over the first 30-60 minutes of a pod's life, then continuously refined. The baseline records the process tree (which programs spawn which), the network destinations (which IPs and DNS names get connected to), the file accesses (which paths get opened, read, written), and the syscall pattern. Anything that deviates from the baseline is a candidate alert.
+
+RHACS does this natively — every pod has a "process baseline" you can view in the UI, and the policy engine can fire on deviation. Falco doesn't do this natively (it's signature-based); the open-source equivalent is **Tetragon's tracking policies** or **Aqua Tracee's behavioural signatures**, both of which build process and network baselines.
+
+For zero-day detection, behavioural is more powerful than signature, but it costs more. Baselines need a learning period; baselines drift when the workload legitimately changes (a new feature deploys, a config flips, traffic shifts); and the false-positive rate is higher than signatures' because every legitimate deviation looks like a deviation. The discipline is to use both — signatures for known-bad, behavioural for the unknown-unknowns, with the behavioural side tuned aggressively to keep the noise low.
+
+## Network observability
+
+Runtime security isn't just about processes. It's about the **network** every pod is doing — who it's talking to, what protocols, how much data, in which direction.
+
+<Whiteboard client:load data={{ nodes: rtNodes, edges: rtEdges }} height={460} />
+
+Reading the diagram: an attacker spawns `/bin/bash` inside the payments-api pod and opens an outbound connection to 185.x.y.z. Every syscall (`execve`, `connect`) hits the kernel; the Collector / Falco / Tetragon DaemonSet observes the kernel events via eBPF; the detection engine matches against rules and behavioural baselines; matches stream to the SIEM, page the on-call, and optionally trigger auto-response (kill pod, apply isolation NetworkPolicy).
+
+The high-value rules in a BFSI environment are usually network rules:
+
+- **Egress to unauthorised CIDR.** Production pods should only talk to a known set of external endpoints (payment processor, identity provider, monitoring). Any other egress is alert-worthy.
+- **DNS to unknown domain.** Resolving `attacker.com` from a payments pod is a signal even before the connection completes.
+- **Unexpected ingress.** A pod that shouldn't accept inbound connections suddenly listening on a port.
+- **Volume anomaly.** A pod that normally exchanges 10 MB/hour suddenly egressing 10 GB.
+
+The lab runs **NetObserv** on the spoke for network observability — see [`/docs/openshift-platform/platform-services/netobserv`](/docs/openshift-platform/platform-services/netobserv). NetObserv collects flow data via eBPF and provides the cluster-wide flow view; for finer-grained per-pod rules, Tetragon or Cilium itself is the deeper substrate. RHACS also collects network flows via the Collector; both run side by side without conflict.
+
+## The alert-fatigue problem
+
+Out-of-the-box rules from any runtime tool generate **hundreds of alerts per day** on a real cluster. Most are noise — legitimate operations that happen to match a generic rule, scheduled system updates, debugging sessions, automation accounts behaving normally. Within a week, the on-call has tuned out the alert channel; within a month, real alerts get missed.
+
+The standard pattern for keeping the signal-to-noise ratio survivable:
+
+**Phase 1: tune for your environment.** Run the default rule set in `inform` mode for two weeks. List the top 20 noisiest rules. For each, decide: disable, narrow the scope (add a `not container.image.repository in (registry.lab/build-tools/...)` to exclude legitimate tooling), or accept and live with it. Most of the volume reduction comes from disabling maybe 5 rules and narrowing 10 more.
+
+**Phase 2: route by severity.** Critical alerts (privileged container, cluster-admin SA exec, known exploit signatures) page the on-call. High alerts (shell in production pod, unexpected network) ticket. Medium alerts (image age, unsigned image) land in a daily digest. Low alerts log only. The corollary: most rules should ship as Medium or Low by default, and you promote to High/Critical only after tuning has settled.
+
+**Phase 3: correlate.** A single shell spawn in a known-good admin pod is noise; the same shell spawn *plus* an outbound connection to a new external IP *plus* a file write under `/tmp` *in a customer-facing pod* is an incident. SIEM correlation rules are how you turn three medium-severity signals into one critical alert. Tools like RHACS, Splunk ES, and Elastic Security all support this; the open-source path is a custom SIEM correlation engine.
+
+The mistake to avoid is **promoting to enforce too early**. Auto-killing a pod looks productive until the day a legitimate cron job trips a rule and takes down billing. The default should be notify-only for the first quarter; auto-response only on a small list of well-understood rules with high-confidence signatures.
+
+## Response automation
+
+When a rule fires, what should happen? Three response patterns, in escalating order of operational risk:
+
+**Notify only.** Send to SIEM, page the on-call, file a JIRA ticket. The cheapest response and the right default. No risk of false-positive impact.
+
+**Network isolation.** Apply a deny-all NetworkPolicy to the offending pod's namespace, or label the pod so an existing NetworkPolicy isolates it. The pod stays running (for forensics) but can't talk to anything. Reversible; recovery is `oc delete networkpolicy`.
+
+**Kill the pod.** `kubectl delete pod` on detection. Falco Talon, RHACS, Tetragon all support this. Use sparingly — a wrongly-fired auto-kill in production is its own outage, and you've now destroyed the evidence you wanted to investigate.
+
+The general rule: **notify by default, isolate on high-confidence, kill only when the evidence is overwhelming and the impact of running compromised exceeds the impact of killing**. For a credential-stealing pattern in a payments pod, kill is justified; for a generic "shell-in-container" rule, notify is enough.
+
+The lab's auto-response posture is conservative: notify for almost everything, network-isolate on a tight allowlist of high-confidence rules (process injection detection, known-malicious-IP egress), and never auto-kill. The argument is that a wrongly-killed pod is worse than a slightly-late human response, given the lab's typical incident volume.
+
+## Lab posture
+
+The runtime stack on the lab today:
+
+- **RHACS Central** on `hub-dc-v6`, **SecuredCluster** on `spoke-dc-v6`. Collector runs as a DaemonSet on every spoke node; default collection method is eBPF with kernel-module fallback. Cross-link [`/learn/acm-multicluster/security-with-rhacs`](/learn/acm-multicluster/security-with-rhacs).
+- **NetObserv** on the spoke for flow observability. Used for cluster-wide flow visibility, not per-flow rule evaluation.
+- **Falco / Tetragon / Tracee** — **not deployed**. RHACS covers the use cases that justify a runtime tool; running a second one would double the eBPF footprint without adding coverage. The architecture decision is reviewed annually.
+- **Alert routing** — RHACS violations stream to a Splunk HEC integration via a `Notifier` CR; high-severity rules also page PagerDuty. See the RHACS integrations chapter in [`/learn/acm-multicluster/security-with-rhacs`](/learn/acm-multicluster/security-with-rhacs).
+- **Auto-response** — notify only. No auto-kill, no auto-isolate. Documented in the response-policy doc; reviewed quarterly.
+
+The pattern is one well-tuned runtime tool plus structured alert routing, not multiple tools in shadow mode. Adding Falco for "defence in depth" would double the noise budget without doubling the signal.
+
+## Try this
+
+1. **Install Falco in a test namespace.** Use the upstream Helm chart; deploy with `driver.kind=modern-bpf`. Wait two minutes for rules to load. Spawn a shell in a pod (`oc exec -it ... -- /bin/sh`). The Falco logs should show a "Terminal shell in container" event within seconds.
+2. **Write a custom Falco rule** for "outbound DNS query to a non-internal domain from a customer-facing pod." Use the `evt.type = sendto` and `fd.name` fields; restrict the scope with `container.image.repository` to your tenant namespace's images. Test by curling an external domain from inside the pod.
+3. **Tune RHACS's noisiest policy.** Open the RHACS UI; find the policy with the most violations in the last 7 days; either disable it, narrow its scope with an exclusion, or change its severity. Document the change with a justification in the policy's notes.
+4. **Walk the ATT&CK heatmap.** Open your tool's coverage view. Identify three techniques in the *Privilege Escalation* tactic with zero rule coverage. Decide for each whether the gap matters in your environment.
+
+## Common failure modes
+
+**Falco can't load eBPF probes — kernel headers missing.** Old kernels need `kernel-devel` installed on the host, or you fall back to the legacy kernel module (which has its own build dependencies). The modern fix is `driver.kind=modern-bpf` which uses BTF/CO-RE and doesn't need kernel headers — supported on RHEL 8.6+ and most modern distros. If the cluster is on an older kernel, install `falcoctl` to manage probe rebuilds or accept the kernel-module path.
+
+**RHACS Collector OOMKilled.** Almost always a kernel-version mismatch with the eBPF program; the program loads but mis-counts events and the in-memory ring buffer grows unbounded. Fix: set `collectionMethod: KERNEL_MODULE` on the affected SecuredCluster, or upgrade the node OS. The Collector logs name the kernel version it loaded for, which is the diagnostic.
+
+**Alert volume exceeds the SIEM ingest limit.** A bad release fires the same rule hundreds of times per minute; Splunk's HEC starts dropping events; the SIEM is now blind to *other* alerts. Fix at two layers: tune the noisiest rules at source (RHACS deduplication, Falco rule narrowing), and apply per-policy notifier routing so high-volume rules go to a low-priority channel that absorbs the burst. The deeper fix is to admission-gate the bad release earlier — if your runtime layer is generating hundreds of violations per minute, the build-time gate should have caught it.
+
+**Auto-kill took down production.** A Helm-update changed an image label; a generic "untrusted image" rule fired on every new pod; the response was `delete pod`; the rollout stalled because every replacement pod also got killed. The fix is procedural — auto-response is enabled only for rules that have been at notify-only for at least one quarter, with a documented exemption path. Revert to notify-only when the post-mortem completes.
+
+**Behavioural baseline never finishes learning.** The baseline window is supposed to be 30-60 minutes per pod; if the pod restarts more than the learning period, the baseline never stabilises and every operation looks anomalous. Fix: extend the learning window (`processBaselineUpdates.lockTimestamp` in RHACS), or fix the underlying CrashLoopBackOff first — a pod that can't stay up doesn't have a stable behaviour to baseline.
+
+## References
+
+- Falco: [falco.org](https://falco.org/)
+- Falco rules library: [github.com/falcosecurity/rules](https://github.com/falcosecurity/rules)
+- Falco Talon (response automation): [falco-talon.org](https://falco-talon.org/)
+- Cilium Tetragon: [tetragon.io](https://tetragon.io/)
+- Aqua Tracee: [aquasecurity.github.io/tracee](https://aquasecurity.github.io/tracee/latest/)
+- MITRE ATT&CK for Containers: [attack.mitre.org/matrices/enterprise/containers](https://attack.mitre.org/matrices/enterprise/containers/)
+- eBPF: [ebpf.io](https://ebpf.io/)
+- BTF / CO-RE explainer: [nakryiko.com/posts/bpf-portability-and-co-re](https://nakryiko.com/posts/bpf-portability-and-co-re/)
+- Red Hat Advanced Cluster Security: [docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/)
+- Sysdig Secure: [sysdig.com/products/secure](https://sysdig.com/products/secure/)
+
+**Next:** [Module 08 — Secrets management](/learn/devsecops/secrets-management) — where the secrets come from, where they go, and the four patterns to pick between.
