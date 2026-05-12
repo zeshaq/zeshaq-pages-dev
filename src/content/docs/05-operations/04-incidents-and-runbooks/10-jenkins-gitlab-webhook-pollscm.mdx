@@ -1,0 +1,142 @@
+---
+title: "Jenkins + GitLab webhook — the pollSCM bootstrap trap"
+description: "Why a freshly-cloned Jenkins pipeline ignores GitLab pushes even when the webhook delivery log shows HTTP 200: declarative-pipeline triggers register at build time, so build #1 has to run manually before notifyCommit resolves the job."
+sidebar_label: "Jenkins pollSCM bootstrap"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page documents the non-obvious onboarding gotcha that hits every new Jenkins pipeline cloned from the `openliberty-readiness-probe` template (and similar declarative Jenkinsfiles) when GitLab webhook delivery looks healthy but no builds fire on push. The fix is two lines in the Jenkinsfile plus one manual build. The trap reproduces on every clone of the template until the template itself is hardened.
+
+## Symptom
+
+All of the following are true together:
+
+1. A new Jenkins job has been created for a GitLab project.
+2. The GitLab webhook is configured against the Jenkins `notifyCommit` endpoint.
+3. The GitLab webhook event log shows `HTTP 200` for pushes.
+4. No corresponding Jenkins build appears in the job history on those pushes.
+5. Manual builds via the Jenkins UI or API DO work.
+
+If the webhook event log shows anything other than `200`, fix the delivery layer first (TLS, hostname resolution, Jenkins reachability, CSRF crumb). This page covers only the case where delivery succeeds but no build fires.
+
+Diagnostic that pinpoints the cause — inspect the registered triggers in the job's config XML:
+
+```bash
+curl -s -u "$JENKINS_USER:$JENKINS_TOKEN" \
+  https://jenkins.sub.comptech-lab.com/job/<name>/config.xml \
+  | grep -A2 "<triggers>"
+```
+
+- Presence of `<hudson.triggers.SCMTrigger>` inside `<triggers>` means `pollSCM` IS registered — this page does not apply.
+- Absence of `<hudson.triggers.SCMTrigger>` (or an empty `<triggers/>`) means the directive has not been installed yet — this IS the case.
+
+## Root cause
+
+Two coupled mechanisms, both required:
+
+1. **Jenkins `notifyCommit` only fires for jobs whose declarative pipeline declares `triggers { pollSCM('...') }`.** Without that block, the webhook delivery is silently ignored even though the URL match against the job's SCM URL is correct.
+
+2. **Declarative-pipeline triggers are registered at build time.** Jenkins reads the `Jenkinsfile` and installs the `pollSCM` directive into the job config only AFTER a build has run and parsed the file. So merely adding `triggers { pollSCM(...) }` to the repository is not enough — a manual build #1 has to execute first.
+
+The combined effect: a freshly-cloned job from a template without `pollSCM` looks like a broken webhook on push #1, regardless of how clean the GitLab side is.
+
+## Fix
+
+Three steps and a probe.
+
+### Step 1 — Add the trigger block to the Jenkinsfile
+
+Place it alongside `agent`, `options`, `parameters`, inside the top-level `pipeline { ... }`:
+
+```groovy
+pipeline {
+  agent { label 'docker-runtime' }
+  triggers { pollSCM('H/5 * * * *') }
+  options { timestamps() }
+  stages { /* ... */ }
+}
+```
+
+The cron expression `H/5 * * * *` is a no-op safety net (Jenkins polls every five minutes). The real trigger is `notifyCommit` from the GitLab webhook. **Do not raise the schedule frequency** — the fix is the `notifyCommit` path, not a busy poll.
+
+### Step 2 — Commit, push, and run build #1 manually
+
+Push to the project's default branch. Then trigger build #1 from the UI or API so Jenkins parses the Jenkinsfile and registers the trigger into the job config:
+
+```bash
+curl -s -X POST -u "$JENKINS_USER:$JENKINS_TOKEN" \
+  https://jenkins.sub.comptech-lab.com/job/<name>/build
+```
+
+Wait for the build to complete (or at minimum to start and parse the Jenkinsfile).
+
+### Step 3 — Confirm the trigger is now registered
+
+```bash
+curl -s -u "$JENKINS_USER:$JENKINS_TOKEN" \
+  https://jenkins.sub.comptech-lab.com/job/<name>/config.xml \
+  | grep -A3 "<triggers>"
+```
+
+Expected output now contains `<hudson.triggers.SCMTrigger>` with the cron spec.
+
+### Step 4 — Validate end-to-end
+
+```bash
+cd <project-clone>
+echo "$(date -u +%FT%TZ)" >> README.md
+git commit -am "chore: webhook bootstrap probe"
+git push
+```
+
+Within seconds, build #2 should appear in the Jenkins job history listed as triggered by `SCM change`.
+
+### Pre-action diagnostic state
+
+Before fixing, capture:
+
+1. The GitLab project hooks event log:
+
+   ```bash
+   GLAB=https://gitlab.sub.comptech-lab.com/api/v4
+   curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+     "$GLAB/projects/<project-id>/hooks/<hook-id>/events" | jq '.[0:3]'
+   ```
+
+   Confirm recent deliveries return `200`.
+
+2. The Jenkins job's `config.xml` `<triggers>` block (shown above).
+
+3. The Jenkinsfile's `pipeline { ... }` block — verify it currently lacks `triggers { pollSCM(...) }`.
+
+## Forbidden actions
+
+- **Do NOT raise the `pollSCM` cron frequency above `H/5 * * * *`** as a workaround. The fix is `notifyCommit`, not a busy poll.
+- **Do NOT add a second webhook in GitLab** pointing at `/job/<name>/build?token=...` as a "belt and braces" workaround. It bypasses the trigger model and creates anonymous-build security exposure.
+- **Do NOT remove `triggers { pollSCM(...) }`** from working pipelines thinking the webhook will keep working without it. Trigger registration is what makes `notifyCommit` resolve the job.
+
+## Example: `liberty-smoke` (observed 2026-05-09)
+
+- GitLab event log: `200` on every push since the project was created.
+- Jenkins job history: only manual builds; no SCM-triggered builds.
+- `config.xml`: `<triggers/>` is empty.
+- Fix: added `triggers { pollSCM('H/5 * * * *') }` to the Jenkinsfile, pushed, ran build #1 manually. Build #1's cause was `Started by user`.
+- After build #1: `config.xml` showed `<hudson.triggers.SCMTrigger><spec>H/5 * * * *</spec>...`.
+- Pushed a one-line README change. Build #2 fired automatically with cause `Started by SCM change`.
+
+## Prevention
+
+The trap reproduces on every clone of the `openliberty-readiness-probe` template until the template Jenkinsfile is hardened. Two parallel changes close the gap at the source:
+
+1. **Add `triggers { pollSCM('H/5 * * * *') }` to the template's Jenkinsfile** so new clones inherit it.
+2. **Document the "bootstrap-trigger build #1" step** in the developer-handbook day-1 quickstart so first-day developers do not mistake the silent-webhook symptom for a broken pipeline.
+
+Both items are tracked as template-hardening follow-ups under the `developer-handbook/` work.
+
+## References
+
+- `opp-full-plat/connection-details/jenkins.md` — Jenkins connection details and credential custody.
+- `opp-full-plat/runbooks/jenkins-gitlab-webhook-pollscm.md` — operator-facing source.
+- `opp-full-plat/developer-handbook/` — first-day developer quickstart (target page for documenting the bootstrap-build step).
+- Jenkins [`SCMTrigger` documentation](https://www.jenkins.io/doc/book/pipeline/syntax/#triggers).

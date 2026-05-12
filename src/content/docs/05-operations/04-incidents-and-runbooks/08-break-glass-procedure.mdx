@@ -1,0 +1,250 @@
+---
+title: "Break-glass procedure for fleet operations"
+description: "The operator-facing companion to ADR 0025: when GitOps can't recover in time, the four-condition gate, the audit record, the backport contract, and the prohibited actions that still need a PR."
+sidebar_label: "Break-glass procedure"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page is the on-call operator's procedure for the GitOps-only operations policy defined in ADR 0025. Reach for it when a live change against `hub-dc-v6`, `spoke-dc-v6`, or any future fleet member looks necessary outside the normal GitOps path. The policy itself is in the ADR; this page tells you what to do, in order, while the incident is open.
+
+Read ADR 0025 once before you are on call. Use this page during the incident.
+
+## Symptom
+
+You are looking at one of:
+
+- A declared production incident with a fifteen-minute time budget that no GitOps MR can satisfy.
+- Argo CD on the owning cluster is itself degraded — the operator pod is `CrashLoopBackOff`, a webhook is rejecting reconciles, or the GitLab credential is invalid.
+- A missing CRD, finalizer, or admission webhook is blocking reconciliation cluster-wide.
+- A failed MachineConfig rollout has left nodes unrecoverable through normal GitOps drift correction (the [MCO stuck-node](/docs/05-operations/04-incidents-and-runbooks/11-mco-stuck-node-recovery) recovery class).
+
+If none of these are true — if you simply have a change you know is correct, an upgrade with no MR yet, or a drift you noticed during read-only inspection — **this is not break-glass**. Open the MR.
+
+## Root cause
+
+Break-glass exists because GitOps is the audit chain, not a magic wand. Some failure modes prevent GitOps from acting: Argo CD itself is down, a CRD is missing so Argo can't even render the diff, a webhook blocks reconciliation, a node-level fault needs a cordon before the next reconcile loop runs. In those cases the cluster needs a human to mutate it directly, and the audit chain has to be re-established by hand.
+
+The four conditions below define the gate; the audit record below is the substitute for the missing GitOps history.
+
+## Fix
+
+The procedure is checklist-shaped on purpose. Skipping a step is what produces the "we don't know what changed at 3 AM last Tuesday" outcome the policy is built to avoid.
+
+### The four-condition gate
+
+All four MUST be true at the moment you decide to act:
+
+1. There is a declared production incident or imminent production impact.
+2. Argo CD on the owning cluster cannot recover the state on its own within the time budget.
+3. A corrective action is needed in under fifteen minutes.
+4. No GitOps PR path can complete inside that window.
+
+If unsure, default to "PR first". The cost of an MR is minutes. The cost of an unrecorded live change is a failed compliance audit.
+
+### Pre-action checklist
+
+Complete every item before you mutate anything.
+
+1. **Declare the incident.** Open or comment on an issue under `zeshaq/opp-full-plat`, naming the cluster, namespace, object, and the reason GitOps cannot recover. Title prefix: `incident:` or `break-glass:`.
+
+2. **Page the on-call platform lead.** For the lab fleet this is the workspace owner; in a real rotation, follow the paging procedure. Do not proceed solo for any action under [Forbidden actions](#forbidden-actions).
+
+3. **Identify the owning Argo CD Application.**
+
+   ```bash
+   K=/home/ze/.kube/configs/<cluster>.kubeconfig
+   oc --kubeconfig "$K" -n openshift-gitops get applications.argoproj.io
+   oc --kubeconfig "$K" -n openshift-gitops get application <app> \
+     -o jsonpath='{.spec.source.repoURL}{"\n"}{.spec.source.path}{"\n"}'
+   ```
+
+   Record the Application name and source path. The backport MR targets that path.
+
+4. **Capture starting state.** Save the full YAML of every resource you intend to mutate:
+
+   ```bash
+   mkdir -p /tmp/break-glass-$(date -u +%Y%m%dT%H%M%SZ)
+   oc --kubeconfig "$K" -n <ns> get <kind> <name> -o yaml \
+     > /tmp/break-glass-*/before-<kind>-<name>.yaml
+   ```
+
+   Redact `data:` blocks in Secret captures before pasting into the audit record.
+
+5. **Confirm the four conditions still hold.** If condition 2 has flipped (Argo now reconciles), abort and let GitOps drive.
+
+### Action steps
+
+1. **Make the smallest possible mutation.** Prefer targeted `oc patch` over `oc edit`. Prefer `oc edit` over `oc delete + oc apply`. Prefer one resource over many.
+
+2. **Record the exact command, actor, and timestamp in UTC:**
+
+   ```bash
+   CMD='oc -n openshift-storage patch storagecluster ocs-storagecluster \
+     --type merge -p {"spec":{"managedResources":{"cephCluster":{"reconcileStrategy":"ignore"}}}}'
+   TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   printf '%s actor=%s cmd=%s\n' "$TS" "$USER" "$CMD" \
+     | tee -a /tmp/break-glass-*/commands.log
+   eval "$CMD"
+   ```
+
+3. **If you SSH to a node, capture the session.**
+
+   ```bash
+   script -q -c 'ssh core@<node>' /tmp/break-glass-*/ssh-<node>.log
+   ```
+
+   SSH is the highest-risk break-glass surface. Do not skip the session log.
+
+4. **Capture post-change state** mirroring the `before-` capture into `after-<kind>-<name>.yaml` in the same directory.
+
+5. **Validate the immediate fix** — pod scheduling resumes, API responds, sync proceeds.
+
+### Post-action checklist (within 24 hours)
+
+The clock starts at the timestamp recorded in step 2.
+
+1. **Open the backport MR.** Target the GitOps repo identified by the owning Application's `spec.source.repoURL`. For OpenShift platform resources this is internal GitLab `comptech-platform/openshift-ops/openshift-platform-gitops`; the local operator clone is at `/home/ze/ops-workspace/clones/platform-gitops`. Title: `break-glass backport: <one-line description>`. Body: link the incident issue and the audit record path. Reviewers: code-owners for the path plus a second platform admin if any prohibited-action exception applied.
+
+2. **Confirm Argo CD reconciles.**
+
+   ```bash
+   oc --kubeconfig "$K" -n openshift-gitops get application <app> \
+     -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+   ```
+
+   Expected: `Synced Healthy`. If the live state still drifts after sync, the backport is incomplete; iterate before closing.
+
+3. **If the change cannot be backported, revert.** Within the same 24 hours, apply the captured `before-<kind>-<name>.yaml` (or let Argo CD overwrite). Record the revert in the audit record.
+
+4. **Close the incident.** Comment on the issue with the audit record path under `reports/break-glass/`, the backport MR link or revert evidence, the Argo CD `Synced/Healthy` confirmation, and any follow-up issues opened.
+
+5. **Update audit evidence.** The audit record's existence under `reports/break-glass/` is what compliance reviews.
+
+### Audit record template
+
+Paste this into `reports/break-glass/YYYY-MM-DD-<incident-slug>.md` and fill every field. Mark unused fields `n/a`.
+
+```markdown
+# Break-Glass Record: <one-line description>
+
+- Incident issue: #<n>
+- Cluster: <hub-dc-v6 | spoke-dc-v6 | other>
+- Namespace: <ns or cluster-scoped>
+- Resource(s): <kind/name, kind/name>
+- Owning Argo CD Application: <namespace/name>
+- Owning GitOps repo + path: <repo>/<path>
+- Actor: <user>
+- Start timestamp (UTC): <YYYY-MM-DDTHH:MM:SSZ>
+- End timestamp (UTC): <YYYY-MM-DDTHH:MM:SSZ>
+- Expiry (start + 24h): <YYYY-MM-DDTHH:MM:SSZ>
+
+## Trigger
+
+Why GitOps could not recover within the time budget. One short paragraph.
+
+## Conditions Verified
+
+- Declared incident: yes / no + reference
+- Argo CD unable to recover: yes / no + evidence
+- Under fifteen minutes required: yes / no
+- No GitOps PR path possible in that window: yes / no
+
+## Prohibited-Action Exception
+
+- Applied: yes / no
+- If yes, named second reviewer: <user>
+- Post-incident PR label: <label>
+
+## Commands Executed
+
+(paste contents of /tmp/break-glass-*/commands.log)
+
+## Before / After State (Redacted)
+
+(paste relevant fields from before-/after-<kind>-<name>.yaml)
+
+## SSH Session Log (If Applicable)
+
+- File: <path or n/a>
+
+## Validation
+
+- Immediate symptom cleared: yes / no + evidence
+- Argo CD post-backport status: <Synced/Healthy or other>
+- Backport PR: <link or n/a>
+- Revert evidence: <link or n/a>
+
+## Follow-Up
+
+- Issues opened: #<n>, #<n>
+- Pattern to promote into GitOps: yes / no + brief note
+```
+
+## Forbidden actions
+
+These changes MUST NOT be made by break-glass. They require a normal GitOps MR with code-owner review even during an active incident, unless the prohibited action IS the incident remediation and a second reviewer is named in the audit record per ADR 0025 section 4.
+
+- Bypassing or disabling an RHACS image, deployment, runtime, or admission policy. RHACS is authoritative for image supply per ADR 0019.
+- Disabling, deleting, or modifying security operators directly on the cluster: RHACS, compliance, cert-manager, External Secrets, oauth.
+- Granting `cluster-admin`, broad ClusterRoleBindings, or expanded AppProject destinations without code-owner review.
+- Direct edits to `rendered-*` MachineConfig objects.
+- Patching `MachineConfigPool` `desiredConfig` annotations as a substitute for a real MachineConfig change. The only documented exception is the [MCO stuck-node recovery](/docs/05-operations/04-incidents-and-runbooks/11-mco-stuck-node-recovery), which has its own tracked issue.
+- Direct edits to etcd, etcd Secrets, or `kube-system` cluster signing keys.
+- Silent rotation of Vault, Nexus, or GitLab credentials referenced by ExternalSecret without updating the source of truth in the same change window.
+
+## Example: emergency node cordon, done right
+
+Symptom: a worker on `spoke-dc-v6` is producing kernel errors and threatening pods on it. Argo CD does not own node-level scheduling state.
+
+1. Open incident issue `incident: cordon spoke worker <node> due to kernel errors`.
+2. Capture state:
+
+   ```bash
+   K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+   oc --kubeconfig "$K" get node <node> -o yaml \
+     > /tmp/break-glass-*/before-node-<node>.yaml
+   ```
+
+3. Cordon and drain:
+
+   ```bash
+   TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   echo "$TS actor=$USER cordon=<node>" \
+     | tee -a /tmp/break-glass-*/commands.log
+   oc --kubeconfig "$K" adm cordon <node>
+   oc --kubeconfig "$K" adm drain <node> \
+     --ignore-daemonsets --delete-emptydir-data
+   ```
+
+4. Cordoning a node is operational scheduling, not GitOps desired state. The "backport" here is a follow-up: either repair the node and uncordon (record in the same audit file), or open an MR to remove the node from the MachineSet if it is being retired permanently.
+
+5. Write the audit record. Close the incident with the validation evidence.
+
+## Example: emergency node cordon, done wrong
+
+Same symptom, handled badly:
+
+- Operator opens the console, clicks "Cordon".
+- No incident issue. No starting-state capture. No commands log.
+- The cordon is forgotten over the weekend. The node stays unusable.
+- Next session report has no record of the live change.
+- Compliance audit cannot reconstruct who did what.
+
+This is non-compliant under ADR 0025 even though the action itself (cordon) was reasonable. The failure is the absence of the audit record and the missing 24-hour follow-up.
+
+## Prevention
+
+The whole policy is the prevention. Two structural reinforcements:
+
+1. **Every cluster mutation goes through the platform-gitops MR loop** by default. Break-glass is the exception, not a parallel path. If an action keeps recurring as break-glass, promote it to a normal GitOps pattern via the follow-up issues.
+2. **Audit records are reviewed quarterly.** Patterns that appear repeatedly become MRs that close the gap (a missing webhook becomes a kustomize patch; a recurring cordon becomes a NodeRemediation policy).
+
+## References
+
+- ADR 0025 (`gitops-only-operations-break-glass`) — the policy this page implements.
+- ADR 0015 (`federated-gitops-repo-architecture`) — section "OpenShift Operations Rule".
+- ADR 0018 (`acm-openshift-gitops-pull-model-v6`) — section "Guardrails And Gotchas".
+- [MCO stuck-node recovery](/docs/05-operations/04-incidents-and-runbooks/11-mco-stuck-node-recovery) — the one documented `desiredConfig` exception.
+- `opp-full-plat/runbooks/break-glass-procedure.md` — operator-facing source.
+- `opp-full-plat/connection-details/platform-admin-handoff.md` section "Break-Glass Rules".

@@ -1,0 +1,164 @@
+---
+title: "Rotate the RHACS Central admin password"
+description: "Vault path secret/ocp/platform/rhacs-admin -> ESO Secret central-admin-password -> Central CR adminPasswordSecret. The rollout-restart-deploy/central step matters because Central caches the htpasswd at startup."
+sidebar_label: "Rotate RHACS Central admin"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page covers rotating the RHACS Central admin password — the credential that automation uses to generate init-bundles, query the API, and authenticate to the Central UI. Since #255 / `!73` (2026-05-11) the credential flows Vault -> ESO -> Central CR rather than living in the bundled `central-htpasswd` Secret, which means rotation is a Vault write plus an ESO refresh plus a `rollout restart deploy/central` — three actions, in that order. The rollout restart matters because **Central caches the htpasswd at startup**; a Vault write alone does not change what Central accepts. Pair this page with [Rotate secrets and tokens](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) — that page covers the cross-system rotation contract; this page is the Central-specific overlay.
+
+## When to run this
+
+- **Quarterly cadence** under the lab's 90-day rotation policy.
+- **Personnel change** — anyone with the Central admin credential leaves the team.
+- **Suspected leak** — the password landed in chat, a session report, or a commit message.
+- **Drift-check failure** — the [Secrets custody drift check](/docs/05-operations/04-incidents-and-runbooks/12-secrets-custody-drift-check) returned `401` against `https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/auth/m2m`.
+- **After an init-bundle regeneration cycle** — the bundle generation calls the API as admin; rotating the bundle's credential together with the admin password is the clean separation.
+
+## Prerequisites
+
+1. **Vault write access** to `secret/ocp/platform/rhacs-admin`.
+
+   ```bash
+   VAULT_ADDR=https://vault.sub.comptech-lab.com:8200
+   vault kv get secret/ocp/platform/rhacs-admin
+   ```
+
+2. **`oc` access to the hub cluster** (`hub-dc-v6`) — Central runs in the `stackrox` namespace there.
+
+   ```bash
+   K=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+   oc --kubeconfig "$K" -n stackrox get deploy central
+   ```
+
+3. **The current admin password** for the post-rotation probe. Pull it from Vault into a local variable; do not echo it.
+
+4. **A GitHub issue** describing the rotation; branch prefix `secret-rot/rhacs-admin-<UTC-date>`. Track under #255 if this is the first rotation since `!73` landed.
+
+## Procedure
+
+The full flow is three steps: Vault write, ESO refresh, rollout restart. Skipping any step leaves Central authenticating against the old password.
+
+### Step 1 — Generate the new password and write to Vault
+
+```bash
+NEW_PASS=$(openssl rand -base64 30 | tr -d '/+=' | head -c 28)
+
+VAULT_ADDR=https://vault.sub.comptech-lab.com:8200
+vault kv put secret/ocp/platform/rhacs-admin password="$NEW_PASS"
+```
+
+The convention is 24 alphanumeric characters minimum, no `&`, `@`, `%`, `?`, `:`, `#` — same convention as [Rotate secrets and tokens](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens). Use 28 chars to leave headroom.
+
+After the write, confirm Vault accepted it and the kv version incremented:
+
+```bash
+vault kv metadata get secret/ocp/platform/rhacs-admin | head -5
+```
+
+### Step 2 — Force the ESO refresh
+
+ESO reconciles at `refreshInterval` (default 5m). To force an immediate refresh on the `central-admin-password` ExternalSecret:
+
+```bash
+K=/home/ze/.kube/configs/hub-dc-v6.kubeconfig
+
+oc --kubeconfig "$K" -n stackrox annotate externalsecret central-admin-password \
+  force-sync="$(date -u +%s)" --overwrite
+
+oc --kubeconfig "$K" -n stackrox get externalsecret central-admin-password \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+```
+
+Expected: `True`. If `False`, check the ESO operand log:
+
+```bash
+oc --kubeconfig "$K" -n external-secrets logs deploy/external-secrets --tail=50
+```
+
+Common cause: ESO egress to Vault is broken; see [ESO egress to Vault](/docs/05-operations/04-incidents-and-runbooks/03-eso-egress-to-vault).
+
+Confirm the Secret holds the new password (without echoing it):
+
+```bash
+NEW_FROM_SECRET=$(oc --kubeconfig "$K" -n stackrox get secret central-admin-password \
+  -o jsonpath='{.data.password}' | base64 -d)
+[ "$NEW_FROM_SECRET" = "$NEW_PASS" ] && echo "ESO refresh OK" || echo "ESO refresh MISMATCH"
+```
+
+### Step 3 — Rollout-restart Central
+
+Central reads the htpasswd at startup and caches it in memory. A Vault write + ESO refresh does NOT change what Central accepts at login until the pod restarts:
+
+```bash
+oc --kubeconfig "$K" -n stackrox rollout restart deployment/central
+oc --kubeconfig "$K" -n stackrox rollout status deployment/central --timeout=5m
+```
+
+Expected: `deployment "central" successfully rolled out`. Central is a singleton with a PVC-backed PostgreSQL operand alongside; the rollout-restart is a clean pod replace (no DB schema migration).
+
+## Verification
+
+Probe the new password against the Central API:
+
+```bash
+ROUTE=central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com
+
+curl -sk -u "admin:$NEW_PASS" \
+  "https://${ROUTE}/v1/auth/m2m" -o /dev/null -w "%{http_code}\n"
+```
+
+Expected: `200`. Anything else, treat as drift and re-check the steps in order — Vault, ESO Secret, rollout.
+
+Then probe with the old password:
+
+```bash
+OLD_PASS=<from Vault audit / pre-rotation capture>
+curl -sk -u "admin:$OLD_PASS" \
+  "https://${ROUTE}/v1/auth/m2m" -o /dev/null -w "%{http_code}\n"
+```
+
+Expected: `401`. Proves the old password is dead, not just that the new one works.
+
+Unset locals and clean up:
+
+```bash
+unset NEW_PASS NEW_FROM_SECRET OLD_PASS
+```
+
+The rotation is complete when ALL of these are true:
+
+1. `curl -u admin:<new>` against `/v1/auth/m2m` returns `200`.
+2. `curl -u admin:<old>` against `/v1/auth/m2m` returns `401`.
+3. `vault kv get secret/ocp/platform/rhacs-admin` shows the new password.
+4. The `central-admin-password` Secret in the `stackrox` namespace holds the new value.
+5. `oc -n stackrox rollout status deployment/central` reports successfully rolled out.
+6. The session report captures the timestamp, the actor, the Vault path, and the probe evidence.
+
+## A note on `central-htpasswd.password`
+
+The bundled `central-htpasswd` Secret has a `password` key that is **empty by design** since `!73`. Central reads the admin credential from the Secret named in `Central.spec.central.adminPasswordSecret` (`central-admin-password`), not from `central-htpasswd`. Do not be misled by an empty `password` field in `central-htpasswd` — that is the new shape.
+
+```bash
+oc --kubeconfig "$K" -n stackrox get secret central-htpasswd \
+  -o jsonpath='{.data.password}'
+```
+
+Expected: an empty value. If it has content, an older Central CR shape is in place; align with the post-`!73` shape before rotating.
+
+## Forbidden actions
+
+- **Do NOT write the new password to `central-htpasswd.password`.** The Central CR reads `adminPasswordSecret`, not `central-htpasswd`; writing the wrong key has no effect and confuses the next operator.
+- **Do NOT skip the `rollout restart deploy/central` step.** A Vault + ESO refresh without the restart leaves Central authenticating against the cached old password. Login probes will return `401` for the new password and `200` for the old one — the opposite of what the rotation is supposed to achieve.
+- **Do NOT manually edit the `central-admin-password` Secret.** ESO owns it; manual edits are reconciled away on the next sync.
+- **Do NOT generate a password under 24 characters.** The 24-char alphanumeric convention is documented in [Rotate secrets and tokens](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens).
+- **Do NOT paste the new password into chat, session report, or any non-Vault destination.**
+
+## References
+
+- [Rotate secrets and tokens](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) — parent rotation procedure; this page is the RHACS-specific overlay.
+- [ESO egress to Vault](/docs/05-operations/04-incidents-and-runbooks/03-eso-egress-to-vault) — common failure mode when the ESO refresh hangs.
+- [Secrets custody drift check](/docs/05-operations/04-incidents-and-runbooks/12-secrets-custody-drift-check) — probe matrix to confirm the new credential before declaring done.
+- Issue #255 / MR `!73` on `platform-gitops` (Central CR moved to `adminPasswordSecret` shape).
+- `opp-full-plat/connection-details/rhacs.md` — Central topology, init-bundle convention, route URLs.

@@ -1,0 +1,187 @@
+---
+title: "Add a division to the federated GitLab"
+description: "Onboard a new division on the lab's federated GitLab: ct-* role group, GitLab group, CODEOWNERS edits, runner-class tag scope, ESO Vault path conventions for the new division's tenant secrets."
+sidebar_label: "Add a division"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page covers onboarding a new division on the lab's federated GitLab — the per-tenant boundary that pairs a GitLab group with a `ct-*` role group, an `app-`/`engagement-` namespace shape, ESO Vault paths under `secret/apps/<division>/<app>/...`, and a runner-class tag scope. The shape is the lab's standardised tenancy contract (ADR 0023). A division onboarding is one MR per tenant repo (gitlab-config, platform-gitops, vault-policies, opp-full-plat) plus a handful of UI clicks; this page enumerates the steps in the order that produces a clean cut-over.
+
+Pair with [Add a cluster to the fleet](/docs/05-operations/05-routine-tasks/04-add-a-cluster-to-the-fleet) — that page is the cluster-side onboarding; this page is the tenant-side. Both target ADR 0023's federated-tenancy contract.
+
+## When to run this
+
+- **A new client engagement lands** that needs its own GitLab group, code-owners, and Vault path tree.
+- **A platform-internal team is being split out** from an existing division (e.g., `team-platform` -> `team-platform-data` + `team-platform-runtime`).
+- **A compliance scope-change** demands a new tenancy boundary (PCI cardholder data confined to its own division per audit recommendation).
+
+The task is not appropriate for adding a single new app to an existing division — that is one MR against the existing tenant overlay, not a division-creation cycle.
+
+## Prerequisites
+
+1. **Division name agreed.** Naming convention: lowercase, hyphen-separated, no abbreviations. Examples: `team-bank-employees`, `team-platform-data`, `team-retail-loyalty`. The same string appears across:
+
+   - GitLab group path: `gitlab.sub.comptech-lab.com/<division>/`
+   - Role group name: `ct-<division>-developers`, `ct-<division>-maintainers`
+   - Vault path: `secret/apps/<division>/<app>/<env>/*`
+   - Quay namespace: `<division>` (with per-app robot tokens under it)
+   - OpenShift namespaces: `<division>-app-<env>` (app namespaces) and `<division>-engagement-<env>` (engagement-scoped)
+
+2. **Operator access** to GitLab (admin), Vault (root or appropriately-scoped), and `platform-gitops` (MR rights).
+
+3. **ADR 0023 read once.** The page implements the ADR's contract; the rationale is in the ADR.
+
+4. **A GitHub issue** describing the onboarding; branch prefix `tenant-onb/<division>`.
+
+## Procedure
+
+Six steps. Land them in the order below — Vault paths before GitLab group, GitLab group before runner tags, runner tags before CODEOWNERS — so each step's prerequisites are in place when the next runs.
+
+### Step 1 — Create the Vault path tree
+
+```bash
+VAULT_ADDR=https://vault.sub.comptech-lab.com:8200
+
+vault kv put secret/apps/<division>/_meta \
+  description="<division> tenant root" \
+  owner="<lead-email>" \
+  created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+The convention is `secret/apps/<division>/<app>/<env>/<key>` with envs `dev`, `stage`, `prod` and app-scoped sub-paths. The `_meta` entry at the division root is the audit anchor — it documents who owns the tenant and when it was created.
+
+Then write a Vault policy for the division:
+
+```hcl
+# /home/ze/opp-full-plat/clones/vault-policies/<division>.hcl
+path "secret/data/apps/<division>/*" {
+  capabilities = ["read", "list"]
+}
+
+path "secret/metadata/apps/<division>/*" {
+  capabilities = ["list", "read"]
+}
+```
+
+Apply:
+
+```bash
+vault policy write apps-<division> \
+  /home/ze/opp-full-plat/clones/vault-policies/<division>.hcl
+```
+
+### Step 2 — Create the GitLab group and the ct-* role groups
+
+In the GitLab UI:
+
+1. **Groups -> New group** -> path `<division>`, visibility `internal`, set the description from the agreed engagement scope.
+2. **Group -> Members** — add the lead as `Owner`. Other members are added by the lead later.
+
+The lab's `ct-*` role group convention (eleven groups today) — replicate for the new division:
+
+| Role group | Members | GitLab access level |
+|---|---|---|
+| `ct-<division>-developers` | Developers on the team | Developer |
+| `ct-<division>-maintainers` | Engineering leads | Maintainer |
+| `ct-<division>-reviewers` | Cross-team reviewers (security, platform) | Reporter (read + comment) |
+
+Create as GitLab subgroups under the division's group, then attach the appropriate access level. The lab's existing eleven role groups serve as a template; copy the structure.
+
+### Step 3 — Wire the runner-class tag scope
+
+The lab runs five planned runner classes — `docker-runtime`, `openliberty`, `static-build`, `playwright-e2e`, `image-push`. Each new division gets explicit access to the subset it needs:
+
+In GitLab UI -> Group `<division>` -> CI/CD -> Runners -> attach the runner classes the division will use. For most new divisions, `docker-runtime` and `static-build` are sufficient; add `openliberty` for divisions building Liberty apps, `image-push` for divisions that push to Quay, `playwright-e2e` for divisions running browser tests.
+
+Tag scope is enforced by the runner's `tags:` directive in `.gitlab-ci.yml`. The lab convention is one runner class per job rather than mixing classes — keeps the failure surface scoped.
+
+### Step 4 — Add the division to platform-gitops
+
+MR against `comptech-platform/openshift-ops/openshift-platform-gitops`:
+
+1. **Namespace overlay.** Add `clusters/<cluster>/tenants/<division>/` with `namespace.yaml`, `quota.yaml`, `limit-ranges.yaml`. Inherit defaults from `tenants/_base/` and override only what the division explicitly demands.
+
+2. **SecretStore for ESO.** Each division gets a namespace-scoped `SecretStore` reading from `secret/apps/<division>/*`. Use the `vault-apps` reference SecretStore as the template:
+
+   ```yaml
+   apiVersion: external-secrets.io/v1
+   kind: SecretStore
+   metadata:
+     name: vault-apps-<division>
+     namespace: <division>-app-prod
+   spec:
+     provider:
+       vault:
+         server: https://vault.sub.comptech-lab.com:8200
+         path: secret
+         version: v2
+         auth:
+           kubernetes:
+             role: apps-<division>
+             mountPath: kubernetes-<cluster>
+   ```
+
+   Namespace-scoped SecretStore (not ClusterSecretStore) per ADR 0023 — tenants must not be able to read each other's Vault paths.
+
+3. **RHACS Quay robot Secret.** Each division gets a `quay-robot-team-<division>` Secret in `openshift-pipelines`, materialized by ESO from Vault `secret/apps/<division>/<app>/ci/quay-robot`. Reuse the shared `push-image-quay` Tekton Task with the new Secret name as the parameter.
+
+4. **RHACS init-bundle.** The init-bundle is shared across divisions; the per-namespace ExternalSecrets that materialise the three TLS Secrets in `<division>-app-prod` reference the same Vault path `secret/ocp/platform/rhacs-init-bundle`.
+
+### Step 5 — Edit CODEOWNERS
+
+`CODEOWNERS` files live in multiple repos. Add the new division everywhere it has a stake:
+
+- `platform-gitops/CODEOWNERS` — `/clusters/*/tenants/<division>/ @<division>-maintainers @platform-admin`
+- `opp-full-plat/CODEOWNERS` — `/connection-details/<division>-*.md @<division>-maintainers`
+- `vault-policies/CODEOWNERS` — `<division>.hcl @<division>-maintainers @platform-admin`
+
+CODEOWNERS edits land as part of the same MR as the platform-gitops addition; do not split them across MRs (the audit trail is the diff in one commit).
+
+### Step 6 — Open the tenant repo template under the new GitLab group
+
+The lab's `_template-tenant-repo` (an internal mirror of the `openliberty-readiness-probe` shape) is the bootstrap for any new tenant app:
+
+```bash
+git clone git@gitlab.sub.comptech-lab.com:comptech-platform/_template-tenant-repo.git \
+  /tmp/template-repo
+
+cd /tmp/template-repo
+git remote set-url origin \
+  git@gitlab.sub.comptech-lab.com:<division>/<first-app>.git
+git push -u origin main
+```
+
+The first app under the division is the smoke test for the rest of the onboarding — once it builds, scans, and lands in DefectDojo and Quay, the division is live.
+
+## Verification
+
+The division is onboarded when ALL of these are true:
+
+1. `vault kv list secret/apps/<division>/` returns at least the `_meta` entry.
+2. `vault policy read apps-<division>` returns the policy contents.
+3. GitLab UI shows the `<division>` group with at least three `ct-*` subgroups and at least one assigned runner class.
+4. `oc --kubeconfig "$K" get ns <division>-app-prod` returns the namespace with the inherited quota and limit ranges.
+5. `oc --kubeconfig "$K" -n <division>-app-prod get secretstore vault-apps-<division>` reports `Ready=True`.
+6. The first tenant app builds and pushes to Quay under `<division>/<first-app>:<tag>`.
+7. CODEOWNERS in `platform-gitops`, `opp-full-plat`, and `vault-policies` lists the new `ct-<division>-maintainers` group.
+8. The platform-gitops MR has merged and Argo CD reports `Synced/Healthy` for the new tenant overlay.
+9. The session report or onboarding issue captures the division name, the MR link, the Vault policy file, and the first-app smoke-test evidence.
+
+## Forbidden actions
+
+- **Do NOT skip the namespace-scoping on the SecretStore.** Using `ClusterSecretStore` for a tenant's Vault paths breaks the per-division boundary that ADR 0023 builds.
+- **Do NOT inherit a higher access level than the division actually needs.** The default is `Developer` on the GitLab group; `Maintainer` is for engineering leads only; nothing requires `Owner` at the division level except the lead.
+- **Do NOT attach runner classes the division has no use for.** Each runner class has a cost (concurrency licence on shared agents, image-pull rate); attach the minimum subset that covers the division's pipelines.
+- **Do NOT skip the CODEOWNERS edits.** A division with merge rights on tenant overlays but no CODEOWNERS entry produces silent drift — the platform admin reviewer is bypassed.
+- **Do NOT bootstrap the first tenant app outside the `_template-tenant-repo` shape.** Tenants that drift from the template skip the Trivy scan, the DefectDojo import, and the Quay push convention.
+
+## References
+
+- ADR 0023 (`federated-tenancy-contract`) — the shape this page implements.
+- [Add a cluster to the fleet](/docs/05-operations/05-routine-tasks/04-add-a-cluster-to-the-fleet) — the cluster-side onboarding (this page is the tenant-side).
+- [Rotate secrets and tokens](/docs/05-operations/05-routine-tasks/02-rotate-secrets-and-tokens) — the rotation contract for the new division's credentials.
+- `opp-full-plat/connection-details/gitlab-operator-guide.md` — federated-GitLab operator handoff (issue #128).
+- `opp-full-plat/connection-details/compliance-implementor-handbook.md` — compliance scope per division.
+- `opp-full-plat/clones/vault-policies/` — the per-division Vault policy tree.
+- Quay robot token convention — Vault path `secret/apps/<division>/<app>/ci/quay-robot` consumed by the shared `push-image-quay` Tekton Task.

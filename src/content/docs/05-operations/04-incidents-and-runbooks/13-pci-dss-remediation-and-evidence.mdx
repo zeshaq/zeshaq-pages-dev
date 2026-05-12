@@ -1,0 +1,224 @@
+---
+title: "PCI-DSS remediation and evidence"
+description: "The human-facing playbook for the PCI-0 -> PCI-5 + PCI-1.13 audit chain: interpret a Compliance Operator scan, drive the TailoredProfile exception process, collect evidence from spoke-dc-v6, publish the pack via platform-gitops MRs !53/!54/!55."
+sidebar_label: "PCI-DSS remediation"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page is the standing playbook for the PCI-DSS audit chain that runs against `spoke-dc-v6`. The chain is structured as six phases — PCI-0 (baseline), PCI-1 (remediation wave 1), PCI-1.13 (the IPv6 / OVN-K side incident), PCI-2 through PCI-5 — and lives under milestone #30. At chain close on 2026-05-11 the spoke FAIL counts were 8 (master profile) / 3 (worker profile) / 0 (platform profile). The evidence pack was published via `!53`, `!54`, `!55` on `platform-gitops`. This page tells the operator how to drive the chain from "scan emitted a new FAIL" to "evidence pack signed off".
+
+If you arrived here mid-cycle and need to interpret a scan result or open an exception, jump to [Fix](#fix). The end-to-end shape is in [Root cause](#root-cause); the evidence-pack publication is in [Prevention](#prevention).
+
+## Symptom
+
+You are looking at one of:
+
+- A new Compliance Operator scan has emitted FAIL counts that differ from the last close-out's baseline (8 / 3 / 0).
+- A sub-issue under #246-#252 is open and assigned for remediation.
+- An auditor has requested the evidence pack for the most recent chain close.
+- A TailoredProfile change has landed in GitOps and the scan now passes a previously-failing rule (or vice versa).
+
+The Compliance Operator surfaces scan results as `ComplianceCheckResult` objects per rule. Read the current state on `spoke-dc-v6`:
+
+```bash
+K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-compliance get compliancescan
+oc --kubeconfig "$K" -n openshift-compliance get compliancecheckresult \
+  -o custom-columns=NAME:.metadata.name,STATUS:.status,SEVERITY:.severity \
+  | awk '$2 != "PASS" && $2 != "INFO"'
+```
+
+A clean baseline shows only the eight master / three worker rules below as FAIL; anything else is new and triggers remediation.
+
+## Root cause
+
+The PCI-DSS profile shipped by Red Hat's Compliance Operator is a *general* baseline. Many of its rules either do not apply to the lab's pull-model architecture, fail because of a deliberate ADR-backed design choice (the IPv6 / OVN-K case is canonical), or pass only when paired with a complementary control documented elsewhere. The chain exists to do three things, in order:
+
+1. **Run the scan** against `spoke-dc-v6` and emit FAIL counts per profile (master / worker / platform).
+2. **Triage each FAIL** into one of three buckets — remediation in GitOps, formal exception via TailoredProfile, or compensating control documented in the close-out memo.
+3. **Publish the evidence pack** — sanitized auditor-facing markdown plus the raw scan output — via platform-gitops MR, archived to MinIO under the `developer-ci-evidence/pci-dss/<chain>/` prefix.
+
+The phases (PCI-0 through PCI-5, plus PCI-1.13) are the lab's wave numbering. Each phase has a sub-issue and a close-out memo; the chain closes when all phases close. At 2026-05-11 chain close the FAIL counts settled at 8 / 3 / 0 with seven sub-issues remaining open as durable follow-ups.
+
+## Fix
+
+The procedure is identical regardless of which FAIL surfaced — interpret, triage, remediate, document, validate. The exact remediation differs per rule.
+
+### Step 1 — Pull the scan into a working table
+
+```bash
+K=/home/ze/.kube/configs/spoke-dc-v6.kubeconfig
+
+oc --kubeconfig "$K" -n openshift-compliance get compliancecheckresult \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status}{"\t"}{.severity}{"\n"}{end}' \
+  | sort \
+  | tee /tmp/pci-dss-scan-$(date -u +%Y%m%d).tsv
+```
+
+For each FAIL, capture the rule's `description` and `rationale`:
+
+```bash
+oc --kubeconfig "$K" -n openshift-compliance get compliancecheckresult \
+  <rule-name> -o jsonpath='{.description}{"\n\n"}{.rationale}{"\n"}'
+```
+
+### Step 2 — Triage into one of three buckets
+
+For each FAIL, the operator decides:
+
+| Bucket | When to use it | Mechanism |
+|---|---|---|
+| Remediation in GitOps | The rule reflects a lab gap, fixable by a config change. | MR against `platform-gitops` adding the corrective resource. |
+| Formal exception via TailoredProfile | The rule does not apply or is in conflict with a documented ADR. | MR adding the rule to the spoke's TailoredProfile `disableRules:` list, with rationale. |
+| Compensating control | The rule applies but is satisfied by a control outside the scan's view (a NetworkPolicy that the rule does not see; a Vault-side audit log). | Add the control to the close-out memo with the evidence pointer. |
+
+The bucketing is the load-bearing call. The chain has eight FAILs at close (master profile) because each was assessed individually:
+
+| Open sub-issue | What it covers | Likely bucket |
+|---|---|---|
+| #246 | ClusterLogForwarder — log destination matches PCI rule expectation | Remediation (CLF config in GitOps) |
+| #247 | FileIntegrity — Compliance Operator FileIntegrity operand on each node | Remediation (operator install + tuning) |
+| #248 | cert-manager Ingress — Ingress-level cert annotation policy | Remediation (annotations in tenant overlays) |
+| #249 | `allowedRegistries` — ImagePolicy lists only Nexus + Quay endpoints | Remediation (ClusterImagePolicy MR) |
+| #250 | SPO namespace — SecurityProfilesOperator namespace label + selector | Remediation (namespace label MR) |
+| #251 | Identity Provider — htpasswd IdP listed in OAuth CR | Compensating control (htpasswd is intentional per ADR; document in memo) |
+| #252 | master-node auditd — auditd rule set on masters | Remediation (MachineConfig MR) |
+
+These seven remain open as durable follow-ups under milestone #30. The eighth master FAIL (the IPv6 / OVN-K rule) and the three worker FAILs were closed via TailoredProfile exception with rationale pointing at ADR 0026.
+
+### Step 3 — Drive the remediation
+
+For each FAIL in the remediation bucket:
+
+1. Open the sub-issue (or reuse if existing). Branch prefix: `policy/pci-dss-<rule-id>` per [Routine tasks overview](/docs/05-operations/05-routine-tasks/01-overview).
+2. Craft the MR against `platform-gitops`. The MR description references this page and the sub-issue.
+3. Merge. Argo CD reconciles to `Synced/Healthy`.
+4. Re-run the Compliance Operator scan:
+
+   ```bash
+   oc --kubeconfig "$K" -n openshift-compliance annotate \
+     compliancescan <scan-name> compliance.openshift.io/rescan= --overwrite
+   ```
+
+5. Confirm the rule now reports PASS. If it still reports FAIL, the change does not match the rule's check expression — read the rule's `instructions` field for the exact check:
+
+   ```bash
+   oc --kubeconfig "$K" -n openshift-compliance get compliancecheckresult \
+     <rule-name> -o jsonpath='{.instructions}'
+   ```
+
+### Step 4 — Drive the exception (TailoredProfile)
+
+For each FAIL in the exception bucket:
+
+1. Open the sub-issue. Title prefix: `pci-dss exception: <rule-id>`.
+2. Edit the spoke's TailoredProfile in `platform-gitops`:
+
+   ```yaml
+   apiVersion: compliance.openshift.io/v1alpha1
+   kind: TailoredProfile
+   metadata:
+     name: spoke-dc-v6-pci-dss-master
+     namespace: openshift-compliance
+   spec:
+     extends: ocp4-pci-dss-node-master
+     title: "spoke-dc-v6 master profile — PCI-DSS with lab exceptions"
+     description: |
+       Extends ocp4-pci-dss-node-master. Each disabled rule has a
+       documented rationale in the close-out memo.
+     disableRules:
+       - name: <rule-id>
+         rationale: "<one-sentence rationale; link ADR or sub-issue>"
+   ```
+
+3. Merge. Argo CD reconciles. Re-run the scan. The rule no longer reports FAIL.
+
+4. Add the rationale to the close-out memo at `opp-full-plat/reports/pci-dss/<chain>/close-out.md` under `## Exceptions`.
+
+### Step 5 — Document the compensating control
+
+For each FAIL in the compensating-control bucket, add to the close-out memo under `## Compensating Controls`:
+
+- Rule ID.
+- The control (named) that satisfies the rule.
+- The evidence pointer (file path, log query, MR reference).
+- The reviewer (auditor or platform lead) who confirmed the control.
+
+The memo is the auditor's view of why a rule that did not pass is still acceptable.
+
+### Step 6 — Validate the chain
+
+The chain closes when ALL of these are true:
+
+- The scan reports the documented FAIL counts (currently 8 / 3 / 0) with each remaining FAIL traceable to a sub-issue, exception, or compensating control.
+- Every sub-issue is either closed (remediation merged) or labelled `durable-follow-up` (open beyond chain close).
+- The close-out memo lists every exception and every compensating control.
+- The evidence pack is published — see [Prevention](#prevention).
+
+## Prevention
+
+The chain is itself the prevention contract; the evidence pack is what makes it durable.
+
+### Evidence pack publication
+
+The pack is one `.tar.gz` per chain containing the sanitized close-out memo plus the supporting scan output:
+
+```bash
+mkdir -p /tmp/pci-evidence-2026-05-11/
+cp /home/ze/opp-full-plat/reports/pci-dss/2026-05-11/close-out.md \
+   /tmp/pci-evidence-2026-05-11/
+
+oc --kubeconfig "$K" -n openshift-compliance get compliancecheckresult \
+  -o yaml > /tmp/pci-evidence-2026-05-11/compliancecheckresults.yaml
+
+oc --kubeconfig "$K" -n openshift-compliance get tailoredprofile \
+  -o yaml > /tmp/pci-evidence-2026-05-11/tailoredprofiles.yaml
+
+tar czf /tmp/pci-evidence-2026-05-11.tar.gz -C /tmp pci-evidence-2026-05-11/
+```
+
+Then publish via [Backfill evidence to MinIO](/docs/05-operations/05-routine-tasks/06-backfill-evidence-to-minio) under the `developer-ci-evidence/pci-dss/<chain>/` prefix.
+
+The 2026-05-11 chain close shipped its pack via three platform-gitops MRs:
+
+| MR | What it carried |
+|---|---|
+| `!53` | TailoredProfile updates for the closed exceptions (IPv6 / OVN-K rule on master + three worker rules). |
+| `!54` | Close-out memo committed under `opp-full-plat/reports/pci-dss/2026-05-11/close-out.md` plus the MinIO lifecycle rule for the `pci-dss/` prefix. |
+| `!55` | The evidence-pack tarball reference and the sub-issue label updates (`durable-follow-up` for #246-#252). |
+
+The three-MR split is the lab's convention: TailoredProfile in one MR (controlled-change scope), memo + lifecycle in one MR (audit scope), evidence index in one MR (publication scope). Conflating them produces an MR that nobody reviews properly.
+
+### Re-run cadence
+
+The Compliance Operator scan re-runs on its own schedule (default daily for the lab). The chain re-opens when:
+
+- A new FAIL appears that was not present at last chain close.
+- A previously-failing rule starts passing (the documented FAIL count drops; update the baseline).
+- An open sub-issue lands its remediation MR (re-run the scan to confirm; close the sub-issue if PASS).
+
+A chain that has been stable for 90 days qualifies for archive — the next chain inherits the baseline.
+
+### Durable follow-ups
+
+The seven open sub-issues at chain close (#246-#252) are tracked under milestone #30 and re-surfaced in every quarterly chain. They are not gating for chain close (each is bucketed as compensating control or scheduled remediation), but they accumulate technical debt until they close.
+
+## Forbidden actions
+
+- **Do NOT disable a rule in TailoredProfile without a rationale.** Every `disableRules:` entry must include a `rationale` field pointing at an ADR, an incident issue, or a documented compensating control.
+- **Do NOT close a chain with FAILs that are not bucketed.** Every FAIL belongs in remediation, exception, or compensating control. "We will look at it later" is not a bucket.
+- **Do NOT publish the evidence pack with raw secret material.** Scan output occasionally includes Secret data; the close-out memo and the tarball are sanitized before publication.
+- **Do NOT skip the three-MR split** for chain-close publication. The convention is the audit trail.
+
+## References
+
+- `opp-full-plat/connection-details/compliance-implementor-handbook.md` — the canonical PCI-0 -> PCI-5 phase chain reference.
+- `opp-full-plat/reports/pci-dss/2026-05-11/close-out.md` — the 2026-05-11 chain close memo.
+- [Roll out a policy](/docs/05-operations/05-routine-tasks/05-roll-out-a-policy) — the routine-task page for the MR mechanics.
+- [Backfill evidence to MinIO](/docs/05-operations/05-routine-tasks/06-backfill-evidence-to-minio) — the evidence-pack publication step.
+- [MCO stuck-node recovery](/docs/05-operations/04-incidents-and-runbooks/11-mco-stuck-node-recovery) and [IPv6 disable / OVN-K](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) — the PCI-1.13 incident pair.
+- Milestone #30 (PCI-DSS chain); sub-issues #246-#252 (durable follow-ups).
+- Platform-gitops MRs `!53`, `!54`, `!55` (2026-05-11 chain close).
+- ADR 0026 (IPv6 for OVN — backing the TailoredProfile exception).

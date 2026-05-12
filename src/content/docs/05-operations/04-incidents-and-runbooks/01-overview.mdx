@@ -1,8 +1,8 @@
 ---
 title: "Incidents and runbooks — overview"
-description: "How incident response works on the fleet: the loop from alert to postmortem, the seven incident classes the lab has paid for, and how to use this section under pressure."
+description: "How incident response works on the fleet: the loop from alert to postmortem, the twelve incident classes the lab has paid for, and how to use this section under pressure."
 sidebar_label: "Overview"
-last_reviewed: 2026-05-11
+last_reviewed: 2026-05-12
 draft: false
 ---
 
@@ -36,7 +36,7 @@ export const incEdges = [
   { id: "f6", source: "postmortem", target: "memory",     label: "preserve in memory", ...muted },
 ];
 
-This subsection is the operator's incident library. Seven incidents have been documented in detail because the lab has paid for each at least once. Reading them ahead of time is the cheapest insurance the fleet has.
+This subsection is the operator's incident library. Twelve incidents have been documented in detail because the lab has paid for each at least once. Reading them ahead of time is the cheapest insurance the fleet has.
 
 Every runbook follows the same five-section schema, mandated by the section tracker (#229) and by the workspace's runbook convention:
 
@@ -60,7 +60,7 @@ The loop runs left to right and bottom-up:
 4. **Validate.** Argo CD returns to `Synced / Healthy` (or the incident-specific success indicator). Update the issue with validation evidence.
 5. **Postmortem.** Write a dated session report under `opp-full-plat/reports/sessions/`. If the lesson is durable, update the relevant runbook, and (if architectural) open an ADR amendment review issue.
 
-## The seven incident classes
+## The twelve incident classes
 
 | # | Page | Class | Severity |
 |---|---|---|---|
@@ -70,8 +70,12 @@ The loop runs left to right and bottom-up:
 | 05 | [OBC -> operand storage-Secret bridge](/docs/05-operations/04-incidents-and-runbooks/05-obc-operand-secret-bridge) | NooBaa OBC Secret key shape doesn't match LokiStack/TempoStack expectation | Medium — observability stack stuck `Warning Degraded` |
 | 06 | [SigNoz v0.122 auth API shape](/docs/05-operations/04-incidents-and-runbooks/06-signoz-v0122-auth) | v0.121 -> v0.122 login API moved; old code silently fails | Low — affects automation, not user UI |
 | 07 | [WSO2 APIM JMS URL encoding](/docs/05-operations/04-incidents-and-runbooks/07-wso2-apim-jms-url-encoding) | HTML-escaped `&amp;` in JMS URL where `%26` is required; published APIs don't reach gateway | Medium — silent app-publish failure |
-
-The seventh slot in the brief is the [MCO stuck-node recovery](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn) — captured as the procedural companion under the IPv6 page because the two incidents are intertwined (the stuck-node recovery is what unblocks the IPv6 rollback).
+| 08 | [Break-glass procedure](/docs/05-operations/04-incidents-and-runbooks/08-break-glass-procedure) | Operator-facing companion to ADR 0025: when GitOps can't recover in time | Procedure — gates every direct mutation |
+| 09 | [DefectDojo Jenkins import](/docs/05-operations/04-incidents-and-runbooks/09-defectdojo-jenkins-import) | Trivy -> DefectDojo import RED/UNSTABLE: token drift, parser bumps, dedup gotchas | Medium — supply-chain visibility |
+| 10 | [Jenkins + GitLab webhook pollSCM bootstrap](/docs/05-operations/04-incidents-and-runbooks/10-jenkins-gitlab-webhook-pollscm) | New job: webhook `HTTP 200` but no builds; declarative triggers register at build time | Low — first-push gotcha |
+| 11 | [MCO stuck-node recovery](/docs/05-operations/04-incidents-and-runbooks/11-mco-stuck-node-recovery) | Procedural companion to #135: `desiredConfig` annotation patch unsticks a node MCO refuses to roll | Critical — cluster network down |
+| 12 | [Secrets custody drift check](/docs/05-operations/04-incidents-and-runbooks/12-secrets-custody-drift-check) | Local-mirror credential silently mismatches the live VM; probe-before-you-work protocol | Procedure — prevents 10-minute mid-task fights |
+| 13 | [PCI-DSS remediation and evidence](/docs/05-operations/04-incidents-and-runbooks/13-pci-dss-remediation-and-evidence) | Playbook for the PCI-0 -> PCI-5 chain: scan interpretation, exception process, evidence pack | Procedure — quarterly audit cycle |
 
 ## How to use this section under pressure
 
@@ -104,5 +108,6 @@ If you experience an incident that does not fit one of the seven below, open an 
 - `opp-full-plat/runbooks/wso2-apim-jms-url-encoding-trap.md`
 - `opp-full-plat/runbooks/secrets-custody-drift-check.md`
 - `opp-full-plat/runbooks/jenkins-gitlab-webhook-pollscm.md`
+- `opp-full-plat/runbooks/defectdojo-jenkins-import.md`
 - ADRs: 0018 (pull model), 0019 (image supply), 0025 (break-glass)
 - Issues: #135 (IPv6/OVN incident), #142 (MCO runbook), #153 (Routes CRD permanent fix), #229 (this section)

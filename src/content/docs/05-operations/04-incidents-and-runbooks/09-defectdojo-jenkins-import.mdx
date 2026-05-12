@@ -1,0 +1,211 @@
+---
+title: "DefectDojo Jenkins import — validate, triage, retry"
+description: "Operating the Jenkins -> Trivy -> DefectDojo import chain: token rotation, parser bumps, dedup gotchas, retention contract, idempotent re-runs, and the live wiring for jboss-chat-image-build."
+sidebar_label: "DefectDojo Jenkins import"
+last_reviewed: 2026-05-12
+draft: false
+---
+
+This page is the operator runbook for the Jenkins -> Trivy -> DefectDojo import chain delivered under the Trivy/DefectDojo import-contracts milestone (issues #64, #65, #66). Use it when a build went green but no engagement appeared, when the dashboard shows duplicate findings, when the API token has been rotated, or when a Trivy version bump broke the parser. If the Jenkins job itself never started, fix the upstream webhook first via [Jenkins + GitLab webhook pollSCM bootstrap](/docs/05-operations/04-incidents-and-runbooks/10-jenkins-gitlab-webhook-pollscm) — this page assumes the build started and the failure is in the DefectDojo stages.
+
+## Symptom
+
+You are looking at one of:
+
+- A `*-defectdojo-import` Jenkins job is RED or UNSTABLE with `HTTP 401`, `403`, `400`, or `5xx` from the DefectDojo API.
+- A team reports a build went green but the DefectDojo dashboard shows no corresponding engagement / test.
+- The dashboard shows duplicate findings inside one engagement for one build.
+- The `Trivy artifact assert` stage fails before any DefectDojo call.
+
+Pull the canonical evidence from the build artifact, not from chat:
+
+```bash
+jq -r '.product, .engagement, .engagement_id, .test_id' \
+  defectdojo-import.json
+```
+
+Expected console-log lines on a healthy import:
+
+- `defectdojo: product 'team-platform/sample' found id=<n>` (or `created`)
+- `defectdojo: engagement '<branch>-build-<N>' found id=<n>` (or `created`)
+- `defectdojo import OK: test=<n> crit=<n> high=<n> med=<n> low=<n>`
+
+## Root cause
+
+The pipeline is a four-stage chain — Trivy scan -> artifact assert -> DefectDojo import -> evidence push to MinIO. Each stage has a distinct failure surface:
+
+| Failure | Layer | Root cause |
+|---|---|---|
+| `HTTP 401` | DefectDojo API auth | Jenkins credential holds an old token; DefectDojo rotated. |
+| `HTTP 403` | DefectDojo RBAC | The ci-bot user lacks `Importer` (global) or `Maintainer` on the product. |
+| `HTTP 400 parser_error` | DefectDojo parser | Trivy on the agent shipped a JSON schema bump the DefectDojo parser does not understand. |
+| `HTTP 5xx after 3 attempts` | DefectDojo backend | The DefectDojo container restarted; the shared lib retries 2/4/8s with backoff and fails fast on the fourth. |
+| Duplicate findings | Dedup setting | The engagement was created without `deduplication_on_engagement=true` (legacy engagement) or two `scan_type`s landed on one engagement (by design). |
+| `Trivy artifact assert` fails | Upstream filename mismatch | Path A build emits `trivy-scan.json`; this pipeline expects `trivy-image.json` by convention. |
+
+## Fix
+
+Each failure has a short triage path.
+
+### HTTP 401 — token drift
+
+The token has been rotated in DefectDojo but the Jenkins credential still holds the old value. Check Vault metadata:
+
+```bash
+vault kv metadata get secret/platform/defectdojo/api-token | head -10
+```
+
+Rotate in this order — DefectDojo UI -> Vault -> Jenkins credential -> retry the build. The shared lib `httpJson` retries on 5xx only, so 401 fails fast — re-running the job is the correct recovery.
+
+### HTTP 403 — RBAC
+
+In the DefectDojo UI: `Configuration -> Users -> <ci-bot user>`. The user needs the global `Importer` role or an explicit `Maintainer`-level grant on the product / product type. If the product was created with a different owner, grant the ci-bot user `Writer`. Retry the job after granting.
+
+### HTTP 400 — parser bump
+
+Trivy on the agent shipped a schema bump the DefectDojo parser does not understand yet.
+
+```bash
+ssh ze@<jenkins-agent> 'trivy --version'
+```
+
+Recovery: re-run the build with `SCAN_TYPE=Generic Findings Import` and a pre-flattened JSON. This is temporary; open a follow-up issue to pin the agent's Trivy version or update the DefectDojo parser. Long-term: align the agent's Trivy minor with the DefectDojo-supported window (DefectDojo release notes list supported Trivy versions per release).
+
+### HTTP 5xx — DefectDojo restart
+
+Confirm DefectDojo health from the agent:
+
+```bash
+curl -fsS https://defectdojo.apps.sub.comptech-lab.com/ \
+  -o /dev/null -w '%{http_code}\n'
+```
+
+If DefectDojo is restarting, wait for healthy, then retry the build. The container logs are operator-owned; out of scope for this page.
+
+### Duplicate findings
+
+```bash
+TOKEN=$(vault kv get -field=token secret/platform/defectdojo/api-token)
+PRODUCT_ID=$(curl -s -H "Authorization: Token $TOKEN" \
+  "$DD/api/v2/products/?name=team-platform%2Fsample" \
+  | jq -r '.results[0].id')
+curl -s -H "Authorization: Token $TOKEN" \
+  "$DD/api/v2/engagements/?product=$PRODUCT_ID&name=main-build-42" \
+  | jq '.results[0] | {id, name, deduplication_on_engagement}'
+unset TOKEN
+```
+
+The shared library `ensureEngagement` always sets `deduplication_on_engagement=true`; a legacy engagement without the flag needs to be deleted in the UI and re-imported. If a second job is importing into the same engagement under a different `scan_type`, dedup is scoped per scan_type by DefectDojo design — that is not duplication, that is two parsers seeing the same CVE. Consolidate jobs onto one `scan_type` or filter in the dashboard.
+
+### Trivy artifact assert fails
+
+The Path A pipeline (`ocp-build-deploy.groovy`) emits `trivy-scan.json` — the import pipeline expects `trivy-image.json` by convention. If the tenant chained the import job to a Path A build, set the `TRIVY_JSON` parameter to `trivy-scan.json` on the import job.
+
+### Verifying a successful import
+
+Three commands. The token is read into a single shell variable that is unset after.
+
+```bash
+TOKEN=$(vault kv get -field=token secret/platform/defectdojo/api-token)
+
+curl -s -H "Authorization: Token $TOKEN" \
+  "$DD/api/v2/products/?name=team-platform%2Fsample" \
+  | jq '.results[0] | {id, name, prod_type_name, created}'
+
+PRODUCT_ID=$(curl -s -H "Authorization: Token $TOKEN" \
+  "$DD/api/v2/products/?name=team-platform%2Fsample" | jq -r '.results[0].id')
+curl -s -H "Authorization: Token $TOKEN" \
+  "$DD/api/v2/engagements/?product=$PRODUCT_ID&name=main-build-42" \
+  | jq '.results[0] | {id, name, branch_tag, build_id, status}'
+
+ENG_ID=<engagement-id-from-above>
+for sev in Critical High Medium Low; do
+  count=$(curl -s -H "Authorization: Token $TOKEN" \
+    "$DD/api/v2/findings/?test__engagement=$ENG_ID&severity=$sev&active=true&limit=1" \
+    | jq -r '.count')
+  printf '%-8s %s\n' "$sev" "$count"
+done
+unset TOKEN
+```
+
+Compare the totals against `defectdojo-import.json` from the build artifact; they should match within the active-finding scope. Mismatch typically means another import landed on the same engagement (the engagement-per-build convention prevents this in practice) or `close_old_findings` masked older entries (expected).
+
+### Confirm the build evidence is in MinIO
+
+```bash
+mc ls ci-evidence/developer-ci-evidence/team-platform/sample/42/
+```
+
+Expected: `defectdojo-import.json` alongside the upstream Trivy job's `trivy-scan.json`.
+
+## Current live wiring
+
+As of 2026-05-12, `jboss-chat-image-build` is the first live app wired to DefectDojo:
+
+- Product: `team-bank-employees/jboss-chat`
+- Engagement pattern: `<branch>-build-<BUILD_NUMBER>`
+- Latest validated engagement: `main-build-22`
+- Validated tests: `chat-backend`, `bff`, `frontend-v1`, `frontend-v2`, `eap-domain`
+
+The Jenkinsfile keeps the existing Critical Trivy table gate and also writes `trivy-reports/<image>.json` for DefectDojo. Import responses are archived under `defectdojo-import/`. Other Jenkins jobs do not auto-populate DefectDojo until they adopt the same pattern or the reusable `trivy-defectdojo-import.groovy` pipeline.
+
+Credentials in Jenkins:
+
+| Credential ID | Type | Purpose |
+|---|---|---|
+| `defectdojo-base-url` | Secret text | `https://defectdojo.apps.sub.comptech-lab.com` |
+| `defectdojo-api-token` | Secret text | DefectDojo user token; Vault `secret/platform/defectdojo/api-token` |
+| `minio-developer-ci-evidence` | Username / pwd | MinIO writer for the `developer-ci-evidence` bucket |
+
+The token's Vault path is the authoritative custody location; the Jenkins credential is a materialized copy. Never echo the token from a shell prompt or paste it into a chat.
+
+## Retention contract
+
+| Surface | Retention |
+|---|---|
+| Jenkins build artifacts (non-main branches) | 30 days OR 100 builds |
+| Jenkins build artifacts (main branch) | 365 days OR 500 builds |
+| MinIO `developer-ci-evidence/<team>/<app>/<build>/` | 90 days |
+| DefectDojo engagement records | Indefinite; engagements close on re-import |
+| DefectDojo finding records | Indefinite; status transitions via `close_old_findings` |
+| DefectDojo database backups | Operator-owned; not yet automated |
+
+The Jenkins-side rotation is enforced by the `buildDiscarder` in `templates/jenkinsfiles/trivy-defectdojo-import.groovy`. Jobs that override it must keep the same days-vs-builds ceiling.
+
+## Restart and retry — safe and unsafe
+
+The pipeline is idempotent: `ensureProduct` reuses, `ensureEngagement` is keyed on `name = <branch>-build-<N>`, `importScan` with `deduplication_on_engagement=true` + `close_old_findings=true` updates findings in place.
+
+**Safe:**
+
+- Re-run a failed import on the same build number — the Rebuild button in the UI. Engagement is reused; findings are deduped.
+- Push a new commit (new build number). A new engagement is created (`<branch>-build-<N+1>`).
+- Force re-create from scratch: delete the engagement via the DefectDojo UI, then re-run the build. `ensureEngagement` recreates it. This is the only cleanup path that requires UI action; the API does not expose a "purge by branch" verb.
+
+**Unsafe:**
+
+- Manually editing the engagement's `deduplication_on_engagement` flag in the UI — diverges from the lib invariants and the next import re-sets it, churning the audit log.
+- Re-importing the same Trivy JSON into a different engagement to "fix" a count — engagements are append-only artifacts; the import history is the audit trail.
+
+## Prevention
+
+Six hardening gaps must close before any team is told to depend on DefectDojo findings as a deploy gate:
+
+1. **API token rotation is manual.** A scheduled rotator that spins the token, writes Vault, and patches the Jenkins credential is needed.
+2. **DefectDojo database backup is not automated.** Operator owns the restic/MinIO snapshot job for the DefectDojo Postgres volume.
+3. **No health endpoint for the import flow.** The shared lib could emit a Prometheus textfile to the agent's node-exporter directory; until then the monitoring story is "look at the Jenkins job history".
+4. **Notification path is a placeholder.** The `post { failure }` block echoes a `notify:` line; tenants wrap with their own notifier.
+5. **Token scope is broader than needed.** Long-term goal: a dedicated DefectDojo user per tenant team.
+6. **No automated test of the runbook itself.** Required: a small `scripts/check-defectdojo-import.sh` run weekly to confirm at least one engagement was created in the last 24h.
+
+Track each as a separate issue under the milestone.
+
+## References
+
+- `opp-full-plat/templates/jenkinsfiles/trivy-defectdojo-import.groovy` — the pipeline.
+- `opp-full-plat/templates/jenkinsfiles/lib/defectdojo.groovy` — the shared lib.
+- `opp-full-plat/plans/jenkins/defectdojo-import-onboarding.md` — tenant onboarding.
+- [Jenkins + GitLab webhook pollSCM bootstrap](/docs/05-operations/04-incidents-and-runbooks/10-jenkins-gitlab-webhook-pollscm) — relevant if the upstream Trivy job never fires.
+- `opp-full-plat/connection-details/ci-evidence-schema.md` — canonical MinIO key layout under `developer-ci-evidence/`.
+- Issues: #64, #65, #66 (Trivy/DefectDojo import-contracts milestone).
+- DefectDojo API reference: `https://documentation.defectdojo.com/api/api-v2-docs/`.
