@@ -158,6 +158,53 @@ A backup that has never been restored is not a backup; it is a hopeful object in
 
 The first drill takes a full day. The fifth drill takes an hour. The day a real disaster lands, you want to be on drill number five, not drill number one.
 
+## RHACS Central backup-and-restore
+
+The ACM DR story is well-trodden. RHACS is a different shape — Central is a stateful service with its own PostgreSQL, its own certificate authority, and a small handful of credentials that ripple through the fleet's security posture if lost. It's not in scope for the ACM cluster-backup operator covered earlier; wire it separately.
+
+### What gets backed up
+
+Central is, under the hood, a PostgreSQL database plus a small set of certificates and configuration. A backup is a logical dump of that PostgreSQL and captures the entire RHACS state: every Policy (defaults plus your custom ones), every integration configuration (Notifiers, scanners, SIEM forwarders), every active violation and exception with its expiry, the init-bundle materials for each SecuredCluster, role bindings, auth-provider configuration, and the Central CA with its derived certificates. What does **not** get backed up is image scan data — Scanner V4 treats its vulnerability cache as regeneratable and re-scans on demand after restore.
+
+### The two backup paths
+
+**`roxctl central backup`** is the manual path: from a host that can reach Central with an admin API token, produce a tarball locally and upload to S3 yourself. Fine for ad-hoc snapshots before a risky operation.
+
+**Central's built-in scheduled backup** is the production path. Configure a backup integration on Central (Amazon S3, S3-compatible storage, or Google Cloud Storage), set a daily cron, and Central writes the same tarball to the configured destination on its own. Configuration lives in Central, so it survives upgrades; destination credentials follow the same Notifier+ESO custody flow as every other integration. Red Hat formally supports AWS S3 and GCS; S3-API-compatible third-party stores (MinIO, NooBaa, Wasabi) usually work but aren't guaranteed — test the restore path before you trust it.
+
+### Retention
+
+A reasonable lab default: **30 days hot, 1 year cold** — daily backups in the primary bucket, monthly snapshots archived to cheaper storage. The bucket lifecycle policy enforces this; Central doesn't manage retention itself.
+
+For PCI-DSS audit trails, the regulator-driven number matters more than the operational one — some banking regulators require 7 years of policy-change and enforcement event history. The RHACS backup itself doesn't have to be retained that long; the **violations export** forwarded to your SIEM (via the integrations section earlier) does. Treat SIEM as the audit-grade record and Central backup as the recovery-grade record. Keep them separate.
+
+### The restore procedure
+
+A restore is a sequence, not a single command. Skip a step and the result will look healthy but have subtle gaps. The strict order:
+
+1. **Stop Central.** Scale `deploy/central` to zero replicas. The database must not be in use.
+2. **Restore PostgreSQL** from the backup dump into Central's database (`pg_restore` for external Postgres, or per the Operator procedure for the bundled StatefulSet).
+3. **Restore the Central encryption key.** Load-bearing and easy to forget. Central encrypts sensitive integration credentials with a key in the `central-encryption-key` Secret; without it, every integration's stored credential decrypts to garbage.
+4. **Restore the Central TLS certificates** (`central-tls`). This is the CA the SecuredCluster sensors validate against when they reconnect.
+5. **Restart Central.** Watch the startup logs — decryption errors here mean a missed or wrong encryption key.
+6. **Re-register every SecuredCluster.** The init-bundles in the restored database may have rotated since the backup was taken; sensors on each spoke may have certificates that no longer validate against the restored CA. Regenerate init-bundles via the Central API and reapply them to each spoke's `stackrox` namespace.
+
+A practiced restore on a small fleet runs 30–60 minutes. Under pressure for the first time, longer.
+
+### The init-bundle gotcha
+
+RHACS init-bundles are time-limited credentials — one year is the convention. After restoring from a backup older than the bundle's expiry, every sensor with an expired bundle fails to reconnect. Symptom: TLS handshake failures in `oc -n stackrox logs deploy/sensor`; the SecuredCluster CR on the spoke shows `Unhealthy`. The fix is the same flow as fresh onboarding: regenerate via the Central API, materialise through Vault and ESO into each spoke's `stackrox` namespace, let the sensor pick up the new cert. See the lab's [init-bundle-via-ESO documentation](/docs/openshift-platform/security/init-bundle-via-eso). Document this as load-bearing — the first instinct after a restore is to blame the network; it's usually the bundles.
+
+### The lab's posture
+
+RHACS Central runs on `hub-dc-v6` in the `stackrox` namespace. Scheduled backup is **not yet wired** — the same MinIO and DR work that gates ACM cluster-backup gates this. The path forward is a backup integration pointed at MinIO with a daily cron, plus a second-DC replication target when that infrastructure lands. The hub-restore runbook needs an explicit *"restore RHACS Central"* step, after the ACM control plane is back and before the SecuredClusters are expected to reconnect. For credential rotation, see [/docs/operations/routine-tasks/rotate-rhacs-central-admin/](/docs/operations/routine-tasks/rotate-rhacs-central-admin) — the Vault+ESO custody flow that handles the admin password handles the backup-destination credentials too.
+
+### References
+
+- [docs.redhat.com — RHACS Backup and restore](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/backup_and_restore/)
+- [docs.redhat.com — RHACS Configuring automatic backups](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/configuring/backing-up-and-restoring-rhacs)
+- [docs.redhat.com — RHACS init-bundle generation](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/installing/install-secured-cluster-services-on-openshift-container-platform)
+
 ## The lab's current state
 
 Pragmatically, where the lab is today:

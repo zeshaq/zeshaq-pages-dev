@@ -223,6 +223,101 @@ Before Argo CD integration was the reference, ACM shipped its own GitOps via `Su
 
 It still works. It's still supported. The thing to know: most teams should use `ApplicationSet` + pull model in 2026, not `Subscription`. The Subscription model predates ACM's Argo CD integration and lacks Argo's diffing, rollback, and sync-policy ergonomics. The exception is teams who specifically want the Subscription model's primitive (e.g., delivering Helm releases by chart URL rather than rendered manifests in Git) — that path is still valid, just niche.
 
+## Argo CD Agent — the new pull-model agent
+
+`gitops-addon` is what the lab runs today, and it works. It is also the *first* iteration of Red Hat's pull-model GitOps story, and the strategic direction has already moved on. The replacement is the **Argo CD Agent**, a separate component that ships with OpenShift GitOps 1.19 and is built explicitly for the multicluster pull-model case that gitops-addon retrofitted onto an existing Argo CD instance. If you are designing for the next 24 months, read this section even if you don't migrate immediately — the shape of the next generation determines which gitops-addon decisions you'll regret later.
+
+### Why it exists
+
+gitops-addon solves the right problem (no kubeconfig on the hub, spokes reconcile locally) with a pragmatic shape — a full OpenShift GitOps install on every spoke, with ACM ManifestWork as the courier and the hub Argo doing the heavy lifting of holding the canonical Application CRs. That shape has two cost lines that compound past ~30 spokes:
+
+- **Agent-side footprint.** Each spoke runs a complete OpenShift GitOps deployment — operator, application-controller, repo-server, redis. At fleet scale that is a lot of duplicate infrastructure.
+- **Disconnected-spoke fragility.** ManifestWork delivery assumes a working spoke-to-hub watch. If the spoke is in a network partition for hours, the hub has to retry; if Argo on the spoke is restarting at the same moment, drift accumulates and operator hand-holding is required to clear it.
+
+Argo CD Agent reworks the design with those two costs in mind. Instead of running a full Argo on every spoke and dispatching Applications as ManifestWork, you run a **principal** on the hub (a single Argo CD instance plus a small agent process) and a **lightweight agent** on each spoke. The agent talks to the principal over an mTLS-authenticated channel, owns local reconcile, and ships status back. Released GA in OpenShift GitOps 1.19, it is the direction Red Hat is investing the GitOps roadmap behind.
+
+### Architecture
+
+<Whiteboard client:load data={{
+  nodes: [
+    { id: "ctlpHdr", position: { x: 40,  y: 0   }, data: { label: "Control plane (hub)" }, style: { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 240, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" } },
+    { id: "git",     position: { x: 40,  y: 80  }, data: { label: "Git repo" }, style: ext },
+    { id: "principal", position: { x: 40, y: 180 }, data: { label: "Argo CD principal\n(UI + Application CRs)" }, style: ctrl },
+    { id: "agent",   position: { x: 40,  y: 300 }, data: { label: "Argo CD Agent process\n(on hub)" }, style: ctrl },
+    { id: "wlHdr",   position: { x: 460, y: 0   }, data: { label: "Workload cluster (spoke)" }, style: { background: "#0c1812", border: "1px solid #15803d", borderRadius: 10, padding: 10, color: "#ffffff", width: 240, textAlign: "center", fontWeight: 700, fontSize: 12, letterSpacing: "0.03em", textTransform: "uppercase" } },
+    { id: "spokeAgent", position: { x: 460, y: 100 }, data: { label: "Argo CD Agent\n(spoke side)" }, style: agent },
+    { id: "spokeArgo",  position: { x: 460, y: 220 }, data: { label: "Lightweight Argo CD\n(local reconcile)" }, style: agent },
+    { id: "spokeApi",   position: { x: 460, y: 340 }, data: { label: "Spoke kube-apiserver" }, style: stage },
+  ],
+  edges: [
+    { id: "ag1", source: "principal", target: "agent", style: { stroke: "#1f2937" } },
+    { id: "ag2", source: "principal", target: "git", label: "pulls", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
+    { id: "ag3", source: "spokeAgent", target: "agent", label: "mTLS .spec down / .status up", style: { stroke: "#15803d", strokeDasharray: "5,5" }, animated: true },
+    { id: "ag4", source: "spokeAgent", target: "spokeArgo", style: { stroke: "#1f2937" } },
+    { id: "ag5", source: "spokeArgo", target: "spokeApi", label: "reconcile", style: { stroke: "#1f2937" } },
+  ]
+}} height={460} />
+
+Reading the diagram:
+
+- The **principal** is a single Argo CD instance on the hub that holds the UI, the Application CRs, and a co-located agent process that fans out to spokes. There is only ever one principal.
+- The **agent** runs on each workload cluster and is small — it is a process, not a full Argo CD. It maintains an mTLS connection back to the principal's agent, receives Application `.spec` updates (or publishes them, depending on the mode), and drives a lightweight local Argo CD that performs the actual reconcile against the spoke's `kubernetes.default.svc`.
+- All cross-cluster traffic is spoke-initiated and uses mTLS. No kubeconfig on the hub, no hub-to-spoke API call.
+
+The key technical wins over gitops-addon are (a) the spoke does not run a full operator install, just the agent and a slimmer Argo CD, and (b) the principal-to-agent channel is purpose-built for the pull pattern instead of riding on ACM's general-purpose ManifestWork.
+
+### Two modes — Managed and Autonomous
+
+The Agent has two operational modes that determine where the source of truth for the Application's `.spec` lives. You pick per agent, and you can mix modes across a fleet.
+
+| | **Managed mode** | **Autonomous mode** |
+| --- | --- | --- |
+| `.spec` owner | Principal (hub) | Workload cluster (spoke) |
+| `.status` direction | Spoke → principal | Spoke → principal |
+| Who creates Applications | Hub operator via principal UI/CLI | Spoke team via spoke Git |
+| Hub outage during sync | Blocks new sync | Spoke continues; status backlog clears on reconnect |
+| Best for | Tightly-governed fleets, central platform team owns rollout | Independent ops teams per site, GitOps purist setup |
+
+**Managed mode** is what most BFSI fleets want. The platform team writes Application CRs once on the principal, the agent propagates them, and the spoke can't drift the spec without it being reverted to match the hub. The compromise is that a compromised principal can push bad spec to every spoke — the agent will dutifully apply it.
+
+**Autonomous mode** is what teams who *really* care about Git-as-the-source-of-truth want. The Application CR lives in a spoke-local Git repo, the spoke's Argo reconciles it, and the principal sees status only. A compromised principal can't push anything; the principal also can't *fix* anything cluster-side without the spoke team's cooperation. Best fit when each site has its own ops team and you need centralised observability without centralised authority.
+
+The architecture supports `argocd-w<n>` per-workload namespaces on the principal so each spoke's Applications are isolated even on the shared hub view. That isolation matters when you mix tenants on one principal.
+
+### vs ACM gitops-addon
+
+A side-by-side, for the actual decision:
+
+| Concern | gitops-addon (current lab) | Argo CD Agent (new direction) |
+| --- | --- | --- |
+| Source-of-truth for Application CR | Hub Argo CD (always) | Principal in managed; spoke in autonomous |
+| Spoke footprint | Full OpenShift GitOps install | Agent + slimmer Argo CD |
+| Courier for spec | ACM ManifestWork | Purpose-built mTLS channel |
+| Disconnected spoke resilience | Eventual; depends on ManifestWork retry | Better; agent reconnects independently |
+| OpenShift dependency | OpenShift only (uses Routes, OLM, ACM) | OpenShift GitOps 1.19+; not tied to ACM |
+| GA status | GA, broadly deployed since 2024 | GA in OpenShift GitOps 1.19 (late 2025) |
+| Multi-mode (managed/autonomous) | No | Yes |
+| Scales comfortably past ~30 spokes | Increasing operational cost | Designed for it |
+
+Both are GA and supported; both will be supported for some years. Argo CD Agent is the direction; gitops-addon is the install base. Coexistence on the same hub is allowed during a transition — you can run gitops-addon on existing spokes and Argo CD Agent on new ones.
+
+### The Routes CRD trap, again
+
+The earlier section in this module documented the Routes CRD that gitops-addon installs on every spoke and the OpenAPI v2 collision it causes on OpenShift. **Argo CD Agent does not (currently) hit the same trap** — its spoke side is a slimmer install that doesn't ship the same CRD bundle. That said, the discipline is the same: any addon you install onto an OpenShift spoke can collide with a native aggregated APIService, and "the cluster looks healthy on every other angle" is exactly how this class of bug presents. After any new addon install, run the lab's CRD-inventory check (see the [Routes CRD runbook](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd)) and confirm no duplicate API surfaces.
+
+### When to migrate
+
+Don't migrate just because the Agent is newer. The cost of switching the lab's GitOps plane is non-trivial — re-wiring Subscriptions, re-shipping Application CRs, re-training operators on the new console flow. Three pragmatic triggers justify the work: spoke count crosses ~30 (agent-side footprint starts to matter), you have disconnected or intermittently-connected spokes (the Agent's reconnect model beats ManifestWork-over-watch), or each site has its own ops team that wants its own Argo CD UI (autonomous mode plus per-workload namespaces gives you that for free).
+
+If none of those are true today and won't be true in the next 12 months, gitops-addon is fine. The lab's two-spoke fleet doesn't yet meet any trigger. Read the linked Red Hat docs anyway and sketch — on paper or in `/whiteboard` — what an autonomous-mode install on `spoke-dc-v6` would look like. The exercise of describing the data flow without re-reading the spec is the readiness check.
+
+### References
+
+- [docs.redhat.com — Argo CD Agent architecture](https://docs.redhat.com/en/documentation/red_hat_openshift_gitops/1.19/html/argo_cd_agent_architecture/)
+- [docs.redhat.com — Argo CD Agent installation and configuration](https://docs.redhat.com/en/documentation/red_hat_openshift_gitops/1.19/html/installing_argo_cd_agent/)
+- [docs.redhat.com — Red Hat OpenShift GitOps 1.19 release notes](https://docs.redhat.com/en/documentation/red_hat_openshift_gitops/1.19/html/release_notes/)
+- [argo-cd.readthedocs.io — Applications in any namespace](https://argo-cd.readthedocs.io/en/stable/operator-manual/app-any-namespace/)
+
 ## The lab's setup
 
 Pull model end-to-end. The hub `openshift-platform-gitops` GitLab repo holds:

@@ -153,6 +153,92 @@ The lab's pattern — captured in [`/docs/operations/routine-tasks/rotate-rhacs-
 
 The lab does **not** populate `central-htpasswd.password` — that field is empty by design, because the password lives in `central-admin-password` instead. The init-bundle automation reads the same Vault path, so a rotation propagates everywhere in one step.
 
+## RHACS integrations — SIEM, ticketing, image scanners
+
+Central, the Scanner V4, and the per-spoke SecuredCluster footprints all produce one kind of output: **violations**. A violation is the runtime event that some policy was tripped — a deploy with a high-severity CVE, a shell spawned in a production pod, an admission request that asks for a privileged container. Without somewhere to send those violations, they sit in the Central UI and depend on someone logging in to see them. The integration layer is how violations reach the on-call channel, the SIEM, the ticketing system, and the audit trail.
+
+Integrations are not optional in a serious deployment. They are the load-bearing path between "Central detected something" and "an engineer is fixing it."
+
+### Integration categories
+
+Five categories cover everything Central can talk to today:
+
+**Notification targets.** Email, Slack and Microsoft Teams via incoming webhook, JIRA and ServiceNow as ticketing systems, generic webhook as the escape hatch. The Slack and Teams integrations are best for low-volume awareness channels; JIRA and ServiceNow are best for high-severity violations where a ticket needs to exist for the audit trail.
+
+**SIEM forwarders.** Splunk HEC (HTTP Event Collector), Elasticsearch, IBM QRadar, and generic syslog. These are the integrations the security team usually cares about most — every violation event flows as a structured log entry into the SIEM, where it correlates with other security signals (IDS, EDR, network telemetry) for incident response.
+
+**Image-scanner integrations.** Scanner V4 ships inside RHACS and is the default, but Central can also consume scan results from external scanners: Quay's built-in scanner, JFrog Xray, Sonatype Nexus IQ, Snyk, Anchore, and registry-side scanners on Docker Trusted Registry. Findings from any configured scanner merge into the policy engine; a policy that says "no critical CVEs" applies regardless of which scanner found them.
+
+**Cloud-provider security platforms.** AWS Security Hub, GCP Security Command Center, Azure Sentinel. Violations from RHACS appear as findings in the cloud provider's central security view alongside their native signals. Useful when the platform is multicloud and the security team uses the cloud provider's pane of glass rather than RHACS's.
+
+**Image-signature verifiers.** cosign and sigstore for verifying image signatures at admission time. A signed-image policy can require that production deploys only run images signed by an approved key; cosign's verifier integration is how Central checks signatures at policy evaluation.
+
+### The integration object shape
+
+In the RHACS Operator world, integrations don't all use the same CR — different ones live under different APIs. The newer pattern uses `integration.stackrox.io/v1` CRs that the operator reconciles into the running Central; the older pattern (still widely deployed) configures integrations via the Central API directly and stores them in Central's database.
+
+For each integration, RHACS surfaces two adjacent CRs:
+
+- **`Notifier`** — the integration configuration: endpoint URL, credentials secret reference, retry settings, format options.
+- **`IntegrationHealth`** — a read-only status surface that says "this integration is healthy, last successful call N seconds ago" or "this integration is failing with error X." The on-call should monitor this; a silently-broken Splunk integration is a security gap that doesn't trigger any built-in alarm.
+
+Authentication is per-integration. Splunk needs an HEC token; JIRA needs basic auth or an API token; webhooks need whatever secret you configure on the receiving end; Slack needs the incoming-webhook URL. Each integration's secret material is referenced by a `secretName` in the `Notifier` CR; the secret itself is materialised separately.
+
+### Operational pattern
+
+The mistake to avoid is **clicking integrations into existence through the Central UI**. The UI is fine for a single integration during evaluation; it does not scale beyond a handful, and worse, it leaves the integration state in Central's database rather than in Git. A year later, nobody remembers why the Splunk HEC token is what it is, and rotation requires re-clicking a path that nobody documented.
+
+The lab's pattern: integration configuration is GitOps-managed (`Notifier` CRs in `platform-gitops`), and integration credentials follow the standard secret-custody flow:
+
+1. Credentials live in Vault under `secret/ocp/stackrox/integrations/<name>`.
+2. ExternalSecrets Operator (ESO) materialises them as Kubernetes Secrets in the `stackrox` namespace on the hub.
+3. The `Notifier` CR references the materialised Secret by name.
+4. Rotation is a `vault kv put`; ESO sees the change and updates the Secret; Central picks it up on next reconcile.
+
+This is the same custody pattern Module 09 already documented for the init-bundle and the Central admin password. Use it for every Notifier, every external scanner, every cloud-provider integration. Don't make integrations the place where the secret-custody discipline breaks down.
+
+### A worked Splunk HEC Notifier
+
+```yaml
+apiVersion: integration.stackrox.io/v1
+kind: Notifier
+metadata:
+  name: splunk-soc
+  namespace: stackrox
+spec:
+  type: splunk
+  splunk:
+    httpEndpoint: https://splunk-hec.security.example.com/services/collector/event
+    source: rhacs
+    sourceType: _json
+    truncate: 10000
+    insecureSkipVerify: false
+  credentialsSecret:
+    name: splunk-hec-token   # ESO-materialised from Vault
+```
+
+The `credentialsSecret` is the ESO-materialised Secret containing the HEC token. The `Notifier` itself is a small, declarative resource; the secret material is the only thing that needs rotation.
+
+### The throttling problem
+
+A bad release on a high-volume cluster can generate hundreds of violations per minute — every new pod trips the same policy, every image scan finds the same CVE, every admission request loses the same gate. Without rate-limiting at the Notifier, you'll flood your SIEM and your on-call channel in the same minute, and the signal-to-noise on the actual problem will be terrible.
+
+Two patterns to apply, in order:
+
+**Per-policy notifier selection.** RHACS lets you attach notifiers to specific policies. Noisy policies (Image Age, default deny-by-default rules) go to a low-priority audit channel; high-severity policies (privileged container, secret-in-environment) go to the on-call channel and JIRA. Don't send every policy to every notifier.
+
+**Notifier-side throttling.** For the SIEM forwarders that take volume well (Splunk, Elasticsearch), let the signal flow — the SIEM is built for it. For human-facing channels (Slack, Teams, PagerDuty), enable Central's deduplication so the same violation on the same resource doesn't fire twice within a window. The Slack integration in particular gets unusable past ~20 messages/minute.
+
+The deeper fix is upstream: if you're generating hundreds of violations per minute, the release is genuinely broken, and what you want is to fail the rollout early — admission `enforce` mode on the high-severity policy, an Argo Rollouts AnalysisRun against the RHACS violation count metric. Notifications are how you find out; admission gates are how you avoid finding out.
+
+### References
+
+- [docs.redhat.com — RHACS integrating with other tools](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/integrating/)
+- [docs.redhat.com — RHACS Slack integration](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/integrating/integrate-with-slack)
+- [docs.redhat.com — RHACS Splunk integration](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/integrating/integrate-with-splunk)
+- [docs.redhat.com — RHACS JIRA integration](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/integrating/integrate-with-jira)
+- [docs.redhat.com — RHACS image-scanner integrations](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/latest/html/integrating/integrate-with-image-vulnerability-scanners)
+
 ## The hub-on-spoke pattern
 
 Where do you put Central?

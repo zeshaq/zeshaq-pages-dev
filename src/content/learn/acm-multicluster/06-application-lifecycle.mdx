@@ -155,6 +155,119 @@ The lab's documented convention (`/docs/openshift-platform/gitops-operating-mode
 
 You almost never see waves 4–9 used in the lab; the gap is room to wedge in new platform layers without renumbering.
 
+## Argo Rollouts — progressive delivery across clusters
+
+ApplicationSet says *where* a workload runs. Argo Rollouts says *how* a new version of that workload replaces the old one. The two are independent — you can run Rollouts without ApplicationSet, or vice versa — but the interesting wins show up when you compose them across a fleet.
+
+For a single cluster, the question is well-understood: a blue/green swap, or a canary that shifts 10% of traffic to the new version, observes some metric, and either promotes or rolls back. The multicluster questions are different and more interesting:
+
+- Can you canary a release on **one** cluster while the rest of the fleet stays on the previous version? (Yes — that's per-cluster blast radius.)
+- Can you stagger a fleet-wide rollout in waves, gating each wave on the previous wave's health? (Yes — combine with Placement waves.)
+- Can a hub-side metrics endpoint gate promotion on every spoke's canary? (Yes — point the AnalysisTemplate at hub Thanos.)
+
+Each of these is what Argo Rollouts buys you on top of ApplicationSet's fan-out.
+
+### The primitives
+
+Argo Rollouts ships as a separate operator from Argo CD — installed by the Red Hat OpenShift GitOps operator, configured via a `RolloutManager` CR. Once installed, three resource kinds matter:
+
+| CR | Replaces | Role |
+| --- | --- | --- |
+| **`Rollout`** | `Deployment` | A managed ReplicaSet pair (stable + canary) plus a strategy that says how to swap traffic between them. |
+| **`AnalysisTemplate`** + **`AnalysisRun`** | (nothing) | A reusable specification for "query metric X, succeed if &lt;= threshold, fail if &gt; threshold." A `Rollout` step references the template; the controller creates an `AnalysisRun` to evaluate it. |
+| **`Experiment`** | (nothing) | Spins up a short-lived parallel ReplicaSet with its own traffic share for A/B testing without committing to a rollout. |
+
+A `Rollout` looks like a `Deployment` but with a `strategy` block that's structured rather than free-form — `blueGreen` or `canary`, each with its own ergonomics.
+
+### Strategies
+
+**Blue/green** with `previewService` and `activeService`. The Rollout maintains two Services; the active one points at the stable ReplicaSet, the preview points at the new one. You verify the new version against the preview Service (an in-cluster test rig, a manual smoke), then promote, which swaps the selector on the active Service. Traffic shifts in one step.
+
+**Canary** with traffic-shifting. The Rollout walks through declared `steps` — `setWeight: 10`, `pause: 60s`, `setWeight: 25`, `pause: 5m`, etc. Traffic shaping happens via an integrated traffic provider: OpenShift Routes, Istio, AWS ALB, NGINX, or SMI. The pause can be timed (`pause: 60s`) or indefinite (`pause: {}`) — indefinite waits for a human `kubectl argo rollouts promote`.
+
+**Header- or cookie-based** dark-launch. Through the traffic provider, you can route a specific cookie or header to the canary while everyone else still hits stable. Useful for letting your own engineers hit the new build before any production user does.
+
+### Multicluster patterns with ApplicationSet
+
+The natural pairing is to wrap the `Rollout` (and its Services, the AnalysisTemplate) in an ApplicationSet whose cluster generator fans out across spokes. Two distinct patterns sit on top:
+
+**Per-cluster independent rollouts.** Every matched cluster runs its own Rollout, each driven by Argo Rollouts on that spoke. If you canary, each spoke independently walks through the steps with its own AnalysisRun querying the spoke's local Prometheus. This is the simplest pattern; the cost is that "is the rollout going well?" is answered per cluster, not fleet-wide.
+
+**Shared analysis against hub metrics.** The Rollout CR is still per cluster, but the AnalysisTemplate's metric provider points at the **hub's Thanos query endpoint**. Every spoke's canary blocks on the same metric, queried with a cluster label. The benefit is a single SLO that gates rollouts everywhere; the cost is that the hub becomes load-bearing for promotion — if Thanos query is down, no spoke promotes.
+
+For staggered fleet rollout, the lever is **Placement** rather than the Rollout itself. Wave 1 of your Placement selects `env=canary` clusters only; the ApplicationSet generates Rollouts there first. After a soak period, you flip the Placement to include `env=prod-eu`; the ApplicationSet generates Rollouts on those next, picking up the same already-promoted image digest. This is the multicluster equivalent of canary-cluster-then-fleet.
+
+### A worked Rollout
+
+A canary that pauses at 10% for human approval, then auto-walks to 100% only if the error rate stays sane:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: web }
+spec:
+  replicas: 6
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: {}                 # wait for manual promote
+        - setWeight: 50
+        - analysis:
+            templates: [{ templateName: error-rate-p99 }]
+        - setWeight: 100
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - { name: web, image: registry.lab/web:GIT_SHA }
+```
+
+The companion `AnalysisTemplate`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata: { name: error-rate-p99 }
+spec:
+  metrics:
+    - name: error-rate
+      interval: 30s
+      successCondition: result[0] <= 0.01
+      provider:
+        prometheus:
+          address: http://thanos-query.observability.svc:9090
+          query: |
+            sum(rate(http_requests_total{app="web",code=~"5.."}[5m]))
+              / sum(rate(http_requests_total{app="web"}[5m]))
+```
+
+If the 5xx rate stays under 1% for the analysis window, the rollout proceeds to `setWeight: 100`. If it breaches, the AnalysisRun fails and the Rollout auto-rolls-back to stable.
+
+### The gotcha for banking
+
+For a payment service you almost never want fully-automatic promotion. The CAB-grade pattern is `pause: {}` (indefinite) at 10%, with a human running `kubectl argo rollouts promote web` after the change-board sign-off. You still get automated traffic-shifting and automated rollback on metric breach; you just don't surrender the promotion decision to an `interval` timer. Argo Rollouts is comfortable with that pattern — the manual gate is the default for high-stakes services in regulated environments.
+
+For lower-stakes internal services, fully-automated promotion with a metric gate is fine. Don't apply the same gating ceremony everywhere; pick the gate that matches the blast radius.
+
+### Failure-mode shape
+
+Three states tell you what happened.
+
+**Rollout `Paused`.** Either intentional (a step has `pause: {}` waiting on a human) or accidental (nobody clicked promote). `kubectl argo rollouts get rollout web` shows which step it's parked on; the UI gives you a button if you'd rather click.
+
+**Rollout `Degraded`.** Either an AnalysisRun's metric threshold breached and the rollout aborted to stable, or the new ReplicaSet failed health checks and the controller refused to advance. The AnalysisRun's status tells you which metric and which value tripped it; the ReplicaSet's pod events tell you the readiness story.
+
+**Rollout `Healthy` but the app is broken.** The most painful failure mode. The metric you chose for promotion gating didn't capture the regression — say, you gated on 5xx rate but the bug is a 200-OK response with the wrong value. Argo Rollouts can't catch what you didn't tell it to measure. The fix is on the AnalysisTemplate side: better SLIs, more of them, or a synthetic transaction check alongside the volume metrics.
+
+### References
+
+- [docs.redhat.com — Argo Rollouts overview](https://docs.redhat.com/en/documentation/red_hat_openshift_gitops/1.19/html/argo_rollouts/)
+- [argoproj.io — Argo Rollouts canary strategy](https://argoproj.github.io/argo-rollouts/features/canary/)
+- [argoproj.io — Analysis templates](https://argoproj.github.io/argo-rollouts/features/analysis/)
+- [argoproj.io — Traffic management providers](https://argoproj.github.io/argo-rollouts/features/traffic-management/)
+
 ## Drift handling
 
 Argo's `selfHeal: true` reverts manual edits. `prune: true` removes resources that were dropped from Git. Both are typical for managed-cluster Applications, because the whole point of pull-model GitOps is that the cluster matches Git, not the operator's last hotfix.
