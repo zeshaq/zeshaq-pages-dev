@@ -57,7 +57,7 @@ The three paths:
 - **Provision a new cluster** via Hive. You give ACM the infrastructure credentials and the install config; ACM does the OpenShift install for you and then imports the result. End-to-end greenfield.
 - **Pull-mode import** (sometimes called "auto-import"). The hub writes an `auto-import-secret` into the spoke's hub-side namespace, and a small bootstrap agent on the target pulls the klusterlet manifests down. Used when you don't want to push YAML to the target manually.
 
-In the lab's v6 fleet, `spoke-dc-v6` joined via the first path — it was installed independently as a workload cluster, then imported into `hub-dc-v6` once both were stable. Cite [`/docs/openshift-platform/acm-multicluster/managedcluster-registration/`](/docs/openshift-platform/acm-multicluster/managedcluster-registration) for the worked example.
+In the lab's v6 fleet, `spoke-dc-v6` joined via the first path — it was installed independently as a workload cluster, then imported into `hub-dc-v6` once both were stable. Cite [`/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration/`](/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration) for the worked example.
 
 ## Import an existing cluster — the walkthrough
 
@@ -197,7 +197,7 @@ A second misconception: ACM does **not** project user identities into managed cl
 
 Two patterns work:
 
-- **Federated identity provider.** Every cluster — hub and spokes — uses the same OAuth/OIDC source, so the same user logs into all of them with the same identity. Spoke-side `ClusterRoleBindings` reference the same `alice@corp` username (or group claim) that the hub uses. The lab takes this path with Keycloak: see [/docs/lab-infrastructure/other-platform-vms/keycloak-oidc](/docs/lab-infrastructure/other-platform-vms/keycloak-oidc). One IdP, every cluster trusts it, identities line up by name.
+- **Federated identity provider.** Every cluster — hub and spokes — uses the same OAuth/OIDC source, so the same user logs into all of them with the same identity. Spoke-side `ClusterRoleBindings` reference the same `alice@corp` username (or group claim) that the hub uses. The lab takes this path with Keycloak: see [/docs/openshift-platform/lab-infrastructure/other-platform-vms/keycloak-oidc](/docs/openshift-platform/lab-infrastructure/other-platform-vms/keycloak-oidc). One IdP, every cluster trusts it, identities line up by name.
 - **Service-account projection per cluster.** Where federation isn't available — disconnected sites, third-party tenants — ACM addons run as their own ServiceAccount on the spoke, and you map those SAs to spoke-side ClusterRoles via the `cluster-permission` component. This is how RHACS, GitOps, and other addons get whatever spoke privileges they need without bringing user identities into the loop.
 
 Most labs and most enterprises end up with the first model. The second is the fallback when policy or topology forbids a shared IdP.
@@ -276,7 +276,7 @@ The first two commands list every set on the hub and every namespace that has a 
 
 `spoke-dc-v6` was imported, not provisioned. It was installed standalone (compact-3-AIO + 3 baremetal workers via agent-based installer), then once the install was stable, six manifests in `platform-gitops` landed on `hub-dc-v6` to register it — the namespace, the ManagedCluster, the KlusterletAddonConfig, a ManagedClusterSetBinding, a Placement, and a GitOpsCluster. The bootstrap import bundle was applied once on the spoke as a break-glass operation; everything after is GitOps.
 
-The Placement that activates work on `spoke-dc-v6` selects `env=dc, role=spoke, gitops-managed=true`. The naming reflects the [pre-v6 → v6 transition](/docs/history-and-replay/pre-v6-to-v6-transition): pre-v6 had four clusters (`hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr`); v6 retained the `dc` and `spoke` labels so the Placement shape stays stable when (if) a DR pair is built later. See [`/docs/openshift-platform/acm-multicluster/managedcluster-registration/`](/docs/openshift-platform/acm-multicluster/managedcluster-registration) for the full manifest set.
+The Placement that activates work on `spoke-dc-v6` selects `env=dc, role=spoke, gitops-managed=true`. The naming reflects the [pre-v6 → v6 transition](/docs/openshift-platform/history-and-replay/pre-v6-to-v6-transition): pre-v6 had four clusters (`hub-dc`, `spoke-dc`, `hub-dr`, `spoke-dr`); v6 retained the `dc` and `spoke` labels so the Placement shape stays stable when (if) a DR pair is built later. See [`/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration/`](/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration) for the full manifest set.
 
 ## Try this
 
@@ -326,5 +326,5 @@ You can now make a managed cluster appear, give it labels that mean something, a
 - Red Hat ACM docs — Importing a managed cluster: [docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/)
 - Hive operator (upstream): [github.com/openshift/hive](https://github.com/openshift/hive)
 - OpenShift docs — Cluster Version Operator and upgrades: [docs.openshift.com](https://docs.openshift.com)
-- Lab docs — ManagedCluster registration: [/docs/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/acm-multicluster/managedcluster-registration)
-- Lab docs — pre-v6 to v6 transition: [/docs/history-and-replay/pre-v6-to-v6-transition](/docs/history-and-replay/pre-v6-to-v6-transition)
+- Lab docs — ManagedCluster registration: [/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration)
+- Lab docs — pre-v6 to v6 transition: [/docs/openshift-platform/history-and-replay/pre-v6-to-v6-transition](/docs/openshift-platform/history-and-replay/pre-v6-to-v6-transition)

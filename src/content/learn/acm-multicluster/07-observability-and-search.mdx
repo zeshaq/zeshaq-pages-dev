@@ -92,7 +92,7 @@ The pragmatic split:
 - **Hub** — fleet-shaped SLIs. "More than 2 clusters are reporting `KubeAPIErrorBudgetBurn`." "ETCD leader changes exceed threshold across the fleet."
 - **Spoke** — high-noise local alerts. "A specific Pod is CrashLooping." "Disk pressure on a specific node."
 
-Putting noisy spoke-internal alerts on the hub turns the hub AlertManager into a fire hose. Putting fleet SLI alerts on a single spoke means you don't see the fleet-wide pattern. The lab keeps Loki and Tempo local-per-spoke for the same reason — high-volume signals stay close to where they're produced (`/docs/openshift-platform/platform-services/cluster-logging-and-loki/`).
+Putting noisy spoke-internal alerts on the hub turns the hub AlertManager into a fire hose. Putting fleet SLI alerts on a single spoke means you don't see the fleet-wide pattern. The lab keeps Loki and Tempo local-per-spoke for the same reason — high-volume signals stay close to where they're produced (`/docs/openshift-platform/openshift-platform/platform-services/cluster-logging-and-loki/`).
 
 ## Cluster health metrics — fleet status not workload status
 
@@ -140,10 +140,10 @@ Crucially, when this alert fires, **none of the spoke's own alerts can reach the
 
 The lab keeps the workload-vs-health split deliberate. Workload observability lives in two places:
 
-- **Spoke-local Loki and Tempo**, for logs and traces with cluster-local correlation. See [/docs/openshift-platform/platform-services/cluster-logging-and-loki/](/docs/openshift-platform/platform-services/cluster-logging-and-loki/).
-- **SigNoz on a separate VM**, the long-term observability sink for out-of-cluster workloads. See [/docs/lab-infrastructure/observability-vms/signoz-overview](/docs/lab-infrastructure/observability-vms/signoz-overview).
+- **Spoke-local Loki and Tempo**, for logs and traces with cluster-local correlation. See [/docs/openshift-platform/openshift-platform/platform-services/cluster-logging-and-loki/](/docs/openshift-platform/openshift-platform/platform-services/cluster-logging-and-loki/).
+- **SigNoz on a separate VM**, the long-term observability sink for out-of-cluster workloads. See [/docs/openshift-platform/lab-infrastructure/observability-vms/signoz-overview](/docs/openshift-platform/lab-infrastructure/observability-vms/signoz-overview).
 
-Cluster-health observability is hub-side. When MCO is enabled, the curated allowlist includes the cluster-health series and the hub's Thanos Ruler evaluates the RHACM-shipped alert rules. The on-call routing for cluster-health alerts is documented at [/docs/operations/incidents-and-runbooks/](/docs/operations/incidents-and-runbooks/) — that's the home for the runbooks that the alerts page into.
+Cluster-health observability is hub-side. When MCO is enabled, the curated allowlist includes the cluster-health series and the hub's Thanos Ruler evaluates the RHACM-shipped alert rules. The on-call routing for cluster-health alerts is documented at [/docs/openshift-platform/operations/incidents-and-runbooks/](/docs/openshift-platform/operations/incidents-and-runbooks/) — that's the home for the runbooks that the alerts page into.
 
 For the lab today, MCO is not yet enabled on `hub-dc-v6` (the object-store wiring is parked behind the same NooBaa work that gates several other features). The `ManagedClusterConditionUnknown` alert still fires through the hub's `cluster-monitoring-operator` because the registration controller exports its conditions to the in-cluster Prometheus regardless of whether MCO is on. That's the minimum viable alerting posture; the full MCO-backed setup is a near-term upgrade.
 
@@ -201,10 +201,10 @@ A few sharp edges that surface around fleet sizes of 25+ clusters:
 
 The lab uses MCO for metrics fan-in. But it keeps **logs and traces local per-spoke**:
 
-- **Loki** runs on each spoke via the Cluster Logging Operator (`/docs/openshift-platform/platform-services/cluster-logging-and-loki/`).
+- **Loki** runs on each spoke via the Cluster Logging Operator (`/docs/openshift-platform/openshift-platform/platform-services/cluster-logging-and-loki/`).
 - **Tempo** runs on each spoke under the Tempo Operator, backed by per-spoke object storage.
-- **Cluster Observability Operator (COO)** on the spoke runs Perses dashboards for the spoke-local view (`/docs/openshift-platform/platform-services/perses-dashboards/`).
-- **SigNoz** on a separate VM is the long-term observability sink for some out-of-cluster workloads (`/docs/lab-infrastructure/observability-vms/signoz-overview/`).
+- **Cluster Observability Operator (COO)** on the spoke runs Perses dashboards for the spoke-local view (`/docs/openshift-platform/openshift-platform/platform-services/perses-dashboards/`).
+- **SigNoz** on a separate VM is the long-term observability sink for some out-of-cluster workloads (`/docs/openshift-platform/lab-infrastructure/observability-vms/signoz-overview/`).
 
 Why split it? Metrics are aggregable and small per series; the fan-in pays off. Logs and traces are bulky and best correlated with cluster-local context (Pods, namespaces, request IDs). Federating them to the hub means moving terabytes a day and losing the per-cluster correlation you actually need when debugging.
 
@@ -231,8 +231,8 @@ The console hides the split well — Perses tabs on the spoke, Grafana on the hu
 - OCM Search proposal — `https://open-cluster-management.io/`
 - OpenShift Cluster Monitoring — `https://docs.openshift.com/container-platform/latest/monitoring/monitoring-overview.html`
 - Red Hat Insights — `https://docs.redhat.com/en/documentation/red_hat_insights/`
-- Lab — `/docs/openshift-platform/platform-services/cluster-logging-and-loki/`
-- Lab — `/docs/openshift-platform/platform-services/perses-dashboards/`
-- Lab — `/docs/lab-infrastructure/observability-vms/signoz-overview/`
+- Lab — `/docs/openshift-platform/openshift-platform/platform-services/cluster-logging-and-loki/`
+- Lab — `/docs/openshift-platform/openshift-platform/platform-services/perses-dashboards/`
+- Lab — `/docs/openshift-platform/lab-infrastructure/observability-vms/signoz-overview/`
 
 **Next:** [Module 08 — Hosted Control Planes and Cluster Pools](/learn/acm-multicluster/hosted-control-planes-and-cluster-pools) covers two ways to provision *more* clusters quickly — HyperShift's hosted control planes and ACM's warm-pool ClusterPool.

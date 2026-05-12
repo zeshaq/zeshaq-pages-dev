@@ -59,7 +59,7 @@ The path a Policy takes from authored YAML to a compliance result on the dashboa
 6. **`config-policy-controller`** on the spoke evaluates each `ConfigurationPolicy` every 30 seconds. It compares declared `object-templates` against live cluster state. The result is a compliance status — `Compliant` or `NonCompliant`.
 7. **The status flows back** via `governance-policy-status-sync` (spoke) → `governance-policy-status-sync` (hub) → the original Policy's `.status.status[]` list, with one entry per managed cluster.
 
-The ACM Governance dashboard reads the hub-side Policy `.status` to render compliance per cluster, per policy. The lab's [policies-and-placement doc](/docs/openshift-platform/acm-multicluster/policies-and-placement) walks through the five CR types and the spoke-side controllers in detail.
+The ACM Governance dashboard reads the hub-side Policy `.status` to render compliance per cluster, per policy. The lab's [policies-and-placement doc](/docs/openshift-platform/openshift-platform/acm-multicluster/policies-and-placement) walks through the five CR types and the spoke-side controllers in detail.
 
 ## Policy templates
 
@@ -116,7 +116,7 @@ The corollary: keep `inform`-only policies in production indefinitely if all you
 
 ## A worked example — disable default OperatorHub sources
 
-This is the lab's [policies-and-placement doc](/docs/openshift-platform/acm-multicluster/policies-and-placement) example trimmed to its essence. The goal: every spoke must have its default OperatorHub sources disabled (because the lab's [Nexus image-supply rule](/docs/openshift-platform/disconnected-image-supply) requires it).
+This is the lab's [policies-and-placement doc](/docs/openshift-platform/openshift-platform/acm-multicluster/policies-and-placement) example trimmed to its essence. The goal: every spoke must have its default OperatorHub sources disabled (because the lab's [Nexus image-supply rule](/docs/openshift-platform/openshift-platform/disconnected-image-supply) requires it).
 
 ```yaml
 apiVersion: policy.open-cluster-management.io/v1
@@ -217,7 +217,7 @@ spec:
     - require-etcd-encryption
 ```
 
-You then bind the PolicySet (not the individual Policies) to your Placement. The lab's [PCI-DSS profile baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline) is the right context — ACM PolicySets pair with OpenShift Compliance Operator scans to give you both *the desired state* (PolicySet) and *the audit evidence* (compliance-operator scan results) for the same controls. They're complementary, not redundant.
+You then bind the PolicySet (not the individual Policies) to your Placement. The lab's [PCI-DSS profile baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline) is the right context — ACM PolicySets pair with OpenShift Compliance Operator scans to give you both *the desired state* (PolicySet) and *the audit evidence* (compliance-operator scan results) for the same controls. They're complementary, not redundant.
 
 ## Evaluation cadence and performance
 
@@ -236,7 +236,7 @@ ACM's native `ConfigurationPolicy` is good at *"this resource must look like thi
 
 ### The operator, briefly
 
-The Compliance Operator is an OpenShift-Plus operator that runs **per cluster** in `openshift-compliance`. It uses OpenSCAP to scan both the OpenShift control plane (against profiles like `ocp4-cis`, `ocp4-pci-dss-4-0`, `ocp4-nist-800-53`, `ocp4-moderate`) and the RHCOS nodes (against the matching `*-node-*` profile). For every rule the scan evaluates, it emits a `ComplianceCheckResult` CR with a PASS, FAIL, or MANUAL verdict and an optional `ComplianceRemediation` CR that, if applied, fixes the failing config. The lab's worked walkthrough is at [/docs/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline).
+The Compliance Operator is an OpenShift-Plus operator that runs **per cluster** in `openshift-compliance`. It uses OpenSCAP to scan both the OpenShift control plane (against profiles like `ocp4-cis`, `ocp4-pci-dss-4-0`, `ocp4-nist-800-53`, `ocp4-moderate`) and the RHCOS nodes (against the matching `*-node-*` profile). For every rule the scan evaluates, it emits a `ComplianceCheckResult` CR with a PASS, FAIL, or MANUAL verdict and an optional `ComplianceRemediation` CR that, if applied, fixes the failing config. The lab's worked walkthrough is at [/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline).
 
 The operator is *per cluster* because OpenSCAP needs node access to scan kernel parameters, sshd config, and file permissions. There is no fleet-wide flavour of it. What ACM contributes is the **fleet-wide installation, configuration, and result aggregation** layer on top.
 
@@ -245,7 +245,7 @@ The operator is *per cluster* because OpenSCAP needs node access to scan kernel 
 ACM does not install or extend the operator. It deploys and configures it across the fleet by way of Policy CRs. The lab's pattern is a `PolicySet` named something like `compliance-operator-baseline` that contains three or four Policies:
 
 1. **Install policy.** A `ConfigurationPolicy` whose `object-templates` declare the `Namespace`, `OperatorGroup`, and `Subscription` for the Compliance Operator on every selected cluster. This is exactly the three-CR pattern from Chapter 3 of the DO432 source, but written once on the hub and fanned out.
-2. **ScanSetting policy.** A `ConfigurationPolicy` that creates a `ScanSetting` CR pinning the result-server pod onto worker nodes (avoids the RBD-on-master attach failures that bit old `spoke-dc` — see [/docs/openshift-platform/compliance/scansetting-and-bindings](/docs/openshift-platform/compliance/scansetting-and-bindings)), specifies a schedule, sets the retention policy, and reserves storage for the results.
+2. **ScanSetting policy.** A `ConfigurationPolicy` that creates a `ScanSetting` CR pinning the result-server pod onto worker nodes (avoids the RBD-on-master attach failures that bit old `spoke-dc` — see [/docs/openshift-platform/openshift-platform/compliance/scansetting-and-bindings](/docs/openshift-platform/openshift-platform/compliance/scansetting-and-bindings)), specifies a schedule, sets the retention policy, and reserves storage for the results.
 3. **ScanSettingBinding policy.** A `ConfigurationPolicy` whose `object-templates` declare a `ScanSettingBinding` that ties a `TailoredProfile` (PCI-DSS v4 with the lab's exclusions) to the `ScanSetting` from step 2.
 4. **(Optional) Remediation-application policy.** A `ConfigurationPolicy` setting `applyRemediations: true` on the suite when you trust the operator's auto-fixes for low-risk findings.
 
@@ -253,9 +253,9 @@ All four bind to the same `Placement` that selects clusters needing compliance s
 
 ### Why TailoredProfile matters
 
-A stock profile ships rules written against an idealised cluster shape. Real clusters have legitimate exceptions: a rule that demands every Route use a custom signer when ODF's noobaa-mgmt route is reconciled back to the cluster-issuer; a rule that flags `kubernetes.io/cluster-service: "true"` on a namespace that the lab actually wants tagged that way; a rule that disables IPv6 at the kernel level, which would break OVN-Kubernetes ([ADR 0026](/docs/architecture-decisions/adr-0026-ipv6-baseline)).
+A stock profile ships rules written against an idealised cluster shape. Real clusters have legitimate exceptions: a rule that demands every Route use a custom signer when ODF's noobaa-mgmt route is reconciled back to the cluster-issuer; a rule that flags `kubernetes.io/cluster-service: "true"` on a namespace that the lab actually wants tagged that way; a rule that disables IPv6 at the kernel level, which would break OVN-Kubernetes ([ADR 0026](/docs/openshift-platform/architecture-decisions/adr-0026-ipv6-baseline)).
 
-A `TailoredProfile` lets you say *"start from `ocp4-pci-dss-4-0`, disable rules X and Y, set variable Z to value W, and record why."* The disabled-rule list is small but load-bearing. The lab's PCI-DSS v4 tailored profile excludes a handful of rules with documented rationale — the `CSO` (cluster-service-objects) tagging rule and the `ingress-ciphers` rule are two of them, each tied to a specific lab decision rather than a relaxation of the standard. The full list and the rationale-per-exclusion is at [/docs/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline).
+A `TailoredProfile` lets you say *"start from `ocp4-pci-dss-4-0`, disable rules X and Y, set variable Z to value W, and record why."* The disabled-rule list is small but load-bearing. The lab's PCI-DSS v4 tailored profile excludes a handful of rules with documented rationale — the `CSO` (cluster-service-objects) tagging rule and the `ingress-ciphers` rule are two of them, each tied to a specific lab decision rather than a relaxation of the standard. The full list and the rationale-per-exclusion is at [/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline).
 
 Without tailoring, you either accept perpetual FAILs that aren't real findings, or you exclude rules cluster-by-cluster — both terrible. With tailoring, the exclusion is one CR per profile per fleet, written down, reviewable in Git.
 
@@ -335,7 +335,7 @@ ACM does not replace Gatekeeper or Kyverno. It wraps them. The pattern is two la
 
 ACM's role is propagation and inventory. The engine does the validation. The two are complementary, not duplicate.
 
-The lab runs Red Hat's Gatekeeper Operator on `spoke-dc-v6` already — see [/docs/openshift-platform/platform-services/gatekeeper](/docs/openshift-platform/platform-services/gatekeeper). The install was hand-rolled because there was only one spoke; if a second spoke ever arrives, the install gets wrapped in an ACM Policy and fanned out via Placement.
+The lab runs Red Hat's Gatekeeper Operator on `spoke-dc-v6` already — see [/docs/openshift-platform/openshift-platform/platform-services/gatekeeper](/docs/openshift-platform/openshift-platform/platform-services/gatekeeper). The install was hand-rolled because there was only one spoke; if a second spoke ever arrives, the install gets wrapped in an ACM Policy and fanned out via Placement.
 
 ### A worked example using PolicyGenerator
 
@@ -398,7 +398,7 @@ The ACM Governance dashboard at *Governance → Policies* aggregates per-policy 
 - For each `NonCompliant` policy, which clusters are non-compliant.
 - For each non-compliant cluster, the human-readable reason (the `ConfigurationPolicy.status.compliancyDetails[].conditions[].message`).
 
-Wire this to your alerting if you care about drift. *"PolicySet `pci-dss-fleet` has any cluster `NonCompliant` for more than 10 minutes"* is the canonical Alertmanager rule. Cross-link [`/docs/openshift-platform/compliance/`](/docs/openshift-platform/compliance) for how the lab pairs ACM governance with Compliance Operator scans.
+Wire this to your alerting if you care about drift. *"PolicySet `pci-dss-fleet` has any cluster `NonCompliant` for more than 10 minutes"* is the canonical Alertmanager rule. Cross-link [`/docs/openshift-platform/openshift-platform/compliance/`](/docs/openshift-platform/openshift-platform/compliance) for how the lab pairs ACM governance with Compliance Operator scans.
 
 ## Try this
 
@@ -445,6 +445,6 @@ You can now write a Policy, target it at a fleet, and watch compliance flow back
 - Red Hat ACM docs — Governance: [docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/)
 - PolicyGenerator (open-cluster-management-io): [github.com/open-cluster-management-io/policy-generator-plugin](https://github.com/open-cluster-management-io/policy-generator-plugin)
 - ACM policy collection (community policies): [github.com/open-cluster-management-io/policy-collection](https://github.com/open-cluster-management-io/policy-collection)
-- Lab docs — Policies and Placement: [/docs/openshift-platform/acm-multicluster/policies-and-placement](/docs/openshift-platform/acm-multicluster/policies-and-placement)
-- Lab docs — Compliance overview: [/docs/openshift-platform/compliance](/docs/openshift-platform/compliance)
-- Lab docs — PCI-DSS profile baseline: [/docs/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/compliance/pci-dss-profile-baseline)
+- Lab docs — Policies and Placement: [/docs/openshift-platform/openshift-platform/acm-multicluster/policies-and-placement](/docs/openshift-platform/openshift-platform/acm-multicluster/policies-and-placement)
+- Lab docs — Compliance overview: [/docs/openshift-platform/openshift-platform/compliance](/docs/openshift-platform/openshift-platform/compliance)
+- Lab docs — PCI-DSS profile baseline: [/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline](/docs/openshift-platform/openshift-platform/compliance/pci-dss-profile-baseline)

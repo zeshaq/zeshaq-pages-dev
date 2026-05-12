@@ -101,7 +101,7 @@ You generate the bundle once per managed cluster, apply it to the SecuredCluster
 
 In a lab without automation, you generate the bundle by running roxctl on a laptop, downloading a YAML file, and `oc apply`-ing it onto the spoke. That is fine for a demo. It is not fine for a fleet, because at 30 clusters you have 30 YAML files containing private keys floating around someone's `~/Downloads`.
 
-The pattern this lab uses instead — see [`/docs/openshift-platform/security/init-bundle-via-eso/`](/docs/openshift-platform/security/init-bundle-via-eso) — is:
+The pattern this lab uses instead — see [`/docs/openshift-platform/openshift-platform/security/init-bundle-via-eso/`](/docs/openshift-platform/openshift-platform/security/init-bundle-via-eso) — is:
 
 1. A scheduled job calls **Central's REST API** directly: `POST /v1/cluster-init/init-bundles` with `{"name": "<cluster-name>"}`. The response is a JSON document containing all the bundle's Secret materials.
 2. The job flattens the response into Vault under `secret/ocp/<cluster>/rhacs/init-bundle`.
@@ -119,13 +119,13 @@ The biggest source of confusion in this product pair is the word "policy." They 
 
 You need both. Network policy in every namespace is not a security rule; it is a baseline-config rule. A pod that opens a shell into `/bin/bash` at runtime is not a config issue; it is a security event. They are complementary, not competing.
 
-For the lab's per-tenant policy set — for example the platform-team Policy that enforces a default-deny NetworkPolicy across every PCI-scoped namespace — see [`/docs/openshift-platform/security/app-team-policy-set/`](/docs/openshift-platform/security/app-team-policy-set). For the RHACS side, the default policy library that ships with Central is the starting point; almost every operator adds a few of their own.
+For the lab's per-tenant policy set — for example the platform-team Policy that enforces a default-deny NetworkPolicy across every PCI-scoped namespace — see [`/docs/openshift-platform/openshift-platform/security/app-team-policy-set/`](/docs/openshift-platform/openshift-platform/security/app-team-policy-set). For the RHACS side, the default policy library that ships with Central is the starting point; almost every operator adds a few of their own.
 
 ## Per-tenant policy exceptions
 
 Real fleets need exceptions. A tenant's base image has a known CVE; the upstream maintainer has not pushed a fixed image yet; the tenant cannot stop shipping. The right answer is a **time-bounded exception** with a written justification, not a permanent disable of the policy.
 
-RHACS supports this natively: each policy violation can be deferred or marked as a false positive, with an expiry and a comment. The lab wraps that in a documented workflow — the tenant opens a ticket, the platform team reviews, the exception is applied with a 30-day clock, and a recurring report surfaces exceptions that are about to expire. See [`/docs/application-delivery/tenant-onboarding/rhacs-tenant-exception-process/`](/docs/application-delivery/tenant-onboarding/rhacs-tenant-exception-process).
+RHACS supports this natively: each policy violation can be deferred or marked as a false positive, with an expiry and a comment. The lab wraps that in a documented workflow — the tenant opens a ticket, the platform team reviews, the exception is applied with a 30-day clock, and a recurring report surfaces exceptions that are about to expire. See [`/docs/openshift-platform/application-delivery/tenant-onboarding/rhacs-tenant-exception-process/`](/docs/openshift-platform/application-delivery/tenant-onboarding/rhacs-tenant-exception-process).
 
 The mistake to avoid is **silent permanent exceptions**. The exception expires, the team rotates, nobody remembers what the original justification was, and a year later the CVE is still there and nobody can explain why.
 
@@ -136,7 +136,7 @@ Scanner V4 sits between two surfaces: **the registry** and **the kube-apiserver*
 - **At push time**, the registry's webhook posts to Scanner; Scanner pulls the manifest, layers, and SBOM, computes vulnerabilities, and stores the result against the image digest.
 - **At admission time**, the admission webhook on each spoke calls Sensor; Sensor asks Central for the policy verdict on the image digests in the incoming pod spec; Central pulls the latest scan result (or triggers a scan if missing) and returns allow/deny.
 
-The mistake everyone makes once is **setting the admission webhook to `enforce` without first running it in `inform`**. The first day in `enforce` mode, kube-controller-manager itself fails to schedule pods because some openshift- namespace image has a high-severity CVE you did not know about. Run in `inform` for at least a week; sort out the violations; then flip to enforce. For the lab's policy set and the cluster-scope rules, see [`/docs/openshift-platform/security/scanner-v4-and-image-policies/`](/docs/openshift-platform/security/scanner-v4-and-image-policies).
+The mistake everyone makes once is **setting the admission webhook to `enforce` without first running it in `inform`**. The first day in `enforce` mode, kube-controller-manager itself fails to schedule pods because some openshift- namespace image has a high-severity CVE you did not know about. Run in `inform` for at least a week; sort out the violations; then flip to enforce. For the lab's policy set and the cluster-scope rules, see [`/docs/openshift-platform/openshift-platform/security/scanner-v4-and-image-policies/`](/docs/openshift-platform/openshift-platform/security/scanner-v4-and-image-policies).
 
 A useful trick: an admission policy can exempt the `openshift-*` namespaces (Red Hat images, which are scanned and patched by Red Hat) and enforce only against tenant namespaces. That is the practical compromise — most of the noise is in the openshift- namespaces; most of the actual risk is in tenant images.
 
@@ -144,7 +144,7 @@ A useful trick: an admission policy can exempt the `openshift-*` namespaces (Red
 
 A pragmatic operational concern. The first Central admin password is generated by the operator at install time. That password is what every operator who SSHs into the UI uses; it is also what the lab's init-bundle generator uses to call the Central API. Rotating it is therefore non-trivial.
 
-The lab's pattern — captured in [`/docs/operations/routine-tasks/rotate-rhacs-central-admin/`](/docs/operations/routine-tasks/rotate-rhacs-central-admin) — is:
+The lab's pattern — captured in [`/docs/openshift-platform/operations/routine-tasks/rotate-rhacs-central-admin/`](/docs/openshift-platform/operations/routine-tasks/rotate-rhacs-central-admin) — is:
 
 1. Generate a new password in Vault: `vault kv put secret/ocp/platform/rhacs-admin password=<new>`.
 2. ESO sees the change and updates the Kubernetes Secret `central-admin-password` in `stackrox`.
@@ -282,7 +282,7 @@ In the lab today, Central runs on **hub-dc-v6** and SecuredCluster runs on **spo
 
 ## Cross-link
 
-ACM Governance gives you the declarative-config side of the fleet's security posture; RHACS gives you the runtime-and-image side. Together they are the defence-in-depth that compliance audits actually expect to see. For the lab's integrated view — how Policy reports and RHACS violations feed the same compliance dashboard — see [`/docs/openshift-platform/security/rhacs-overview/`](/docs/openshift-platform/security/rhacs-overview).
+ACM Governance gives you the declarative-config side of the fleet's security posture; RHACS gives you the runtime-and-image side. Together they are the defence-in-depth that compliance audits actually expect to see. For the lab's integrated view — how Policy reports and RHACS violations feed the same compliance dashboard — see [`/docs/openshift-platform/openshift-platform/security/rhacs-overview/`](/docs/openshift-platform/openshift-platform/security/rhacs-overview).
 
 ## References
 

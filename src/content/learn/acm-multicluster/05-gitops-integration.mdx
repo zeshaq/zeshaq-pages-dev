@@ -73,7 +73,7 @@ The diagram shows both models side by side. On the left (push), one hub Argo app
 
 The key inversion: the hub no longer reaches the spoke. The hub only writes to *itself* (and to the spoke's hub-side namespace, which is also on the hub). ACM ships the ManifestWork; the klusterlet on the spoke pulls it; the spoke Argo CD owns the reconcile loop against the spoke API server. The hub has no kubeconfig for the spoke, doesn't need TCP/6443 to the spoke, and doesn't need to be online during the spoke's reconcile.
 
-For the lab's `hub-dc-v6` + `spoke-dc-v6` pair this is the chosen design — see [ADR 0018](/docs/architecture-decisions/adr-0018-acm-gitops-pull) and the [pull-model overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview) for the manifested decision.
+For the lab's `hub-dc-v6` + `spoke-dc-v6` pair this is the chosen design — see [ADR 0018](/docs/openshift-platform/architecture-decisions/adr-0018-acm-gitops-pull) and the [pull-model overview](/docs/openshift-platform/openshift-platform/gitops-operating-model/pull-model-overview) for the manifested decision.
 
 ## Which to pick
 
@@ -147,14 +147,14 @@ The fix is one command:
 oc delete crd routes.route.openshift.io
 ```
 
-Routes themselves survive — they live behind the aggregated APIService, not the CRD. `oc get routes -A` works throughout. Within seconds `/openapi/v2` recovers and Argo CD picks up on the next sync. The lab's [runbook for this incident](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd) tracks the permanent fix under issue #153.
+Routes themselves survive — they live behind the aggregated APIService, not the CRD. `oc get routes -A` works throughout. Within seconds `/openapi/v2` recovers and Argo CD picks up on the next sync. The lab's [runbook for this incident](/docs/openshift-platform/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd) tracks the permanent fix under issue #153.
 
 Two paths to permanent prevention:
 
 - **Deploy `gitops-addon` with the no-CRD flag on OpenShift spokes.** The addon supports a configuration that detects an existing `v1.route.openshift.io` APIService and skips the CRD install. Set it; verify on the spoke that the CRD is gone.
 - **Apply a `ValidatingAdmissionPolicy`** on the spoke that denies creation of `routes.route.openshift.io` as a CRD. This catches the addon if it tries to recreate the CRD on a reconcile.
 
-The teaching moment: the convenience of a unified addon design has a real cost when one of the target environments has a native API the addon assumed wouldn't exist. Always check what the addon installs *as a CRD* against what your cluster already provides *as an APIService*. The lab's [gitops-operating-model docs](/docs/openshift-platform/gitops-operating-model) cover the VAP guardrail in detail.
+The teaching moment: the convenience of a unified addon design has a real cost when one of the target environments has a native API the addon assumed wouldn't exist. Always check what the addon installs *as a CRD* against what your cluster already provides *as an APIService*. The lab's [gitops-operating-model docs](/docs/openshift-platform/openshift-platform/gitops-operating-model) cover the VAP guardrail in detail.
 
 ## ApplicationSet from the hub
 
@@ -303,7 +303,7 @@ Both are GA and supported; both will be supported for some years. Argo CD Agent 
 
 ### The Routes CRD trap, again
 
-The earlier section in this module documented the Routes CRD that gitops-addon installs on every spoke and the OpenAPI v2 collision it causes on OpenShift. **Argo CD Agent does not (currently) hit the same trap** — its spoke side is a slimmer install that doesn't ship the same CRD bundle. That said, the discipline is the same: any addon you install onto an OpenShift spoke can collide with a native aggregated APIService, and "the cluster looks healthy on every other angle" is exactly how this class of bug presents. After any new addon install, run the lab's CRD-inventory check (see the [Routes CRD runbook](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd)) and confirm no duplicate API surfaces.
+The earlier section in this module documented the Routes CRD that gitops-addon installs on every spoke and the OpenAPI v2 collision it causes on OpenShift. **Argo CD Agent does not (currently) hit the same trap** — its spoke side is a slimmer install that doesn't ship the same CRD bundle. That said, the discipline is the same: any addon you install onto an OpenShift spoke can collide with a native aggregated APIService, and "the cluster looks healthy on every other angle" is exactly how this class of bug presents. After any new addon install, run the lab's CRD-inventory check (see the [Routes CRD runbook](/docs/openshift-platform/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd)) and confirm no duplicate API surfaces.
 
 ### When to migrate
 
@@ -329,7 +329,7 @@ Pull model end-to-end. The hub `openshift-platform-gitops` GitLab repo holds:
 
 One `ApplicationSet` (`spoke-cluster-config-pull`) generates one `Application` per spoke that the `gitops-managed` Placement returns. Today that Placement returns exactly `spoke-dc-v6`, so the ApplicationSet generates one Application: `spoke-dc-v6-cluster-config`. The Application's labels mark it for pull-model wrapping; ACM ships it; the spoke Argo CD picks it up and reconciles `clusters/spoke-dc-v6/` against the spoke API.
 
-The lab's [pull-model overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview) has the full diagram and the seven manifests under `fleet-registration/`. The ADR rationale is in [ADR 0018](/docs/architecture-decisions/adr-0018-acm-gitops-pull).
+The lab's [pull-model overview](/docs/openshift-platform/openshift-platform/gitops-operating-model/pull-model-overview) has the full diagram and the seven manifests under `fleet-registration/`. The ADR rationale is in [ADR 0018](/docs/openshift-platform/architecture-decisions/adr-0018-acm-gitops-pull).
 
 ## Try this
 
@@ -376,9 +376,9 @@ Watch the spoke Argo CD revert it within ~30 seconds (the default reconcile inte
 
 **ApplicationSet generates but the Application never appears on the spoke.** Two causes are common. First, `gitops-addon` isn't installed on the spoke — the spoke Argo CD doesn't exist, so there's no one to pick up the ManifestWork. Check `oc -n openshift-gitops get deploy openshift-gitops-operator-controller-manager` on the spoke; if it's missing, your `GitOpsCluster.spec.gitopsAddon.enabled` is false or the Placement doesn't match. Second, the generated Application is missing the `pull-to-ocm-managed-cluster: "true"` label — without it, ACM doesn't wrap and ship it. Re-read the ApplicationSet template.
 
-**Application appears on the spoke but is `OutOfSync` indefinitely.** The most common cause is RBAC on the spoke. Argo CD on the spoke needs `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` on the API group of the resource being reconciled. The `argocd-platform-extensions` ClusterRole shipped by `gitops-addon` covers a fixed allowlist of API groups; if your manifests touch a different group (a CRD shipped by an operator not in the allowlist), Argo can't reconcile it. Fix: add the API group to the ClusterRole via GitOps (the lab does this through `platform-gitops` MRs — see [spoke RBAC extensions](/docs/openshift-platform/gitops-operating-model/spoke-rbac-extensions)).
+**Application appears on the spoke but is `OutOfSync` indefinitely.** The most common cause is RBAC on the spoke. Argo CD on the spoke needs `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` on the API group of the resource being reconciled. The `argocd-platform-extensions` ClusterRole shipped by `gitops-addon` covers a fixed allowlist of API groups; if your manifests touch a different group (a CRD shipped by an operator not in the allowlist), Argo can't reconcile it. Fix: add the API group to the ClusterRole via GitOps (the lab does this through `platform-gitops` MRs — see [spoke RBAC extensions](/docs/openshift-platform/openshift-platform/gitops-operating-model/spoke-rbac-extensions)).
 
-**The Routes CRD trap.** Symptom: every Application on every spoke goes `OutOfSync` with `ComparisonError: failed to load open api schema`. Fix: `oc delete crd routes.route.openshift.io` on each affected spoke. Permanent fix: configure `gitops-addon` to skip the CRD on OpenShift, or apply a VAP that denies it. See the [runbook](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd) for the diagnostic command sequence and the permanent fix tracked under issue #153.
+**The Routes CRD trap.** Symptom: every Application on every spoke goes `OutOfSync` with `ComparisonError: failed to load open api schema`. Fix: `oc delete crd routes.route.openshift.io` on each affected spoke. Permanent fix: configure `gitops-addon` to skip the CRD on OpenShift, or apply a VAP that denies it. See the [runbook](/docs/openshift-platform/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd) for the diagnostic command sequence and the permanent fix tracked under issue #153.
 
 **Spoke Application appears but the spoke Argo reports "destination cluster not found".** The Application's `spec.destination.server: https://kubernetes.default.svc` is correct on the spoke (it's the in-cluster API), but if the Application accidentally got `destination.name: spoke-dc-v6` instead, Argo CD looks up a cluster Secret by that name and fails. Use `server: https://kubernetes.default.svc`, not `name:`.
 
@@ -397,7 +397,7 @@ You now have the cluster on the hub, governance flowing through Placement, and w
 - Argo CD ApplicationSet — Cluster generator: [argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster/](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster/)
 - Argo CD ApplicationSet — Cluster Decision Resource generator: [argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster-Decision-Resource/](https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators-Cluster-Decision-Resource/)
 - OpenShift GitOps operator: [docs.openshift.com/gitops/](https://docs.openshift.com/gitops/)
-- Lab docs — Pull-model overview: [/docs/openshift-platform/gitops-operating-model/pull-model-overview](/docs/openshift-platform/gitops-operating-model/pull-model-overview)
-- Lab docs — Routes CRD incident runbook: [/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd](/docs/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd)
-- Lab docs — ADR 0018 ACM + GitOps pull: [/docs/architecture-decisions/adr-0018-acm-gitops-pull](/docs/architecture-decisions/adr-0018-acm-gitops-pull)
-- Lab docs — Spoke RBAC extensions: [/docs/openshift-platform/gitops-operating-model/spoke-rbac-extensions](/docs/openshift-platform/gitops-operating-model/spoke-rbac-extensions)
+- Lab docs — Pull-model overview: [/docs/openshift-platform/openshift-platform/gitops-operating-model/pull-model-overview](/docs/openshift-platform/openshift-platform/gitops-operating-model/pull-model-overview)
+- Lab docs — Routes CRD incident runbook: [/docs/openshift-platform/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd](/docs/openshift-platform/operations/incidents-and-runbooks/acm-gitops-addon-routes-crd)
+- Lab docs — ADR 0018 ACM + GitOps pull: [/docs/openshift-platform/architecture-decisions/adr-0018-acm-gitops-pull](/docs/openshift-platform/architecture-decisions/adr-0018-acm-gitops-pull)
+- Lab docs — Spoke RBAC extensions: [/docs/openshift-platform/openshift-platform/gitops-operating-model/spoke-rbac-extensions](/docs/openshift-platform/openshift-platform/gitops-operating-model/spoke-rbac-extensions)
