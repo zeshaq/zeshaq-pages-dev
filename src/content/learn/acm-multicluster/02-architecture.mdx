@@ -81,7 +81,7 @@ Some hub components only show up if you opt in. The defaults in the `MultiCluste
 - **Default-on:** policy propagator, application-manager, search.
 - **Opt-in:** observability (needs an object store like NooBaa, ODF, or S3-compatible), submariner, gitops-addon, hypershift-addon.
 
-The lab keeps the hub storage-light deliberately and runs observability off NooBaa-backed object storage rather than full ODF. See [/docs/openshift-platform/cluster-topology/hub-dc-v6](/docs/openshift-platform/cluster-topology/hub-dc-v6).
+The lab keeps the hub storage-light deliberately and runs observability off NooBaa-backed object storage rather than full ODF. See [/docs/openshift-platform/openshift-platform/cluster-topology/hub-dc-v6](/docs/openshift-platform/openshift-platform/cluster-topology/hub-dc-v6).
 
 ## Managed clusters
 
@@ -159,12 +159,12 @@ Storage is the most common surprise. The PostgreSQL search backend wants **SSD**
 
 The conceptual model above is portable. The lab's wiring is specific:
 
-- **hub-dc-v6** — compact 3-AIO management cluster, deliberately storage-light. NooBaa-backed observability; no full ODF on the hub. See [/docs/openshift-platform/cluster-topology/hub-dc-v6](/docs/openshift-platform/cluster-topology/hub-dc-v6).
-- **spoke-dc-v6** — workload cluster, 3 VM masters + 3 physical workers with ODF for tenant data. See [/docs/openshift-platform/cluster-topology/spoke-dc-v6](/docs/openshift-platform/cluster-topology/spoke-dc-v6).
-- **Pull-model GitOps**. The hub runs ACM and an `ApplicationSet` controller that fans out via `clusterDecisionResource`; each spoke runs OpenShift GitOps locally and reconciles from internal GitLab. The reasoning is in [ADR 0018](/docs/architecture-decisions/adr-0018-acm-gitops-pull) and [ADR 0019](/docs/architecture-decisions/adr-0019-pull-model-gitops).
+- **hub-dc-v6** — compact 3-AIO management cluster, deliberately storage-light. NooBaa-backed observability; no full ODF on the hub. See [/docs/openshift-platform/openshift-platform/cluster-topology/hub-dc-v6](/docs/openshift-platform/openshift-platform/cluster-topology/hub-dc-v6).
+- **spoke-dc-v6** — workload cluster, 3 VM masters + 3 physical workers with ODF for tenant data. See [/docs/openshift-platform/openshift-platform/cluster-topology/spoke-dc-v6](/docs/openshift-platform/openshift-platform/cluster-topology/spoke-dc-v6).
+- **Pull-model GitOps**. The hub runs ACM and an `ApplicationSet` controller that fans out via `clusterDecisionResource`; each spoke runs OpenShift GitOps locally and reconciles from internal GitLab. The reasoning is in [ADR 0018](/docs/openshift-platform/architecture-decisions/adr-0018-acm-gitops-pull) and [ADR 0019](/docs/openshift-platform/architecture-decisions/adr-0019-pull-model-gitops).
 - **Storage-light hub** isn't a default — it's a sized decision for a lab where the spoke is the data plane, not the hub. If you copy this design, do the sizing math first; observability is the constraint that bites.
 
-For the lab-specific ACM component wiring, see the platform docs at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub) and [/docs/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/acm-multicluster/managedcluster-registration).
+For the lab-specific ACM component wiring, see the platform docs at [/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub) and [/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration](/docs/openshift-platform/openshift-platform/acm-multicluster/managedcluster-registration).
 
 ## Day-1 install walkthrough
 
@@ -187,7 +187,7 @@ You can install ACM through the OpenShift console or through GitOps. The two pat
 
 **Path A — Operator Hub.** Open the OpenShift web console, go to *OperatorHub*, and filter for *Advanced Cluster Management for Kubernetes*. Pick the certified Red Hat tile, install cluster-scoped, choose the `release-2.16` channel (or whichever minor your fleet has standardised on), and let the Subscription land in `open-cluster-management`. After the operator install completes, go to *Installed Operators → Advanced Cluster Management → MultiClusterHub*, click *Create MultiClusterHub*, and submit the default form. This is the fastest path for a one-off hub.
 
-**Path B — GitOps (recommended for fleet ops).** Author a `Namespace`, `OperatorGroup`, `Subscription`, and `MultiClusterHub` manifest, commit them to `platform-gitops` under `clusters/<hub>/platform/acm/`, and let Argo CD apply them with sync waves so the Subscription lands before the MCH CR. This is what the lab does — the actual manifests are documented at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub). The advantage is reproducibility: tear the hub down, re-install, and the same component set comes back.
+**Path B — GitOps (recommended for fleet ops).** Author a `Namespace`, `OperatorGroup`, `Subscription`, and `MultiClusterHub` manifest, commit them to `platform-gitops` under `clusters/<hub>/platform/acm/`, and let Argo CD apply them with sync waves so the Subscription lands before the MCH CR. This is what the lab does — the actual manifests are documented at [/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub). The advantage is reproducibility: tear the hub down, re-install, and the same component set comes back.
 
 Pick GitOps if you operate more than one hub or expect the install to be re-run.
 
@@ -215,7 +215,7 @@ Once the MCH CR exists, the operator unrolls the rest. The `oc get multiclusterh
 
 ### The lab's install posture
 
-`hub-dc-v6` runs MCH with `disableHubSelfManagement: false`, the opposite of what you might expect for a control-plane-only hub. The reason is GitOps: the hub's Argo CD instance targets `local-cluster` as a destination, so the hub must be a `ManagedCluster` of itself. The hub's enabled-component set is deliberately small — registration, work, placement, app-lifecycle, GRC, console, cluster-permission, cluster-lifecycle — with search, observability, insights, and the backup operator left off until they're needed. The full component table and the actual Subscription + MCH YAML are at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub).
+`hub-dc-v6` runs MCH with `disableHubSelfManagement: false`, the opposite of what you might expect for a control-plane-only hub. The reason is GitOps: the hub's Argo CD instance targets `local-cluster` as a destination, so the hub must be a `ManagedCluster` of itself. The hub's enabled-component set is deliberately small — registration, work, placement, app-lifecycle, GRC, console, cluster-permission, cluster-lifecycle — with search, observability, insights, and the backup operator left off until they're needed. The full component table and the actual Subscription + MCH YAML are at [/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub).
 
 ### Post-install checks
 
@@ -281,7 +281,7 @@ For a team that *only* wants centralised provisioning and registration — say, 
 
 ### The lab's posture
 
-`hub-dc-v6` runs both. The `multicluster-engine` operator and the `advanced-cluster-management` operator are installed via GitOps as separate Subscriptions; the MCE CR is reconciled first (sync wave 10), the MCH CR is reconciled in a later wave so the `multiclusterhub-operator` finds MCE already healthy. The actual Subscription and CR manifests are documented at [/docs/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/acm-multicluster/multiclusterhub) — read that page after this section to see how the lab pins both channels and which MCE components it disables.
+`hub-dc-v6` runs both. The `multicluster-engine` operator and the `advanced-cluster-management` operator are installed via GitOps as separate Subscriptions; the MCE CR is reconciled first (sync wave 10), the MCH CR is reconciled in a later wave so the `multiclusterhub-operator` finds MCE already healthy. The actual Subscription and CR manifests are documented at [/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub](/docs/openshift-platform/openshift-platform/acm-multicluster/multiclusterhub) — read that page after this section to see how the lab pins both channels and which MCE components it disables.
 
 ### References
 

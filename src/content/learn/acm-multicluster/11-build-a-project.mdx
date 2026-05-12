@@ -374,7 +374,7 @@ spec:
   veleroTtl: 168h                  # 7-day retention
 ```
 
-You also need a Velero `BackupStorageLocation` pointing at your object store. The cluster-backup operator's docs walk through the BSL — see [`/docs/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/acm-multicluster/acm-cluster-backup) for the lab's variant.
+You also need a Velero `BackupStorageLocation` pointing at your object store. The cluster-backup operator's docs walk through the BSL — see [`/docs/openshift-platform/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/openshift-platform/acm-multicluster/acm-cluster-backup) for the lab's variant.
 
 After an hour, `oc get backup -n open-cluster-management-backup` shows three rolling backups: acm-credentials-schedule, acm-resources-schedule, and acm-managed-clusters-schedule. In your object store you can see the actual files.
 
@@ -415,7 +415,7 @@ You have a one-spoke fleet doing the right things. Stretch goals, in roughly inc
 - **Add a second managed cluster.** Apply the same labels. Verify the ApplicationSet produces a second Application, the Policy is `Compliant` on both, the observability addon lands, the SecuredCluster registers. This is the test of whether your fleet really is multi-cluster — if a manual step is needed for the second cluster, the fan-out is incomplete.
 - **Flip one policy to `enforce` after a week in `inform`.** Pick a policy where you have understood the existing violations. Watch ACM remediate.
 - **Add a hosted-control-plane (HCP) managed cluster.** Same import flow, different control-plane location (it runs on the hub). The fan-out works the same way.
-- **Federate the GitOps repo across tenant groups.** The lab's pattern lives at [`/docs/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership/`](/docs/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership) — each tenant team owns its own subdirectory and its own Argo CD AppProject. The hub still does fan-out, but ownership is decentralised.
+- **Federate the GitOps repo across tenant groups.** The lab's pattern lives at [`/docs/openshift-platform/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership/`](/docs/openshift-platform/architecture-decisions/adr-0023-federated-gitlab-group-repo-ownership) — each tenant team owns its own subdirectory and its own Argo CD AppProject. The hub still does fan-out, but ownership is decentralised.
 - **Run a real DR drill.** Build a sandbox cluster. Restore the latest hub backup into it. Time how long it takes. Find the steps that are not in your runbook. Update the runbook. Repeat next quarter.
 - **Tighten the RHACS posture.** Move a policy to admission-control enforce mode. Watch the first deploy that gets blocked, understand why, exempt the openshift- namespaces, repeat.
 - **Add a VM to the fleet.** Module 12 covers OpenShift Virtualization on managed clusters. The stretch is to install CNV via a Policy on the spoke, deploy one small RHEL 9 VirtualMachine via the same ApplicationSet pattern this capstone uses for Pods, and watch a unified fleet view that includes both. See [Module 12 — OpenShift Virtualization](/learn/acm-multicluster/openshift-virtualization).
@@ -487,7 +487,7 @@ Thirteen modules in:
 - You have done the whole stack end-to-end on one spoke (this module).
 - You know how to extend the same fleet to virtual-machine workloads when the BFSI estate hands you Windows guests or vendor-shipped VMs (Module 12, optional).
 
-This track is the foundation. The operational depth — the on-call runbooks, the GitOps repository conventions, the per-tenant onboarding workflows — lives in the lab's own platform docs. Start at [`/docs/openshift-platform/acm-multicluster/`](/docs/openshift-platform/acm-multicluster) and work outward.
+This track is the foundation. The operational depth — the on-call runbooks, the GitOps repository conventions, the per-tenant onboarding workflows — lives in the lab's own platform docs. Start at [`/docs/openshift-platform/openshift-platform/acm-multicluster/`](/docs/openshift-platform/openshift-platform/acm-multicluster) and work outward.
 
 The fleet you built in this capstone is a sandbox. The fleet a real platform team runs is a hundred times more nuanced — tenant isolation, change-control gates, audit trails, multi-DC failover, the long tail of policy exceptions. But the shape is the same. ACM gives you one place to see the whole fleet, one place to enforce baselines, one place to ship apps, and one place to recover from a disaster. The work after this is filling that shape with the specifics of your environment.
 

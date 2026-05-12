@@ -115,7 +115,7 @@ Predicates are label selectors. Common shapes:
 
 ACM auto-labels managed clusters with `vendor`, `cloud`, `region`, `openshiftVersion`, and a few others. You add your own (`env`, `role`, `compliance`, `feature=experimental`) as flat-key labels on the `ManagedCluster` resource.
 
-The lab today runs one spoke, so its primary ApplicationSet has a trivial Placement that matches `cluster=spoke-dc-v6` and emits exactly one decision. See `/docs/openshift-platform/gitops-operating-model/application-and-applicationset/` for the actual definition. The shape is identical to a fleet of fifty — the predicate just gets more selective.
+The lab today runs one spoke, so its primary ApplicationSet has a trivial Placement that matches `cluster=spoke-dc-v6` and emits exactly one decision. See `/docs/openshift-platform/openshift-platform/gitops-operating-model/application-and-applicationset/` for the actual definition. The shape is identical to a fleet of fifty — the predicate just gets more selective.
 
 <Whiteboard client:load data={{ nodes: fanoutNodes, edges: fanoutEdges }} height={420} />
 
@@ -139,13 +139,13 @@ ApplicationSet does not have promotion semantics. It fans out *the same Applicat
 
 The pattern that works: your **app-repo** holds kustomize overlays per environment, each pinned to a specific image digest. The ApplicationSet's `path` parameter changes per environment, so `env=dev` clusters get `overlays/dev`, `env=prd` clusters get `overlays/prd`. Promotion = a PR to the app repo that bumps the prd overlay to the digest currently running in stg.
 
-See `/docs/application-delivery/build-paths/build-once-promote-by-digest/` for how the lab wires this. The short version: CI builds once, tags an image digest, opens a PR to bump the next env's overlay to that digest, a human approves the PR, ArgoCD reconciles.
+See `/docs/openshift-platform/application-delivery/build-paths/build-once-promote-by-digest/` for how the lab wires this. The short version: CI builds once, tags an image digest, opens a PR to bump the next env's overlay to that digest, a human approves the PR, ArgoCD reconciles.
 
 ## Sync waves and dependencies
 
 Argo's `argocd.argoproj.io/sync-wave` annotation orders manifests within a single Application sync. Lower wave numbers go first. Managed-cluster Applications inherit this — when the spoke's Argo reconciles, it respects the same waves.
 
-The lab's documented convention (`/docs/openshift-platform/gitops-operating-model/sync-wave-conventions/`) reserves:
+The lab's documented convention (`/docs/openshift-platform/openshift-platform/gitops-operating-model/sync-wave-conventions/`) reserves:
 
 - **Wave 1** — cert-manager, namespace setup.
 - **Wave 2** — External Secrets Operator (ESO).
@@ -310,8 +310,8 @@ The spoke runs its own `openshift-gitops` (the pull-model agent). It receives Ap
 - Argo CD ApplicationSet generators — `https://argo-cd.readthedocs.io/en/stable/operator-manual/applicationset/Generators/`
 - Argo CD sync waves and resource hooks — `https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/`
 - Open Cluster Management Placement API — `https://open-cluster-management.io/concepts/placement/`
-- Lab — `/docs/openshift-platform/gitops-operating-model/application-and-applicationset/`
-- Lab — `/docs/openshift-platform/gitops-operating-model/sync-wave-conventions/`
-- Lab — `/docs/application-delivery/build-paths/build-once-promote-by-digest/`
+- Lab — `/docs/openshift-platform/openshift-platform/gitops-operating-model/application-and-applicationset/`
+- Lab — `/docs/openshift-platform/openshift-platform/gitops-operating-model/sync-wave-conventions/`
+- Lab — `/docs/openshift-platform/application-delivery/build-paths/build-once-promote-by-digest/`
 
 **Next:** [Module 07 — Observability and Search](/learn/acm-multicluster/observability-and-search) covers what to do once Applications are landing on many clusters and you want one screen to see them all.

@@ -80,7 +80,7 @@ ACM ships a bundled operator called **cluster-backup**. It is OADP under the hoo
 - **acm-resources-schedule** — the ACM CRs and the policy and application objects.
 - **acm-managed-clusters-schedule** — the registration data needed to re-establish spoke connections after a restore.
 
-For the lab's enable/disable runbook, see [`/docs/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/acm-multicluster/acm-cluster-backup).
+For the lab's enable/disable runbook, see [`/docs/openshift-platform/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/openshift-platform/acm-multicluster/acm-cluster-backup).
 
 It is **disabled** on hub-dc-v6 today. The doc explains why — the lab is single-DC and the restore target (hub-dr-v6) has not been built yet — but the operator itself is a 30-second install once the DR pair lands.
 
@@ -95,7 +95,7 @@ The two failure modes that always bite:
 - **You forgot the OpenShift plugin.** Vanilla Velero does not know about `Route`, `ImageStream`, `BuildConfig`, or `SecurityContextConstraints`. The `velero-plugin-for-openshift` plugin teaches it; without it, your backup is missing the OpenShift-specific surface.
 - **You forgot CSI snapshotting.** Without `EnableCSI` set and a `VolumeSnapshotLocation`, Velero falls back to file-by-file restic copies of PVs. That works but is slow and brittle on large volumes. CSI snapshots are atomic, fast, and the only reasonable choice for stateful workloads.
 
-For the lab's install recipe and the `DataProtectionApplication` pattern, see [`/docs/openshift-platform/backup-oadp/operator-install/`](/docs/openshift-platform/backup-oadp/operator-install).
+For the lab's install recipe and the `DataProtectionApplication` pattern, see [`/docs/openshift-platform/openshift-platform/backup-oadp/operator-install/`](/docs/openshift-platform/openshift-platform/backup-oadp/operator-install).
 
 ## The picture
 
@@ -132,7 +132,7 @@ Pick targets first, then verify the tooling supports them. Defaults that are san
 | PV data (databases, queues) | 1 hour | 1 to several hours (volume copy time) |
 | Object storage itself | governed by storage replication | depends on cross-region setup |
 
-For a BFSI-scoped tenant the bar is higher: **RPO &lt;= 15 minutes, RTO &lt;= 4 hours**. That changes the design — hub backups have to run every 15 minutes, the DR pair has to be warm (a running OCP cluster that periodically `oc apply`s the latest backup, even if it is not the active hub), and the object store has to be cross-region replicated. See the BFSI scoring at [`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review) for the full criteria.
+For a BFSI-scoped tenant the bar is higher: **RPO &lt;= 15 minutes, RTO &lt;= 4 hours**. That changes the design — hub backups have to run every 15 minutes, the DR pair has to be warm (a running OCP cluster that periodically `oc apply`s the latest backup, even if it is not the active hub), and the object store has to be cross-region replicated. See the BFSI scoring at [`/docs/openshift-platform/foundations/bfsi-readiness-review/`](/docs/openshift-platform/foundations/bfsi-readiness-review) for the full criteria.
 
 The mistake to avoid is **declaring RPO and RTO based on what you wish the tooling could do**. Run a real drill; measure; adjust the targets to the truth.
 
@@ -193,11 +193,11 @@ A practiced restore on a small fleet runs 30–60 minutes. Under pressure for th
 
 ### The init-bundle gotcha
 
-RHACS init-bundles are time-limited credentials — one year is the convention. After restoring from a backup older than the bundle's expiry, every sensor with an expired bundle fails to reconnect. Symptom: TLS handshake failures in `oc -n stackrox logs deploy/sensor`; the SecuredCluster CR on the spoke shows `Unhealthy`. The fix is the same flow as fresh onboarding: regenerate via the Central API, materialise through Vault and ESO into each spoke's `stackrox` namespace, let the sensor pick up the new cert. See the lab's [init-bundle-via-ESO documentation](/docs/openshift-platform/security/init-bundle-via-eso). Document this as load-bearing — the first instinct after a restore is to blame the network; it's usually the bundles.
+RHACS init-bundles are time-limited credentials — one year is the convention. After restoring from a backup older than the bundle's expiry, every sensor with an expired bundle fails to reconnect. Symptom: TLS handshake failures in `oc -n stackrox logs deploy/sensor`; the SecuredCluster CR on the spoke shows `Unhealthy`. The fix is the same flow as fresh onboarding: regenerate via the Central API, materialise through Vault and ESO into each spoke's `stackrox` namespace, let the sensor pick up the new cert. See the lab's [init-bundle-via-ESO documentation](/docs/openshift-platform/openshift-platform/security/init-bundle-via-eso). Document this as load-bearing — the first instinct after a restore is to blame the network; it's usually the bundles.
 
 ### The lab's posture
 
-RHACS Central runs on `hub-dc-v6` in the `stackrox` namespace. Scheduled backup is **not yet wired** — the same MinIO and DR work that gates ACM cluster-backup gates this. The path forward is a backup integration pointed at MinIO with a daily cron, plus a second-DC replication target when that infrastructure lands. The hub-restore runbook needs an explicit *"restore RHACS Central"* step, after the ACM control plane is back and before the SecuredClusters are expected to reconnect. For credential rotation, see [/docs/operations/routine-tasks/rotate-rhacs-central-admin/](/docs/operations/routine-tasks/rotate-rhacs-central-admin) — the Vault+ESO custody flow that handles the admin password handles the backup-destination credentials too.
+RHACS Central runs on `hub-dc-v6` in the `stackrox` namespace. Scheduled backup is **not yet wired** — the same MinIO and DR work that gates ACM cluster-backup gates this. The path forward is a backup integration pointed at MinIO with a daily cron, plus a second-DC replication target when that infrastructure lands. The hub-restore runbook needs an explicit *"restore RHACS Central"* step, after the ACM control plane is back and before the SecuredClusters are expected to reconnect. For credential rotation, see [/docs/openshift-platform/operations/routine-tasks/rotate-rhacs-central-admin/](/docs/openshift-platform/operations/routine-tasks/rotate-rhacs-central-admin) — the Vault+ESO custody flow that handles the admin password handles the backup-destination credentials too.
 
 ### References
 
@@ -209,12 +209,12 @@ RHACS Central runs on `hub-dc-v6` in the `stackrox` namespace. Scheduled backup 
 
 Pragmatically, where the lab is today:
 
-- **ACM cluster-backup is disabled on hub-dc-v6.** It will be enabled when the DR pair is built. The runbook in [`/docs/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/acm-multicluster/acm-cluster-backup) walks through the enable.
+- **ACM cluster-backup is disabled on hub-dc-v6.** It will be enabled when the DR pair is built. The runbook in [`/docs/openshift-platform/openshift-platform/acm-multicluster/acm-cluster-backup/`](/docs/openshift-platform/openshift-platform/acm-multicluster/acm-cluster-backup) walks through the enable.
 - **OADP is installed on spoke-dc-v6** with a `DataProtectionApplication` CR pointing at the lab's MinIO. It is exercised periodically for the workloads that have real PVs.
-- **hub-dr-v6** is reserved in the fleet design but not yet provisioned. It is the planned restore target. See [`/docs/architecture-decisions/adr-0022-v6-fleet-purge/`](/docs/architecture-decisions/adr-0022-v6-fleet-purge) for the architectural decision.
+- **hub-dr-v6** is reserved in the fleet design but not yet provisioned. It is the planned restore target. See [`/docs/openshift-platform/architecture-decisions/adr-0022-v6-fleet-purge/`](/docs/openshift-platform/architecture-decisions/adr-0022-v6-fleet-purge) for the architectural decision.
 - **MinIO is single-instance** on a dedicated VM. Adequate for the lab; the replication work to a second DC's object store is tracked separately.
 
-The BFSI readiness review rates DR as 🔴 High — the missing DR pair is the load-bearing gap. See [`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review).
+The BFSI readiness review rates DR as 🔴 High — the missing DR pair is the load-bearing gap. See [`/docs/openshift-platform/foundations/bfsi-readiness-review/`](/docs/openshift-platform/foundations/bfsi-readiness-review).
 
 ## Try this
 
@@ -256,7 +256,7 @@ The BFSI readiness review rates DR as 🔴 High — the missing DR pair is the l
 
 ## BFSI cross-link
 
-The BFSI readiness review treats DR as a **🔴 High** risk so long as the reserved DR pair (hub-dr-v6) is not built. The criteria are spelled out at [`/docs/foundations/bfsi-readiness-review/`](/docs/foundations/bfsi-readiness-review). Until then, the lab's posture is single-DC with rebuild-from-GitOps as the fallback — adequate for a lab, not adequate for a regulated tenant.
+The BFSI readiness review treats DR as a **🔴 High** risk so long as the reserved DR pair (hub-dr-v6) is not built. The criteria are spelled out at [`/docs/openshift-platform/foundations/bfsi-readiness-review/`](/docs/openshift-platform/foundations/bfsi-readiness-review). Until then, the lab's posture is single-DC with rebuild-from-GitOps as the fallback — adequate for a lab, not adequate for a regulated tenant.
 
 ## References
 
