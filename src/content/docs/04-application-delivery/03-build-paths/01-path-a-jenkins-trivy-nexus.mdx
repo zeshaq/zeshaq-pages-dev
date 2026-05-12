@@ -113,7 +113,7 @@ The build agent is a single, long-running VM with warm caches:
 
 - Maven local repo (`~/.m2/repository`) — saves 30-90 seconds per Liberty/Spring build.
 - Buildah layer cache — saves UBI base layer downloads.
-- `/opt/claude-agent/scripts/` checkout — provides `update-overlay-digest.sh` and `promote.sh`.
+- `/opt/ops-workspace/scripts/` checkout — provides `update-overlay-digest.sh` and `promote.sh`.
 
 For builds that benefit from the warm cache (Liberty + Maven, Spring Boot + Maven, Node.js + npm), Path A is faster cold-to-cold than a fresh Tekton pod. For builds that elastically scale across many cluster nodes, Path B's per-build pod model wins. The choice is captured in the [decision matrix](./06-path-decision-matrix).
 
@@ -129,14 +129,14 @@ For builds that benefit from the warm cache (Liberty + Maven, Spring Boot + Mave
 | Skopeo | 1.13.3 | Registry inspection (`skopeo inspect` to verify pushed digest) |
 | Trivy | 0.70.0 | Scan client, server mode against the Trivy VM |
 | MinIO client (`mc`) | recent stable | Evidence upload |
-| `claude-agent/scripts/update-overlay-digest.sh` | versioned by repo HEAD | Overlay patch |
-| `claude-agent/scripts/promote.sh` | versioned by repo HEAD | Dev → stg → prd promotion |
+| `ops-workspace/scripts/update-overlay-digest.sh` | versioned by repo HEAD | Overlay patch |
+| `ops-workspace/scripts/promote.sh` | versioned by repo HEAD | Dev → stg → prd promotion |
 
 Skopeo presence was rechecked on 2026-05-09 and is at `/usr/bin/skopeo`. Trivy server URL is fronted by HAProxy on the Trivy VM.
 
 ## Credentials
 
-All credentials referenced below live in the Jenkins credential store at `https://jenkins.apps.sub.comptech-lab.com/credentials/`. Local custody copies live under `codex-opp-agent/secrets/jenkins/` (Git-ignored). Do not paste values into this file, into tickets, or into chat.
+All credentials referenced below live in the Jenkins credential store at `https://jenkins.apps.sub.comptech-lab.com/credentials/`. Local custody copies live under `opp-full-plat/secrets/jenkins/` (Git-ignored). Do not paste values into this file, into tickets, or into chat.
 
 | Credential ID | Type | Owner | Scope | Used for |
 |---|---|---|---|---|
@@ -154,12 +154,12 @@ The OCP-targeting Jenkins pipeline has eight user-visible stages plus a `post {}
 
 ### 1. Prepare Workspace
 
-Verifies `podman`, `skopeo`, `trivy`, `mc`, and the `claude-agent` script set are present on the agent. Sets `XDG_RUNTIME_DIR` to a workspace-local directory so rootless Podman doesn't fight with other concurrent users on the agent.
+Verifies `podman`, `skopeo`, `trivy`, `mc`, and the `ops-workspace` script set are present on the agent. Sets `XDG_RUNTIME_DIR` to a workspace-local directory so rootless Podman doesn't fight with other concurrent users on the agent.
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `podman system info` fails | `XDG_RUNTIME_DIR` missing or wrong perms | The stage runs `install -d -m 0700 $WORKSPACE/.xdg-runtime`; persistent failure points at agent-side Podman corruption (rebuild or reinstall). |
-| `claude-agent/scripts/update-overlay-digest.sh missing` | `/opt/claude-agent` checkout absent or stale | SSH to the agent, `git clone https://github.com/zeshaq/claude-agent.git /opt/claude-agent` (or `git -C /opt/claude-agent pull`). |
+| `ops-workspace/scripts/update-overlay-digest.sh missing` | `/opt/ops-workspace` checkout absent or stale | SSH to the agent, `git clone https://github.com/zeshaq/ops-workspace.git /opt/ops-workspace` (or `git -C /opt/ops-workspace pull`). |
 
 ### 2. Checkout App Source
 
@@ -188,7 +188,7 @@ Loads `lib/build-<LANGUAGE>.groovy` from the shared library and runs the languag
 | `no Containerfile/Dockerfile in repo root` | Tenant repo missing build recipe | Tenant fix: add `Containerfile` at repo root that `FROM`s a base hosted on `docker-group.*`. |
 | Maven artifact resolution fails | Maven `settings.xml` points outside lab Nexus group | Use lab `settings.xml` template from `examples/app-repo-template/`. |
 | npm registry timeout | npm not pointed at lab proxy | Tenant fix: `npm config set registry https://npm-group.apps.sub.comptech-lab.com/` or commit `.npmrc`. |
-| Language lib not found | Tenant repo didn't vendor shared library and `/opt/claude-agent` doesn't have sibling `codex-opp-agent/` checkout | Operator: clone `codex-opp-agent` next to `claude-agent` on the agent. |
+| Language lib not found | Tenant repo didn't vendor shared library and `/opt/ops-workspace` doesn't have sibling `opp-full-plat/` checkout | Operator: clone `opp-full-plat` next to `ops-workspace` on the agent. |
 
 ### 5. Trivy Scan Gate
 
@@ -236,7 +236,7 @@ The schema is codified in `ci-evidence-schema.md` (DEV-OCP-3.7, #195) and is ide
 Clones the app monorepo, invokes:
 
 ```bash
-claude-agent/scripts/update-overlay-digest.sh \
+ops-workspace/scripts/update-overlay-digest.sh \
   team-<TEAM> <APP> <env> <digest>
 ```
 
@@ -254,7 +254,7 @@ and pushes the commit `bump: team-<TEAM>/<APP> <env> @<sha256-short>` to `APP_MO
 Runs only when both `PROMOTE_FROM` and `PROMOTE_TO` are set on the build. Reuses the clone from stage 8, invokes:
 
 ```bash
-claude-agent/scripts/promote.sh \
+ops-workspace/scripts/promote.sh \
   team-<TEAM> <APP> <PROMOTE_FROM> <PROMOTE_TO>
 ```
 

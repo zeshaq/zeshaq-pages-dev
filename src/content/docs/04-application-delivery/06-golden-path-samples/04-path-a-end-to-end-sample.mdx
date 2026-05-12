@@ -50,7 +50,7 @@ It exercises:
 - `update-overlay-digest.sh` to patch the `apps/team-platform/liberty-hello/overlays/dev/kustomization.yaml` digest field, commit, push to a branch, and open an MR via the GitLab API.
 - The platform `ApplicationSet` picks up the merged MR; hub Argo wraps a `ManifestWork`; spoke Argo pulls and reconciles.
 
-Per [issue #202 (DEV-OCP-5.3)](https://github.com/zeshaq/codex-opp-agent/issues/202).
+Per [issue #202 (DEV-OCP-5.3)](https://github.com/zeshaq/opp-full-plat/issues/202).
 
 ## Timing breakdown
 
@@ -104,14 +104,14 @@ platform-apps-monorepo/                   # tenant overlay repo
 
 The tenant's `Jenkinsfile` derives from `templates/jenkinsfiles/liberty-app.Jenkinsfile`. Stages:
 
-1. **Prepare Workspace** — verifies podman, skopeo, trivy, mc, and `claude-agent` scripts are present.
+1. **Prepare Workspace** — verifies podman, skopeo, trivy, mc, and `ops-workspace` scripts are present.
 2. **Checkout App Source** — `checkout scm` on the GitLab project.
 3. **Registry Login** — `podman login` to `docker-group.*` (pull) and `app-registry.*` (push), using `nexus-jenkinsbot` credential.
 4. **Build Image** — `podman build` with `BASE_IMAGE_REGISTRY=docker-group.apps.sub.comptech-lab.com`.
 5. **Trivy Scan Gate** — `trivy image --server $TRIVY_SERVER_URL --severity CRITICAL --exit-code 1`. Build fails on any CRITICAL; HIGH is warning only.
 6. **Push to Nexus** — `podman push $APP_IMAGE_REGISTRY/$TEAM/$APP:build-$BUILD_NUMBER` and capture digest with `skopeo inspect`.
 7. **Upload Evidence** — `mc cp build.log sbom.spdx.json trivy-scan.json image-digest.txt minio/developer-ci-evidence/$TEAM/$APP/$GIT_SHA/`.
-8. **Patch Overlay** — clone `platform-apps-monorepo`, run `/opt/claude-agent/scripts/update-overlay-digest.sh team-platform liberty-hello dev <digest>`, commit, push to branch `ci/dev/<short-sha>`, open MR via GitLab API.
+8. **Patch Overlay** — clone `platform-apps-monorepo`, run `/opt/ops-workspace/scripts/update-overlay-digest.sh team-platform liberty-hello dev <digest>`, commit, push to branch `ci/dev/<short-sha>`, open MR via GitLab API.
 
 Full Jenkinsfile lives at `developer-handbook/examples/jenkins/Jenkinsfile.nexus-app` and is the starting template tenants adapt.
 
@@ -232,8 +232,8 @@ The cross-path parity (evidence schema, Trivy policy, overlay-patch convention) 
 ## References
 
 - Issue #202 (DEV-OCP-5.3) — sample closure.
-- `codex-opp-agent/connection-details/jenkins-ocp-path.md` — Path-A operator reference.
-- `codex-opp-agent/connection-details/build-path-matrix.md` — Path A vs Path B decision matrix.
-- `codex-opp-agent/connection-details/ci-evidence-schema.md` — cross-path evidence parity.
-- `codex-opp-agent/connection-details/promotion-model.md` — build-once / promote-by-digest.
+- `opp-full-plat/connection-details/jenkins-ocp-path.md` — Path-A operator reference.
+- `opp-full-plat/connection-details/build-path-matrix.md` — Path A vs Path B decision matrix.
+- `opp-full-plat/connection-details/ci-evidence-schema.md` — cross-path evidence parity.
+- `opp-full-plat/connection-details/promotion-model.md` — build-once / promote-by-digest.
 - `developer-handbook/examples/jenkins/Jenkinsfile.nexus-app` — starting Jenkinsfile.

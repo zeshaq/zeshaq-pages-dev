@@ -6,7 +6,7 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-The contract codified at `codex-opp-agent/connection-details/app-repo-contract.md` (DEV-OCP-2.1, issue #182) defines the **exact** shape a tenant repo MUST take so that:
+The contract codified at `opp-full-plat/connection-details/app-repo-contract.md` (DEV-OCP-2.1, issue #182) defines the **exact** shape a tenant repo MUST take so that:
 
 - The platform `ApplicationSet` git-generator can discover overlays without per-app configuration.
 - Jenkins (Path A) and Tekton (Path B) can write image-digest patches into per-env overlays.
@@ -227,7 +227,7 @@ CI (Jenkins Path A or Tekton Path B) ends every successful build with a step tha
 4. Commits `bump: <team>/<app> dev @<sha256-short>` and pushes to a branch like `ci/dev/<short-sha>`.
 5. Opens an MR / PR into `main`.
 
-The script lives at [`claude-agent/scripts/update-overlay-digest.sh`](https://github.com/zeshaq/claude-agent/blob/main/scripts/update-overlay-digest.sh). It is idempotent: running it twice with the same digest produces no second commit.
+The script lives at [`ops-workspace/scripts/update-overlay-digest.sh`](https://github.com/zeshaq/ops-workspace/blob/main/scripts/update-overlay-digest.sh). It is idempotent: running it twice with the same digest produces no second commit.
 
 The exact change applied:
 
@@ -312,7 +312,7 @@ A green lint is necessary but not sufficient — the spoke's admission policy st
 
 ```bash
 # Lint the whole monorepo (run from the repo root).
-bash /opt/claude-agent/scripts/app-repo-lint.sh
+bash /opt/ops-workspace/scripts/app-repo-lint.sh
 
 # Render a single overlay for review.
 kustomize build apps/team-platform/liberty-hello/overlays/dev
@@ -342,16 +342,16 @@ kustomize build apps/team-platform/liberty-hello/overlays/prd \
 A copy-paste starting point lives at:
 
 ```
-codex-opp-agent/examples/app-repo-template/
+opp-full-plat/examples/app-repo-template/
 ```
 
 See its `README.md` for the customisation recipe. The Liberty hello-world sample [04 — Path-A end-to-end](../06-golden-path-samples/04-path-a-end-to-end-sample) walks through onboarding a new app from that template, end to end.
 
 ## References
 
-- `codex-opp-agent/connection-details/app-repo-contract.md` (issue #182, DEV-OCP-2.1)
-- `codex-opp-agent/connection-details/image-digest-overlay.md` (issue #185, DEV-OCP-2.4)
-- `codex-opp-agent/connection-details/promotion-model.md` (issue #184, DEV-OCP-2.3)
-- `codex-opp-agent/adr/0014-developer-readiness-platform-contract.md`
-- `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md`
+- `opp-full-plat/connection-details/app-repo-contract.md` (issue #182, DEV-OCP-2.1)
+- `opp-full-plat/connection-details/image-digest-overlay.md` (issue #185, DEV-OCP-2.4)
+- `opp-full-plat/connection-details/promotion-model.md` (issue #184, DEV-OCP-2.3)
+- `opp-full-plat/adr/0014-developer-readiness-platform-contract.md`
+- `opp-full-plat/adr/0019-nexus-only-image-supply-chain.md`
 - Kustomize `images:` reference — `kustomize.config.k8s.io/v1beta1/Kustomization`.

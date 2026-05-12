@@ -51,7 +51,7 @@ The diagram reads left → right by ADR. Red (active) and amber (standby) on the
 
 ## Pre-v6: the four-cluster fleet (ADR 0001)
 
-ADR 0001 was accepted **2026-05-04**. It defined the operator workspace at `/home/ze/codex-opp-agent` and named the fleet:
+ADR 0001 was accepted **2026-05-04**. It defined the operator workspace at `/home/ze/opp-full-plat` and named the fleet:
 
 | Cluster | Role | Notes |
 | --- | --- | --- |
@@ -87,7 +87,7 @@ This phased the work:
 1. **DR off (2026-05-08).** Active scope narrowed to `hub-dc` + `spoke-dc`. No destructive teardown.
 2. **VM platform rebuilt (2026-05-08).** Edge (PDNS + HAProxy), GitLab, MinIO, Nexus, oc-mirror, Vault, Jenkins, SigNoz, Trivy, DefectDojo, Monitoring, Redis, Kafka, WSO2, docker-runtime — all rebuilt or stood up on this day. See [Rebuild Timeline E2](/docs/08-history-and-replay/01-rebuild-timeline/#e2--vm-platform-reset-2026-05-08).
 3. **v6 fleet built (2026-05-09).** `hub-dc-v6` installed and Day-1 baseline; `spoke-dc-v6` installed and ACM-registered. The two clusters ran in parallel with the pre-v6 fleet for less than a day.
-4. **Pre-v6 purge (2026-05-10).** Issue [#156](https://github.com/zeshaq/codex-opp-agent/issues/156) OPS-V6-FLEET-1 + ADR 0022 formalized that pre-v6 names are decommissioned. `CLUSTERS.md` updated, plans updated, memory updated.
+4. **Pre-v6 purge (2026-05-10).** Issue [#156](https://github.com/zeshaq/opp-full-plat/issues/156) OPS-V6-FLEET-1 + ADR 0022 formalized that pre-v6 names are decommissioned. `CLUSTERS.md` updated, plans updated, memory updated.
 
 ## ADR 0022: the formal supersession
 
@@ -118,7 +118,7 @@ The transition was **architectural reset, not workspace reset**. The following c
 
 ### Workspace
 
-- `codex-opp-agent` workspace structure — every file under `adr/`, `plans/`, `scripts/rebuild/`, `connection-details/`, `runbooks/`, `reports/sessions/` was kept and is still authoritative.
+- `opp-full-plat` workspace structure — every file under `adr/`, `plans/`, `scripts/rebuild/`, `connection-details/`, `runbooks/`, `reports/sessions/` was kept and is still authoritative.
 - ADR 0001 itself — not modified. It is the historical anchor; only its cluster list was superseded.
 - Session-report cadence — every session under v6 still produces a timestamped report in `reports/sessions/`.
 - ASSESSMENT/CURRENT_STATE/TODO/RUNBOOK/SESSION_LOG markdown convention.
@@ -207,7 +207,7 @@ The reset wasn't only about clusters; it was also about how content is organized
 - `comptech-platform/tenant-registry/*` — tenant onboarding metadata
 - `comptech-platform/divisions/<division>/*` — per-division tenant content
 
-Role-groups (`ct-*` naming) and CODEOWNERS govern who can merge what. The full pattern is documented in `gitlab-operator-guide.md` and tracked under [#83](https://github.com/zeshaq/codex-opp-agent/issues/83) "federated GitOps architecture readiness."
+Role-groups (`ct-*` naming) and CODEOWNERS govern who can merge what. The full pattern is documented in `gitlab-operator-guide.md` and tracked under [#83](https://github.com/zeshaq/opp-full-plat/issues/83) "federated GitOps architecture readiness."
 
 ## Compliance and PCI-DSS: a feature of v6, not pre-v6
 
@@ -224,13 +224,12 @@ PCI-DSS work consumed most of 2026-05-10 and closed on 2026-05-11 — see [Rebui
 
 ADR 0022 lists the validation items. Each one was performed and is checked:
 
-- `codex-opp-agent/CLUSTERS.md` — `hub-dr` and `spoke-dr` sections removed; Active Scope updated to name `hub-dc-v6` / `spoke-dc-v6`. ✓
-- `codex-opp-agent/plans/federated-gitops-readiness-gates.md` — references to "future `hub-dr`" / "future `spoke-dr`" updated to "future `hub-dr-v6`" / "future `spoke-dr-v6`". ✓
-- ADR Index issue [#131](https://github.com/zeshaq/codex-opp-agent/issues/131) — ADR 0022 added; note on ADR 0001 that the cluster list is superseded by 0022. ✓
-- Workspace memory at `/home/ze/.claude/projects/-home-ze-claude-agent/memory/` updated to v6-only scope with explicit decommissioned-DR guard (`project_workspace_scope.md`). ✓
+- `opp-full-plat/CLUSTERS.md` — `hub-dr` and `spoke-dr` sections removed; Active Scope updated to name `hub-dc-v6` / `spoke-dc-v6`. ✓
+- `opp-full-plat/plans/federated-gitops-readiness-gates.md` — references to "future `hub-dr`" / "future `spoke-dr`" updated to "future `hub-dr-v6`" / "future `spoke-dr-v6`". ✓
+- ADR Index issue [#131](https://github.com/zeshaq/opp-full-plat/issues/131) — ADR 0022 added; note on ADR 0001 that the cluster list is superseded by 0022. ✓
 - ADR 0001 itself **not** modified — historical record preserved. ✓
 
-The day-wrap issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159) (2026-05-10) records both ADRs accepted that day: 0020 (PCI-DSS baseline) and 0022 (v6 fleet membership). Counter: 16 MRs merged to `platform-gitops` `main`, 2 MRs merged to `codex-opp-agent` `main`, 15 issues closed.
+The day-wrap issue [#159](https://github.com/zeshaq/opp-full-plat/issues/159) (2026-05-10) records both ADRs accepted that day: 0020 (PCI-DSS baseline) and 0022 (v6 fleet membership). Counter: 16 MRs merged to `platform-gitops` `main`, 2 MRs merged to `opp-full-plat` `main`, 15 issues closed.
 
 ## What the transition cost
 
@@ -247,11 +246,10 @@ Some practical residue is worth being explicit about:
 - ADR 0022 — v6 fleet membership (the formal supersession)
 - ADR 0023 — federated GitLab group/repo ownership
 - ADR 0024 — OpenShift-only platform-gitops boundary
-- Issue [#156](https://github.com/zeshaq/codex-opp-agent/issues/156) OPS-V6-FLEET-1 — the purge work
-- Issue [#131](https://github.com/zeshaq/codex-opp-agent/issues/131) — ADR Index (carries the supersession note on 0001)
-- Issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159) — 2026-05-10 day wrap (records both ADRs accepted that day)
+- Issue [#156](https://github.com/zeshaq/opp-full-plat/issues/156) OPS-V6-FLEET-1 — the purge work
+- Issue [#131](https://github.com/zeshaq/opp-full-plat/issues/131) — ADR Index (carries the supersession note on 0001)
+- Issue [#159](https://github.com/zeshaq/opp-full-plat/issues/159) — 2026-05-10 day wrap (records both ADRs accepted that day)
 - `reports/sessions/20260508-090555-descope-dr-clusters.md` — DR de-scope record
 - `reports/sessions/20260509-080024-hub-dc-v6-boot-install-complete.md` — v6 hub install
 - `reports/sessions/20260509-152004-developer-handbook-dh9-refresh.md` (and the spoke install report from the same day) — v6 spoke install
-- Memory `project_workspace_scope.md` — v6-only scope; pre-v6 DR decommissioned
-- `codex-opp-agent/CLUSTERS.md` — current fleet inventory
+- `opp-full-plat/CLUSTERS.md` — current fleet inventory

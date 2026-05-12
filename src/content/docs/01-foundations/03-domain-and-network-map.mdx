@@ -70,7 +70,7 @@ The platform's public DNS plane is **`sub.comptech-lab.com`**. Two derived wildc
 
 The wildcard certificate strategy mirrors the wildcard hostnames. There is one Let's Encrypt wildcard for `*.apps.sub.comptech-lab.com` (used by HAProxy at `127.0.0.1:8443` for VM-side TLS termination), and one wildcard for `*.mon.sub.comptech-lab.com` (the monitoring track), both renewed via `acme.sh --dns dns_pdns` from the PowerDNS VM since the lab is internet-disconnected for inbound traffic and the DNS-01 challenge is the only practical issuance path.
 
-The OpenShift clusters issue their own per-cluster ingress wildcards on `*.apps.<cluster>.sub.comptech-lab.com`. Those are independent of HAProxy and are terminated by the cluster's ingress controller. **HAProxy never terminates OpenShift route traffic** (memory entry `feedback_haproxy_scope.md`).
+The OpenShift clusters issue their own per-cluster ingress wildcards on `*.apps.<cluster>.sub.comptech-lab.com`. Those are independent of HAProxy and are terminated by the cluster's ingress controller. **HAProxy never terminates OpenShift route traffic.**
 
 ### Why two PowerDNS daemons on one VM
 
@@ -180,7 +180,7 @@ The mechanical steps for a new platform-VM hostname (e.g., a new tool VM `toolin
 3. **Cert:** the existing `wildcard-apps.pem` already covers anything under `*.apps.sub.comptech-lab.com`. No new cert needed.
 4. **Validate:** `dig @<recursor> tooling.apps.sub.comptech-lab.com A +short` returns the HAProxy edge; `curl -sSI https://tooling.apps.sub.comptech-lab.com/` returns the backend's response.
 
-For a `*.mon.sub.comptech-lab.com` hostname the pattern is slightly different — five rule additions across SNI rule, vm-tls host-header → backend, public-apps-http redirect ACL, vm-tls deny-unless ACL, plus the new backend if needed — because the monitoring wildcard is loaded on a separate cert and HAProxy needs explicit SNI rules to pick the right certificate at the loopback termination. The memory entry `reference_lab_infrastructure.md` documents the five-spot mirror procedure.
+For a `*.mon.sub.comptech-lab.com` hostname the pattern is slightly different — five rule additions across SNI rule, vm-tls host-header → backend, public-apps-http redirect ACL, vm-tls deny-unless ACL, plus the new backend if needed — because the monitoring wildcard is loaded on a separate cert and HAProxy needs explicit SNI rules to pick the right certificate at the loopback termination.
 
 ## Common DNS/edge failure modes
 
@@ -205,7 +205,6 @@ If either VM is lost the lab degrades hard. The operating model treats both as c
 
 ## References
 
-- Memory: `reference_lab_infrastructure.md`, `reference_haproxy_vm.md`, `reference_pdns_vm.md`, `feedback_haproxy_scope.md`
 - `connection-details/platform-admin-handoff.md` (private) — network details table, cluster API/ingress VIPs
 - `connection-details/nexus.md` (private) — three-endpoint DNS records
 - `adr/0019-nexus-only-image-supply-chain.md` — runtime registry hostname allowlist

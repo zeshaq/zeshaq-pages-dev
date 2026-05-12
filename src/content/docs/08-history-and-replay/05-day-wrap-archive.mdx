@@ -6,12 +6,12 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-This page is the chronological index of **session-closeout** records — the auditable handoff trail that lets the next operator (human or agent) resume work without reading chat history. The cadence has two layers:
+This page is the chronological index of **session-closeout** records — the auditable handoff trail that lets the next operator resume work without reading chat history. The cadence has two layers:
 
-1. **Per-session reports** under `codex-opp-agent/reports/sessions/<timestamp>-<slug>.md`. Every non-trivial session produces one. The `scripts/close-session.sh <slug>` helper creates a timestamped stub; the operator fills it before final handoff.
+1. **Per-session reports** under `opp-full-plat/reports/sessions/<timestamp>-<slug>.md`. Every non-trivial session produces one. The `scripts/close-session.sh <slug>` helper creates a timestamped stub; the operator fills it before final handoff.
 2. **Day-wrap issues** on GitHub when the day's work warrants a roll-up summary (multiple operators installed, multiple ADRs accepted, large number of MRs merged). These reference the underlying per-session reports.
 
-The day-wrap convention itself was set during the 2026-05-05 → 2026-05-09 window (session-routines + session-closeout patterns appeared on 2026-05-05 and 2026-05-08). The most explicit roll-up — `Session 2026-05-10: day wrap` — is [issue #159](https://github.com/zeshaq/codex-opp-agent/issues/159).
+The day-wrap convention itself was set during the 2026-05-05 → 2026-05-09 window (session-routines + session-closeout patterns appeared on 2026-05-05 and 2026-05-08). The most explicit roll-up — `Session 2026-05-10: day wrap` — is [issue #159](https://github.com/zeshaq/opp-full-plat/issues/159).
 
 This page is the **index**, not the content. Each entry links to the underlying record. Per the workspace boundary rule, the linked records may discuss internal IPs and credentials in their full form; the published index avoids restating those.
 
@@ -33,7 +33,7 @@ This page is the **index**, not the content. Each entry links to the underlying 
 
 ## 2026-05-10 — the big day-wrap
 
-[**Issue #159 — Session 2026-05-10: day wrap — 7 operators, 16 MRs, 15 issues closed, 2 ADRs**](https://github.com/zeshaq/codex-opp-agent/issues/159)
+[**Issue #159 — Session 2026-05-10: day wrap — 7 operators, 16 MRs, 15 issues closed, 2 ADRs**](https://github.com/zeshaq/opp-full-plat/issues/159)
 
 Headline numbers:
 
@@ -41,7 +41,7 @@ Headline numbers:
 | --- | --- |
 | Operators installed end-to-end | 7 (Compliance, OADP, cert-manager × 2 clusters, FIO, SPO, CSO) |
 | MRs merged to `platform-gitops` `main` | 16 |
-| MRs merged to `codex-opp-agent` `main` | 2 (ADR 0020, ADR 0022 + pre-v6 purge) |
+| MRs merged to `opp-full-plat` `main` | 2 (ADR 0020, ADR 0022 + pre-v6 purge) |
 | Issues closed | 15 |
 | ADRs accepted | 0020 (PCI-DSS baseline), 0022 (v6 fleet membership) |
 | Project board [#10](https://github.com/users/zeshaq/projects/10) cards moved to Validated | 6 of 22 |
@@ -220,7 +220,7 @@ These early days set up the workspace conventions and assessed the pre-v6 fleet.
 
 Every entry above is backed by either an issue, a session report, or both. The general pattern:
 
-- **GitHub issues** (`https://github.com/zeshaq/codex-opp-agent/issues/<N>`) carry the durable decision, the MR refs, the gate criteria, and the closeout comment.
+- **GitHub issues** (`https://github.com/zeshaq/opp-full-plat/issues/<N>`) carry the durable decision, the MR refs, the gate criteria, and the closeout comment.
 - **Session reports** (`reports/sessions/<timestamp>-<slug>.md`) carry the live commands, validation output, files-changed lists, residual risks, and next steps. These are the operator-facing detail.
 - **`SESSION_LOG.md`** carries a one-paragraph summary per session and is the chronological flat file.
 - **`CURRENT_STATE.md`** is the "fast resume" snapshot. It is rewritten at the top of each session; older content moves down. The very top is always the latest session's headline.
@@ -232,18 +232,16 @@ The day-wrap pattern (a GitHub issue summarizing the day) is reserved for days t
 
 Three operational reasons:
 
-1. **Resume without chat.** The next operator (human or agent) starts a session by reading `CURRENT_STATE.md`, `TODO.md`, the latest few session reports, and any open day-wrap issue. They never need to read chat transcripts to know where work left off.
-2. **Audit trail for the framework.** Site Replication Readiness (REP-7) is the dry-run gate; the day-wrap archive is the contemporaneous record that any "ask Claude" moments during a replay are framework gaps, not historical noise.
+1. **Resume without chat.** The next operator starts a session by reading `CURRENT_STATE.md`, `TODO.md`, the latest few session reports, and any open day-wrap issue. They never need to read chat transcripts to know where work left off.
+2. **Audit trail for the framework.** Site Replication Readiness (REP-7) is the dry-run gate; the day-wrap archive is the contemporaneous record that any ad-hoc lookups during a replay are framework gaps, not historical noise.
 3. **PCI-DSS / compliance evidence.** Closeout records carry "no secrets printed," "live changes vs read-only," "files changed," "follow-ups created" — exactly the audit trail PCI-DSS reviewers expect when reconstructing how a control was put in place.
 
 ## References
 
-- [Day-wrap issue #159](https://github.com/zeshaq/codex-opp-agent/issues/159) — Session 2026-05-10
-- `codex-opp-agent/SESSION_LOG.md` — 229 entries from 2026-05-05 to 2026-05-11
-- `codex-opp-agent/reports/sessions/` — 244 timestamped session reports
-- `codex-opp-agent/scripts/begin-session.sh` and `codex-opp-agent/scripts/close-session.sh` — the helper scripts that formalize the cadence (added 2026-05-05 18:39 UTC under `session-routines.md`)
-- `codex-opp-agent/CURRENT_STATE.md` — fast-resume snapshot
-- `codex-opp-agent/TODO.md` — next-order-of-business queue
-- `codex-opp-agent/RUNBOOK.md` — the standing operating procedures including `Session Begin Routine` and `Session Close Routine`
-- Memory `feedback_workspace_protocol.md` — read CURRENT_STATE / SESSION_LOG / TODO before non-trivial work; produce a dated session record at end
-- Memory `feedback_github_first_tracking.md` — open issue first; findings/decisions/recommendations go on issues; chat is ephemeral, GitHub is durable
+- [Day-wrap issue #159](https://github.com/zeshaq/opp-full-plat/issues/159) — Session 2026-05-10
+- `opp-full-plat/SESSION_LOG.md` — 229 entries from 2026-05-05 to 2026-05-11
+- `opp-full-plat/reports/sessions/` — 244 timestamped session reports
+- `opp-full-plat/scripts/begin-session.sh` and `opp-full-plat/scripts/close-session.sh` — the helper scripts that formalize the cadence (added 2026-05-05 18:39 UTC under `session-routines.md`)
+- `opp-full-plat/CURRENT_STATE.md` — fast-resume snapshot
+- `opp-full-plat/TODO.md` — next-order-of-business queue
+- `opp-full-plat/RUNBOOK.md` — the standing operating procedures including `Session Begin Routine` and `Session Close Routine`

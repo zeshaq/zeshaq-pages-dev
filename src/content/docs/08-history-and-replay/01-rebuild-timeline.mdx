@@ -71,7 +71,7 @@ This page is the rolled-up history of the CompTech lab rebuild. It collects ever
 | **E1 — pre-v6 fleet** | 2026-05-04 → 2026-05-08 | `hub-dc` + `spoke-dc` + `hub-dr` + `spoke-dr`; ADR 0001 baseline; push-model GitOps from `lab-gitops` | Architectural lessons (cluster naming, Argo push pain), `lab-gitops-full` repo as desired-state reference |
 | **E2 — VM platform reset** | 2026-05-08 (single intensive day) | Edge (PDNS + HAProxy) re-set; GitLab + MinIO + Nexus + oc-mirror + Vault + Jenkins + SigNoz + Trivy + DefectDojo + Monitoring + Redis + Kafka + WSO2 + docker-runtime VMs deployed | Every VM listed in [Lab Infrastructure §2](/docs/02-lab-infrastructure/) |
 | **E3 — v6 install** | 2026-05-09 | `hub-dc-v6` then `spoke-dc-v6` installed on OCP 4.20.18 from the mirror; pull-model Argo bootstrap | The active fleet today |
-| **E4 — federation + compliance** | 2026-05-10 → 2026-05-11 | Federated GitLab content model; pre-v6 purge (ADR 0022); 22-operator queue + ACM + ODF + ESO + RHACS + OADP; PCI-DSS v4 baseline ran end-to-end | Current operating state — see [CURRENT_STATE.md](https://github.com/zeshaq/codex-opp-agent/blob/main/CURRENT_STATE.md) |
+| **E4 — federation + compliance** | 2026-05-10 → 2026-05-11 | Federated GitLab content model; pre-v6 purge (ADR 0022); 22-operator queue + ACM + ODF + ESO + RHACS + OADP; PCI-DSS v4 baseline ran end-to-end | Current operating state — see [CURRENT_STATE.md](https://github.com/zeshaq/opp-full-plat/blob/main/CURRENT_STATE.md) |
 
 The rest of this page is the same story with dates, scope, outcomes, and lessons per major attempt.
 
@@ -85,7 +85,7 @@ Three horizontal lanes — **VM platform** (amber), **OpenShift fleet** (gray, b
 
 **Scope.** Earlier rebuild attempts whose only surviving artifact is `/home/ze/cloud-init/` — a folder of ~117 files including admin passwords, deploy keys, OIDC client secrets, and RKE2 join tokens.
 
-**Outcome.** Never reached a working OpenShift fleet. The artifacts are not authoritative for current state. The workspace boundary rule (see [feedback memory entry](https://github.com/zeshaq/codex-opp-agent/issues/150) — REP-6 migrated this to runbooks) forbids writing to `/home/ze/cloud-init/`; reading is allowed but every value found there is treated as historical, not current truth.
+**Outcome.** Never reached a working OpenShift fleet. The artifacts are not authoritative for current state. The workspace boundary rule (see [REP-6 issue](https://github.com/zeshaq/opp-full-plat/issues/150) — REP-6 migrated this to runbooks) forbids writing to `/home/ze/cloud-init/`; reading is allowed but every value found there is treated as historical, not current truth.
 
 **Lesson kept.** Secrets sprawl across cloud-init files is exactly what later led to:
 
@@ -254,13 +254,13 @@ See the dedicated [cloud-init scrap page](/docs/08-history-and-replay/02-failed-
 
 **Scope.** With the v6 fleet running, the focus moved to federated content, the 22-operator queue, and the PCI-DSS baseline. Two ADRs accepted: **0020 (PCI-DSS baseline)** and **0022 (v6 fleet membership)**.
 
-**2026-05-10 day-wrap (issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159)) — headline numbers:**
+**2026-05-10 day-wrap (issue [#159](https://github.com/zeshaq/opp-full-plat/issues/159)) — headline numbers:**
 
 | Metric | Count |
 | --- | --- |
 | Operators installed end-to-end | 7 (Compliance, OADP, cert-manager × 2 clusters, FIO, SPO, CSO) |
 | MRs merged to `platform-gitops` `main` | 16 |
-| MRs merged to `codex-opp-agent` `main` | 2 |
+| MRs merged to `opp-full-plat` `main` | 2 |
 | Issues closed | 15 |
 | ADRs accepted | 0020, 0022 |
 | Project board #10 cards moved to Validated | 6 of 22 |
@@ -287,7 +287,7 @@ Three things never broke and never had to be re-decided:
 
 1. **Network plane.** The `30.30.0.0/16` lab subnet allocation pattern, PDNS as the lab resolver, HAProxy as the edge for VM hosts (not for OpenShift), and the `*.sub.comptech-lab.com` DNS plane. Set in E2 and unchanged since.
 2. **Image supply chain.** Nexus for everything except OCP install mirrors (which go through `oc-mirror`). ADR 0019 codified this; ADR 0024 reinforced it; the rule has held through every rebuild attempt.
-3. **Workspace at `/home/ze/codex-opp-agent`.** The decision in ADR 0001 to maintain a local operator workspace with AGENTS.md, CLUSTERS.md, plans/, scripts/rebuild/, ADRs, and reports/sessions/ is the reason this timeline exists. Without the workspace, every rebuild attempt would have been amnesic.
+3. **Workspace at `/home/ze/opp-full-plat`.** The decision in ADR 0001 to maintain a local operator workspace with AGENTS.md, CLUSTERS.md, plans/, scripts/rebuild/, ADRs, and reports/sessions/ is the reason this timeline exists. Without the workspace, every rebuild attempt would have been amnesic.
 
 ## References
 
@@ -302,7 +302,7 @@ Three things never broke and never had to be re-decided:
 - ADR 0023 — federated GitLab group/repo ownership
 - ADR 0024 — OpenShift-only platform-gitops boundary
 - ADR 0026 — IPv6 baseline for OVN-Kubernetes
-- `codex-opp-agent/SESSION_LOG.md` — 229 entries from 2026-05-05 to 2026-05-11
-- `codex-opp-agent/reports/sessions/` — 244 timestamped session reports
-- Day-wrap issue [#159](https://github.com/zeshaq/codex-opp-agent/issues/159) — 2026-05-10 closeout
+- `opp-full-plat/SESSION_LOG.md` — 229 entries from 2026-05-05 to 2026-05-11
+- `opp-full-plat/reports/sessions/` — 244 timestamped session reports
+- Day-wrap issue [#159](https://github.com/zeshaq/opp-full-plat/issues/159) — 2026-05-10 closeout
 - Site Replication Readiness milestone (REP-0..REP-7) — see [/docs/08-history-and-replay/04-site-replication-readiness/](/docs/08-history-and-replay/04-site-replication-readiness/)

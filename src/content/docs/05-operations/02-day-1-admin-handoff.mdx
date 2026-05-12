@@ -8,13 +8,13 @@ draft: false
 
 This page is the first-100-hours runbook for a platform admin who has just been handed the keys to the active OpenShift v6 fleet. It is a checklist, not a narrative. Tick the items in order; stop and ask before improvising. If you are returning to the role after a session break, you can skip the "before you start" block and resume at the "every-session warm-up".
 
-Sanitization note: all kubeadmin passwords, root tokens, robot pull-secrets, Vault root tokens, MAC addresses, hardware serials, and internal IPv4 addresses are kept in the operator's local `codex-opp-agent/secrets/` mirror and in the corresponding entries in Vault. They are deliberately not published on this page. Where this page says "the *X* host" or "the Vault VM", the address is in `connection-details/<service>.md` inside the workspace.
+Sanitization note: all kubeadmin passwords, root tokens, robot pull-secrets, Vault root tokens, MAC addresses, hardware serials, and internal IPv4 addresses are kept in the operator's local `opp-full-plat/secrets/` mirror and in the corresponding entries in Vault. They are deliberately not published on this page. Where this page says "the *X* host" or "the Vault VM", the address is in `connection-details/<service>.md` inside the workspace.
 
 ## Before you start
 
-1. **You have a writable workspace.** The Claude-agent workspace boundary is `/home/ze/claude-agent`, `/home/ze/secrets`, `/home/ze/codex-opp-agent`. Other `/home/ze/*` paths are off-limits unless explicitly named. If your operator account does not have read access to `codex-opp-agent/secrets/` and write access to `codex-opp-agent/`, stop and re-do onboarding.
-2. **You have a GitHub identity in `zeshaq/codex-opp-agent`.** All issues, milestones, ADR review threads, and the operations tracking record live there.
-3. **You have a GitLab identity with developer permission on `comptech-platform/openshift-ops/openshift-platform-gitops`** and a Personal Access Token stored at `codex-opp-agent/the operator GitLab PAT (local-only)`. The PAT is used by the API-driven MR flow; it does not need to be in your shell environment.
+1. **You have a writable workspace.** The operator workspace boundary is `/home/ze/ops-workspace`, `/home/ze/secrets`, `/home/ze/opp-full-plat`. Other `/home/ze/*` paths are off-limits unless explicitly named. If your operator account does not have read access to `opp-full-plat/secrets/` and write access to `opp-full-plat/`, stop and re-do onboarding.
+2. **You have a GitHub identity in `zeshaq/opp-full-plat`.** All issues, milestones, ADR review threads, and the operations tracking record live there.
+3. **You have a GitLab identity with developer permission on `comptech-platform/openshift-ops/openshift-platform-gitops`** and a Personal Access Token stored at `opp-full-plat/the operator GitLab PAT (local-only)`. The PAT is used by the API-driven MR flow; it does not need to be in your shell environment.
 4. **You have `oc`, `kubectl`, `git`, `curl`, `jq`, `skopeo`, and `ssh` on the workstation you operate from.** The workspace assumes these as the minimal toolset; no `oc-mirror` is needed on the operator workstation (it runs on the mirror VM).
 
 ## Hour 1: read these, in this order
@@ -124,7 +124,7 @@ Expected: every Application is `Synced / Healthy`. If something is `OutOfSync` o
 The platform is disconnected. Every image must come from an approved local prefix. Run the drift script:
 
 ```bash
-cd /home/ze/codex-opp-agent
+cd /home/ze/opp-full-plat
 scripts/openshift-image-supply-check.sh hub-dc-v6   "$K_HUB"
 scripts/openshift-image-supply-check.sh spoke-dc-v6 "$K_SPOKE"
 ```
@@ -138,10 +138,10 @@ If a pod is pulling from `registry.redhat.io` or `quay.io` directly and no IDMS/
 Pick something tiny — a CHANGELOG fix, a typo in a `kustomization.yaml`, a comment in a `Subscription`. The goal is to walk the MR flow end to end while the failure modes are inexpensive:
 
 1. Open or comment on a GitHub issue describing the change (even one-line fixes get an issue under the GitHub-first tracking convention).
-2. Branch in `/home/ze/claude-agent/clones/platform-gitops/`:
+2. Branch in `/home/ze/ops-workspace/clones/platform-gitops/`:
 
    ```bash
-   cd /home/ze/claude-agent/clones/platform-gitops
+   cd /home/ze/ops-workspace/clones/platform-gitops
    git pull --ff-only origin main
    git checkout -b doc-1/first-mr
    ```
@@ -168,7 +168,7 @@ Day-1 success criterion: you have walked the loop once without surprises. If the
 
 ## Day 2-3: shadow a real change
 
-If a routine task is on the [TODO](/docs/05-operations/05-routine-tasks/01-overview) — operator bump, policy rollout, evidence backfill — pair on it with the outgoing operator or with the workspace's session-log history. Read the most recent five session reports under `codex-opp-agent/reports/sessions/` to see the conventions in practice.
+If a routine task is on the [TODO](/docs/05-operations/05-routine-tasks/01-overview) — operator bump, policy rollout, evidence backfill — pair on it with the outgoing operator or with the workspace's session-log history. Read the most recent five session reports under `opp-full-plat/reports/sessions/` to see the conventions in practice.
 
 The session-report convention is one report per session under `reports/sessions/YYYYMMDD-HHMMSS-<slug>.md` capturing what was done, what changed, what was validated, and any residual risk. Adopt the convention before you accumulate the first three sessions of debt.
 
@@ -197,15 +197,15 @@ If you find yourself watching `oc get pods -A -w`, you are watching the wrong la
 
 Once you have done the first-100-hours pass, every subsequent session opens with:
 
-1. Read `codex-opp-agent/CURRENT_STATE.md`, `SESSION_LOG.md`, `TODO.md` (in that order).
-2. Read the two most recent dated reports under `codex-opp-agent/reports/sessions/`.
+1. Read `opp-full-plat/CURRENT_STATE.md`, `SESSION_LOG.md`, `TODO.md` (in that order).
+2. Read the two most recent dated reports under `opp-full-plat/reports/sessions/`.
 3. Run the cluster health snapshot (hour 3 above).
 4. Run the Argo sanity check.
 5. Run the image-supply drift check (weekly cadence is fine if there has been no install activity).
-6. Skim open incident issues (label `incident` on `zeshaq/codex-opp-agent`).
+6. Skim open incident issues (label `incident` on `zeshaq/opp-full-plat`).
 7. Pick the next item from `TODO.md`'s "Next Order Of Business" section.
 
-The protocol is the codex-opp-agent workspace's stated convention (read CURRENT_STATE / SESSION_LOG / TODO at start, write a dated session record at end). It is the difference between operating a fleet and groping for context.
+The protocol is the opp-full-plat workspace's stated convention (read CURRENT_STATE / SESSION_LOG / TODO at start, write a dated session record at end). It is the difference between operating a fleet and groping for context.
 
 ## What MUST stay out of GitHub, GitLab, chat, and this page
 
@@ -240,10 +240,9 @@ The handoff doc's "Stop Criteria" list is short and absolute. Stop and escalate 
 
 ## References
 
-- `codex-opp-agent/connection-details/platform-admin-handoff.md` (the canonical handoff doc)
-- `codex-opp-agent/connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md`, `openshift-gitops-hub-dc-v6.md`
-- `codex-opp-agent/connection-details/nexus.md`, `vault-app-secrets.md`, `minio.md`, `signoz.md`
-- `codex-opp-agent/runbooks/break-glass-procedure.md`, `secrets-custody-drift-check.md`
-- `codex-opp-agent/adr/0015`, `0016`, `0018`, `0019`, `0025`
+- `opp-full-plat/connection-details/platform-admin-handoff.md` (the canonical handoff doc)
+- `opp-full-plat/connection-details/openshift-hub-dc-v6.md`, `openshift-spoke-dc-v6.md`, `openshift-gitops-hub-dc-v6.md`
+- `opp-full-plat/connection-details/nexus.md`, `vault-app-secrets.md`, `minio.md`, `signoz.md`
+- `opp-full-plat/runbooks/break-glass-procedure.md`, `secrets-custody-drift-check.md`
+- `opp-full-plat/adr/0015`, `0016`, `0018`, `0019`, `0025`
 - Issues: #127 (this handoff), #229 (this section)
-- Memory: `reference_platform_admin_handoff`, `feedback_workspace_protocol`, `feedback_github_first_tracking`

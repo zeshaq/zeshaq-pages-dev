@@ -27,7 +27,7 @@ export const opsNodes = [
   { id: "cluster",   position: { x: 720, y: 150 }, data: { label: "hub-dc-v6\n+ spoke-dc-v6" }, style: agentBox },
   { id: "alerts",    position: { x: 480, y: 150 }, data: { label: "Prometheus +\nSigNoz alerts" }, style: dataBox },
   { id: "incident",  position: { x: 240, y: 150 }, data: { label: "Incident issue\n(break-glass record)" }, style: incBox },
-  { id: "postmortem",position: { x: 0,   y: 150 }, data: { label: "Postmortem +\nmemory entry" }, style: dataBox },
+  { id: "postmortem",position: { x: 0,   y: 150 }, data: { label: "Postmortem +\noperator note" }, style: dataBox },
   { id: "runbook",   position: { x: 0,   y: 300 }, data: { label: "Runbook\n(under runbooks/)" }, style: dataBox },
   { id: "adr",       position: { x: 240, y: 300 }, data: { label: "ADR amendment\n(if architectural)" }, style: dataBox },
 ];
@@ -55,12 +55,12 @@ If you are a brand-new platform admin, read this page, then [day-1 admin handoff
 
 The arrows are the rules:
 
-- **Every non-trivial change starts with a GitHub issue** in `zeshaq/codex-opp-agent`. The issue carries the milestone, the phase, the governing ADR set, and the validation/rollback plan. This is the durable record per the workspace's GitHub-first tracking convention; chat is ephemeral, the issue is authoritative.
+- **Every non-trivial change starts with a GitHub issue** in `zeshaq/opp-full-plat`. The issue carries the milestone, the phase, the governing ADR set, and the validation/rollback plan. This is the durable record per the workspace's GitHub-first tracking convention; chat is ephemeral, the issue is authoritative.
 - **Changes land as MRs against the internal GitLab `platform-gitops` repo.** The repo is GitLab (not GitHub) so the `gh` CLI does not work for opening MRs — you POST to the GitLab API with a PAT. Branch names embed the issue key, commits carry a tracking header, and the MR description follows the documented template. See [MR mechanics](/docs/05-operations/03-platform-gitops-mr-mechanics).
 - **Argo CD pulls.** Hub and spoke each run their own OpenShift GitOps instance; the spoke is the routine reconciler, the hub coordinates placement. The operator never `oc apply`s as a routine — `oc apply` is break-glass.
 - **The cluster emits signal.** Prometheus on each cluster ships a curated subset of metrics to the hub's federated observability stack; SigNoz on its own VM is the trace/log backend the platform leans on for app-side investigations.
 - **Alerts open incident issues.** The incident issue is the artefact of an on-call shift; it captures the symptom, the diagnosis, the action (and the break-glass record if a live change happened), and the postmortem.
-- **Postmortems land as runbooks and memory entries.** A runbook is the literal recipe the next operator follows under pressure; the memory entry is the one-paragraph "what this taught us" so the lesson survives session boundaries.
+- **Postmortems land as runbooks and operator notes.** A runbook is the literal recipe the next operator follows under pressure; the operator note is the one-paragraph "what this taught us" so the lesson survives session boundaries.
 
 ## The four operator surfaces
 
@@ -69,13 +69,13 @@ The arrows are the rules:
 | **Active clusters** | `hub-dc-v6` (3-master compact, all-in-one, management) and `spoke-dc-v6` (3 control-plane + 3 physical workers, ODF) | `connection-details/openshift-hub-dc-v6.md`, `connection-details/openshift-spoke-dc-v6.md` |
 | **GitOps source of truth** | Internal GitLab repo `comptech-platform/openshift-ops/openshift-platform-gitops` plus the operator working copy under `clones/platform-gitops/` | `connection-details/platform-admin-handoff.md`, `connection-details/gitlab-operator-guide.md` |
 | **Image supply** | Nexus three-endpoint split: `mirror-registry.*` (oc-mirror), `docker-group.*` (dev pull), `app-registry.*` (CI push) | `connection-details/nexus.md` |
-| **Secrets & evidence** | Vault VM (`vault.sub.comptech-lab.com:8200`) for app/platform credentials, MinIO for backups and CI evidence, `codex-opp-agent/secrets/` for the local mirror of platform creds not yet in Vault | `connection-details/vault-app-secrets.md`, `connection-details/minio.md` |
+| **Secrets & evidence** | Vault VM (`vault.sub.comptech-lab.com:8200`) for app/platform credentials, MinIO for backups and CI evidence, `opp-full-plat/secrets/` for the local mirror of platform creds not yet in Vault | `connection-details/vault-app-secrets.md`, `connection-details/minio.md` |
 
 Each surface has its own access plane, its own rotation schedule, and its own break-glass procedure. Day-1 handoff covers the access details; routine tasks cover the rotations; incidents cover the breakage.
 
 ## Day-to-day, by clock time
 
-- **At session start:** read `CURRENT_STATE.md`, `SESSION_LOG.md`, `TODO.md` in `codex-opp-agent`. They are the snapshot from the last operator (often yourself, the day before). Then run the 10-second cluster health snapshot from the [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff).
+- **At session start:** read `CURRENT_STATE.md`, `SESSION_LOG.md`, `TODO.md` in `opp-full-plat`. They are the snapshot from the last operator (often yourself, the day before). Then run the 10-second cluster health snapshot from the [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff).
 - **During focused work:** open or refresh the GitHub issue for the work, edit GitOps under `clones/platform-gitops/`, `kubectl kustomize` both cluster overlays, commit on a branch matching the issue key, open the MR via the GitLab API, watch Argo reconcile, validate, comment on the issue with the validation evidence.
 - **On alerts:** open an incident issue, run the symptom-matching part of the relevant runbook from the [incidents index](/docs/05-operations/04-incidents-and-runbooks/01-overview), capture the before-state, make the smallest correct change, capture the after-state, write the audit record.
 - **At session end:** add a dated session report under `reports/sessions/`, update `CURRENT_STATE.md` / `SESSION_LOG.md` / `TODO.md`, commit the workspace, do not push live state without a backport.
@@ -88,7 +88,7 @@ This section is the *operator* handbook. It assumes:
 - you understand the [hub-spoke pull model](/blog/rhacm) at the architectural level;
 - you have shell access from a workspace host that can reach the lab `30.30.0.0/16` network.
 
-It is *not* the developer handbook — apps targeting the Docker runtime VM (paused for OpenShift app delivery per the user's 2026-05-09 decision) follow a separate path covered in section 4. It is also not the compliance auditor handbook — that lives at `codex-opp-agent/connection-details/compliance-implementor-handbook.md` and is consumed by the auditor role.
+It is *not* the developer handbook — apps targeting the Docker runtime VM (paused for OpenShift app delivery per the user's 2026-05-09 decision) follow a separate path covered in section 4. It is also not the compliance auditor handbook — that lives at `opp-full-plat/connection-details/compliance-implementor-handbook.md` and is consumed by the auditor role.
 
 ## What you will find in each subsection
 
@@ -105,8 +105,7 @@ The active fleet is the v6 pair — `hub-dc-v6` and `spoke-dc-v6`. The pre-v6 `h
 
 ## References
 
-- `codex-opp-agent/connection-details/platform-admin-handoff.md`
-- `codex-opp-agent/runbooks/break-glass-procedure.md`
-- `codex-opp-agent/adr/0015`, `0016`, `0018`, `0019`, `0025`
-- Memory: `reference_platform_gitops_mr_path`, `reference_platform_admin_handoff`, `project_workspace_scope`
+- `opp-full-plat/connection-details/platform-admin-handoff.md`
+- `opp-full-plat/runbooks/break-glass-procedure.md`
+- `opp-full-plat/adr/0015`, `0016`, `0018`, `0019`, `0025`
 - Issues: #127 (handoff), #142 (MCO runbook), #143 (MR conventions doc), #229 (this section tracker)

@@ -64,15 +64,15 @@ There are two clones of `platform-gitops` on the operator workstation:
 
 | Path | Purpose | Writable? |
 |---|---|---|
-| `/home/ze/platform-gitops` | Personal scratchpad used by the user historically | Outside Claude-agent workspace boundary; do **not** edit from automation |
-| `/home/ze/claude-agent/clones/platform-gitops/` | Automation working copy inside the workspace boundary | Yes — branch, commit, push from here |
+| `/home/ze/platform-gitops` | Personal scratchpad used by the user historically | Outside the automation workspace boundary; do **not** edit from automation |
+| `/home/ze/ops-workspace/clones/platform-gitops/` | Automation working copy inside the workspace boundary | Yes — branch, commit, push from here |
 
-This is the workspace boundary rule: writable in `/home/ze/{claude-agent, secrets, codex-opp-agent}`; other `/home/ze/*` paths are read-only unless explicitly named. Always use the `clones/` copy for changes from this workspace.
+This is the workspace boundary rule: writable in `/home/ze/{ops-workspace, secrets, opp-full-plat}`; other `/home/ze/*` paths are read-only unless explicitly named. Always use the `clones/` copy for changes from this workspace.
 
 At session start, sync the clone with `main`:
 
 ```bash
-cd /home/ze/claude-agent/clones/platform-gitops
+cd /home/ze/ops-workspace/clones/platform-gitops
 git checkout main
 git pull --ff-only origin main
 ```
@@ -141,14 +141,14 @@ ADRs:      <comma-separated ADR numbers>
 <rollback plan: concrete steps>
 ```
 
-Commit author is `Zahid Platform Admin <zahid@comptech-lab.com>` (configured in the clone). **No `Co-Authored-By` trailer** — this matches the repo's existing style across 30+ commits. The Claude-agent commits do not add a `Claude` co-author here.
+Commit author is `Zahid Platform Admin <zahid@comptech-lab.com>` (configured in the clone). **No `Co-Authored-By` trailer** — this matches the repo's existing style across 30+ commits.
 
 ## Pre-commit validation
 
 Before every `git commit`, prove the kustomization builds clean on both cluster overlays:
 
 ```bash
-cd /home/ze/claude-agent/clones/platform-gitops
+cd /home/ze/ops-workspace/clones/platform-gitops
 kubectl kustomize clusters/hub-dc-v6   > /dev/null
 kubectl kustomize clusters/spoke-dc-v6 > /dev/null
 ```
@@ -202,7 +202,7 @@ The MR description has a stable shape. Reviewers expect every section.
 
 <1-3 lines plus tracking artifacts>
 
-Tracking: zeshaq/codex-opp-agent#<n>, milestone "<milestone>", phase <phase>.
+Tracking: zeshaq/opp-full-plat#<n>, milestone "<milestone>", phase <phase>.
 Governing ADRs: <list>.
 
 ## Changes
@@ -380,9 +380,8 @@ If a real incident requires one of these, follow the [break-glass procedure](/do
 
 ## References
 
-- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"GitOps Source Of Truth" and §"Operator Install Workflow"
-- `codex-opp-agent/connection-details/gitlab-operator-guide.md`
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
-- `codex-opp-agent/adr/0015`, `0016`, `0018`, `0019`
-- Memory: `reference_platform_gitops_mr_path`, `reference_spoke_argo_extension_rbac`
+- `opp-full-plat/connection-details/platform-admin-handoff.md` §"GitOps Source Of Truth" and §"Operator Install Workflow"
+- `opp-full-plat/connection-details/gitlab-operator-guide.md`
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+- `opp-full-plat/adr/0015`, `0016`, `0018`, `0019`
 - Issues: #143 (MR conventions doc), #229 (this section)

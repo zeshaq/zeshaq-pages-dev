@@ -111,7 +111,6 @@ This report (`scripts/openshift-image-supply-check.sh`) must show **0 uncovered 
 
 - An accidental `oc-mirror` push from a developer machine could overwrite an OpenShift platform image. The three-endpoint split forces explicit access control.
 - Audit logs become much clearer when "platform mirror push" and "CI image push" are on separate paths.
-- Memory entry `project_nexus_endpoint_split.md` formalizes this split for operator-agent recall.
 
 **Allow external registry pulls and rely on egress firewall.** What the previous lab cycle effectively did. Rejected because the ODF operand-digest incident proved the failure mode is real: an upstream registry hiccup at install time breaks operators that should have been local.
 
@@ -122,17 +121,16 @@ This report (`scripts/openshift-image-supply-check.sh`) must show **0 uncovered 
 - **Operational work is added before new operators or application runtimes are introduced.** The drift report must be clean; the IDMS/ITMS for the new operator must exist in GitOps; the operand digests must be in Nexus. This pays for itself the first time the lab loses internet.
 - **OpenShift resources may continue to show external source names** because IDMS/ITMS rewrites pulls at *node runtime*. A source name (e.g. `registry.redhat.io/...`) is not automatically a failure; it is a failure only when the mirror rule or mirrored digest is missing. The drift report distinguishes the two.
 - **Hard admission policy is intentionally a later gate.** The first phase is to measure and document drift, then enforce once platform and tenant allowlists are proven. A premature enforcement policy can block kube-system / openshift-* workloads and require a console-recovery.
-- **The three Nexus endpoints are immutable boundaries.** Application images go to `app-registry.*` and only `app-registry.*`. `oc-mirror` writes only to `mirror-registry.*`. Memory entries (`feedback_oc_mirror_off_limits.md`) reinforce the rule for operator-agent recall.
+- **The three Nexus endpoints are immutable boundaries.** Application images go to `app-registry.*` and only `app-registry.*`. `oc-mirror` writes only to `mirror-registry.*`.
 - **Build paths follow the matrix in `build-path-matrix.md`** — different build flows (Jenkins for OpenShift-native, GitLab CI for VM-runtime apps, etc.) all push to the same `app-registry.*` regardless of executor.
 
 ## References
 
-- Source: `codex-opp-agent/adr/0019-nexus-only-image-supply-chain.md`
+- Source: `opp-full-plat/adr/0019-nexus-only-image-supply-chain.md`
 - Federation context: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
 - v6 pull-model GitOps: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
-- Nexus operating notes: `codex-opp-agent/connection-details/nexus.md`
-- Image registry allowlist policy: `codex-opp-agent/connection-details/image-registry-allowlist.md`
-- Image digest overlay pattern: `codex-opp-agent/connection-details/image-digest-overlay.md`
-- App registry pull-secret: `codex-opp-agent/connection-details/app-registry-pullsecret.md`
-- Build-path matrix: `codex-opp-agent/connection-details/build-path-matrix.md`
-- Memory entries: `feedback_oc_mirror_off_limits.md`, `project_nexus_endpoint_split.md`
+- Nexus operating notes: `opp-full-plat/connection-details/nexus.md`
+- Image registry allowlist policy: `opp-full-plat/connection-details/image-registry-allowlist.md`
+- Image digest overlay pattern: `opp-full-plat/connection-details/image-digest-overlay.md`
+- App registry pull-secret: `opp-full-plat/connection-details/app-registry-pullsecret.md`
+- Build-path matrix: `opp-full-plat/connection-details/build-path-matrix.md`

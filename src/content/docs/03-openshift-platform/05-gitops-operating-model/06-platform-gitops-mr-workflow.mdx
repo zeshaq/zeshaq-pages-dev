@@ -13,15 +13,15 @@ draft: false
 | Path | Purpose |
 | --- | --- |
 | `comptech-platform/openshift-ops/openshift-platform-gitops` (GitLab project) | Source of truth |
-| `http://<gitlab-vm>/comptech-platform/openshift-ops/openshift-platform-gitops.git` | LAN endpoint — used by Argo CD, automation, CI, and the GitLab API. Internal hostname is in `codex-opp-agent/connection-details/`. |
+| `http://<gitlab-vm>/comptech-platform/openshift-ops/openshift-platform-gitops.git` | LAN endpoint — used by Argo CD, automation, CI, and the GitLab API. Internal hostname is in `opp-full-plat/connection-details/`. |
 | `https://gitlab.apps.sub.comptech-lab.com/comptech-platform/openshift-ops/openshift-platform-gitops` | Public browser/API route — human dashboard only, not for automation |
 | `/home/ze/platform-gitops/` | Operator-workstation clone (the user's hands-on copy) |
-| `/home/ze/claude-agent/clones/platform-gitops/` | Agent-staging clone (workspace-boundary compliant working copy) |
+| `/home/ze/ops-workspace/clones/platform-gitops/` | Automation working copy (workspace-boundary compliant) |
 
 Sync at session start:
 
 ```bash
-cd /home/ze/claude-agent/clones/platform-gitops
+cd /home/ze/ops-workspace/clones/platform-gitops
 git pull --ff-only origin main
 ```
 
@@ -164,7 +164,7 @@ The issue key matches the GitHub issue's title prefix (the planning side is GitH
 ### Pre-commit validation
 
 ```bash
-cd /home/ze/claude-agent/clones/platform-gitops
+cd /home/ze/ops-workspace/clones/platform-gitops
 kubectl kustomize clusters/hub-dc-v6 > /tmp/hub.yaml
 kubectl kustomize clusters/spoke-dc-v6 > /tmp/spoke.yaml
 git diff --check
@@ -232,4 +232,3 @@ If something lands here that belongs elsewhere, the platform maintainers remove 
 - `adr/0015-federated-gitops-repo-architecture.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0024-openshift-only-platform-gitops-boundary.md`, `adr/0025-gitops-only-operations-break-glass.md`.
 - `connection-details/platform-admin-handoff.md` — operator install workflow.
 - `connection-details/gitlab-operator-guide.md` — GitLab operator-level details (group layout, branch protection, runner classes).
-- Memory: `reference_platform_gitops_mr_path.md`, `reference_gitops_sources.md`.

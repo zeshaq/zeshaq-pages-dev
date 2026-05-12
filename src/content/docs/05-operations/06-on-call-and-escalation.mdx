@@ -6,15 +6,15 @@ last_reviewed: 2026-05-11
 draft: false
 ---
 
-This page documents how on-call works on the lab. The lab is operated by a small team (currently solo with Claude-agent assistance per `user_role`), so "on-call" reads more as "the convention you follow when something is on fire" rather than a multi-tier PagerDuty rota. The conventions still matter — they keep recovery deterministic when the operator is tired, paged at 3 AM, or context-switching from another task.
+This page documents how on-call works on the lab. The lab is operated by a small team (currently a solo operator), so "on-call" reads more as "the convention you follow when something is on fire" rather than a multi-tier PagerDuty rota. The conventions still matter — they keep recovery deterministic when the operator is tired, paged at 3 AM, or context-switching from another task.
 
-The paging path, the escalation matrix, and the break-glass triggers are documented here. Per [section tracker #229](https://github.com/zeshaq/codex-opp-agent/issues/229), this page does not expose pager numbers, on-call phone numbers, or the rotation calendar — those live in the operator's local notes and the team-internal channels.
+The paging path, the escalation matrix, and the break-glass triggers are documented here. Per [section tracker #229](https://github.com/zeshaq/opp-full-plat/issues/229), this page does not expose pager numbers, on-call phone numbers, or the rotation calendar — those live in the operator's local notes and the team-internal channels.
 
 ## The on-call posture
 
 | Item | Value |
 |---|---|
-| Active rotation | Solo operator (workspace owner) + Claude-agent assistance |
+| Active rotation | Solo operator (workspace owner) |
 | Off-hours | Best-effort; the lab has no 24x7 SLO |
 | Paging surface | GitHub issue with `incident` label + workspace owner notification |
 | Escalation | Workspace owner -> infrastructure team -> network team (external) |
@@ -38,7 +38,7 @@ What triggers a page (and who/what does the paging):
 
 The "page" itself is currently:
 
-1. An issue is opened on `zeshaq/codex-opp-agent` with the `incident` label (manually if the operator notices first; automatically as the alerting integrations mature).
+1. An issue is opened on `zeshaq/opp-full-plat` with the `incident` label (manually if the operator notices first; automatically as the alerting integrations mature).
 2. The workspace owner is notified (channel TBD per local convention).
 3. The operator picks up the issue, follows the relevant [runbook](/docs/05-operations/04-incidents-and-runbooks/01-overview), and updates the issue with progress.
 
@@ -74,7 +74,7 @@ The lab's "infrastructure team" and "network team" are external teams (not the O
 
 ## Break-glass triggers
 
-Break-glass is the explicit policy in ADR 0025 governing live changes that bypass the [GitOps MR flow](/docs/05-operations/03-platform-gitops-mr-mechanics). The full procedure is in `codex-opp-agent/runbooks/break-glass-procedure.md`; this page is the operator-facing summary.
+Break-glass is the explicit policy in ADR 0025 governing live changes that bypass the [GitOps MR flow](/docs/05-operations/03-platform-gitops-mr-mechanics). The full procedure is in `opp-full-plat/runbooks/break-glass-procedure.md`; this page is the operator-facing summary.
 
 All four of these conditions MUST be true at the moment you decide to act:
 
@@ -107,7 +107,7 @@ If one of these forbidden actions IS the incident remediation, a second platform
 
 ### The audit record
 
-Every break-glass action produces a record under `codex-opp-agent/reports/break-glass/YYYY-MM-DD-<incident-slug>.md`. The template lives in `runbooks/break-glass-procedure.md`. The record captures:
+Every break-glass action produces a record under `opp-full-plat/reports/break-glass/YYYY-MM-DD-<incident-slug>.md`. The template lives in `runbooks/break-glass-procedure.md`. The record captures:
 
 - Incident issue, cluster, namespace, resource(s), owning Argo CD Application.
 - Actor, start / end / expiry timestamps (UTC).
@@ -136,24 +136,23 @@ The twenty-four-hour clock is absolute. Drifting past it without backport or rev
 - The kubeconfigs for both clusters (`K_HUB`, `K_SPOKE`) in shell env vars.
 - The GitLab PAT (`"$LOCAL_GITLAB_PAT_FILE"  # operator PAT, local-only`) loaded into the curl wrapper.
 - A scratch directory for `/tmp/break-glass-$(date -u +%Y%m%dT%H%M%SZ)` captures.
-- The [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff) and [break-glass procedure runbook](https://github.com/zeshaq/codex-opp-agent/blob/main/runbooks/break-glass-procedure.md) (the runbook lives in the workspace; this site has the operator-facing summary).
+- The [day-1 handoff](/docs/05-operations/02-day-1-admin-handoff) and [break-glass procedure runbook](https://github.com/zeshaq/opp-full-plat/blob/main/runbooks/break-glass-procedure.md) (the runbook lives in the workspace; this site has the operator-facing summary).
 - An open browser tab to the hub OpenShift console -> Observe -> Alerts.
 
 ## Postmortem cadence
 
 After every incident with the `incident` label:
 
-1. Write a dated session report under `codex-opp-agent/reports/sessions/`.
+1. Write a dated session report under `opp-full-plat/reports/sessions/`.
 2. Close the incident issue with: timeline, root cause, fix, validation evidence, follow-up issues opened.
-3. If the lesson is durable: update the relevant runbook in `codex-opp-agent/runbooks/`, the relevant published page in this section, the relevant memory entry under `~/.claude/projects/-home-ze-claude-agent/memory/`.
+3. If the lesson is durable: update the relevant runbook in `opp-full-plat/runbooks/` and the relevant published page in this section.
 4. If the lesson is architectural: open an ADR amendment review issue (the pattern that produced ADR 0026 from ADR 0005 — see [IPv6 incident](/docs/05-operations/04-incidents-and-runbooks/04-ipv6-disable-breaks-ovn)).
 
 The postmortem is *not* a separate scheduled meeting in the lab's solo posture; it is the close-out of the incident issue. The deliverables are the same.
 
 ## References
 
-- `codex-opp-agent/adr/0025-gitops-only-operations-break-glass.md`
-- `codex-opp-agent/runbooks/break-glass-procedure.md`
-- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"Break-Glass Rules"
-- `codex-opp-agent/plans/federated-gitops-readiness-gates.md` (FG-6)
-- Memory: `user_role`, `feedback_subagent_first`, `feedback_github_first_tracking`
+- `opp-full-plat/adr/0025-gitops-only-operations-break-glass.md`
+- `opp-full-plat/runbooks/break-glass-procedure.md`
+- `opp-full-plat/connection-details/platform-admin-handoff.md` §"Break-Glass Rules"
+- `opp-full-plat/plans/federated-gitops-readiness-gates.md` (FG-6)

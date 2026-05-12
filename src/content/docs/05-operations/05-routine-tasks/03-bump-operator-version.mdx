@@ -47,7 +47,7 @@ Before mutating anything:
      -o jsonpath='{.status.channels[?(@.name=="<channel>")].currentCSV}{"\n"}'
    ```
 
-3. **Confirm catalog coverage.** The new CSV must be present in the mirrored CatalogSource. If `oc get packagemanifest` does not show the new version, run an `oc mirror --v2` cycle from the mirror VM first (see [What To Do If An Operator Package Is Missing](https://github.com/zeshaq/codex-opp-agent/blob/main/connection-details/platform-admin-handoff.md) — recipe in `connection-details/platform-admin-handoff.md`).
+3. **Confirm catalog coverage.** The new CSV must be present in the mirrored CatalogSource. If `oc get packagemanifest` does not show the new version, run an `oc mirror --v2` cycle from the mirror VM first (see [What To Do If An Operator Package Is Missing](https://github.com/zeshaq/opp-full-plat/blob/main/connection-details/platform-admin-handoff.md) — recipe in `connection-details/platform-admin-handoff.md`).
 
 4. **Confirm operand image coverage.** Spot-check that the operand images in the new CSV's `relatedImages` are mirrored. The image-supply drift script catches this after rollout, but the cheap check beforehand is:
 
@@ -102,7 +102,7 @@ ls /home/ze/ocp-mirror-workspaces/dc-lab/full-workspace/working-dir/cluster-reso
 Branch and edit in the working copy:
 
 ```bash
-cd /home/ze/claude-agent/clones/platform-gitops
+cd /home/ze/ops-workspace/clones/platform-gitops
 git checkout main
 git pull --ff-only origin main
 git checkout -b op-bump/<operator>-<from>-to-<to>
@@ -144,12 +144,12 @@ spec:
 
 If the new CSV needs an RBAC group not currently in `argocd-platform-extensions`, extend the ClusterRole at sync-wave 0 in the same MR or in a sequenced preceding MR. See [Spoke RBAC extension memory](/docs/05-operations/07-known-gotchas).
 
-Update `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` with the new pin (in a separate hunk inside the same MR for the version-lock file lives in `codex-opp-agent`, not `platform-gitops` — this is a cross-repo update; sequence the MRs).
+Update `plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md` with the new pin (in a separate hunk inside the same MR for the version-lock file lives in `opp-full-plat`, not `platform-gitops` — this is a cross-repo update; sequence the MRs).
 
 ### Step 3 — Validate the build
 
 ```bash
-cd /home/ze/claude-agent/clones/platform-gitops
+cd /home/ze/ops-workspace/clones/platform-gitops
 kubectl kustomize clusters/hub-dc-v6   > /dev/null
 kubectl kustomize clusters/spoke-dc-v6 > /dev/null
 ```
@@ -235,7 +235,7 @@ A bump is complete when **all** of the following are true:
 6. `oc get mcp` shows every pool `UPDATED=True / UPDATING=False / DEGRADED=False` (where MCP-touching).
 7. The image-supply drift script reports zero uncovered external runtime references.
 8. The CHANGELOG entry on `platform-gitops` describes the bump.
-9. `operator-version-lock.md` on `codex-opp-agent` reflects the new pin.
+9. `operator-version-lock.md` on `opp-full-plat` reflects the new pin.
 10. The session report under `reports/sessions/` captures the bump's evidence.
 
 Skipping step 7 is how the image-supply silently drifts — every bump must re-validate the drift posture.
@@ -257,9 +257,8 @@ Skipping step 7 is how the image-supply silently drifts — every bump must re-v
 
 ## References
 
-- `codex-opp-agent/connection-details/platform-admin-handoff.md` §"Operator Install Workflow" + §"Catalog Refresh Workflow"
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`
-- `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md`, `0019-nexus-only-image-supply-chain.md`
-- Memory: `reference_platform_gitops_mr_path`, `reference_spoke_argo_extension_rbac`
+- `opp-full-plat/connection-details/platform-admin-handoff.md` §"Operator Install Workflow" + §"Catalog Refresh Workflow"
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/operator-version-lock.md`
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/imageset-config.yaml`
+- `opp-full-plat/adr/0018-acm-openshift-gitops-pull-model-v6.md`, `0019-nexus-only-image-supply-chain.md`
 - Issues: #137 (hub catalog capture), #229 (this section)

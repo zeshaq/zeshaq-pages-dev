@@ -22,7 +22,7 @@ export const scrapNodes = [
 
   { id: "vault", position: { x: 600, y: 0   }, data: { label: "Vault VM\n(centralized custody)" }, style: goodBox },
   { id: "nexus", position: { x: 600, y: 120 }, data: { label: "Nexus VM + oc-mirror\n(single image supply)" }, style: goodBox },
-  { id: "git",   position: { x: 600, y: 240 }, data: { label: "GitLab + codex-opp-agent\n(declarative state)" }, style: goodBox },
+  { id: "git",   position: { x: 600, y: 240 }, data: { label: "GitLab + opp-full-plat\n(declarative state)" }, style: goodBox },
 ];
 
 export const scrapEdges = [
@@ -81,17 +81,17 @@ Some of the files (`arif-rke2-*` tokens, `awx-rke2-admin-password`) reference RK
 
 ## The boundary rule
 
-The workspace boundary rule is recorded in the agent memory entry `feedback_workspace_boundary.md` (the canonical operating constraint for filesystem access). The relevant clause:
+The workspace boundary rule is the canonical operating constraint for filesystem access. The relevant clause:
 
 > **`/home/ze/cloud-init` is read-only.** Reading (`ls`, `cat`, `grep`, etc.) is allowed when needed. **Never write** to anything under that path. It is leftover historical data from a previous failed installation. Treat values found there as **not authoritative** — they are evidence of past state, not current truth. If the user asks about something in cloud-init, you may inspect it; do not modify it.
 
 This rule has three operational implications:
 
 1. **No automation writes to `cloud-init/`.** No script, no Ansible playbook, no GitOps reconcile loop. The folder is frozen.
-2. **No new secrets land in `cloud-init/`.** New credentials are written to `/home/ze/secrets/` or to the workspace `codex-opp-agent/secrets/` (local-only, contents not enumerated here) — both of which are git-ignored. Vault is the durable backing store.
+2. **No new secrets land in `cloud-init/`.** New credentials are written to `/home/ze/secrets/` or to the workspace `opp-full-plat/secrets/` (local-only, contents not enumerated here) — both of which are git-ignored. Vault is the durable backing store.
 3. **Values found in `cloud-init/` are flagged historical when reported.** When the user asks "what's the GitLab root password?" the answer is **not** `cat /home/ze/cloud-init/gitlab-root-password`; the answer is "Vault path `secret/infra/gitlab/admin/root`" — and if that's empty, the cloud-init value is offered as historical evidence only, with the recommendation to rotate immediately.
 
-REP-6 (issue [#150](https://github.com/zeshaq/codex-opp-agent/issues/150)) explicitly distinguished this kind of operational rule from project-knowledge memory:
+REP-6 (issue [#150](https://github.com/zeshaq/opp-full-plat/issues/150)) explicitly distinguished this kind of operational rule from project-knowledge memory:
 
 - **Behavioral feedback** (like the cloud-init boundary) stays in memory because it governs how the agent operates.
 - **Operational knowledge** (the actual replacement patterns — Vault paths, Nexus URLs, GitOps repos) was migrated into runbooks and connection-details documents that any operator can find.
@@ -120,16 +120,16 @@ The pattern: **one credential, one location, one tier.** Vault is the durable st
 
 The cloud-init scrap folder was the negative example that motivated:
 
-1. **ADR 0001 — operator workspace.** A single tracked workspace at `/home/ze/codex-opp-agent` for assessment, plans, scripts, ADRs, reports, and (git-ignored) secrets. Replaces the "everything lives in `cloud-init/`" pattern with "everything lives in a versioned workspace, with secrets staged separately."
+1. **ADR 0001 — operator workspace.** A single tracked workspace at `/home/ze/opp-full-plat` for assessment, plans, scripts, ADRs, reports, and (git-ignored) secrets. Replaces the "everything lives in `cloud-init/`" pattern with "everything lives in a versioned workspace, with secrets staged separately."
 2. **ADR 0019 — Nexus-only image supply chain.** Single image-supply path. Replaces "every system's image refs are in its cloud-init file" with "every system pulls from `nexus-mirror.apps.sub.comptech-lab.com`."
-3. **ADR 0024 — OpenShift-only platform-gitops boundary.** Platform state for the v6 fleet is declarative under `platform-gitops` on GitLab; VM-tier state is captured in `codex-opp-agent/connection-details/` and `scripts/rebuild/`. Replaces "scattered point-in-time captures" with "declarative state, versioned, MR-reviewed."
+3. **ADR 0024 — OpenShift-only platform-gitops boundary.** Platform state for the v6 fleet is declarative under `platform-gitops` on GitLab; VM-tier state is captured in `opp-full-plat/connection-details/` and `scripts/rebuild/`. Replaces "scattered point-in-time captures" with "declarative state, versioned, MR-reviewed."
 
 ## Why we still read it sometimes
 
 Even though `cloud-init/` is scrap, it is not deleted. Three reasons to keep it:
 
 1. **Forensic evidence.** When investigating "did a previous attempt set this OIDC client?", the cloud-init folder is the only place the historical OAuth client_id might be recorded. Reading it is fine; just flag the value as historical.
-2. **Migration audit.** REP-6 used cloud-init as one of the inputs when deciding which memory entries to migrate to runbooks. The folder is a checklist of "things that were credentialed in the old world but should be re-credentialed in the new world."
+2. **Migration audit.** REP-6 used cloud-init as one of the inputs when deciding which operator notes to migrate to runbooks. The folder is a checklist of "things that were credentialed in the old world but should be re-credentialed in the new world."
 3. **Negative example for new operators.** When a new operator (human or agent) sees `cloud-init/` they immediately understand what the workspace-and-Vault discipline is preventing. Showing the bad state is faster than describing it.
 
 ## The do-not-touch contract
@@ -153,7 +153,7 @@ If a value is needed **and is not in Vault or the workspace**, the procedure is:
 2. Rotate the credential at the source system (GitLab admin UI, RHACS Central API, etc.).
 3. Store the new value in Vault under the correct convention path.
 4. Wire ESO (or the consuming script) to read from Vault.
-5. Update the relevant runbook in `codex-opp-agent/runbooks/` so the next operator finds the live path, not the cloud-init path.
+5. Update the relevant runbook in `opp-full-plat/runbooks/` so the next operator finds the live path, not the cloud-init path.
 
 ## What "failed install" specifically means here
 
@@ -166,12 +166,9 @@ The v6 fleet inherited zero runtime state from cloud-init. It inherited the less
 
 ## References
 
-- Memory `feedback_workspace_boundary.md` — the exact text of the boundary rule
-- Memory `project_workspace_scope.md` — OpenShift-only scope; RKE2/AWX out of scope
 - ADR 0001 — operator workspace
 - ADR 0019 — Nexus-only image supply chain
 - ADR 0024 — OpenShift-only platform-gitops boundary
-- REP-6 issue [#150](https://github.com/zeshaq/codex-opp-agent/issues/150) — migration of memory entries to runbooks
-- `codex-opp-agent/runbooks/secrets-custody-drift-check.md` — the REP-6 output that codifies "one credential, one location"
-- `codex-opp-agent/connection-details/vault-app-secrets.md` — current credential model
-- Memory `reference_rhacs_init_bundle_via_api.md` — replacement for cloud-init's `acs-*` files
+- REP-6 issue [#150](https://github.com/zeshaq/opp-full-plat/issues/150) — migration of operator notes to runbooks
+- `opp-full-plat/runbooks/secrets-custody-drift-check.md` — the REP-6 output that codifies "one credential, one location"
+- `opp-full-plat/connection-details/vault-app-secrets.md` — current credential model

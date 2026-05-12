@@ -53,7 +53,7 @@ export const supplyEdges = [
   { id: "e16", source: "workloads", target: "nexus",  label: "image pull", ...pullEdge },
 ];
 
-This page is the map of the entire disconnected image supply chain for the dc-lab v6 fleet. The ADR that frames every rule on this page is **[ADR 0019: Nexus-Only Image Supply Chain](https://github.com/zeshaq/codex-opp-agent/blob/main/adr/0019-nexus-only-image-supply-chain.md)** — every container image executed on `hub-dc-v6` or `spoke-dc-v6` must be available from the local Nexus mirror before a pod or operator is allowed to pull it.
+This page is the map of the entire disconnected image supply chain for the dc-lab v6 fleet. The ADR that frames every rule on this page is **[ADR 0019: Nexus-Only Image Supply Chain](https://github.com/zeshaq/opp-full-plat/blob/main/adr/0019-nexus-only-image-supply-chain.md)** — every container image executed on `hub-dc-v6` or `spoke-dc-v6` must be available from the local Nexus mirror before a pod or operator is allowed to pull it.
 
 ## Reading the diagram
 
@@ -77,7 +77,7 @@ The single Nexus VM exposes three Docker Registry HTTP API v2 endpoints, each wi
 | `docker-group.apps.sub.comptech-lab.com` | Developer + CI base-image pulls (UBI, Open Liberty, Node.js, Docker Hub passthrough) | `docker-group` (group: `docker-dev-hosted` + `icr-proxy` + `redhat-proxy` + `dockerhub-proxy`) | port `5001` | nothing (group is read-only) | Jenkins / Tekton / developer workstations |
 | `app-registry.apps.sub.comptech-lab.com` | CI-produced application image push and runtime pull (legacy Path A) | `docker-dev-hosted` (hosted) | port `5002` | Jenkins / Tekton | Argo-deployed workload pods |
 
-This separation is non-negotiable per ADR 0019 §5 and the operator handoff memory entry *"Nexus three-endpoint split — install, dev pull, app push"*. Crossing the streams (e.g., pushing an app image to `mirror-registry`) is a class of incident, not a tactical workaround: the OpenShift Image Set tooling owns the layout under `mirror-registry/openshift/...` and assumes it is the only author.
+This separation is non-negotiable per ADR 0019 §5 and the Nexus three-endpoint split (install / dev pull / app push). Crossing the streams (e.g., pushing an app image to `mirror-registry`) is a class of incident, not a tactical workaround: the OpenShift Image Set tooling owns the layout under `mirror-registry/openshift/...` and assumes it is the only author.
 
 ## What "image supply" includes
 
@@ -112,7 +112,7 @@ The first four classes are platform-owned and live on `mirror-registry`. The las
 
 ## Failure-mode digest
 
-The session log under `codex-opp-agent/SESSION_LOG.md` and the issue tracker have these recurring symptoms; the design above is largely a reaction to them.
+The session log under `opp-full-plat/SESSION_LOG.md` and the issue tracker have these recurring symptoms; the design above is largely a reaction to them.
 
 | Symptom | Root cause | Fix | Prevention |
 | --- | --- | --- | --- |
@@ -124,11 +124,9 @@ The session log under `codex-opp-agent/SESSION_LOG.md` and the issue tracker hav
 
 ## References
 
-- ADR 0019: [Nexus-Only Image Supply Chain](https://github.com/zeshaq/codex-opp-agent/blob/main/adr/0019-nexus-only-image-supply-chain.md).
-- `codex-opp-agent/connection-details/nexus.md` — endpoint inventory + curl validations.
-- `codex-opp-agent/connection-details/image-registry-allowlist.md` — two-layer allowlist (this site links to it as page 05).
-- `codex-opp-agent/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays.
-- `codex-opp-agent/plans/disconnected-rebuild/02-registry-mirror.md` — day-zero registry plan.
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current mirror inventory.
-- Memory entry: *project_nexus_endpoint_split.md* — three-endpoint split rationale.
-- Memory entry: *feedback_oc_mirror_off_limits.md* — `oc-mirror` reserved for OpenShift install; app work goes through Nexus only.
+- ADR 0019: [Nexus-Only Image Supply Chain](https://github.com/zeshaq/opp-full-plat/blob/main/adr/0019-nexus-only-image-supply-chain.md).
+- `opp-full-plat/connection-details/nexus.md` — endpoint inventory + curl validations.
+- `opp-full-plat/connection-details/image-registry-allowlist.md` — two-layer allowlist (this site links to it as page 05).
+- `opp-full-plat/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays.
+- `opp-full-plat/plans/disconnected-rebuild/02-registry-mirror.md` — day-zero registry plan.
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/mirror-manifest.md` — current mirror inventory.

@@ -13,7 +13,7 @@ draft: false
 
 Redis is deployed as a standalone private VM service for the v6 rebuild:
 
-- A three-node Sentinel-quorum cluster (`redis-0`, `redis-1`, `redis-2`) on dedicated private IPs in `30.30.30.0/24` (internal-only specifics in `codex-opp-agent/connection-details/`).
+- A three-node Sentinel-quorum cluster (`redis-0`, `redis-1`, `redis-2`) on dedicated private IPs in `30.30.30.0/24` (internal-only specifics in `opp-full-plat/connection-details/`).
 - Public-DNS Sentinel endpoint list at `redis-sentinel.sub.comptech-lab.com:26379`.
 - A debug / non-Sentinel discovery helper at `redis.sub.comptech-lab.com:6379`.
 - Redis currently uses ACLs, host firewalling, AOF persistence, and Sentinel quorum.
@@ -89,13 +89,13 @@ Operating rules that apply *now*:
 - **OpenShift workloads that need Redis must wait** for Vault-delivered credentials (ESO + Vault SecretStore) and for Sentinel-aware client configuration. The default behavior of "stuff `REDIS_URL` into the env" via a hard-coded password is forbidden.
 - **Any request to expose Redis publicly or through HAProxy needs a new ADR.** The current decision is private-only, and an "Redis open on the internet" path is far enough off-design that it has to go through review, not be merged silently.
 - **The hardening gates are sequential by readiness, not strictly ordered.** TLS can happen before backups; the lab just needs both to close before BFSI onboarding.
-- **Production-readiness evidence lives in `codex-opp-agent/connection-details/redis.md`** (and its dated session reports). The closure of each gate is recorded with an `oc`/`redis-cli` output snippet showing the verified state.
+- **Production-readiness evidence lives in `opp-full-plat/connection-details/redis.md`** (and its dated session reports). The closure of each gate is recorded with an `oc`/`redis-cli` output snippet showing the verified state.
 
 ## References
 
-- Source: `codex-opp-agent/adr/0006-redis-sentinel-hardening.md`
+- Source: `opp-full-plat/adr/0006-redis-sentinel-hardening.md`
 - Related VM-service ADRs: [ADR 0007 — Kafka KRaft production readiness](#) (similar structure, source `adr/0007-kafka-kraft-production-readiness.md`)
 - Day-zero PKI rules: [ADR 0005](/docs/06-architecture-decisions/05-adr-0005-network-ingress-pki)
 - Observability targets: [ADR 0010](/docs/06-architecture-decisions/09-adr-0010-signoz-standalone), [ADR 0012](/docs/06-architecture-decisions/10-adr-0012-monitoring-vm)
 - Vault secret-delivery pattern: §4 of this site (`vault-app-secrets.md`)
-- Operating notes: `codex-opp-agent/connection-details/redis.md` (when published; internal-only specifics meanwhile)
+- Operating notes: `opp-full-plat/connection-details/redis.md` (when published; internal-only specifics meanwhile)

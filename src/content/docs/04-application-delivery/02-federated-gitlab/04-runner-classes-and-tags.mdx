@@ -57,7 +57,7 @@ As of 2026-05-11, exactly one runner exists in the live instance: `gitlab-vm-doc
 - unprotected (runs untagged jobs)
 - on a non-dedicated VM
 
-This is the bootstrap runner and explicitly **not** the future trusted platform runner. The runner side of the access model is enforced by convention only until the five-class set is created. Tracked under the `GitLab Runner Operating Model` milestone in the codex-opp-agent repo.
+This is the bootstrap runner and explicitly **not** the future trusted platform runner. The runner side of the access model is enforced by convention only until the five-class set is created. Tracked under the `GitLab Runner Operating Model` milestone in the opp-full-plat repo.
 
 ### Why five classes (vs one big runner)
 
@@ -146,7 +146,7 @@ The webhook is gated by an HMAC secret token. The token is stored:
 
 - in the GitLab project's webhook configuration (Project → Settings → Webhooks → Secret token)
 - in the Jenkins credential store under `git-notifycommit-<project>-token`
-- in local custody under `codex-opp-agent/secrets/` as a per-project token file (local-only, Git-ignored)
+- in local custody under `opp-full-plat/secrets/` as a per-project token file (local-only, Git-ignored)
 
 Verification on the Jenkins side is by the Git Plugin's `notifyCommit` handler; on a mismatch the request is rejected and no build runs.
 
@@ -197,7 +197,7 @@ The credential policy is the firmest part of the access model: secrets do not li
 - **Vault-backed secret delivery.** Applications consume secrets via `ExternalSecret` referencing `secret/apps/<division>/<app>/<env>/*` (path convention DEV-OCP-0.4 / #174).
 - **Protected and masked GitLab variables** for CI bootstrap credentials. Project- or group-scoped; least privilege.
 - **External Secrets references by name** in tenant repos. The reference is committed; the value is not.
-- **Local-only secret custody** during lab bootstrap. The standard path is `codex-opp-agent/secrets/` (local-only, contents not enumerated here), Git-ignored, mode-restricted.
+- **Local-only secret custody** during lab bootstrap. The standard path is `opp-full-plat/secrets/` (local-only, contents not enumerated here), Git-ignored, mode-restricted.
 - **Jenkins credential store** for current Jenkins CI jobs until Vault migration completes.
 
 ### Forbidden
@@ -215,7 +215,7 @@ The credential policy is the firmest part of the access model: secrets do not li
 |---|---|---|
 | Bootstrap GitLab admin PAT | `"$LOCAL_BOOTSTRAP_PAT_FILE"  # bootstrap-admin PAT, local-only` | Local-only, Git-ignored; used by operator scripts. |
 | Operator GitLab PAT | `"$LOCAL_GITLAB_PAT_FILE"  # operator PAT, local-only` | Local-only, Git-ignored; used for platform-gitops MR creation. |
-| Jenkins admin credential | `codex-opp-agent/secrets/jenkins/admin.env` (local-only) | Local-only, Git-ignored. |
+| Jenkins admin credential | `opp-full-plat/secrets/jenkins/admin.env` (local-only) | Local-only, Git-ignored. |
 | Jenkins-side Nexus push credential | Jenkins credential store ID `nexus-jenkinsbot` | Username + password. |
 | Jenkins-side Trivy token | Jenkins credential store ID `trivy-server-token` | Secret text. |
 | Jenkins-side MinIO evidence credential | Jenkins credential store ID `minio-developer-ci-evidence` | Username + password. |

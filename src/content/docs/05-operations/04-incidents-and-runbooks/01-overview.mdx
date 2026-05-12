@@ -24,7 +24,7 @@ export const incNodes = [
   { id: "validate",   position: { x: 720, y: 0   }, data: { label: "Validate\n(Argo Synced/Healthy)" }, style: agentBox },
   { id: "postmortem", position: { x: 480, y: 150 }, data: { label: "Postmortem\n(session report)" }, style: dataBox },
   { id: "runbook",    position: { x: 240, y: 150 }, data: { label: "Runbook\nupdate" }, style: dataBox },
-  { id: "memory",     position: { x: 0,   y: 150 }, data: { label: "Memory entry\n(project_*.md)" }, style: dataBox },
+  { id: "note",       position: { x: 0,   y: 150 }, data: { label: "Operator note" }, style: dataBox },
 ];
 
 export const incEdges = [
@@ -46,7 +46,7 @@ Every runbook follows the same five-section schema, mandated by the section trac
 | **Root cause** | Why does this happen? What is the underlying contract that broke? |
 | **Fix** | Concrete commands — copy-paste-able — to recover the fleet. |
 | **Prevention** | What guardrail, alert, or design change reduces the chance of recurrence? |
-| **References** | The runbook file, ADRs, memory entries, and incident issues that back the page. |
+| **References** | The runbook file, ADRs, and incident issues that back the page. |
 
 ## The incident loop
 
@@ -54,11 +54,11 @@ Every runbook follows the same five-section schema, mandated by the section trac
 
 The loop runs left to right and bottom-up:
 
-1. **Detect.** An alert fires, a `kustomize` builds fail, Argo CD shows `ComparisonError`, a user reports a 404. Open an incident issue on `zeshaq/codex-opp-agent` with the label `incident` and the cluster name.
+1. **Detect.** An alert fires, a `kustomize` builds fail, Argo CD shows `ComparisonError`, a user reports a 404. Open an incident issue on `zeshaq/opp-full-plat` with the label `incident` and the cluster name.
 2. **Triage.** Match the symptom to one of the runbooks below. The diagnostic is usually a single read-only command (e.g., `oc get --raw /openapi/v2` for the Routes CRD incident).
 3. **Fix.** Most fixes are GitOps changes. Some — node cordons, a CRD delete to recover `/openapi/v2`, a stuck-node `desiredConfig` patch — are break-glass actions per ADR 0025 and produce an audit record.
 4. **Validate.** Argo CD returns to `Synced / Healthy` (or the incident-specific success indicator). Update the issue with validation evidence.
-5. **Postmortem.** Write a dated session report under `codex-opp-agent/reports/sessions/`. If the lesson is durable, update the relevant runbook, write a memory entry under `~/.claude/projects/-home-ze-claude-agent/memory/project_*.md`, and (if architectural) open an ADR amendment review issue.
+5. **Postmortem.** Write a dated session report under `opp-full-plat/reports/sessions/`. If the lesson is durable, update the relevant runbook, and (if architectural) open an ADR amendment review issue.
 
 ## The seven incident classes
 
@@ -88,7 +88,7 @@ A runbook becomes a published page when *all* of the following are true:
 - The fix has been validated in production by walking the documented commands.
 - A future operator (or the same operator, six months from now) could follow it without re-deriving the recipe.
 
-If you experience an incident that does not fit one of the seven below, open an incident issue, write the postmortem, then propose a new runbook MR against this site and a parallel runbook under `codex-opp-agent/runbooks/`. The same lesson lives in two places: the operator-facing runbook (procedure under pressure) and this section's published page (the public-facing summary).
+If you experience an incident that does not fit one of the seven below, open an incident issue, write the postmortem, then propose a new runbook MR against this site and a parallel runbook under `opp-full-plat/runbooks/`. The same lesson lives in two places: the operator-facing runbook (procedure under pressure) and this section's published page (the public-facing summary).
 
 ## What is *not* in this section
 
@@ -98,12 +98,11 @@ If you experience an incident that does not fit one of the seven below, open an 
 
 ## References
 
-- `codex-opp-agent/runbooks/break-glass-procedure.md` — overall break-glass policy
-- `codex-opp-agent/runbooks/mco-stuck-node-recovery.md`
-- `codex-opp-agent/runbooks/openshift-ipv6-disable-correct-approach.md`
-- `codex-opp-agent/runbooks/wso2-apim-jms-url-encoding-trap.md`
-- `codex-opp-agent/runbooks/secrets-custody-drift-check.md`
-- `codex-opp-agent/runbooks/jenkins-gitlab-webhook-pollscm.md`
-- Memory entries: `project_acm_gitops_addon_routes_crd`, `project_eso_egress_to_vault`, `project_obc_to_operand_secret_bridge`
+- `opp-full-plat/runbooks/break-glass-procedure.md` — overall break-glass policy
+- `opp-full-plat/runbooks/mco-stuck-node-recovery.md`
+- `opp-full-plat/runbooks/openshift-ipv6-disable-correct-approach.md`
+- `opp-full-plat/runbooks/wso2-apim-jms-url-encoding-trap.md`
+- `opp-full-plat/runbooks/secrets-custody-drift-check.md`
+- `opp-full-plat/runbooks/jenkins-gitlab-webhook-pollscm.md`
 - ADRs: 0018 (pull model), 0019 (image supply), 0025 (break-glass)
 - Issues: #135 (IPv6/OVN incident), #142 (MCO runbook), #153 (Routes CRD permanent fix), #229 (this section)

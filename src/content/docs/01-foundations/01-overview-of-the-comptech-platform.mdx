@@ -1,6 +1,6 @@
 ---
 title: "Overview of the CompTech Platform"
-description: "What the CompTech platform is, the audience for this documentation, the shape of the v6 fleet (hub-dc-v6 + spoke-dc-v6), and how this docs site relates to the source-of-truth in codex-opp-agent."
+description: "What the CompTech platform is, the audience for this documentation, the shape of the v6 fleet (hub-dc-v6 + spoke-dc-v6), and how this docs site relates to the source-of-truth in opp-full-plat."
 sidebar_label: "Overview"
 last_reviewed: 2026-05-11
 draft: false
@@ -40,7 +40,7 @@ export const fleetNodes = [
   { id: "signoz",    position: { x: 320, y: 440 }, data: { label: "SigNoz\n(observability)" }, style: vmBox },
   { id: "docker",    position: { x: 480, y: 440 }, data: { label: "Docker runtime\nVM" }, style: vmBox },
   { id: "ocmirror",  position: { x: 640, y: 440 }, data: { label: "oc-mirror\nworker VM" }, style: vmBox },
-  { id: "github",    position: { x: 280, y: 560 }, data: { label: "GitHub\ncodex-opp-agent (planning)" }, style: extBox },
+  { id: "github",    position: { x: 280, y: 560 }, data: { label: "GitHub\nopp-full-plat (planning)" }, style: extBox },
 ];
 
 export const fleetEdges = [
@@ -92,7 +92,7 @@ This site is written for four overlapping audiences:
 | **Security and audit reviewers** | The compliance and PCI-DSS material in [Operations](/docs/05-operations), the credential custody rules on the [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules) page, and the [ADR](/docs/06-architecture-decisions) record. |
 | **Curious external readers** | The blog posts on [zeshaq.pages.dev](https://zeshaq.pages.dev/blog/) cover individual subsystems in narrative form. This docs site is the structured reference. |
 
-If you are operating the platform — making changes, troubleshooting, onboarding a new tenant — the source-of-truth runbooks live in the private `codex-opp-agent` workspace, not here. This site is published with sanitized prose; internal IP addresses, credentials, and secret values are redacted. Treat this site as the orientation layer.
+If you are operating the platform — making changes, troubleshooting, onboarding a new tenant — the source-of-truth runbooks live in the private `opp-full-plat` workspace, not here. This site is published with sanitized prose; internal IP addresses, credentials, and secret values are redacted. Treat this site as the orientation layer.
 
 ## Fleet shape
 
@@ -103,14 +103,14 @@ The diagram above is the full v6 fleet at a glance. Read it as four bands:
 1. **Top band — the two OpenShift clusters.** `hub-dc-v6` is a compact three-node management cluster running RHACM, OpenShift GitOps, and the gitops-addon that wires hub Argo into ACM placement. `spoke-dc-v6` is a six-node workload cluster (three control-plane VMs plus three physical workers `gold-1`, `gold-2`, `gpu-01`) running ODF, ESO, the ACS Sensor, OADP, LokiStack, TempoStack, and tenant application workloads.
 2. **Middle band — operator subsystems.** Each labelled block is an OpenShift operator and its operand stack. Most live on the spoke; only ACM/MCE and the hub Argo instance live on the hub. The exact installed-versions list is in [Lab Infrastructure §Operator Inventory](/docs/02-lab-infrastructure).
 3. **Lower-middle band — platform VMs.** HAProxy provides the public/private edge with TLS termination; PowerDNS holds the authoritative `sub.comptech-lab.com` zone and serves the lab recursor; GitLab CE is the operational Git source; Vault holds per-app secrets under the `secret/apps/<division>/<app>/...` convention; Nexus exposes three Docker endpoints (install, dev pull, app push).
-4. **Bottom band — supporting VMs and the planning anchor.** MinIO holds evidence and backup data, Jenkins runs CI, SigNoz captures application telemetry, the Docker runtime VM serves non-OpenShift app workloads, and the `oc-mirror` worker VM runs `oc mirror --v2` to refresh OpenShift platform content into Nexus. GitHub `zeshaq/codex-opp-agent` is the planning anchor — issues, milestones, ADRs, reports — but is never a live GitOps source.
+4. **Bottom band — supporting VMs and the planning anchor.** MinIO holds evidence and backup data, Jenkins runs CI, SigNoz captures application telemetry, the Docker runtime VM serves non-OpenShift app workloads, and the `oc-mirror` worker VM runs `oc mirror --v2` to refresh OpenShift platform content into Nexus. GitHub `zeshaq/opp-full-plat` is the planning anchor — issues, milestones, ADRs, reports — but is never a live GitOps source.
 
 Key relationships highlighted on the diagram:
 
 - **Green dashed arrows = pull-mode.** The spoke klusterlet pulls from the hub; both Argo instances pull from internal GitLab. The hub does not push routine spoke configuration; it coordinates placement and lets the spoke reconcile its own local state. This is the ACM + OpenShift GitOps Basic pull pattern from ADR 0018.
 - **Purple solid arrows = data plane.** Workloads pulling images from Nexus, ESO authenticating into Vault, LokiStack/TempoStack writing chunks to MinIO, OADP writing Velero backups to MinIO.
 - **Black solid arrows = control / request.** Jenkins driving build pipelines; the operator subsystem relationships on the spoke.
-- **Red dashed arrow = explicitly NOT a path.** HAProxy is for platform VM edge exposure only. OpenShift routes do not go through HAProxy; the cluster ingress operator answers `*.apps.<cluster>.sub.comptech-lab.com` directly. The memory entry `feedback_haproxy_scope.md` enforces this boundary.
+- **Red dashed arrow = explicitly NOT a path.** HAProxy is for platform VM edge exposure only. OpenShift routes do not go through HAProxy; the cluster ingress operator answers `*.apps.<cluster>.sub.comptech-lab.com` directly.
 
 The fleet is intentionally narrow. There is no `hub-dr-v6` or `spoke-dr-v6` today; those names are reserved (ADR 0022) for a future DR build that has not been authorized. The pre-v6 `hub-dc` / `spoke-dc` / `hub-dr` / `spoke-dr` clusters are **decommissioned**; they may appear in historical session logs but do not exist as live targets and must not appear in new manifests.
 
@@ -129,25 +129,25 @@ This docs site is structured so you can read sections sequentially, jump in mid-
 
 If you are time-boxed and only have an hour, read §1 Foundations end-to-end, then jump to the §3 OpenShift Platform overview, then the [Whiteboard architecture](/docs/03-openshift-platform) on that page. That gives you the operating model and the fleet shape; everything else is detail.
 
-## Relationship to `codex-opp-agent`
+## Relationship to `opp-full-plat`
 
-This published site is the public face of the platform documentation. The internal source-of-truth lives in the **`codex-opp-agent` workspace** at `~/codex-opp-agent/` on the operator workstation and at `github.com/zeshaq/codex-opp-agent` for the planning record. The relationship is:
+This published site is the public face of the platform documentation. The internal source-of-truth lives in the **`opp-full-plat` workspace** at `~/opp-full-plat/` on the operator workstation and at `github.com/zeshaq/opp-full-plat` for the planning record. The relationship is:
 
-| Artifact | This docs site | `codex-opp-agent` |
+| Artifact | This docs site | `opp-full-plat` |
 | --- | --- | --- |
 | **Why a decision was made** | Summary prose + ADR pointer | Full ADR text under `adr/0000-*.md` |
 | **How to operate a subsystem** | Narrative overview + key commands | Full runbook under `connection-details/<subsystem>.md` |
 | **What state is now** | Out of scope (snapshots stale fast) | `CURRENT_STATE.md`, `TODO.md`, dated session reports |
 | **Internal IPs, hostnames, ports** | Generic descriptions only | Concrete addresses in `connection-details/` |
 | **Credential values** | Never published | Never published; custody only — see [Credential Custody Rules](/docs/01-foundations/04-credential-custody-rules) |
-| **Issue / milestone / phase tracking** | Out of scope | GitHub issues under `zeshaq/codex-opp-agent` |
+| **Issue / milestone / phase tracking** | Out of scope | GitHub issues under `zeshaq/opp-full-plat` |
 | **Live cluster manifests** | Out of scope | Internal GitLab `comptech-platform/openshift-ops/openshift-platform-gitops` |
 
-When this site says "see the operator handoff" or "see `connection-details/...`," that pointer is to the private `codex-opp-agent` workspace. The public site is intentionally not a substitute for the private operator material — it is the orientation layer that makes the private material navigable.
+When this site says "see the operator handoff" or "see `connection-details/...`," that pointer is to the private `opp-full-plat` workspace. The public site is intentionally not a substitute for the private operator material — it is the orientation layer that makes the private material navigable.
 
 ## How this site is published
 
-This site is built with [Astro](https://astro.build/) using MDX and React Flow (for the Whiteboard component) and Mermaid (for sequence and state diagrams). Source lives at `github.com/zeshaq/zahid`. A GitHub Actions workflow builds the site on every push to `main` and deploys to [Cloudflare Pages](https://pages.cloudflare.com/) at `zeshaq.pages.dev`. The memory entry `reference_blog_publishing_zahid.md` documents the publishing pipeline.
+This site is built with [Astro](https://astro.build/) using MDX and React Flow (for the Whiteboard component) and Mermaid (for sequence and state diagrams). Source lives at `github.com/zeshaq/zahid`. A GitHub Actions workflow builds the site on every push to `main` and deploys to [Cloudflare Pages](https://pages.cloudflare.com/) at `zeshaq.pages.dev`.
 
 There is **no live read of cluster state into this site**; everything on these pages is hand-authored prose with `last_reviewed: <date>` frontmatter. If a `last_reviewed` date is more than a few months old, treat the page as historical until a session re-validates it against the source-of-truth.
 
@@ -168,4 +168,3 @@ There is **no live read of cluster state into this site**; everything on these p
 - `adr/0022-v6-fleet-membership.md` — active fleet membership and reserved DR names
 - `adr/0024-openshift-only-platform-gitops-boundary.md` — repo boundary
 - `adr/0025-gitops-only-operations-break-glass.md` — GitOps-only operations + break-glass
-- Memory: `project_workspace_scope.md`, `reference_lab_infrastructure.md`, `feedback_workspace_boundary.md`

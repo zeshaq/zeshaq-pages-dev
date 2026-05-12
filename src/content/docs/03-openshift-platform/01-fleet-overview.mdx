@@ -107,13 +107,13 @@ The cluster-side architecture only makes sense in the context of the lab VMs it 
 | `oc-mirror` worker VM | `oc mirror --v2` runner pushing into Nexus mirror-registry | `oc-mirror.sub.comptech-lab.com` |
 | HAProxy edge | TLS termination for VM-hosted tools (Jenkins, SigNoz, Trivy, etc.); not used for OpenShift routes | the HAProxy VM (lab `/24`) |
 
-Specific lab `/24` host addresses for these VMs are kept in `codex-opp-agent/connection-details/` and not republished here.
+Specific lab `/24` host addresses for these VMs are kept in `opp-full-plat/connection-details/` and not republished here.
 
-> Internal-only specifics are kept in `codex-opp-agent/connection-details/`.
+> Internal-only specifics are kept in `opp-full-plat/connection-details/`.
 
 ## The control flow, in words
 
-1. A platform admin opens a merge request against `platform-gitops` (the canonical clone lives at `/home/ze/platform-gitops` for human operators and `/home/ze/claude-agent/clones/platform-gitops/` for agent work). The repo has one directory per cluster: `clusters/hub-dc-v6/` and `clusters/spoke-dc-v6/`. There is also a `clusters/hub-dc-v6/gitops-control/` directory that owns the Argo CD AppProjects, the cluster-admin binding, and the ApplicationSet definition.
+1. A platform admin opens a merge request against `platform-gitops` (the canonical clone lives at `/home/ze/platform-gitops` for personal use and `/home/ze/ops-workspace/clones/platform-gitops/` for automation work). The repo has one directory per cluster: `clusters/hub-dc-v6/` and `clusters/spoke-dc-v6/`. There is also a `clusters/hub-dc-v6/gitops-control/` directory that owns the Argo CD AppProjects, the cluster-admin binding, and the ApplicationSet definition.
 2. On `hub-dc-v6`, the OLM-installed OpenShift GitOps operator runs an Argo CD instance in the `openshift-gitops` namespace. Its `hub-dc-v6-bootstrap` Application reconciles `clusters/hub-dc-v6/bootstrap/` and `gitops-control/`, then everything else listed in the cluster's root `kustomization.yaml`. That instance is bound to `cluster-admin` per [ADR 0019](/docs/06-architecture-decisions/) so it can install operators and write cluster-scope resources on the hub itself.
 3. The hub also installs **ACM** (MultiClusterHub) and **MCE** (Multicluster Engine). MCE provides the registration controllers; ACM adds policy, governance, applications, and console. The hub manifests live under `clusters/hub-dc-v6/platform/acm/` and `clusters/hub-dc-v6/platform/fleet-registration/`.
 4. ACM `ManagedCluster/spoke-dc-v6`, `KlusterletAddonConfig`, and a `Placement` (selecting `env=dc, role=spoke, gitops-managed=true`) wire the spoke into the hub. A `GitOpsCluster` resource with `gitopsAddon.enabled: true` tells ACM to also install OpenShift GitOps on the spoke — as a Deployment (the "gitops-addon" install pattern), not as an OLM CSV.
@@ -122,7 +122,7 @@ Specific lab `/24` host addresses for these VMs are kept in `codex-opp-agent/con
 7. The **spoke Argo CD** reconciles `clusters/spoke-dc-v6/` from internal GitLab against `destination.server: https://kubernetes.default.svc` — that is, against the local API. It installs operators (LSO, ODF, ESO, RHACS, OADP, cert-manager, Loki, Tempo, OpenTelemetry, Tekton, Quay, etc.), then operands (`LVMCluster`, `StorageCluster`, `ClusterSecretStore`, `Central`/`SecuredCluster`, `DataProtectionApplication`, …) per sync-wave ordering.
 8. Images for everything come from Nexus. Cluster-side `ImageDigestMirrorSet` / `ImageTagMirrorSet` resources rewrite upstream registry references at node runtime so any pod that says `registry.redhat.io/foo@sha256:...` actually pulls from `mirror-registry.apps.sub.comptech-lab.com/foo@sha256:...`. The default OperatorHub sources are disabled; only the mirrored `cs-redhat-operator-index-v4-20` and `cs-certified-operator-index-v4-20` catalog sources are active.
 
-This is exactly the Red Hat reference architecture for ACM + OpenShift GitOps Basic pull (ADR 0018). Several things that look unusual at first glance — the spoke Argo running as a Deployment, the ApplicationSet template emitting `project: default`, hub Argo bound to `cluster-admin`, the hub having no `StorageClass` — are intentional features of the pattern, not drift. The memory entry `feedback_acm_gitops_pull_pattern.md` calls these out explicitly.
+This is exactly the Red Hat reference architecture for ACM + OpenShift GitOps Basic pull (ADR 0018). Several things that look unusual at first glance — the spoke Argo running as a Deployment, the ApplicationSet template emitting `project: default`, hub Argo bound to `cluster-admin`, the hub having no `StorageClass` — are intentional features of the pattern, not drift.
 
 ## Cluster endpoints
 
@@ -188,5 +188,4 @@ The rest of the section (image supply, operator lifecycle, storage, networking, 
 - `connection-details/openshift-gitops-hub-dc-v6.md` — hub Argo CD instance details, repo + AppProject + Application.
 - `connection-details/platform-admin-handoff.md` — admin runbook covering credentials, GitOps boundary, operator install workflow, Nexus layout, image-supply rules.
 - `adr/0001-operator-workspace.md`, `adr/0003-gitops-basic-pull-model.md`, `adr/0004-management-only-hubs.md`, `adr/0018-acm-openshift-gitops-pull-model-v6.md`, `adr/0019-nexus-only-image-supply-chain.md`, `adr/0022-v6-fleet-membership.md`, `adr/0024-openshift-only-platform-gitops-boundary.md`, `adr/0025-gitops-only-operations-break-glass.md`.
-- Memory: `project_workspace_scope.md`, `feedback_acm_gitops_pull_pattern.md`, `reference_gitops_sources.md`, `reference_platform_gitops_mr_path.md`.
-- Tracker: codex-opp-agent issue #227.
+- Tracker: opp-full-plat issue #227.

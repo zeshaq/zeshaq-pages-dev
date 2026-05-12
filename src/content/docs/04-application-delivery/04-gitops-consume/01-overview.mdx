@@ -83,26 +83,26 @@ For the **tenant side** (what to put in `apps/<team>/<app>/`), see [the app-repo
 
 Three boundaries are load-bearing and must be preserved when you change anything in this subsection:
 
-1. **Tenants cannot write `Application` or `ApplicationSet` CRs.** The AppProject's `roles` do not include those kinds. If a tenant needs a non-templated Application (a one-off CronJob, a Job), they file a `type/enhancement` issue against `codex-opp-agent`; the platform team adds it to the ApplicationSet template or to a separate AppSet shipping from `platform-gitops`.
-2. **CI cannot push to `stg/` or `prd/` overlays.** The Jenkins overlay-patch step and the Tekton overlay-patch step both refuse to write outside `dev/`. Promotion is a human-driven `scripts/promote.sh` run that copies the digest forward. See [the promotion model](../03-build-paths/04-promotion-model) for the rationale and [`promote.sh`](https://github.com/zeshaq/claude-agent/blob/main/scripts/promote.sh) for the mechanics.
+1. **Tenants cannot write `Application` or `ApplicationSet` CRs.** The AppProject's `roles` do not include those kinds. If a tenant needs a non-templated Application (a one-off CronJob, a Job), they file a `type/enhancement` issue against `opp-full-plat`; the platform team adds it to the ApplicationSet template or to a separate AppSet shipping from `platform-gitops`.
+2. **CI cannot push to `stg/` or `prd/` overlays.** The Jenkins overlay-patch step and the Tekton overlay-patch step both refuse to write outside `dev/`. Promotion is a human-driven `scripts/promote.sh` run that copies the digest forward. See [the promotion model](../03-build-paths/04-promotion-model) for the rationale and [`promote.sh`](https://github.com/zeshaq/ops-workspace/blob/main/scripts/promote.sh) for the mechanics.
 3. **The hub Argo CD never reconciles into the spoke directly.** Every tenant Application is wrapped in a ManifestWork and the spoke's local Argo CD does the actual `kustomize build` and `apply`. This is what makes the pattern survive a hub outage and what keeps the hub CPU footprint flat as spokes scale.
 
 ## Failure-mode preview
 
 These reappear with full *symptom → root cause → fix → prevention* tables on the per-page sections, but flagged here so the operator knows the four most common ways this pipeline breaks:
 
-- **Argo silent / not syncing at all** on a spoke after a manifest change. Usually the ACM gitops-addon installed a rogue `routes.route.openshift.io` CRD that shadows the aggregated OpenShift Route APIService and crashes the `/openapi/v2` endpoint, which stalls every Argo sync silently. See [the platform memory entry](../../03-rhacm-and-pull-model/01-overview#failure-modes) — fix is `oc delete crd routes.route.openshift.io`.
+- **Argo silent / not syncing at all** on a spoke after a manifest change. Usually the ACM gitops-addon installed a rogue `routes.route.openshift.io` CRD that shadows the aggregated OpenShift Route APIService and crashes the `/openapi/v2` endpoint, which stalls every Argo sync silently. See [the platform incident page](../../03-rhacm-and-pull-model/01-overview#failure-modes) — fix is `oc delete crd routes.route.openshift.io`.
 - **`OutOfSync` on a brand-new tenant app** because the cluster-wide `app-registry-pull` Secret was never materialised into the new namespace. Symptom is `ImagePullBackOff` on the `Deployment`. Fix is to label the namespace `apps.platform/tenant=true` so the `ClusterExternalSecret` fans the Secret in; see [04 — ESO Secret and pullSecret](../05-tenant-onboarding/04-eso-secret-and-pullsecret).
 - **ApplicationSet creates an Application against the wrong cluster.** Usually the Placement label matcher overlaps two clusters. Re-run the Placement evaluation: `oc -n open-cluster-management get placementdecision <name> -o yaml` and confirm `status.decisions` contains exactly the target.
 - **`kustomize build` succeeds in Argo but the rendered manifest has a tag, not a digest.** The overlay was hand-edited to a `newTag:` after the digest was patched in by CI. Lint catches this pre-merge; the `kustomize build … | grep -v @sha256` negative check in [03 — App-repo overlay contract](./03-app-repo-overlay-contract) catches it post-merge.
 
 ## References
 
-- `codex-opp-agent/connection-details/app-repo-contract.md` (issue #182)
-- `codex-opp-agent/connection-details/image-digest-overlay.md` (issue #185)
-- `codex-opp-agent/connection-details/promotion-model.md` (issue #184)
-- `codex-opp-agent/connection-details/app-registry-pullsecret.md` (issue #172)
-- `codex-opp-agent/adr/0014-developer-readiness-platform-contract.md`
-- `codex-opp-agent/adr/0015-federated-gitops-repo-architecture.md`
-- `codex-opp-agent/adr/0018-acm-openshift-gitops-pull-model-v6.md`
+- `opp-full-plat/connection-details/app-repo-contract.md` (issue #182)
+- `opp-full-plat/connection-details/image-digest-overlay.md` (issue #185)
+- `opp-full-plat/connection-details/promotion-model.md` (issue #184)
+- `opp-full-plat/connection-details/app-registry-pullsecret.md` (issue #172)
+- `opp-full-plat/adr/0014-developer-readiness-platform-contract.md`
+- `opp-full-plat/adr/0015-federated-gitops-repo-architecture.md`
+- `opp-full-plat/adr/0018-acm-openshift-gitops-pull-model-v6.md`
 - ACM gitops-addon Routes CRD lab memory (incident #153, 2026-05-10)

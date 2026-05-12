@@ -135,7 +135,7 @@ There is no `Allow` action. There is no priority field. There is no namespace-le
 
 For a vendor sidecar `gcr.io/<vendor>/<sidecar>:<tag>`:
 
-1. Tenant opens an issue against `codex-opp-agent` describing the image, vendor licensing terms, consuming app.
+1. Tenant opens an issue against `opp-full-plat` describing the image, vendor licensing terms, consuming app.
 2. Platform admin pulls the image once, re-tags as `app-registry.apps.sub.comptech-lab.com/<vendor>/<sidecar>:<tag>`, pushes. Trivy scans on push gate this; results land in DefectDojo per ADR 0013.
 3. Tenant's GitOps overlay references the `app-registry` path and pins by digest per `image-digest-overlay.md`.
 4. **No VAP change required** — `app-registry.apps.sub.comptech-lab.com/` is already in the cluster-wide allowlist.
@@ -148,7 +148,7 @@ If mirroring is infeasible (vendor licensing forbids re-hosting, image is rebuil
 
 This is a **governance change, not a tenant change**:
 
-1. Open a `type/decision` issue against `codex-opp-agent` proposing the prefix, the consuming team, the supply-chain compensating controls (Trivy policy, RHACS image policy, signing if available), and a sunset criterion ("when vendor publishes to Red Hat Container Catalog, we revert").
+1. Open a `type/decision` issue against `opp-full-plat` proposing the prefix, the consuming team, the supply-chain compensating controls (Trivy policy, RHACS image policy, signing if available), and a sunset criterion ("when vendor publishes to Red Hat Container Catalog, we revert").
 2. Platform admin reviews. If accepted, the change is made in `platform-gitops` at the cluster-wide VAP manifests (both `hub-dc-v6` and `spoke-dc-v6`) by adding the prefix to the `allowedPrefixes` variable, the `description:` annotation, and the `messageExpression`.
 3. The issue records the decision; on merge, the prefix is in the audit trail.
 4. RHACS image policy is updated in parallel via `scripts/rhacs-update-img-allowlist.sh` (Central API) so RHACS doesn't flag the newly-allowed prefix.

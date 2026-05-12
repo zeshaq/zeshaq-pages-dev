@@ -29,7 +29,7 @@ The risk this ADR fixes is silent drift between docs: agents and operators conti
 
 ## Decision
 
-The **active OpenShift fleet membership** for the codex-opp-agent workspace is:
+The **active OpenShift fleet membership** for the opp-full-plat workspace is:
 
 | Cluster | Role | Status |
 |---|---|---|
@@ -55,7 +55,7 @@ When operating against the fleet:
 **Write the supersession as a paragraph in `CURRENT_STATE.md` only.** Lighter ceremony. Rejected because:
 
 - `CURRENT_STATE.md` rotates; it's a living snapshot, not a durable decision.
-- A future operator-agent reads ADRs at session start. Without an ADR, the supersession lives only in memory and chat logs.
+- A future operator reads ADRs at session start. Without an ADR, the supersession lives only in chat logs and personal notes.
 - The drift problem the ADR is fixing is exactly that operators write new things using the old fleet names; only an ADR-level supersession is durable enough to prevent that.
 
 **Leave the DR pair documented as "decommissioned standbys" but reserve them in case we rebuild.** Rejected because:
@@ -70,10 +70,9 @@ When operating against the fleet:
 
 Closeout actions taken at acceptance:
 
-- **`codex-opp-agent/CLUSTERS.md`** — `hub-dr` and `spoke-dr` sections removed; Active Scope updated to name `hub-dc-v6` / `spoke-dc-v6`.
-- **`codex-opp-agent/plans/federated-gitops-readiness-gates.md`** — references to "future `hub-dr`" / "future `spoke-dr`" updated to "future `hub-dr-v6`" / "future `spoke-dr-v6`".
+- **`opp-full-plat/CLUSTERS.md`** — `hub-dr` and `spoke-dr` sections removed; Active Scope updated to name `hub-dc-v6` / `spoke-dc-v6`.
+- **`opp-full-plat/plans/federated-gitops-readiness-gates.md`** — references to "future `hub-dr`" / "future `spoke-dr`" updated to "future `hub-dr-v6`" / "future `spoke-dr-v6`".
 - **ADR Index issue (#131)** — this ADR added with a note on ADR 0001 that the cluster list is superseded by 0022.
-- **Workspace memory** (`/home/ze/.claude/projects/-home-ze-claude-agent/memory/`) updated to v6-only scope with an explicit decommissioned-DR guard. Memory entry: `project_workspace_scope.md`.
 - **ADR 0001 itself is NOT modified.** Historical record preserved.
 
 ## Consequences
@@ -81,16 +80,14 @@ Closeout actions taken at acceptance:
 - **Future readers see ADR 0022 as the source of truth for active fleet membership;** ADR 0001 is the historical anchor for the workspace decision.
 - **Documents and code that still mention old `hub-dr` / `spoke-dr` are flagged as drift-from-current-state** and should be updated when touched. A drift-grep over the workspace is part of routine session closeouts.
 - **Reintroducing DR under v6** (`hub-dr-v6` / `spoke-dr-v6`) requires a new ADR or amendment to record the install, ACM `ManagedCluster` registration, and platform-gitops `clusters/<name>/` directory structure. This ADR reserves the names; it does not authorize the build.
-- **Memory entry `project_workspace_scope.md`** is now the operator-agent's fast-path source of truth for "what clusters are in scope right now." It duplicates the table above for ambient recall.
 
 ## References
 
-- Source: `codex-opp-agent/adr/0022-v6-fleet-membership.md`
+- Source: `opp-full-plat/adr/0022-v6-fleet-membership.md`
 - Superseded predecessor (cluster-list portion only): [ADR 0001](/docs/06-architecture-decisions/03-adr-0001-cluster-list)
 - Federation context: [ADR 0015](/docs/06-architecture-decisions/12-adr-0015-federated-gitops)
 - v6 management baseline: [ADR 0018](/docs/06-architecture-decisions/14-adr-0018-acm-gitops-pull)
-- Platform admin handoff: `codex-opp-agent/connection-details/platform-admin-handoff.md`
-- Compliance implementor handbook: `codex-opp-agent/connection-details/compliance-implementor-handbook.md`
-- Tracker: `zeshaq/codex-opp-agent` #156 (OPS-V6-FLEET-1 — the purge work)
-- ADR Index issue: `zeshaq/codex-opp-agent` #131
-- Memory entry: `project_workspace_scope.md`
+- Platform admin handoff: `opp-full-plat/connection-details/platform-admin-handoff.md`
+- Compliance implementor handbook: `opp-full-plat/connection-details/compliance-implementor-handbook.md`
+- Tracker: `zeshaq/opp-full-plat` #156 (OPS-V6-FLEET-1 — the purge work)
+- ADR Index issue: `zeshaq/opp-full-plat` #131

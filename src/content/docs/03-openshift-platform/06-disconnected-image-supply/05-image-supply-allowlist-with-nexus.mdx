@@ -8,7 +8,7 @@ draft: false
 
 The IDMS / ITMS rewrite story makes pulls from Nexus *possible*. The allowlist enforces that they are the *only* pulls. This page documents the two-layer enforcement model — cluster-side **ValidatingAdmissionPolicy** plus RHACS Central **deploy-time policy** — that closes the loop on ADR 0019.
 
-The canonical operator reference for this enforcement is `codex-opp-agent/connection-details/image-registry-allowlist.md` (tracked under issue **#126** / DEV-OCP-2.5 / **#186**). What follows is the public-facing version of the same controls.
+The canonical operator reference for this enforcement is `opp-full-plat/connection-details/image-registry-allowlist.md` (tracked under issue **#126** / DEV-OCP-2.5 / **#186**). What follows is the public-facing version of the same controls.
 
 ## Why two layers
 
@@ -161,7 +161,7 @@ RHACS policies are stored in Central's database, not GitOps. The matching policy
 
 ### How it gets updated
 
-A helper script lives at `/home/ze/claude-agent/scripts/rhacs-update-img-allowlist.sh`. It:
+A helper script lives at `/home/ze/ops-workspace/scripts/rhacs-update-img-allowlist.sh`. It:
 
 1. Pulls the htpasswd admin password from `oc -n stackrox get secret central-htpasswd` (same pattern as ESO wiring).
 2. GETs the current policy via `https://central-stackrox.apps.hub-dc-v6.sub.comptech-lab.com/v1/policies/<id>`.
@@ -170,7 +170,7 @@ A helper script lives at `/home/ze/claude-agent/scripts/rhacs-update-img-allowli
 
 The script is **idempotent**. To add a registry: edit the `DESIRED_REGISTRIES` array at the top, rerun, confirm.
 
-> The exact Central hostname, policy ID, and helper script auth pattern are kept in `codex-opp-agent/connection-details/image-registry-allowlist.md`.
+> The exact Central hostname, policy ID, and helper script auth pattern are kept in `opp-full-plat/connection-details/image-registry-allowlist.md`.
 
 ### Spoke propagation
 
@@ -223,7 +223,7 @@ Both layers fail-closed. They are designed to overlap, not to mirror each other 
 
 ## References
 
-- `codex-opp-agent/connection-details/image-registry-allowlist.md` (issue #126, extended #186).
+- `opp-full-plat/connection-details/image-registry-allowlist.md` (issue #126, extended #186).
 - ADR 0019 — Nexus-only image supply chain, §Decision 7 + Runtime Allowlist.
 - [03-idms-itms-and-cluster-pull](/docs/openshift-platform/disconnected-image-supply/idms-itms-and-cluster-pull) — rewrite layer underneath this.
-- `codex-opp-agent/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays.
+- `opp-full-plat/connection-details/image-digest-overlay.md` — digest-pinning convention for app overlays.

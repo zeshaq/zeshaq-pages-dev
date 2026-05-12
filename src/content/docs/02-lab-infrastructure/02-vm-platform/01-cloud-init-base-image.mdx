@@ -37,7 +37,7 @@ It is a *generic* cloud-image qcow2 — no lab-specific provisioning is baked in
 
 For any new VM (`<vm>`):
 
-1. **Allocate** an IP and MAC by editing `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`. The deterministic MAC convention is `52:54:00:XX:XX:<last-octet-of-IP-in-hex>`; the exact middle bytes are part of the internal lab convention recorded in `codex-opp-agent/connection-details/`. This makes the allocation table greppable.
+1. **Allocate** an IP and MAC by editing `plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`. The deterministic MAC convention is `52:54:00:XX:XX:<last-octet-of-IP-in-hex>`; the exact middle bytes are part of the internal lab convention recorded in `opp-full-plat/connection-details/`. This makes the allocation table greppable.
 2. **Clone the base qcow2** onto the chosen hypervisor: `cp /var/lib/libvirt/images/ubuntu-24.04-base.qcow2 /var/lib/libvirt/images/<vm>.qcow2`, then `qemu-img resize` it to the per-VM OS disk size (typically `100G`).
 3. **Create a data disk** if the role needs one (Jenkins home, Docker data dir, Vault raft path, MinIO buckets, ClickHouse storage, Loki/Tempo storage…). Mount it at the service's expected path during cloud-init.
 4. **Render cloud-init** for the VM — `user-data`, `meta-data`, `network-config` — and seed an ISO with `cloud-localds` or attach a `noCloud` datasource via libvirt.
@@ -101,7 +101,7 @@ The exact `runcmd` lists for each role live in the corresponding `plans/disconne
 
 There is exactly one SSH user across the fleet: `ze`. Two laptop keys plus the `ocp-bootstrap` host key are pre-authorized via cloud-init. Root login is disabled, password auth is disabled, and `sudo NOPASSWD` is configured so the `ze` user can run privileged commands without prompts (this is a single-operator lab; `sudo`-with-password would only slow recovery work).
 
-Service-specific app admin usernames (`zahid` on Jenkins, `zahid` on Grafana, `zahid` on SigNoz, `zahid` on DefectDojo) are a separate identity — they live inside the application, not in the OS. Their passwords are kept in **local-only ignored** files under `codex-opp-agent/secrets/<service>/`.
+Service-specific app admin usernames (`zahid` on Jenkins, `zahid` on Grafana, `zahid` on SigNoz, `zahid` on DefectDojo) are a separate identity — they live inside the application, not in the OS. Their passwords are kept in **local-only ignored** files under `opp-full-plat/secrets/<service>/`.
 
 ## What cloud-init never does
 
@@ -144,7 +144,7 @@ Expected: `cloud-init status` returns `status: done`. If it returns `running` fo
 
 ## Cloud-init history workspace (read-only)
 
-There is a historical `/home/ze/cloud-init/` workspace on the operator workstation that holds older `ip-allocations.yaml`, retired VM specs, and pre-rebuild material. Per the operator workspace boundary memory, that path is **read-only scrap** — useful for archeology, never for new work. New VM allocations go into `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`, full stop.
+There is a historical `/home/ze/cloud-init/` workspace on the operator workstation that holds older `ip-allocations.yaml`, retired VM specs, and pre-rebuild material. Per the operator workspace boundary memory, that path is **read-only scrap** — useful for archeology, never for new work. New VM allocations go into `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`, full stop.
 
 ## Failure modes
 
@@ -157,8 +157,7 @@ There is a historical `/home/ze/cloud-init/` workspace on the operator workstati
 
 ## References
 
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
-- `codex-opp-agent/plans/disconnected-rebuild/environments/dc-lab/*-vm-plan.md` (Vault, Jenkins, SigNoz, monitoring, Trivy, DefectDojo, Docker runtime, Kafka, Redis, WSO2)
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/allocation-table.md`
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/environment-profile.md`
+- `opp-full-plat/plans/disconnected-rebuild/environments/dc-lab/*-vm-plan.md` (Vault, Jenkins, SigNoz, monitoring, Trivy, DefectDojo, Docker runtime, Kafka, Redis, WSO2)
 - ADRs 0009 (Jenkins VM), 0010 (SigNoz VM), 0012 (monitoring VM), 0013 (DefectDojo VM)
-- Memory: `reference_lab_infrastructure.md`, `feedback_workspace_boundary.md`
