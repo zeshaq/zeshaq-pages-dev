@@ -1,0 +1,72 @@
+---
+title: "Blog ADR 0007 — /docs/ as a master section with per-module sub-trees"
+sidebar_label: "ADR 0007 — Docs master section"
+description: "Why the BRAC POC collection was folded back under /docs/ and the platform docs were re-rooted under /docs/openshift-platform/, with /docs/ becoming a master section."
+last_reviewed: 2026-05-12
+last_updated: 2026-05-12
+draft: false
+---
+
+## Status
+
+Accepted — 2026-05-12. Supersedes [Blog ADR 0006](./06-adr-0006-brac-poc-collection).
+
+## Context
+
+[Blog ADR 0006](./06-adr-0006-brac-poc-collection) promoted the BRAC Bank POC docs out of `/docs/` into a standalone `brac-poc` content collection to keep the platform-docs audience separate from the engagement audience. That decision was correct for the surface-level problem (mixed sidebars, mixed search results), but it created a different problem: **every new reference surface needs its own collection**.
+
+By 2026-05-12 the repository had four content collections (`blog`, `docs`, `learn`, `brac-poc`), three docs-shaped collections among them (`docs`, `learn`, `brac-poc`), and three near-identical layout/sidebar pairs (`DocsLayout` + `DocsSidebar`, `LearnLayout` + `LearnSidebar`, `BracPocLayout` + `BracPocSidebar`). Adding a second engagement, a runbook surface, or a customer-handoff surface would mean cloning the scaffolding again. The actual difference between these surfaces is *which subtree of docs you're scoped to* — not the routing, not the layout, not the schema.
+
+The other forcing function was URL stability. The platform docs at `/docs/<section>/<page>` had baked in the assumption that `/docs/` was the platform-docs landing. Any new docs surface inherited that assumption or had to escape it with a separate collection. Treating `/docs/` as a *master section* — with sub-modules underneath — gives every reference surface a stable, predictable shape without new collections.
+
+## Decision
+
+Use `/docs/<module>/` as the canonical pattern for any docs-shaped surface:
+
+- **OpenShift platform docs** move under `/docs/openshift-platform/` (was `/docs/<section>` at the root of the docs collection).
+- **BRAC POC** moves back under `/docs/brac-poc/` (was the standalone `/brac-poc/` collection).
+- **Future modules** (other engagements, runbooks, handbooks) get their own `/docs/<module>/` sub-tree without new collections, layouts, or sidebars.
+
+The `docs` Astro content collection stays a single collection. The sidebar scopes to a module by reading the first path segment after `/docs/` and filtering the tree. The `DocsLayout` is module-aware via the same path segment. The `brac-poc` collection is retired; its files move into `src/content/docs/brac-poc/` with the same schema.
+
+URL changes are absorbed by `public/_redirects`:
+
+- `/brac-poc/*` → `/docs/brac-poc/:splat` (301).
+- `/docs/<section>/*` → `/docs/openshift-platform/<section>/:splat` for each old top-level section (foundations, lab-infrastructure, application-delivery, operations, architecture-decisions, references, history-and-replay).
+- `/docs/openshift-platform/<subsection>` (which used to be the inner section before the re-root) → `/docs/openshift-platform/openshift-platform/<subsection>` for each known subsection slug. The catch-all is intentionally avoided because `/docs/openshift-platform/` is now the live module home and must not redirect.
+
+## Alternatives considered
+
+1. **Keep four collections, accept the scaffolding cost.**
+   - Every new surface clones a layout, a sidebar, a route, a tree builder. Cost grows linearly with surfaces. Already at three docs-shaped collections; a fourth was the trigger.
+   - Rejected.
+
+2. **Generic `engagements/` collection per the Blog ADR 0006 "alternative #2".**
+   - Still requires a separate collection and separate layout. Only solves the BRAC-specific case, not the general "every new reference surface needs scaffolding" problem.
+   - Rejected.
+
+3. **Use Astro's `getCollection` filters in a single collection but keep all URLs flat under `/docs/`.**
+   - Doesn't solve the sidebar-scoping problem; the audience-mixing of Blog ADR 0006 reappears.
+   - Rejected.
+
+## Consequences
+
+**Positive:**
+
+- One content collection (`docs`), one layout (`DocsLayout`), one sidebar component (`DocsSidebar`) — module-aware via the URL.
+- Adding a new docs surface = create `src/content/docs/<module>/` and drop MDX files in. The sidebar auto-scopes, no code changes.
+- BRAC POC readers and platform readers still see only their module's tree in the sidebar — solved by URL-scoped filtering rather than separate collections.
+- Cross-module discovery happens via the homepage **Sections** row and the `/docs/` landing's module cards, not a shared sidebar.
+
+**Negative:**
+
+- URL changes for every previously published platform doc and every BRAC POC page. Absorbed by 301 redirects in `public/_redirects`; sitemaps regenerate at build.
+- The `/docs/openshift-platform/openshift-platform/<subsection>` URLs are awkward (the module name repeats). Cost of preserving the historical inner section's slug stability against the new module root. Cleaner names can be considered later by promoting the inner-section pages up a level inside the module.
+- Two existing BRAC POC URLs that Blog ADR 0006 said weren't redirected (because the content was brand-new with no external links) now *are* redirected. No cost, just a slight under-promise/over-deliver.
+
+## Related
+
+- [Blog ADR 0001](./01-adr-0001-multi-collection-content-model) — the multi-collection model; this ADR shrinks it from four to three collections.
+- [Blog ADR 0006](./06-adr-0006-brac-poc-collection) — superseded; the BRAC POC collection it created is now retired.
+- `public/_redirects` — the 301 rules that absorb the URL move.
+- `src/pages/index.astro` — the homepage Sections row introduced alongside this decision.
