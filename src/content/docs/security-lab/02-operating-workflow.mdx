@@ -18,6 +18,33 @@ Use the lab in short, documented loops:
 - Update the private lab repo with infrastructure notes and ADRs.
 - Promote reusable learning notes into this docs section after removing secrets.
 
+## Background-First Rule
+
+Long-running lab work should run in the background so disconnects do not lose state. The private lab repo now treats this as an accepted ADR:
+
+- Use sub agents for independent side work when the runtime supports safe parallel delegation.
+- Run long-running shell work in named `tmux` sessions.
+- Keep useful command output in `logs/`.
+- Keep task state in `docs/task-log/`.
+- Update `docs/AGENT_MEMORY.md` when infrastructure state changes.
+- Commit and push durable documentation after state-changing work.
+
+Examples of long-running tasks include VM installs, image imports, package upgrades, scanner feed updates, Security Onion setup, Nexus Dashboard deployment, and large verification jobs.
+
+The standard helper in the private lab repo is:
+
+```bash
+./scripts/start-background-task.sh <session-name> logs/<task>.log '<command>'
+```
+
+On resume, check Git, tmux, and the task notes before continuing:
+
+```bash
+git status --short --branch
+tmux ls
+find docs/task-log -maxdepth 1 -type f | sort
+```
+
 ## Tool Roles
 
 | Tool | Role |
