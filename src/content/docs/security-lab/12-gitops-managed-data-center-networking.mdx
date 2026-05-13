@@ -1,0 +1,380 @@
+---
+title: "Security Lab — GitOps-managed data center networking"
+sidebar_label: "GitOps-managed networking"
+description: "A reference design for managing data center networking with GitOps-style desired state, validation, staged rollout, and drift detection."
+last_reviewed: 2026-05-13
+draft: false
+---
+
+A data center network can be GitOps-managed, but the phrase needs discipline. GitOps for networking should not mean "merge a pull request and blindly push configs to every router." The right model is Git-controlled desired state, strong validation, staged deployment, telemetry-backed verification, and a clear break-glass path.
+
+The goal is to make network operations boring: every change is reviewed, rendered, tested, applied in a controlled sequence, and checked against the real state afterward.
+
+## Executive Recommendation
+
+Use GitOps to manage the network operating model, not just the device configuration.
+
+| Layer | Recommendation | Why |
+| --- | --- | --- |
+| Source of truth | Nautobot or NetBox plus Git | The inventory, IPAM, VRFs, circuits, tenants, and topology need structure before automation can be trusted. |
+| Desired state | Git repository with declarative YAML, JSON, or data models | Pull requests become the review and approval workflow. |
+| Validation | CI pipeline with schema checks, rendered config diffs, policy checks, and simulation | Bad route policy should fail before touching production. |
+| Deployment | Ansible, Nornir, Scrapli, vendor APIs, or a custom controller | The deployment layer should be replaceable; the desired state should not depend on one tool. |
+| Pre-production | EVE-NG, containerlab, Batfish, pyATS, or vendor lab gear | Networks need behavioral tests, not only syntax checks. |
+| Verification | Streaming telemetry, route checks, reachability tests, config state, and alert correlation | The pipeline must prove that the network converged. |
+| Drift handling | Alert or open a pull request first; auto-reconcile only low-risk drift | Blind overwrites can turn a local mistake into a fabric-wide outage. |
+
+## What Belongs In Git
+
+Git should hold the intended network state and the automation that produces device changes.
+
+Good candidates:
+
+- sites, rooms, racks, devices, roles, platforms, and software versions
+- interface descriptions, cabling, LAGs, MLAG/vPC pairs, and breakout maps
+- VLANs, VRFs, route targets, route distinguishers, and tenant networks
+- BGP underlay neighbors and ASN assignments
+- MP-BGP EVPN overlay parameters
+- prefix lists, route maps, communities, and route policy templates
+- loopbacks, point-to-point links, management addresses, and IPAM reservations
+- DNS records, NTP, syslog, SNMP, telemetry, and AAA references
+- firewall objects and policies where supported by review and simulation
+- load balancer VIPs and pool membership
+- Cloudflare DNS, Access, Tunnel, Magic WAN, and security settings via Terraform
+- monitoring targets, alert rules, and dashboard definitions
+
+Keep secrets out of Git. Git can reference a secret path, but the secret value belongs in Vault, a secrets manager, or another controlled secret store.
+
+## What Needs Extra Guardrails
+
+Some changes should never auto-apply without extra review:
+
+- management interface changes
+- AAA, TACACS, RADIUS, SSH, and local user changes
+- underlay routing changes
+- default route changes
+- BGP transit, peering, and private-connect changes
+- route reflector policy
+- EVPN route-target changes
+- firewall deny rules
+- NAT changes
+- DDoS and blackhole policy
+- firmware or network OS upgrades
+- automation credential changes
+- any change affecting out-of-band access
+
+These changes need explicit approval, maintenance windows where appropriate, and a pre-written rollback.
+
+## Reference Pipeline
+
+```text
+Engineer / operator
+        |
+        v
+Pull request
+        |
+        v
+CI validation
+  - schema check
+  - source-of-truth consistency
+  - render configs
+  - show intended diff
+  - route-policy checks
+  - simulation / lab tests
+  - blast-radius scoring
+        |
+        v
+Approval
+        |
+        v
+Staged deployment
+  - pre-checks
+  - lock affected devices
+  - apply in batches
+  - post-checks after each batch
+  - stop on failure
+        |
+        v
+Telemetry verification
+  - BGP state
+  - EVPN state
+  - interface state
+  - reachability
+  - error counters
+  - alert status
+        |
+        v
+Change record and drift monitor
+```
+
+The pipeline should be able to answer three questions before it touches a device:
+
+1. What exactly will change?
+2. What traffic or tenants could be affected?
+3. How will we know the change worked?
+
+## Operating Modes
+
+Do not start with full automatic production reconciliation. Move in stages.
+
+| Mode | Behavior | When to use |
+| --- | --- | --- |
+| Read-only GitOps | Git defines intent, CI renders diffs, humans apply changes manually | First adoption phase or high-risk networks. |
+| Assisted GitOps | Merge triggers automation into lab or staging; production needs manual approval | Good first production model. |
+| Controlled production GitOps | Low-risk changes auto-apply; high-risk changes require approval | Mature operations with good rollback and telemetry. |
+| Closed-loop GitOps | Drift is detected continuously; system opens PRs or reconciles safe drift | Mature networks with strong source-of-truth discipline. |
+
+The trap is jumping straight to closed-loop automation before the inventory and validation are trustworthy.
+
+## Source Of Truth Model
+
+The source of truth should describe the network at multiple levels.
+
+| Data domain | Examples |
+| --- | --- |
+| Physical | sites, racks, devices, optics, cables, patch panels |
+| Logical | tenants, VRFs, VLANs, VNIs, route targets, security zones |
+| Routing | ASNs, loopbacks, BGP neighbors, route reflectors, policy |
+| Services | DNS, NTP, syslog, telemetry collectors, AAA, TACACS/RADIUS |
+| Cloud | VPCs, subnets, gateways, private-connect handoffs, customer VRFs |
+| Security | firewall zones, ACLs, WAF policies, IDS sensor placement |
+| Operations | owners, maintenance windows, criticality, rollback class |
+
+Nautobot or NetBox should carry structured inventory and IPAM. Git should carry templates, policy, environment definitions, and versioned changes. The two must be reconciled; if they disagree, the pipeline should stop.
+
+## Validation Stack
+
+A serious data center network pipeline needs more than YAML lint.
+
+| Tool class | Examples | Use |
+| --- | --- | --- |
+| Schema validation | JSON Schema, Pydantic, Yamale | Reject malformed desired state. |
+| Policy-as-code | OPA, Conftest, custom checks | Enforce standards and forbidden patterns. |
+| Config rendering | Jinja2, Ansible templates, Nornir tasks | Produce device-specific intent from common data. |
+| Network analysis | Batfish | Validate reachability and policy behavior before deployment. |
+| Lab simulation | EVE-NG, containerlab | Test routing and failure behavior in a disposable topology. |
+| State validation | pyATS/Genie, Nornir, Scrapli, gNMI | Compare operational state against expected state. |
+| Observability | Prometheus, Grafana, OpenTelemetry, SIEM/NDR logs | Prove health and detect regressions. |
+
+For Cisco-heavy environments, pyATS and Genie are valuable. For vendor-neutral fabrics, gNMI/OpenConfig, Nornir, Scrapli, and Batfish provide a better cross-platform base.
+
+## Deployment Pattern
+
+Deploy in batches, not all at once.
+
+Recommended batch order:
+
+1. Render all device configs and intended API changes.
+2. Run pre-checks on every affected device.
+3. Lock the change scope in the automation system.
+4. Apply to one lab or canary device first.
+5. Apply to one leaf pair or one rack.
+6. Verify BGP, EVPN, interfaces, reachability, and alerts.
+7. Continue rack-by-rack or site-by-site.
+8. Stop automatically if post-checks fail.
+9. Record evidence in the change record.
+
+For high-risk changes, keep a human approval gate between each batch.
+
+## Drift Detection
+
+There are two kinds of drift.
+
+| Drift type | Example | Action |
+| --- | --- | --- |
+| Benign drift | interface counter, learned route, neighbor uptime | Observe only. |
+| Config drift | manual config change, missing route map, changed BGP neighbor | Alert or open a correction PR. |
+| Emergency drift | break-glass config during incident | Preserve evidence, then reconcile after review. |
+| Dangerous drift | unauthorized AAA or route policy change | Page operator and block auto-reconcile until reviewed. |
+
+For network infrastructure, do not auto-reconcile everything. The network might be in an emergency state for a reason. The safer pattern is:
+
+```text
+detect drift -> classify -> alert or PR -> approve -> reconcile
+```
+
+Only low-risk drift should self-heal automatically.
+
+## Git Repository Shape
+
+One practical structure:
+
+```text
+network-gitops/
+  inventory/
+    sites/
+    devices/
+    links/
+    ipam/
+  intent/
+    tenants/
+    vrfs/
+    bgp/
+    evpn/
+    services/
+    security/
+  templates/
+    cisco-nxos/
+    arista-eos/
+    juniper-junos/
+    sonic/
+    frr/
+  policy/
+    conftest/
+    route-policy/
+    blast-radius/
+  pipelines/
+    render/
+    validate/
+    deploy/
+    verify/
+  labs/
+    eve-ng/
+    containerlab/
+  evidence/
+    README.md
+```
+
+Keep generated configs either as build artifacts or in a separate generated branch. Do not let generated output become the source of truth unless there is a clear reason.
+
+## Change Classes
+
+Every change should have a class. The class decides approval and rollout behavior.
+
+| Class | Examples | Approval | Rollout |
+| --- | --- | --- | --- |
+| Low risk | interface description, monitoring target, non-forwarding metadata | peer review | auto or next batch |
+| Medium risk | new VLAN, new tenant VRF, new BGP customer with route limits | network owner | staged |
+| High risk | route policy, EVPN route targets, firewall deny, private-connect | senior network owner | maintenance window |
+| Critical | underlay, edge BGP, management, AAA, automation credentials | change board and rollback owner | manual gate per batch |
+
+This classification is more important than the tool. Without it, GitOps becomes a faster way to make bigger mistakes.
+
+## Security Controls
+
+GitOps for networking needs security controls from the start.
+
+- Signed commits for production repos.
+- Protected branches and required reviews.
+- CODEOWNERS by network domain.
+- Short-lived deployment credentials.
+- Secrets stored outside Git.
+- Per-vendor and per-site deploy roles.
+- Audit logs from Git, CI, automation, and devices.
+- Break-glass account with separate approval and post-use review.
+- Drift alerts sent to SOC.
+- Change evidence retained with the ticket or pull request.
+
+The automation account should not have unlimited access everywhere. A pipeline that changes leaf interface descriptions does not need authority to change edge BGP policy.
+
+## SOC Integration
+
+A GitOps-managed network should feed the SOC.
+
+Useful events:
+
+- pull request opened, approved, merged, or reverted
+- deployment started, completed, failed, or rolled back
+- route policy changed
+- BGP session changed
+- EVPN neighbor changed
+- route reflector state changed
+- interface error or flap after deployment
+- unexpected config drift
+- break-glass access used
+- automation credential failure
+
+This ties network operations to incident response. If an alert fires five minutes after a route policy PR merged, the SOC should see the change context immediately.
+
+## Vendor Strategy
+
+GitOps should abstract the operating workflow, not hide every vendor detail.
+
+| Platform | Fit |
+| --- | --- |
+| SONiC | Strong for open/disaggregated fabrics with Linux and FRR heritage. |
+| Arista EOS | Strong for cloud fabrics, APIs, telemetry, and automation. |
+| Juniper Junos / Apstra | Strong for structured EVPN/VXLAN operations and validation. |
+| Cisco NX-OS / IOS-XE / IOS-XR | Strong where Cisco operational skills, TAC, and certification alignment matter. |
+| Nokia SR Linux / SR OS | Strong for service-provider-style routing and model-driven operations. |
+| Linux + FRR | Strong for route reflectors, service routing, labs, and private-cloud routing components. |
+
+The GitOps pipeline should support multiple platforms if the business expects vendor diversity. But do not over-abstract: route policy and EVPN behavior still need platform-specific tests.
+
+## Failure Scenarios To Test
+
+Before production adoption, test these:
+
+- bad prefix list blocks tenant reachability
+- wrong route target leaks a tenant route
+- BGP route reflector policy rejects an expected route
+- leaf pair deployment succeeds on one leaf and fails on the other
+- automation loses SSH/API access mid-change
+- telemetry says success but route table disagrees
+- manual emergency config creates drift
+- rollback restores config but not BGP state
+- source of truth and live network disagree
+- CI passes syntax but simulation catches reachability loss
+
+Each failure should produce a runbook update.
+
+## Implementation Phases
+
+### Phase 1: Inventory And Read-Only Validation
+
+- Build source of truth.
+- Import device inventory, interfaces, IPAM, VRFs, and BGP sessions.
+- Render intended configs without applying them.
+- Compare rendered state to live configs.
+- Report drift without changing devices.
+
+### Phase 2: Lab-Gated Changes
+
+- Build EVE-NG or containerlab test topologies.
+- Test BGP, EVPN/VXLAN, route policy, and failure behavior.
+- Run CI validation on every pull request.
+- Keep production application manual.
+
+### Phase 3: Assisted Production Deployment
+
+- Allow approved merges to trigger deployment plans.
+- Require a human approval before production apply.
+- Deploy low-risk changes to canary devices first.
+- Store post-check evidence.
+
+### Phase 4: Controlled Automation
+
+- Auto-apply low-risk changes.
+- Keep medium, high, and critical changes behind approval gates.
+- Add drift PRs.
+- Add SOC alerts for failed deploys and unexpected drift.
+
+### Phase 5: Closed-Loop Operations
+
+- Reconcile safe drift automatically.
+- Open pull requests for unsafe drift.
+- Enforce SLOs for convergence and route propagation.
+- Run regular failure drills.
+
+## Recommended First Lab
+
+Use the existing EVE-NG environment to prove the workflow:
+
+- 2 Linux FRR route reflectors
+- 2 leaf switches or routers
+- 2 tenant VRFs
+- BGP underlay
+- MP-BGP EVPN overlay
+- one route-policy change through Git
+- one simulated bad route leak blocked by CI
+- one drift event detected after manual change
+
+This lab proves the operating model before touching a real production fabric.
+
+## Final Position
+
+Yes, data center network operations can be GitOps-managed. The defensible design is:
+
+> Git holds the desired state. CI proves the change is valid. Automation applies it in controlled stages. Telemetry proves the result. Drift detection keeps the network honest. Humans retain approval over high-risk changes.
+
+That is the model to propose for a regional cloud provider or large private cloud. It is cloud-native without being reckless, and it gives both engineers and executives something they can audit: every network change has intent, review, evidence, and rollback.
