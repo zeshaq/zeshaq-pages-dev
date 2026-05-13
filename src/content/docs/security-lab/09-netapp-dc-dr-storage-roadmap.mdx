@@ -1,0 +1,107 @@
+---
+title: "Security Lab — NetApp DC/DR storage roadmap"
+sidebar_label: "NetApp DC/DR storage"
+description: "Roadmap for simulating real-world NetApp data center and disaster recovery storage operations."
+last_reviewed: 2026-05-13
+draft: false
+---
+
+This roadmap defines a NetApp storage track for real-world DC/DR learning. The goal is to practice operational behavior, not benchmark performance: SVMs, NFS, iSCSI, snapshots, SnapMirror, failover, failback, OpenShift CSI, and DR evidence.
+
+## Target Outcomes
+
+| Outcome | What good looks like |
+| --- | --- |
+| Storage administration | Create SVMs, volumes, LIFs, export policies, LUNs, igroups, snapshots, and quotas |
+| DC/DR design | Model DC1 and DC2 as separate ONTAP clusters |
+| Recovery operations | Fail over NFS and iSCSI workloads to DR and document the exact steps |
+| OpenShift integration | Use NetApp Trident as CSI with ONTAP NAS and SAN backends |
+| Replication operations | Practice SnapMirror async, break, resync, reverse resync, and SVM-DR concepts |
+| Evidence | Produce runbooks, validation outputs, screenshots, and change records |
+
+## Recommended Lab Shape
+
+| Site | Components | Purpose |
+| --- | --- | --- |
+| DC1 | ONTAP cluster, client VM, optional OpenShift workers | Primary production storage |
+| DC2 | ONTAP cluster, client VM, optional OpenShift workers | DR target and recovery site |
+| Shared management | DNS, NTP, monitoring, jump host, Git repo | Common enterprise services |
+| Optional security | Wazuh, Security Onion, Greenbone | Management telemetry and vulnerability visibility |
+
+Suggested networks:
+
+| Network | Example | Use |
+| --- | --- | --- |
+| Management | `30.30.30.0/24` | ONTAP management, System Manager, SSH, API |
+| DC1 storage | `172.31.10.0/24` | NFS/iSCSI data LIFs and client access |
+| DC2 storage | `172.31.20.0/24` | DR-side NFS/iSCSI data LIFs and client access |
+| Replication | `172.31.30.0/24` | SnapMirror intercluster LIFs |
+
+## Platform Choice
+
+| Option | Use it for | Limits |
+| --- | --- | --- |
+| ONTAP Simulator | CLI, System Manager, SVM, volume, NFS, SMB, iSCSI, snapshot, and SnapMirror learning | Best-effort simulator support, no real performance, limited hardware behavior |
+| ONTAP Select 90-day evaluation | Closer VM-based ONTAP behavior, HA, SnapMirror synchronous concepts, larger DR workflows | Official eval deployment expects VMware/vCenter |
+| Cloud Volumes ONTAP / FSx for ONTAP | Cloud DR and hybrid replication concepts | Cloud cost and account setup |
+| NetApp Labs on Demand | MetroCluster and curated advanced labs | External lab access |
+
+Start with ONTAP Simulator if the immediate goal is learning. Use ONTAP Select when the lab needs more realistic VM-based behavior.
+
+## Phase Roadmap
+
+| Phase | Goal | Exit criteria |
+| --- | --- | --- |
+| Phase 0 — Design and guardrails | Choose platform, IP plan, naming, custody rules, and runbook structure | Architecture drafted and no vendor artifacts committed |
+| Phase 1 — Single-site foundations | Build DC1 ONTAP, SVM, NFS, iSCSI, snapshots, Linux host access | NFS and iSCSI work from Linux; snapshot restore documented |
+| Phase 2 — SnapMirror async DR | Build DC2, peer clusters/SVMs, replicate NFS and SAN volumes | DC2 can serve recovered data after planned SnapMirror break |
+| Phase 3 — SVM-DR model | Practice SVM-level replication and activation | Decision matrix for volume SnapMirror versus SVM-DR |
+| Phase 4 — OpenShift and Trident CSI | Use ONTAP as Kubernetes/OpenShift storage backend | PVCs dynamically provision from ONTAP NAS and SAN backends |
+| Phase 5 — BFSI DR scenarios | Run realistic DR drills | Planned DR, accidental delete, corruption recovery, and failback evidence exists |
+| Phase 6 — Governance and monitoring | Add access control, logging, scanning, and evidence discipline | Storage management boundaries and monitoring notes are documented |
+| Phase 7 — Advanced topics | SnapMirror sync, MetroCluster theory, BlueXP DR, automation | Advanced designs documented separately from supported lab facts |
+
+## First Four Weeks
+
+| Week | Target |
+| --- | --- |
+| Week 1 | Download ONTAP Simulator or ONTAP Select eval, define IP plan, deploy first ONTAP node |
+| Week 2 | Create SVM, NFS volume, iSCSI LUN, Linux host access, and snapshot restore runbook |
+| Week 3 | Deploy DC2, configure peering, baseline SnapMirror async |
+| Week 4 | Run planned DR drill, reverse resync, publish evidence |
+
+## BFSI DR Scenarios
+
+| Scenario | What to prove |
+| --- | --- |
+| Planned DR test | Application can run from DC2 without corrupting DC1 replication |
+| Primary volume loss | Recover from latest replicated snapshot |
+| Accidental delete | Restore from local snapshot before invoking DR |
+| Ransomware-style corruption | Identify clean snapshot and recover to isolated volume |
+| Storage maintenance | Migrate workload access without losing documented pathing |
+| DR failback | Reverse resync and return production to DC1 |
+
+## Download Rules
+
+- Download ONTAP Simulator, ONTAP Select, and related tools only from NetApp official sources.
+- Store images under a local ignored path such as `/home/ze/Softwares/netapp-images/`.
+- Record filenames, checksums, versions, and source page URLs.
+- Do not commit NetApp software, licenses, session cookies, entitlement screenshots, or private download URLs.
+
+## Source Notes
+
+- NetApp ONTAP Simulator download guidance: `https://kb.netapp.com/on-prem/ontap/Ontap_OS/OS-KBs/Where_can_the_NetApp_ONTAP_9_Simulator_be_downloaded`
+- ONTAP Select 90-day evaluation deployment: `https://docs.netapp.com/us-en/ontap-select-9181/deploy-evaluation-ontap-select-ovf-template.html`
+- SnapMirror disaster recovery: `https://docs.netapp.com/us-en/ontap/concepts/snapmirror-disaster-recovery-data-transfer-concept.html`
+- SnapMirror synchronous disaster recovery: `https://docs.netapp.com/us-en/ontap/data-protection/snapmirror-synchronous-disaster-recovery-basics-concept.html`
+- SnapMirror SVM replication: `https://docs.netapp.com/us-en/ontap/data-protection/snapmirror-svm-replication-concept.html`
+- ONTAP Select HA: `https://docs.netapp.com/us-en/ontap-select/concept_ha_config.html`
+- NetApp OpenShift storage options and Trident: `https://docs.netapp.com/us-en/netapp-solutions-cloud/openshift/os-solutions-storage-options.html`
+
+## Private Repo
+
+The detailed tracked roadmap lives in:
+
+```text
+/home/ze/codex-security-lab-agent/docs/NETAPP_DC_DR_STORAGE_ROADMAP.md
+```
