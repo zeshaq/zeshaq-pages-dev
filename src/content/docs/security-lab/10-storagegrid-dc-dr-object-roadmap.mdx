@@ -1,0 +1,103 @@
+---
+title: "Security Lab — StorageGRID DC/DR object roadmap"
+sidebar_label: "StorageGRID DC/DR object"
+description: "Roadmap for a full NetApp StorageGRID DC/DR object storage simulation for OpenShift AI and backup targets."
+last_reviewed: 2026-05-13
+draft: false
+---
+
+This roadmap defines the StorageGRID object storage track for the security lab. ONTAP remains the block/file and Trident CSI track. StorageGRID is the S3/object track for OpenShift AI artifacts, OADP backup targets, bucket governance, ILM, retention, and DC/DR object placement.
+
+## Target Decision
+
+Use a full two-site StorageGRID simulation rather than a quick single-site proof of concept.
+
+| Site | VMs | Purpose |
+| --- | --- | --- |
+| DC1 | `sg-admin-dc1-01` | Primary Admin Node and Grid Manager |
+| DC1 | `sg-gw-dc1-01` | DC1 S3 endpoint |
+| DC1 | `sg-storage-dc1-01`, `sg-storage-dc1-02`, `sg-storage-dc1-03` | DC1 object placement |
+| DC2 | `sg-admin-dc2-01` | Non-primary Admin Node |
+| DC2 | `sg-gw-dc2-01` | DC2 S3 endpoint |
+| DC2 | `sg-storage-dc2-01`, `sg-storage-dc2-02`, `sg-storage-dc2-03` | DC2 object placement |
+
+Total target: 10 VMs.
+
+## Lab Profiles
+
+| Profile | VMs | Use |
+| --- | --- | --- |
+| Full DC/DR | 10 | Preferred BFSI simulation |
+| Reduced DC/DR | 8 | Remove dedicated Gateway Nodes and use node client interfaces directly |
+| Minimum supported single-site | 4 | One Admin Node and three Storage Nodes; not enough for DC/DR behavior |
+
+## KVM Approach
+
+The KVM path is not VMware image conversion. Use normal Linux VMs on KVM/libvirt, then install StorageGRID host services on those Linux grid hosts.
+
+Preferred operating systems:
+
+| OS | Use |
+| --- | --- |
+| RHEL 9.4 or 9.6 | Best match for enterprise BFSI discussions |
+| Ubuntu 24.04 | Good lab option if RHEL subscription handling is inconvenient |
+| Debian 12 | Usable lab option, but less aligned with common enterprise standards |
+
+Use Podman where possible. Docker support is deprecated for StorageGRID software-only deployments.
+
+## Network Model
+
+| Network | Example | Purpose |
+| --- | --- | --- |
+| Admin | `30.30.30.0/24` | Grid Manager, SSH, management APIs, monitoring |
+| Grid | `172.32.10.0/24` | Internal node-to-node traffic |
+| DC1 Client | `172.32.11.0/24` | DC1 S3 client endpoint traffic |
+| DC2 Client | `172.32.21.0/24` | DC2 S3 client endpoint traffic |
+
+StorageGRID's Grid Network must be routable between all nodes.
+
+## Phases
+
+| Phase | Goal | Exit criteria |
+| --- | --- | --- |
+| Phase 0 — Prerequisites | Download evaluation software, record license/capacity privately, define IP and DNS plan | Install archive and license available outside Git |
+| Phase 1 — VM deployment | Build 10 Linux grid-host VMs on KVM/libvirt | All VMs boot and required networks route |
+| Phase 2 — Grid installation | Install StorageGRID and join all nodes | Grid Manager reachable and all nodes healthy |
+| Phase 3 — Tenants and buckets | Create OpenShift AI and OADP tenants/buckets | S3 clients can read/write through DC1 and DC2 endpoints |
+| Phase 4 — ILM and placement | Create DC1/DC2 storage pools and site-aware ILM rules | Objects are placed according to policy |
+| Phase 5 — OpenShift AI and OADP | Use StorageGRID for artifacts and backups | OpenShift AI and OADP can write to StorageGRID buckets |
+| Phase 6 — DC/DR drills | Test endpoint, node, and site failure scenarios | Evidence pack documents behavior and recovery steps |
+
+## DR Scenarios
+
+| Scenario | What to prove |
+| --- | --- |
+| DC1 S3 endpoint failure | Clients can use DC2 endpoint and read protected objects |
+| DC1 Storage Node loss | Grid health and object availability behavior are understood |
+| DC1 site isolation | Access behavior follows ILM placement and endpoint routing |
+| Gateway maintenance | S3 access can move between gateways |
+| Object delete mistake | Versioning, retention, or Object Lock behavior is understood where configured |
+| Backup target validation | OADP can write backup metadata and restore from object storage |
+
+## Custody Rules
+
+- Download StorageGRID only from official NetApp evaluation or support sources.
+- Store downloaded archives under `/home/ze/Softwares/netapp-images/` or another ignored local path.
+- Store licenses, recovery packages, passwords, access keys, and private URLs only under `/home/ze/secrets/security-lab`.
+- Commit only sanitized architecture, checksums, source pages, and runbooks.
+
+## Source Notes
+
+- StorageGRID Linux installation: `https://docs.netapp.com/us-en/storagegrid/swnodes/installing-linux.html`
+- StorageGRID software requirements: `https://docs.netapp.com/us-en/storagegrid/swnodes/software-requirements.html`
+- StorageGRID install and upgrade overview: `https://docs.netapp.com/us-en/storagegrid-119/landing-install-upgrade/`
+- StorageGRID FAQ and evaluation/licensing notes: `https://www.netapp.com/learn/storagegrid-faq/`
+- NetApp bare-metal/VM technical report: `https://docs.netapp.com/us-en/storagegrid-enable/technical-reports/bare-metal-index.html`
+
+## Private Repo
+
+The detailed tracked roadmap lives in:
+
+```text
+/home/ze/codex-security-lab-agent/docs/STORAGEGRID_DC_DR_OBJECT_ROADMAP.md
+```
