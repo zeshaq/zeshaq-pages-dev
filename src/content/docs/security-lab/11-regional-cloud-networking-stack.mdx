@@ -1,0 +1,285 @@
+---
+title: "Security Lab — regional cloud networking stack proposal"
+sidebar_label: "Regional cloud networking stack"
+description: "A consulting guide for proposing the networking technology stack for a regional cloud provider."
+last_reviewed: 2026-05-13
+draft: false
+---
+
+A regional cloud provider should not copy an enterprise campus network, and it should not pretend to be AWS or Google on day one. The right target is a cloud networking stack that is open where scale and automation matter, commercial where support accountability matters, and strict about operational discipline everywhere.
+
+The proposal below is the stack I would take into a regional cloud provider discussion. It assumes the provider wants to run IaaS, Kubernetes or OpenShift, object storage, private connectivity, internet edge, and managed security services across one or more regions.
+
+## Executive Recommendation
+
+Use a **hybrid cloud-networking stack**:
+
+| Layer | Recommended direction | Why |
+| --- | --- | --- |
+| Data center fabric | EVPN/VXLAN leaf-spine using SONiC, Arista EOS, Juniper, Cisco NX-OS, or Nokia SR Linux depending maturity | This is the high-scale domain where automation, repeatability, and merchant silicon economics matter. |
+| Fabric control plane | BGP underlay and MP-BGP EVPN overlay | This is the dominant modern data center pattern and avoids controller-only dependency for basic reachability. |
+| Cloud network virtualization | SDN control plane with virtual routers, route tables, security groups, NAT, load balancing, and service insertion | Customers buy cloud abstractions, not switch configs. |
+| Kubernetes networking | Cilium or equivalent CNI, with BGP integration where useful | Kubernetes needs identity-aware policy and service routing, not only VLANs. |
+| Internet edge and backbone | Commercial OEM routers plus DDoS provider integration | This is where support, optics, peering, scale testing, and incident accountability matter. |
+| Private connectivity | Dedicated connect service with BGP, redundant handoffs, VRFs, and customer route policies | This is a revenue product and must be boring, documented, and supportable. |
+| Security services | Cloud firewall, WAF, DDoS, IDS/NDR, SOC telemetry | Regional providers win trust by making security visible and operable. |
+| Automation and telemetry | Git-driven config, CI validation, streaming telemetry, flow logs, packet metadata, and event correlation | The operating model matters more than the brand of switch. |
+
+The mistake to avoid is choosing a vendor before choosing the operating model. A regional cloud provider needs a network that can be tested, generated, upgraded, observed, and rolled back. If those capabilities are absent, even expensive hardware turns into a manually operated risk.
+
+## What Hyperscalers Teach Us
+
+AWS, Google, Microsoft, Alibaba, Tencent, and Cloudflare do not publish every internal implementation detail, but their public architectures show consistent patterns:
+
+- Heavy use of BGP and software control planes.
+- Leaf-spine data center fabrics.
+- Network virtualization above the physical fabric.
+- Anycast, traffic engineering, and private backbone routing.
+- Centralized policy with distributed enforcement.
+- Automation and telemetry as first-class systems.
+
+Microsoft is the clearest public open-networking example: SONiC was built for Azure and is now an open source Linux-based network operating system. Google has published papers on Jupiter, B4, and Andromeda, but those are internal systems rather than downloadable products. Alibaba exposes Cloud Enterprise Network and Transit Router concepts, and has published high-performance Ethernet designs for AI-scale clusters. Cloudflare exposes a global Anycast/SASE model with BGP-based network services.
+
+The lesson is not "install FRR and you are a hyperscaler." The lesson is that cloud networks are distributed software systems. The hardware is only one part of the design.
+
+## Proposed Reference Architecture
+
+```text
+Customer / Internet / partners
+        |
+        v
+Internet edge, DDoS, peering, transit
+        |
+        v
+Regional core / backbone
+        |
+        v
+EVPN/VXLAN data center fabric
+        |
+        +-- IaaS compute and virtualization
+        +-- Kubernetes / OpenShift clusters
+        +-- Object and block storage
+        +-- Security inspection services
+        +-- Customer private connectivity
+
+Control systems:
+- Cloud network API
+- SDN controller
+- IPAM and DNS
+- Route policy engine
+- Git and CI validation
+- Telemetry and SOC pipeline
+```
+
+Reading the model:
+
+- The physical fabric provides resilient IP reachability and segmentation.
+- The cloud network layer exposes customer-facing constructs: VPCs, subnets, route tables, gateways, private links, firewalls, and load balancers.
+- The automation layer owns configuration generation and validation.
+- The telemetry layer proves health, failure behavior, and customer impact.
+
+## Stack By Layer
+
+### Physical Data Center Fabric
+
+Use a leaf-spine design with redundant ToR/leaf switches, ECMP, and consistent cabling standards.
+
+Good options:
+
+| Option | Fit |
+| --- | --- |
+| SONiC on supported merchant-silicon switches | Best when the provider has strong network software engineering and wants vendor independence. |
+| Arista EOS | Strong commercial cloud fabric option with mature automation and telemetry. |
+| Juniper QFX/PTX or Apstra-managed fabrics | Strong for EVPN/VXLAN, routing depth, and structured operations. |
+| Cisco Nexus / NX-OS | Strong if the team is Cisco-heavy or certification/support alignment matters. |
+| Nokia SR Linux / SR OS | Strong where service-provider routing culture and model-driven operations matter. |
+
+For a new regional provider, I would shortlist **SONiC, Arista, and Juniper** first. Cisco remains valid if the operations team is Cisco-native or the customer base strongly expects Cisco alignment.
+
+### Routing Control Plane
+
+Use:
+
+- eBGP underlay between leaves and spines.
+- MP-BGP EVPN overlay for tenant reachability.
+- Anycast gateway on leaves.
+- VRFs for tenant and service segmentation.
+- Route policy templates generated from source of truth.
+
+FRR is useful in three places:
+
+- Linux route reflectors or lab routers.
+- SONiC-based fabrics, where FRR is commonly part of the routing stack.
+- Kubernetes/private-cloud service routing patterns.
+
+FRR should not be the whole proposal. It is a routing component, not a full cloud networking platform by itself.
+
+### Cloud Network Virtualization
+
+This is the most important layer for a cloud provider. Customers should interact with APIs, not physical network constructs.
+
+Required capabilities:
+
+- VPC or project networks.
+- Subnets and route tables.
+- Internet gateways and NAT gateways.
+- Private connectivity gateways.
+- Security groups and network ACLs.
+- Load balancers.
+- Floating IPs or elastic IPs.
+- Service insertion for firewall, WAF, IDS/NDR, and observability.
+- Flow logs per tenant/project.
+
+Implementation choices:
+
+| Approach | Fit |
+| --- | --- |
+| OpenStack Neutron with OVN | Practical open-source IaaS networking base. |
+| Kubernetes with Cilium | Strong for container platforms and service-aware networking. |
+| Custom SDN controller | Valid only if the provider has strong software engineering and long-term platform ownership. |
+| Vendor cloud fabric controllers | Useful when speed and support matter more than deep customization. |
+
+For a regional cloud, I would start with **OpenStack/OVN for IaaS-style VPC networking** and **Cilium for Kubernetes networking**, then integrate both into a common IPAM, DNS, telemetry, and policy model.
+
+### Internet Edge And Backbone
+
+Use commercial routers at the internet edge unless the provider has a proven backbone engineering team.
+
+Requirements:
+
+- Full-table BGP where needed.
+- RPKI validation and route filtering.
+- DDoS scrubbing integration.
+- Anycast service advertisement.
+- Peering and transit policy.
+- Blackhole and mitigation workflows.
+- MACsec or encrypted interconnects where required.
+- Clear vendor support path.
+
+Cloudflare Magic Transit, Akamai Prolexic, or similar services can be part of the edge design for DDoS. They should complement the provider network, not replace internal routing discipline.
+
+### Private Connectivity Product
+
+A regional provider should offer a dedicated private connectivity service early.
+
+Minimum design:
+
+- Dual physical ports or partner handoffs.
+- eBGP with customer edge routers.
+- Per-customer VRF.
+- Route limits and prefix filtering.
+- MD5/TCP-AO where supported.
+- BFD where appropriate.
+- Clear demarcation and support runbooks.
+- Flow logs and route visibility for support teams.
+
+This product is where commercial OEMs often make sense. Customers expect reliability, standard BGP behavior, and a supportable demarcation.
+
+### Security And SOC Integration
+
+Networking should feed the SOC from the start.
+
+Required telemetry:
+
+- Flow logs.
+- DNS logs.
+- Firewall logs.
+- Load balancer logs.
+- WAF logs.
+- DDoS events.
+- BGP session changes.
+- EVPN/VXLAN control-plane changes.
+- Tenant route table changes.
+- Admin API audit logs.
+
+Recommended controls:
+
+- Network IDS/NDR sensors at strategic aggregation points.
+- Wazuh or equivalent endpoint telemetry for Linux/network appliances where applicable.
+- Vulnerability management for exposed services.
+- Cloud firewall and WAF as managed services.
+- Customer-visible security logs as a differentiating feature.
+
+## Commercial Versus Open Decision Matrix
+
+| Question | If yes, lean open/disaggregated | If no, lean commercial |
+| --- | --- | --- |
+| Does the team have network software engineers? | SONiC/FRR/OVN/Cilium become realistic. | Use supported OEM platforms and controllers. |
+| Can the team build CI validation for every config? | Treat network config like software. | Avoid self-integrating too much. |
+| Is vendor cost blocking scale? | Merchant silicon and open NOS may be worth it. | Optimize contracts before changing architecture. |
+| Is the network a core differentiator? | Own more of the platform. | Buy more of the platform. |
+| Is 24x7 incident ownership mature? | Self-operated fabric can work. | Choose TAC-backed designs. |
+| Are compliance and customer contracts support-heavy? | Keep open components behind a supported service model. | Prefer commercial edge and demarcation. |
+
+## Recommended First Proposal
+
+For a serious regional cloud provider, propose this stack:
+
+| Domain | Proposal |
+| --- | --- |
+| DC fabric | EVPN/VXLAN leaf-spine; evaluate SONiC, Arista, Juniper. |
+| Fabric routing | eBGP underlay, MP-BGP EVPN overlay, route policy from source of truth. |
+| IaaS networking | OpenStack Neutron with OVN, or equivalent VPC control plane. |
+| Kubernetes networking | Cilium with Hubble, NetworkPolicy, and BGP where useful. |
+| Edge/backbone | Commercial routers with strict BGP policy, RPKI, DDoS integration, and clear support. |
+| Private connectivity | BGP-based dedicated connect with per-customer VRFs and redundant handoffs. |
+| Security | Cloud firewall, WAF, IDS/NDR, flow logs, SOC integration. |
+| Automation | Git, CI checks, generated configs, lab simulation, staged rollout. |
+| Telemetry | Streaming telemetry, flow logs, BGP/EVPN state, customer-visible logs. |
+
+## Phased Adoption Plan
+
+### Phase 1: Foundation
+
+- Define target services: VPC, private connect, Kubernetes, object storage, internet edge.
+- Build source of truth for sites, racks, devices, links, IPs, ASNs, VRFs, and tenants.
+- Build a lab fabric in EVE-NG or physical test gear.
+- Choose two NOS candidates and run the same EVPN/VXLAN tests on both.
+
+### Phase 2: Fabric
+
+- Deploy one production-ready pod.
+- Validate failure behavior: leaf failure, spine failure, link loss, route leak, bad config rollback.
+- Add streaming telemetry and route-state monitoring.
+- Document golden configs and upgrade process.
+
+### Phase 3: Cloud Network Layer
+
+- Build VPC/subnet/route table abstractions.
+- Integrate IPAM and DNS.
+- Add customer-facing flow logs.
+- Add load balancer and NAT services.
+- Add firewall/service insertion path.
+
+### Phase 4: Edge And Private Connectivity
+
+- Deploy internet edge with RPKI, route filtering, and DDoS integration.
+- Build dedicated connect with redundant BGP handoffs.
+- Publish customer routing limits and runbooks.
+- Add support dashboards for BGP and route table visibility.
+
+### Phase 5: Operations
+
+- Put all network changes through Git and CI.
+- Add pre-production validation before rollout.
+- Track SLOs for packet loss, latency, convergence, and route propagation.
+- Run quarterly failure drills.
+
+## Final Position
+
+The best recommendation is not "Cisco" or "Linux." It is:
+
+> Build the regional cloud network as a software-operated platform. Use open/disaggregated networking where scale, automation, and cost control matter. Use commercial OEMs where support accountability, edge reliability, and customer demarcation matter. Make BGP, EVPN/VXLAN, SDN abstractions, telemetry, and CI-driven operations the foundation.
+
+That position is defensible in front of both engineering and executive stakeholders. It gives the provider a cloud-native direction without asking them to become Google before they have the people, tooling, and operational muscle to own that kind of platform.
+
+## Public Reference Points
+
+- Microsoft SONiC and Azure: `https://azure.microsoft.com/en-us/blog/sonic-the-networking-switch-software-that-powers-the-microsoft-global-cloud/`
+- SONiC architecture: `https://developer.cisco.com/docs/sonic/sonic-architecture/`
+- Google Jupiter paper: `https://research.google/pubs/jupiter-evolving-transforming-googles-datacenter-network-via-optical-circuit-switches-and-software-defined-networking/`
+- Google B4 paper: `https://research.google.com/pubs/archive/41761.pdf`
+- Alibaba Cloud CEN: `https://www.alibabacloud.com/help/en/cen/product-overview/what-is-cen`
+- Tencent Cloud networking: `https://www.tencentcloud.com/solutions/networking`
+- Cloudflare SASE architecture: `https://developers.cloudflare.com/reference-architecture/architectures/sase/`
+- Cloudflare WAN BGP traffic steering: `https://developers.cloudflare.com/magic-wan/reference/traffic-steering/`
