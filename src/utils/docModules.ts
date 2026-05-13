@@ -17,6 +17,7 @@
 export const MODULE_TITLES: Record<string, string> = {
   "openshift-platform": "Full Platform Documentation",
   "brac-poc": "BRAC Bank POC",
+  "security-lab": "Security Lab",
 };
 
 export const MODULE_TAGLINES: Record<string, string> = {
@@ -24,6 +25,8 @@ export const MODULE_TAGLINES: Record<string, string> = {
     "Operating manual for the comptech OpenShift platform — fleet topology, GitOps, image supply, observability, security, compliance, backup, and the ADRs behind it all.",
   "brac-poc":
     "Engagement-specific documentation for the BRAC Bank proof of concept — eight-panel SPA, payment microservice, jboss-chat, demo scope, and the operational decisions made for this engagement.",
+  "security-lab":
+    "Operating notes for the private security and networking lab — Kali, purple-team tooling, SIEM, vulnerability management, EVE-NG, and the Cisco NX-OS fabric learning track.",
 };
 
 export function moduleTitle(id: string): string {

@@ -1,0 +1,58 @@
+---
+title: "Security Lab — current inventory"
+sidebar_label: "Current inventory"
+description: "Current VM, network, and endpoint inventory for the security lab."
+last_reviewed: 2026-05-13
+draft: false
+---
+
+## Host And Networks
+
+| Item | Value |
+| --- | --- |
+| Hypervisor | libvirt/KVM |
+| Host | `dl385` |
+| Management bridge | `br30` |
+| Management gateway | `30.30.0.1` |
+| Management CIDR convention | `30.30.0.0/16` |
+| Isolated lab network | `vapt-lab` |
+| Isolated lab bridge | `virbr-vapt` |
+
+`br30` is used for VM management and web UI access. `vapt-lab` is used for controlled lab traffic between sensors and targets.
+
+## Virtual Machines
+
+| VM | Purpose | Management IP | Primary access |
+| --- | --- | --- | --- |
+| `kali-linux` | Offensive workstation | `30.30.30.60` | SSH |
+| `kali-purple` | Purple-team Kali workstation | `30.30.30.61` | SSH |
+| `eve-ng` | Network emulation | `30.30.30.62` | `http://30.30.30.62/` |
+| `security-onion` | IDS/NSM/SOC stack | `30.30.30.63` | SSH / web after setup |
+| `wazuh` | SIEM/XDR | `30.30.30.64` | `https://30.30.30.64/` |
+| `greenbone` | Vulnerability scanning | `30.30.30.65` | `https://30.30.30.65/` |
+| `linux-target-01` | Linux scan and hardening target | `30.30.30.68` | `http://30.30.30.68/` |
+| `juice-shop` | Web app target | `30.30.30.69` | `http://30.30.30.69:3000/` |
+
+## Lab NICs
+
+These VMs also have a second NIC on `vapt-lab`:
+
+| VM | Lab MAC |
+| --- | --- |
+| `wazuh` | `52:54:00:40:30:64` |
+| `greenbone` | `52:54:00:40:30:65` |
+| `security-onion` | `52:54:00:40:30:63` |
+| `linux-target-01` | `52:54:00:40:30:68` |
+| `juice-shop` | `52:54:00:40:30:69` |
+
+## Quick Health Checks
+
+```bash
+virsh list --all
+tmux ls
+curl -Is http://30.30.30.62/
+curl -kIs https://30.30.30.64/
+curl -kIs https://30.30.30.65/
+curl -Is http://30.30.30.68/
+curl -Is http://30.30.30.69:3000/
+```
