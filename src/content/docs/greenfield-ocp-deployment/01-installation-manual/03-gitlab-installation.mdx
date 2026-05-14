@@ -15,8 +15,8 @@ NetBox is still part of the platform plan, but GitLab comes first so NetBox, Vau
 | Item | Value |
 | --- | --- |
 | VM name | `gf-ocp-gitlab-01` |
-| Public/bootstrap IP | `59.153.29.103` |
-| Private backend IP | `30.30.200.20` |
+| Private IP | `30.30.200.20` |
+| Public IP | None. GitLab is exposed only through HAProxy. |
 | External URL | `http://gitlab.v7.comptech-lab.com` |
 | Edge route | `59.153.29.102` HAProxy to `30.30.200.20:80` |
 | GitLab package | `gitlab-ce` |
@@ -28,20 +28,18 @@ The DNS record points the public GitLab name to HAProxy, not directly to the Git
 gitlab.v7.comptech-lab.com A 59.153.29.102
 ```
 
-The GitLab VM has a public/bootstrap interface for package installation and administration, but GitLab HTTP/HTTPS is allowed only from the HAProxy private address.
+The GitLab VM is private-only. It has no real public interface. Package installation and future updates must use controlled private egress, such as NAT, an HTTP proxy, or an internal package mirror.
 
 ## Creation Flow
 
 The bootstrap flow is:
 
 1. Create or confirm the governance issue and phase.
-2. Reserve `59.153.29.103` and `30.30.200.20`.
+2. Reserve `30.30.200.20`.
 3. Add `gitlab.v7.comptech-lab.com` to PowerDNS, pointing at HAProxy `59.153.29.102`.
 4. Create a cloud-init seed ISO for `gf-ocp-gitlab-01`.
 5. Create a 100 GiB qcow2 VM disk from the Ubuntu 24.04 cloud image.
-6. Boot the VM with two virtio NICs:
-   - `br-real` for `59.153.29.103/27`
-   - `br33` for `30.30.200.20/16`
+6. Boot the VM with one private virtio NIC on `br33` for `30.30.200.20/16`.
 7. Install GitLab CE from the GitLab package repository.
 8. Configure UFW so only HAProxy can reach GitLab HTTP/HTTPS.
 9. Add the HAProxy `gitlab.v7.comptech-lab.com` backend.
@@ -53,22 +51,6 @@ The bootstrap flow is:
 ```yaml
 version: 2
 ethernets:
-  public0:
-    match:
-      macaddress: "52:54:00:70:07:10"
-    set-name: enp1s0
-    dhcp4: false
-    addresses:
-      - 59.153.29.103/27
-    routes:
-      - to: default
-        via: 59.153.29.97
-    nameservers:
-      addresses:
-        - 30.30.200.53
-        - 1.1.1.1
-      search:
-        - v7.comptech-lab.com
   private0:
     match:
       macaddress: "52:54:00:70:07:11"
@@ -76,11 +58,16 @@ ethernets:
     dhcp4: false
     addresses:
       - 30.30.200.20/16
+    nameservers:
+      addresses:
+        - 30.30.200.53
+      search:
+        - v7.comptech-lab.com
 ```
 
 ## Cloud-Init Install Script
 
-The cloud-init script installs the operating-system baseline, hardens SSH, enables UFW, adds the GitLab package repository, and installs GitLab CE.
+The cloud-init script installs the operating-system baseline, hardens SSH, enables UFW, adds the GitLab package repository, and installs GitLab CE. The private-only VM needs package access through NAT, a proxy, an internal mirror, or pre-staged packages before this script can complete.
 
 ```bash
 #!/usr/bin/env bash
@@ -109,7 +96,7 @@ Bundled Alertmanager is disabled for bootstrap:
 alertmanager["enable"] = false
 ```
 
-The reason is practical: the initial dual-interface layout caused the bundled Alertmanager gossip layer to fail advertise-address detection. This is not the platform observability plan; external observability will be added later.
+This is not the platform observability plan; external observability will be added later.
 
 ## HAProxy Backend
 
@@ -191,7 +178,7 @@ Expected result:
 Run GitLab internal checks:
 
 ```bash
-ssh ze@gitlab.v7.comptech-lab.com \
+ssh ze@30.30.200.20 \
   'sudo gitlab-rake gitlab:check SANITIZE=true'
 ```
 
@@ -207,7 +194,7 @@ Expected high-level result:
 Confirm firewall posture:
 
 ```bash
-ssh ze@gitlab.v7.comptech-lab.com 'sudo ufw status verbose'
+ssh ze@30.30.200.20 'sudo ufw status verbose'
 ```
 
 Expected posture:
@@ -216,6 +203,20 @@ Expected posture:
 - SSH allowed;
 - HTTP/HTTPS allowed from `30.30.200.102` only.
 
+Confirm the VM is private-only:
+
+```bash
+ssh ze@30.30.200.20 'ip -br addr; ip route'
+ssh ze@30.30.200.2 \
+  'virsh -c qemu:///system domiflist gf-ocp-gitlab-01'
+```
+
+Expected posture:
+
+- only the private `30.30.200.20/16` address is present;
+- libvirt shows only the `br33` interface;
+- no `br-real` interface is attached to the GitLab VM.
+
 ## Bootstrap Gaps
 
 - TLS is not enabled yet.
@@ -223,4 +224,4 @@ Expected posture:
 - Root password must be moved into Vault and rotated.
 - Initial groups, projects, protected branches, and CI variables still need to be created.
 - GitLab runners still need to be registered.
-- The temporary public/bootstrap interface should be revisited after NAT, proxy, or controlled outbound routing exists for private-only service VMs.
+- Private package egress still needs to be standardized through NAT, proxy, or an internal package mirror.
