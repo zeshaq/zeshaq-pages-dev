@@ -150,11 +150,17 @@ The original local custody file remains only as a bootstrap fallback:
 ```
 
 Rotate the root password after the first operational login and update Vault in
-the same change. No greenfield GitLab PAT has been created yet; future PATs or
-service tokens should use:
+the same change. The first human operator account is `zahid`; its password
+follows the default human login custody path:
 
 ```text
-secret/greenfield/gitlab/pats/<owner-or-purpose>
+secret/greenfield/bootstrap/default-human-login
+```
+
+The bootstrap service account is `svc-greenfield-bootstrap`. Its initial API token is stored in Vault:
+
+```text
+secret/greenfield/gitlab/pats/svc-greenfield-bootstrap
 ```
 
 ## MinIO Backups
@@ -228,6 +234,58 @@ Validation performed:
 - tar member listing shows the expected files without printing file contents.
 
 Do not print the Vault value at `secret/greenfield/gitlab/restore-custody/config-archive`; it contains the encryption passphrase.
+
+## Operational GitLab Structure
+
+The first operational GitLab structure was initialized under issue #308.
+
+Users:
+
+| Username | Purpose |
+| --- | --- |
+| `zahid` | first human owner account |
+| `svc-greenfield-bootstrap` | bootstrap automation service account |
+
+Groups:
+
+| Group | Purpose |
+| --- | --- |
+| `platform` | top-level platform ownership boundary |
+| `platform/infrastructure` | hypervisor, VM, Terraform/OpenTofu, Packer, and Ansible sources |
+| `platform/openshift` | OpenShift installation and platform GitOps sources |
+| `platform/security` | Vault, PKI, trust, and policy automation |
+| `platform/ci` | runner and CI control-plane automation |
+
+Projects:
+
+| Project | Purpose |
+| --- | --- |
+| `platform/infrastructure/terraform-live` | Terraform/OpenTofu live state and environment composition |
+| `platform/infrastructure/packer-images` | Packer image build definitions for platform VMs |
+| `platform/infrastructure/ansible-automation` | Ansible automation for platform VMs and supporting services |
+| `platform/openshift/openshift-install` | OpenShift installation manifests and installer inputs |
+| `platform/openshift/openshift-gitops` | OpenShift desired-state GitOps repository |
+| `platform/security/vault-policies` | Vault policy, auth, and secret-path automation |
+| `platform/security/pki` | PKI, trust bundle, and certificate automation |
+| `platform/ci/gitlab-runner-config` | GitLab runner registration, tags, and executor configuration |
+
+Every initial project is private, has an initialized `main` branch, and has `main` protected with maintainer-level push and merge access. Force-push is disabled.
+
+## Runner Plan
+
+Do not register CI runners directly on the GitLab VM. The first runner should be a separate private-only VM:
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-gitlab-runner-01` |
+| Network | private-only `br33` |
+| Suggested IP | `30.30.200.22` |
+| Registration source | `platform/ci/gitlab-runner-config` |
+| Token custody | Vault, under a future `secret/greenfield/gitlab/runners/<runner-name>` path |
+
+Initial tags should be `gf`, `infra`, `ansible`, `tofu`, `packer`, and `openshift`.
+
+Start with a shell executor on the private runner VM for infrastructure automation. Add Docker or Kubernetes executors only after registry, certificate trust, and runner isolation rules are defined.
 
 ## Restore Drill
 
@@ -372,11 +430,9 @@ Expected result:
 
 Before using GitLab as the durable operational source of truth:
 
-- create required PATs or service tokens and store them in Vault;
-- create operational groups and repositories;
 - register GitLab runners.
 
 - TLS is not enabled yet.
 - Root password must be rotated after first operational login.
-- Initial groups, projects, protected branches, and CI variables still need to be created.
+- CI variables still need to be created.
 - GitLab runners still need to be registered.
