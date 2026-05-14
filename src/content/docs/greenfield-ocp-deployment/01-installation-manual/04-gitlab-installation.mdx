@@ -271,21 +271,60 @@ Projects:
 
 Every initial project is private, has an initialized `main` branch, and has `main` protected with maintainer-level push and merge access. Force-push is disabled.
 
-## Runner Plan
+## Runner VM
 
-Do not register CI runners directly on the GitLab VM. The first runner should be a separate private-only VM:
+Do not register CI runners directly on the GitLab VM. The first runner is a separate private-only VM:
 
 | Item | Value |
 | --- | --- |
 | VM name | `gf-ocp-gitlab-runner-01` |
 | Network | private-only `br33` |
-| Suggested IP | `30.30.200.22` |
+| IP | `30.30.200.22` |
+| vCPU / RAM / disk | `4` vCPU / `8 GiB` RAM / `80 GiB` qcow2 |
 | Registration source | `platform/ci/gitlab-runner-config` |
-| Token custody | Vault, under a future `secret/greenfield/gitlab/runners/<runner-name>` path |
+| Runner type | GitLab instance runner |
+| Executor | `shell` |
+| Token custody | `secret/greenfield/gitlab/runners/gf-ocp-gitlab-runner-01` |
 
-Initial tags should be `gf`, `infra`, `ansible`, `tofu`, `packer`, and `openshift`.
+Tags are `gf`, `infra`, `ansible`, `tofu`, `packer`, and `openshift`.
 
-Start with a shell executor on the private runner VM for infrastructure automation. Add Docker or Kubernetes executors only after registry, certificate trust, and runner isolation rules are defined.
+Installed baseline:
+
+- GitLab Runner `18.11.3`;
+- qemu guest agent;
+- chrony;
+- fail2ban;
+- UFW default deny incoming, allow outgoing, SSH only inbound;
+- SSH password and root login disabled;
+- `ansible`, `git`, `jq`, `make`, `unzip`, and Python tooling.
+
+Do not run `gitlab-runner list` in shared logs. It prints runner authentication tokens from `/etc/gitlab-runner/config.toml`.
+
+The first smoke validation was committed to `platform/ci/gitlab-runner-config`:
+
+```yaml
+runner-smoke:
+  stage: validate
+  tags:
+    - gf
+    - infra
+  script:
+    - hostname
+    - gitlab-runner --version
+    - ansible --version | head -1
+    - git --version
+    - jq --version
+```
+
+Validation passed:
+
+- initial smoke pipeline succeeded on runner id `1`;
+- that runner token was rotated immediately after a local validation command printed it;
+- stale local runner config was cleared;
+- rotated runner token is stored in Vault at version `2`;
+- post-rotation smoke pipeline succeeded on runner id `2`.
+
+Start with this shell executor for infrastructure automation. Add Docker or Kubernetes executors only after registry, certificate trust, and runner isolation rules are defined.
 
 ## Restore Drill
 
@@ -430,9 +469,8 @@ Expected result:
 
 Before using GitLab as the durable operational source of truth:
 
-- register GitLab runners.
+- define protected CI variables.
 
 - TLS is not enabled yet.
 - Root password must be rotated after first operational login.
 - CI variables still need to be created.
-- GitLab runners still need to be registered.
