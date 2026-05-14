@@ -129,15 +129,26 @@ backend be_gitlab_http
 
 ## Secret Custody
 
-The generated initial root password is not printed and is not committed.
+The generated initial root password is not printed and is not committed. It
+has been onboarded into Vault:
 
-Local custody path:
+```text
+secret/greenfield/gitlab/admin/root
+```
+
+The original local custody file remains only as a bootstrap fallback:
 
 ```text
 /home/ze/secrets/greenfield/gitlab-root-password.txt
 ```
 
-Move this into Vault and rotate the root password after the first login.
+Rotate the root password after the first operational login and update Vault in
+the same change. No greenfield GitLab PAT has been created yet; future PATs or
+service tokens should use:
+
+```text
+secret/greenfield/gitlab/pats/<owner-or-purpose>
+```
 
 ## Validation
 
@@ -237,6 +248,15 @@ Expected result:
 - package repository HTTPS returns `HTTP/2 200`.
 
 ## Bootstrap Gaps
+
+Before using GitLab as the durable operational source of truth:
+
+- configure object-storage backups to MinIO;
+- run a backup job;
+- document restore into a fresh VM;
+- create required PATs or service tokens and store them in Vault;
+- create operational groups and repositories;
+- register GitLab runners.
 
 - TLS is not enabled yet.
 - Backups to object storage are not configured yet.
