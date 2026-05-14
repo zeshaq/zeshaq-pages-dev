@@ -1,0 +1,243 @@
+---
+title: "Installation Manual — 02 HAProxy installation"
+sidebar_label: "02 HAProxy installation"
+description: "How the gf-ocp HAProxy edge VM is created with cloud-init, configured as the first single-node edge endpoint, and validated."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+HAProxy is the second greenfield foundation service after PowerDNS. It provides the first stable edge endpoint for the platform while later services are built behind it.
+
+This chapter documents the single-node bootstrap design. Production HA is intentionally deferred until the second edge node and VIP plan are approved.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-haproxy-01` |
+| Public edge IP | `59.153.29.102` |
+| Private management/stats IP | `30.30.200.102` |
+| Public DNS name | `haproxy.v7.comptech-lab.com` |
+| Current mode | Single-node bootstrap edge |
+| Public health endpoint | `http://haproxy.v7.comptech-lab.com/healthz` |
+| Private stats endpoint | `http://30.30.200.102:8404/stats` |
+
+The DNS record already exists in the `v7.comptech-lab.com` zone:
+
+```text
+haproxy.v7.comptech-lab.com A 59.153.29.102
+```
+
+## Creation Flow
+
+The VM is created from the Ubuntu 24.04 cloud image on the greenfield hypervisor. The first build uses cloud-init directly; the long-term target is to move this into GitLab-driven automation.
+
+The bootstrap sequence is:
+
+1. Confirm `59.153.29.102` and `30.30.200.102` are unused.
+2. Prepare cloud-init `user-data`, `meta-data`, and `network-config`.
+3. Create a NoCloud seed ISO with `cloud-localds`.
+4. Create the qcow2 VM disk from the Ubuntu cloud image.
+5. Create the VM with two virtio NICs:
+   - `br-real` for `59.153.29.102/27`
+   - `br33` for `30.30.200.102/16`
+6. Boot the VM and wait for `cloud-init status --wait`.
+7. Validate SSH key access, service health, HAProxy config, DNS, and the public health endpoint.
+
+## Cloud-Init Network Config
+
+The VM uses fixed MAC addresses so netplan can assign stable interface names and static IPs:
+
+```yaml
+version: 2
+ethernets:
+  public0:
+    match:
+      macaddress: "52:54:00:70:07:02"
+    set-name: enp1s0
+    dhcp4: false
+    addresses:
+      - 59.153.29.102/27
+    routes:
+      - to: default
+        via: 59.153.29.97
+    nameservers:
+      addresses:
+        - 30.30.200.53
+        - 1.1.1.1
+      search:
+        - v7.comptech-lab.com
+  private0:
+    match:
+      macaddress: "52:54:00:70:07:03"
+    set-name: enp2s0
+    dhcp4: false
+    addresses:
+      - 30.30.200.102/16
+```
+
+## Cloud-Init User Data
+
+The user-data file sets the host identity and disables password-based SSH:
+
+```yaml
+#cloud-config
+hostname: gf-ocp-haproxy-01
+fqdn: haproxy.v7.comptech-lab.com
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+```
+
+The operator account is key-only:
+
+```yaml
+users:
+  - name: ze
+    groups: [adm, sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY"
+```
+
+The first package set is intentionally small:
+
+```yaml
+packages:
+  - haproxy
+  - qemu-guest-agent
+  - cloud-guest-utils
+  - dnsutils
+  - chrony
+  - curl
+  - jq
+  - fail2ban
+  - net-tools
+  - vim
+```
+
+## HAProxy Bootstrap Config
+
+The initial HAProxy config exposes a public readiness response and a private stats page. It does not yet proxy GitLab, Vault, Quay, NetBox, OpenShift API, or OpenShift apps traffic.
+
+```text
+frontend fe_http_public
+    bind 59.153.29.102:80
+    mode http
+    http-request return status 200 content-type text/plain string "gf-ocp-haproxy-01 ready\n" if { path /healthz }
+    http-request return status 200 content-type text/plain string "gf-ocp-haproxy-01 ready\n" if { path / }
+    http-request return status 503 content-type text/plain string "No backend configured yet\n"
+
+listen stats_private
+    bind 30.30.200.102:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+```
+
+The stats listener is private only. Add authentication or restrict it further before exposing it outside the management network.
+
+## Validation
+
+Confirm DNS points to the HAProxy VM:
+
+```bash
+dig @59.153.29.101 haproxy.v7.comptech-lab.com A +short
+dig @30.30.200.53 haproxy.v7.comptech-lab.com A +short
+dig @1.1.1.1 haproxy.v7.comptech-lab.com A +short
+```
+
+Expected answer:
+
+```text
+59.153.29.102
+```
+
+Confirm public health:
+
+```bash
+curl -fsS http://59.153.29.102/healthz
+curl -fsS http://haproxy.v7.comptech-lab.com/healthz
+```
+
+Expected answer:
+
+```text
+gf-ocp-haproxy-01 ready
+```
+
+Confirm private stats:
+
+```bash
+curl -fsS http://30.30.200.102:8404/stats
+```
+
+Confirm HAProxy configuration:
+
+```bash
+ssh ze@haproxy.v7.comptech-lab.com \
+  'sudo haproxy -c -f /etc/haproxy/haproxy.cfg'
+```
+
+Confirm SSH hardening:
+
+```bash
+ssh ze@haproxy.v7.comptech-lab.com \
+  'sudo sshd -T | egrep "^(passwordauthentication|permitrootlogin|pubkeyauthentication|kbdinteractiveauthentication) "'
+```
+
+Expected values:
+
+```text
+permitrootlogin no
+pubkeyauthentication yes
+passwordauthentication no
+kbdinteractiveauthentication no
+```
+
+## Operations
+
+Reload HAProxy safely:
+
+```bash
+ssh ze@haproxy.v7.comptech-lab.com \
+  'sudo haproxy -c -f /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy'
+```
+
+Check listeners:
+
+```bash
+ssh ze@haproxy.v7.comptech-lab.com \
+  'sudo ss -ltnp | egrep ":(22|80|8404)"'
+```
+
+Check core services:
+
+```bash
+ssh ze@haproxy.v7.comptech-lab.com \
+  'systemctl --no-pager --full status haproxy ssh fail2ban qemu-guest-agent chrony'
+```
+
+## Frontend Backlog
+
+Add concrete frontends and backends when each target service exists:
+
+- GitLab
+- Vault
+- Quay or Harbor
+- NetBox
+- OpenShift API
+- OpenShift apps wildcard
+- MinIO through edge TLS if required
+
+## Production Hardening Backlog
+
+- Add `gf-ocp-haproxy-02`.
+- Add Keepalived or an equivalent VIP mechanism.
+- Move HAProxy config into GitLab-managed automation.
+- Add TLS certificate management.
+- Add backend health checks, logs, metrics, and alerting.
+- Protect the stats endpoint with authentication or tighter network controls.
