@@ -1,0 +1,188 @@
+---
+title: "Installation Manual - 04 Vault installation"
+sidebar_label: "04 Vault installation"
+description: "How the gf-ocp Vault seed VM and three-node Raft cluster are installed, initialized, validated, and prepared for platform secret custody."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+Vault is the greenfield secret broker. It is installed after GitLab, DNS, HAProxy, and private VM egress because later services need a controlled place for credentials, tokens, bootstrap material, and future OpenShift External Secrets Operator integration.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Vault version | `1.21.1` |
+| Seed VM | `gf-ocp-vault-seed-01` / `30.30.200.30` |
+| Raft node 1 | `gf-ocp-vault-01` / `30.30.200.31` |
+| Raft node 2 | `gf-ocp-vault-02` / `30.30.200.32` |
+| Raft node 3 | `gf-ocp-vault-03` / `30.30.200.33` |
+| Client endpoint | `vault.v7.comptech-lab.com` |
+| Network | Private-only on `br33` |
+| Gateway | `30.30.0.1` |
+| DNS | `30.30.200.53`, then `8.8.8.8` |
+| Seal model | Seed Vault Shamir 5/3, main Vault transit auto-unseal |
+| Storage model | Vault Integrated Storage / Raft |
+
+`vault.v7.comptech-lab.com` is a private DNS round-robin endpoint for the three main Raft voters:
+
+```text
+vault.v7.comptech-lab.com A 30.30.200.31
+vault.v7.comptech-lab.com A 30.30.200.32
+vault.v7.comptech-lab.com A 30.30.200.33
+```
+
+## Creation Flow
+
+The bootstrap flow is:
+
+1. Create or confirm the governance issue and phase.
+2. Add PowerDNS records for the seed VM, three Raft nodes, and client endpoint.
+3. Generate local-only Vault CA and node certificates.
+4. Create four private-only Ubuntu 24.04 VMs from the base cloud image.
+5. Install Vault `1.21.1` with SHA256 verification.
+6. Initialize and unseal `gf-ocp-vault-seed-01`.
+7. Enable seed Vault file audit, transit engine, and scoped auto-unseal policy/token.
+8. Configure all three main nodes with Raft storage and transit auto-unseal.
+9. Initialize the main Vault cluster on `gf-ocp-vault-01`.
+10. Join `gf-ocp-vault-02` and `gf-ocp-vault-03` as voters.
+11. Enable main Vault file audit and `secret/` KV v2.
+12. Validate Raft peers, autopilot, health endpoints, and auto-unseal restart behavior.
+
+## Network Config
+
+Each Vault VM is private-only. The same network shape is used for seed and main nodes, with only the IP/MAC changing:
+
+```yaml
+version: 2
+ethernets:
+  enp1s0:
+    match:
+      macaddress: "REPLACE_WITH_VM_MAC"
+    set-name: enp1s0
+    dhcp4: false
+    addresses:
+      - REPLACE_WITH_VM_IP/16
+    routes:
+      - to: default
+        via: 30.30.0.1
+    nameservers:
+      addresses:
+        - 30.30.200.53
+        - 8.8.8.8
+      search:
+        - v7.comptech-lab.com
+```
+
+## Vault Service Pattern
+
+The cloud-init stage installs only the OS baseline, SSH access, firewall posture, the Vault binary, and the systemd service. TLS files, Vault configuration, initialization, and Raft bootstrap are applied after the VMs are reachable.
+
+Important service characteristics:
+
+- Vault binary is installed from the official HashiCorp release archive.
+- The SHA256SUMS file is used to verify the downloaded binary archive.
+- Vault runs as the `vault` system user.
+- Swap and core dumps are disabled.
+- UFW allows SSH, Vault API `8200`, and cluster traffic `8201` only from `30.30.0.0/16`.
+- File audit writes to `/var/log/vault/audit.log`.
+
+## Seal And Raft Model
+
+Seed Vault:
+
+- VM: `gf-ocp-vault-seed-01`
+- Seal: Shamir 5 shares, threshold 3
+- Storage: local Raft storage for the seed tier
+- Transit key: `main-vault-auto-unseal`
+- Token: scoped to transit encrypt/decrypt for the main Vault auto-unseal path
+
+Main Vault:
+
+- VMs: `gf-ocp-vault-01`, `gf-ocp-vault-02`, `gf-ocp-vault-03`
+- Storage: Integrated Storage / Raft
+- Seal: transit auto-unseal using `gf-ocp-vault-seed-01`
+- Recovery shares: 5 shares, threshold 3
+- Initial leader: `gf-ocp-vault-01`
+
+## Secret Custody
+
+All init material, recovery keys, root tokens, transit tokens, CA private keys, and node private keys are local-only and must not be committed.
+
+Current local custody path:
+
+```text
+/home/ze/codex-opp-agent/secrets/greenfield-vault/
+```
+
+Do not print token, key, or private key values in terminal output, issue comments, docs, or Git commits.
+
+## Validation
+
+Check unauthenticated health endpoints:
+
+```bash
+for endpoint in \
+  gf-ocp-vault-seed-01.v7.comptech-lab.com \
+  gf-ocp-vault-01.v7.comptech-lab.com \
+  gf-ocp-vault-02.v7.comptech-lab.com \
+  gf-ocp-vault-03.v7.comptech-lab.com \
+  vault.v7.comptech-lab.com; do
+  curl -fsS --cacert /home/ze/codex-opp-agent/secrets/greenfield-vault/tls/ca.crt \
+    "https://${endpoint}:8200/v1/sys/health?standbyok=true&sealedcode=200" >/dev/null &&
+    echo "${endpoint}: health endpoint reachable"
+done
+```
+
+Check main Vault status, Raft peers, autopilot, audit, and mounts:
+
+```bash
+token=$(jq -r '.root_token' /home/ze/codex-opp-agent/secrets/greenfield-vault/main-vault-init.json)
+printf '%s\n' "$token" | ssh ze@30.30.200.31 \
+  'read -r root_token;
+   export VAULT_ADDR="https://gf-ocp-vault-01.v7.comptech-lab.com:8200";
+   export VAULT_CACERT="/etc/vault.d/tls/ca.crt";
+   export VAULT_TOKEN="$root_token";
+   vault status;
+   vault operator raft list-peers;
+   vault operator raft autopilot state;
+   vault audit list;
+   vault secrets list'
+unset token
+```
+
+Expected high-level result:
+
+- main Vault is initialized and unsealed;
+- seal type is `transit`;
+- storage type is `raft`;
+- HA is enabled;
+- three Raft voters are present;
+- autopilot is healthy with failure tolerance `1`;
+- file audit is enabled;
+- `secret/` KV is mounted.
+
+Validate auto-unseal on a follower:
+
+```bash
+ssh ze@30.30.200.32 \
+  'sudo systemctl restart vault;
+   sleep 8;
+   export VAULT_ADDR=https://gf-ocp-vault-02.v7.comptech-lab.com:8200
+   export VAULT_CACERT=/etc/vault.d/tls/ca.crt
+   vault status'
+```
+
+Expected high-level result:
+
+- `Sealed` is `false`;
+- seal type is `transit`;
+- node returns as standby unless leadership moved.
+
+## Bootstrap Gaps
+
+- Raft snapshot backup to MinIO is not configured yet.
+- A leader failover drill still needs to be run.
+- Isolated snapshot restore still needs to be tested.
+- GitLab credentials and bootstrap tokens still need to be moved into Vault.
+- OpenShift Kubernetes auth mounts should wait until the new clusters exist.
