@@ -1,0 +1,226 @@
+---
+title: "Installation Manual — 03 GitLab installation"
+sidebar_label: "03 GitLab installation"
+description: "How the gf-ocp GitLab VM is created, installed, routed through HAProxy, validated, and prepared as the operational source of truth."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+GitLab is the first control-plane application in the greenfield build. It comes after PowerDNS and HAProxy because it needs stable DNS and an edge route before it can become the operational source of truth for Terraform, Ansible, Packer, GitOps, and CI/CD.
+
+NetBox is still part of the platform plan, but GitLab comes first so NetBox, Vault, registry, runners, and OpenShift automation can be provisioned from GitLab-managed repositories instead of becoming isolated manual installs.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-gitlab-01` |
+| Public/bootstrap IP | `59.153.29.103` |
+| Private backend IP | `30.30.200.20` |
+| External URL | `http://gitlab.v7.comptech-lab.com` |
+| Edge route | `59.153.29.102` HAProxy to `30.30.200.20:80` |
+| GitLab package | `gitlab-ce` |
+| Installed version | `18.11.3-ce.0` |
+
+The DNS record points the public GitLab name to HAProxy, not directly to the GitLab VM:
+
+```text
+gitlab.v7.comptech-lab.com A 59.153.29.102
+```
+
+The GitLab VM has a public/bootstrap interface for package installation and administration, but GitLab HTTP/HTTPS is allowed only from the HAProxy private address.
+
+## Creation Flow
+
+The bootstrap flow is:
+
+1. Create or confirm the governance issue and phase.
+2. Reserve `59.153.29.103` and `30.30.200.20`.
+3. Add `gitlab.v7.comptech-lab.com` to PowerDNS, pointing at HAProxy `59.153.29.102`.
+4. Create a cloud-init seed ISO for `gf-ocp-gitlab-01`.
+5. Create a 100 GiB qcow2 VM disk from the Ubuntu 24.04 cloud image.
+6. Boot the VM with two virtio NICs:
+   - `br-real` for `59.153.29.103/27`
+   - `br33` for `30.30.200.20/16`
+7. Install GitLab CE from the GitLab package repository.
+8. Configure UFW so only HAProxy can reach GitLab HTTP/HTTPS.
+9. Add the HAProxy `gitlab.v7.comptech-lab.com` backend.
+10. Preserve the generated root password in local secret custody without printing it.
+11. Validate UI, redirect behavior, GitLab internal checks, SSH hardening, and firewall posture.
+
+## Network Config
+
+```yaml
+version: 2
+ethernets:
+  public0:
+    match:
+      macaddress: "52:54:00:70:07:10"
+    set-name: enp1s0
+    dhcp4: false
+    addresses:
+      - 59.153.29.103/27
+    routes:
+      - to: default
+        via: 59.153.29.97
+    nameservers:
+      addresses:
+        - 30.30.200.53
+        - 1.1.1.1
+      search:
+        - v7.comptech-lab.com
+  private0:
+    match:
+      macaddress: "52:54:00:70:07:11"
+    set-name: enp2s0
+    dhcp4: false
+    addresses:
+      - 30.30.200.20/16
+```
+
+## Cloud-Init Install Script
+
+The cloud-init script installs the operating-system baseline, hardens SSH, enables UFW, adds the GitLab package repository, and installs GitLab CE.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+systemctl enable --now qemu-guest-agent
+systemctl enable --now chrony
+systemctl enable --now fail2ban
+systemctl restart ssh
+
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow from 30.30.200.102 to any port 80 proto tcp
+ufw allow from 30.30.200.102 to any port 443 proto tcp
+ufw --force enable
+
+curl -fsSL https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash
+EXTERNAL_URL="http://gitlab.v7.comptech-lab.com" apt-get install -y gitlab-ce
+```
+
+Bundled Alertmanager is disabled for bootstrap:
+
+```ruby
+alertmanager["enable"] = false
+```
+
+The reason is practical: the initial dual-interface layout caused the bundled Alertmanager gossip layer to fail advertise-address detection. This is not the platform observability plan; external observability will be added later.
+
+## HAProxy Backend
+
+HAProxy routes the public GitLab host to the private GitLab backend:
+
+```text
+frontend fe_http_public
+    bind 59.153.29.102:80
+    mode http
+    acl host_gitlab hdr(host) -i gitlab.v7.comptech-lab.com
+    acl path_health path /healthz
+    http-request return status 200 content-type text/plain string "gf-ocp-haproxy-01 ready\n" if path_health
+    http-request return status 503 content-type text/plain string "No backend configured yet\n" if !path_health !host_gitlab
+    use_backend be_gitlab_http if host_gitlab
+
+backend be_gitlab_http
+    mode http
+    option httpchk GET /users/sign_in
+    http-check expect rstatus (2|3)[0-9][0-9]
+    http-request set-header X-Forwarded-Proto http
+    http-request set-header X-Forwarded-Ssl off
+    server gitlab01 30.30.200.20:80 check
+```
+
+## Secret Custody
+
+The generated initial root password is not printed and is not committed.
+
+Local custody path:
+
+```text
+/home/ze/secrets/greenfield/gitlab-root-password.txt
+```
+
+Move this into Vault and rotate the root password after the first login.
+
+## Validation
+
+Confirm DNS:
+
+```bash
+dig @59.153.29.101 gitlab.v7.comptech-lab.com A +short
+dig @30.30.200.53 gitlab.v7.comptech-lab.com A +short
+dig @1.1.1.1 gitlab.v7.comptech-lab.com A +short
+```
+
+Expected result:
+
+```text
+59.153.29.102
+```
+
+Confirm sign-in works through HAProxy:
+
+```bash
+curl -sS -o /tmp/gitlab-signin.out -w '%{http_code}\n' \
+  http://gitlab.v7.comptech-lab.com/users/sign_in
+```
+
+Expected result:
+
+```text
+200
+```
+
+Confirm root redirects to sign-in:
+
+```bash
+curl -sS -o /tmp/gitlab-root.out -w '%{http_code} %{redirect_url}\n' \
+  http://gitlab.v7.comptech-lab.com/
+```
+
+Expected result:
+
+```text
+302 http://gitlab.v7.comptech-lab.com/users/sign_in
+```
+
+Run GitLab internal checks:
+
+```bash
+ssh ze@gitlab.v7.comptech-lab.com \
+  'sudo gitlab-rake gitlab:check SANITIZE=true'
+```
+
+Expected high-level result:
+
+- GitLab Shell internal API is available.
+- Redis is available.
+- Gitaly is OK.
+- Sidekiq is running.
+- Database migrations are complete.
+- Active users reports `1` before onboarding.
+
+Confirm firewall posture:
+
+```bash
+ssh ze@gitlab.v7.comptech-lab.com 'sudo ufw status verbose'
+```
+
+Expected posture:
+
+- default incoming deny;
+- SSH allowed;
+- HTTP/HTTPS allowed from `30.30.200.102` only.
+
+## Bootstrap Gaps
+
+- TLS is not enabled yet.
+- Backups to object storage are not configured yet.
+- Root password must be moved into Vault and rotated.
+- Initial groups, projects, protected branches, and CI variables still need to be created.
+- GitLab runners still need to be registered.
+- The temporary public/bootstrap interface should be revisited after NAT, proxy, or controlled outbound routing exists for private-only service VMs.
