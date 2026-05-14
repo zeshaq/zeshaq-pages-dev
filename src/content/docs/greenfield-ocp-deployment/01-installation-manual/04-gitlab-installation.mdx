@@ -93,16 +93,17 @@ ufw allow from 30.30.200.102 to any port 443 proto tcp
 ufw --force enable
 
 curl -fsSL https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash
-EXTERNAL_URL="http://gitlab.v7.comptech-lab.com" apt-get install -y gitlab-ce
-```
-
-Bundled Alertmanager is disabled for bootstrap:
-
-```ruby
+install -d -m 0755 /etc/gitlab
+cat > /etc/gitlab/gitlab.rb <<'GITLAB_RB'
+external_url "http://gitlab.v7.comptech-lab.com"
+# Greenfield bootstrap: disable bundled Alertmanager. External platform observability will be added later.
 alertmanager["enable"] = false
+GITLAB_RB
+apt-get install -y gitlab-ce=18.11.3-ce.0
+gitlab-ctl reconfigure
 ```
 
-This is not the platform observability plan; external observability will be added later.
+Preseed `external_url` and `alertmanager["enable"] = false` before installing the GitLab package. Appending the Alertmanager setting only after package install can make the first omnibus converge fail on Alertmanager advertise-address detection. This is not the platform observability plan; external observability will be added later.
 
 ## HAProxy Backend
 
@@ -228,6 +229,48 @@ Validation performed:
 
 Do not print the Vault value at `secret/greenfield/gitlab/restore-custody/config-archive`; it contains the encryption passphrase.
 
+## Restore Drill
+
+A full restore drill was completed under issue #307 into a throwaway VM:
+
+| Item | Value |
+| --- | --- |
+| Restore VM | `gf-ocp-gitlab-restore-01` |
+| Restore IP | `30.30.200.21` |
+| Hypervisor | `30.30.200.2` |
+| Backup archive | `1778793572_2026_05_14_18.11.3_gitlab_backup.tar` |
+| Config custody object | `config-custody/gitlab-config-secrets-20260514T213510Z.tar.gz.enc` |
+| Config custody metadata | `secret/greenfield/gitlab/restore-custody/config-archive` |
+| Result | restore succeeded and the restore VM was powered off for inspection |
+
+The drill restored `/etc/gitlab/gitlab.rb`, `/etc/gitlab/gitlab-secrets.json`, and `/etc/gitlab/gitlab-backup-object-storage.rb` before running the GitLab backup restore.
+
+High-level restore command sequence:
+
+```bash
+sudo gitlab-ctl stop puma
+sudo gitlab-ctl stop sidekiq
+sudo gitlab-backup restore BACKUP=1778793572_2026_05_14_18.11.3 force=yes
+sudo gitlab-ctl restart
+sudo gitlab-rake gitlab:check SANITIZE=true
+```
+
+Validation passed:
+
+- restore and source package versions matched `18.11.3-ce.0`;
+- restore and source inventory counts matched `users=1 groups=0 projects=0`;
+- local restore VM sign-in returned HTTP `200` after Puma warmed up;
+- local restore VM root path returned HTTP `302` to `/users/sign_in`;
+- `gitlab-rake gitlab:check SANITIZE=true` completed with healthy core checks;
+- production GitLab route still returned HTTP `200` after the drill;
+- restore VM remained private-only on `30.30.200.21/16`.
+
+Observed non-fatal restore details:
+
+- PostgreSQL extension ownership warnings appeared for `pg_trgm`, `btree_gist`, and `amcheck`, but the restore task exited `0` and completed successfully.
+- Immediate HTTP checks can return transient `502` while Puma recreates its socket after restore; wait and recheck before treating this as a failure.
+- Cloud-init should seed an explicit operator SSH public key. Reusing the first key from another host can create an inaccessible VM.
+
 ## Validation
 
 Confirm DNS:
@@ -329,13 +372,11 @@ Expected result:
 
 Before using GitLab as the durable operational source of truth:
 
-- document restore into a fresh VM;
 - create required PATs or service tokens and store them in Vault;
 - create operational groups and repositories;
 - register GitLab runners.
 
 - TLS is not enabled yet.
-- GitLab config and secrets file backup still needs a restore-ready custody workflow.
 - Root password must be rotated after first operational login.
 - Initial groups, projects, protected branches, and CI variables still need to be created.
 - GitLab runners still need to be registered.
