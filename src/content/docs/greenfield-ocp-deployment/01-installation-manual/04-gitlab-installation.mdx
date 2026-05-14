@@ -200,6 +200,34 @@ gitlab-backups/1778793572_2026_05_14_18.11.3_gitlab_backup.tar
 
 Important restore note: GitLab backup archives do not include `/etc/gitlab/gitlab.rb`, `/etc/gitlab/gitlab-secrets.json`, or the root-only backup include file. Those files must be backed up through the infrastructure secret/config workflow before GitLab is considered restore-ready.
 
+## Config And Secrets Restore Custody
+
+The required non-archive restore files are preserved separately as an encrypted MinIO object:
+
+| Item | Value |
+| --- | --- |
+| MinIO bucket | `gitlab-backups` |
+| MinIO object | `config-custody/gitlab-config-secrets-20260514T213510Z.tar.gz.enc` |
+| Vault metadata/passphrase path | `secret/greenfield/gitlab/restore-custody/config-archive` |
+| Encryption | `openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000` |
+
+The encrypted archive contains:
+
+```text
+/etc/gitlab/gitlab.rb
+/etc/gitlab/gitlab-secrets.json
+/etc/gitlab/gitlab-backup-object-storage.rb
+```
+
+Validation performed:
+
+- the encrypted object exists in MinIO;
+- the object checksum matches the Vault metadata;
+- decrypting with the Vault-held passphrase succeeds;
+- tar member listing shows the expected files without printing file contents.
+
+Do not print the Vault value at `secret/greenfield/gitlab/restore-custody/config-archive`; it contains the encryption passphrase.
+
 ## Validation
 
 Confirm DNS:
