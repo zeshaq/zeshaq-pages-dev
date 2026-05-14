@@ -1,0 +1,142 @@
+---
+title: "Installation Manual - 01 MinIO object storage"
+sidebar_label: "01 MinIO object storage"
+description: "How the greenfield physical MinIO host is promoted as the primary project object store, exposed through HAProxy, and integrated with Vault."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+MinIO is the first greenfield foundation service because later platform
+services need durable object storage for backups, state, image blobs, and CI
+evidence. The physical MinIO host is treated as the project object-storage
+foundation before DNS, edge routing, GitLab, Vault, and OpenShift automation
+start depending on it.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Host | physical MinIO server |
+| Hostname | `minio` |
+| Private IP | `30.30.200.1` |
+| API route | `https://minio.v7.comptech-lab.com` |
+| Console route | `https://minio-console.v7.comptech-lab.com` |
+| Internal API | `http://30.30.200.1:9000` |
+| Internal console | `http://30.30.200.1:9001` |
+| Data path | `/srv/minio/data` |
+| Edge | `gf-ocp-haproxy-01` / `59.153.29.102` |
+| Secret custody | Vault `secret/greenfield/object-storage/minio/*` |
+
+## Service Buckets
+
+| Bucket | Service user | Purpose |
+| --- | --- | --- |
+| `vault-raft-snapshots` | `vault-snapshot` | Vault integrated-storage snapshot backups |
+| `gitlab-backups` | `gitlab-backup` | GitLab application backups |
+| `tofu-state` | `tofu-state` | Terraform/OpenTofu S3-compatible state |
+| `ci-evidence` | `ci-evidence` | CI logs, scans, SBOMs, and compliance evidence |
+| `ocp-oadp-backups` | `oadp-backup` | Future OpenShift/OADP backups |
+| `quay-storage` | `quay-storage` | Future Quay object storage |
+
+Each service user is scoped to its own bucket. Access keys are generated once,
+kept out of Git, and stored in Vault.
+
+## DNS And Edge
+
+PowerDNS records:
+
+```text
+minio.v7.comptech-lab.com         A 59.153.29.102
+minio-console.v7.comptech-lab.com A 59.153.29.102
+```
+
+HAProxy routes:
+
+- HTTP requests for the MinIO hosts redirect to HTTPS.
+- `https://minio.v7.comptech-lab.com` forwards to `30.30.200.1:9000`.
+- `https://minio-console.v7.comptech-lab.com` forwards to `30.30.200.1:9001`.
+- The certificate is a Let's Encrypt certificate issued with DNS-01 against
+  the delegated `v7.comptech-lab.com` PowerDNS zone.
+
+## MinIO Public URL Settings
+
+The MinIO service environment includes:
+
+```text
+MINIO_SERVER_URL="https://minio.v7.comptech-lab.com"
+MINIO_BROWSER_REDIRECT_URL="https://minio-console.v7.comptech-lab.com"
+```
+
+These values keep browser redirects and generated URLs aligned with the HAProxy
+TLS endpoints.
+
+## Vault Custody
+
+Credential records are stored in Vault under:
+
+```text
+secret/greenfield/object-storage/minio/config
+secret/greenfield/object-storage/minio/users/vault-snapshot
+secret/greenfield/object-storage/minio/users/gitlab-backup
+secret/greenfield/object-storage/minio/users/tofu-state
+secret/greenfield/object-storage/minio/users/ci-evidence
+secret/greenfield/object-storage/minio/users/oadp-backup
+secret/greenfield/object-storage/minio/users/quay-storage
+```
+
+Do not print or commit root credentials, service access keys, service secret
+keys, or MinIO environment files.
+
+## Validation
+
+DNS:
+
+```bash
+dig +short minio.v7.comptech-lab.com @30.30.200.53
+dig +short minio-console.v7.comptech-lab.com @30.30.200.53
+dig +short minio.v7.comptech-lab.com @1.1.1.1
+dig +short minio-console.v7.comptech-lab.com @1.1.1.1
+```
+
+Expected result: all return `59.153.29.102`.
+
+Edge:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://minio.v7.comptech-lab.com/minio/health/live
+curl -sS -o /dev/null -w '%{http_code}\n' https://minio-console.v7.comptech-lab.com/
+```
+
+Expected result: both return `200`.
+
+Certificate:
+
+```bash
+echo | openssl s_client \
+  -connect minio.v7.comptech-lab.com:443 \
+  -servername minio.v7.comptech-lab.com 2>/dev/null |
+  openssl x509 -noout -subject -issuer -dates
+```
+
+Expected result: certificate subject is `minio.v7.comptech-lab.com` and the
+issuer is Let's Encrypt.
+
+Vault:
+
+```bash
+vault kv metadata get secret/greenfield/object-storage/minio/config
+vault kv metadata get secret/greenfield/object-storage/minio/users/vault-snapshot
+```
+
+Expected result: metadata exists. Do not print secret values.
+
+## Operational Notes
+
+- MinIO root credentials remain on the MinIO host in the service environment
+  file and should not be copied into Git.
+- Service-user credentials are the durable automation interface.
+- TLS renewal currently depends on the DNS-01 procedure for the delegated
+  PowerDNS zone; make renewal automation a follow-up task before production
+  cutover.
+- MinIO itself still needs a backup or replication design. This host is the
+  first foundation object store, not a complete HA object-storage platform yet.
