@@ -120,12 +120,18 @@ frontend fe_http_public
 
 backend be_gitlab_http
     mode http
-    option httpchk GET /users/sign_in
+    option httpchk
+    http-check send meth GET uri /users/sign_in ver HTTP/1.1 hdr Host gitlab.v7.comptech-lab.com
     http-check expect rstatus (2|3)[0-9][0-9]
     http-request set-header X-Forwarded-Proto http
     http-request set-header X-Forwarded-Ssl off
     server gitlab01 30.30.200.20:80 check
 ```
+
+The health check must send the GitLab host header and the `/users/sign_in` URI
+in the same `http-check send` line. A malformed host/header string can make
+HAProxy mark the backend down and return `503` even when direct access to
+`30.30.200.20` returns `200`.
 
 ## Secret Custody
 
