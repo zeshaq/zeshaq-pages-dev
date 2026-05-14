@@ -161,6 +161,54 @@ validate:ansible
 validate:netbox-inventory
 ```
 
+## NetBox Gated Plan Pipeline
+
+NetBox now has a gated plan path in:
+
+```text
+platform/infrastructure/ansible-automation
+```
+
+Pipeline jobs:
+
+| Job | Behavior |
+| --- | --- |
+| `plan:netbox` | renders a non-secret plan artifact |
+| `apply:netbox-blocked` | manual, intentionally blocked, creates nothing |
+
+Plan artifact:
+
+```text
+evidence/plans/netbox-plan.yml
+```
+
+Public planning examples:
+
+```text
+bootstrap/cloud-init/gf-ocp-netbox-01.user-data.example.yaml
+bootstrap/cloud-init/gf-ocp-netbox-01.network-config.example.yaml
+scripts/vms/gf-ocp-netbox-01.env.example
+```
+
+Validated pipeline:
+
+```text
+platform/infrastructure/ansible-automation pipeline 10
+```
+
+Pipeline `10` reached the expected `manual` state:
+
+```text
+lint:shell-and-yaml-hygiene  success
+validate:ansible            success
+validate:netbox-inventory   success
+plan:netbox                 success
+apply:netbox-blocked        manual
+```
+
+No NetBox VM was created. Enabling real apply requires a separate live-change
+issue and explicit operator approval.
+
 ## Network Config
 
 ```yaml
