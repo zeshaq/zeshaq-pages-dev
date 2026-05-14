@@ -70,6 +70,56 @@ Prepared cloud-init files and evidence logs stay in ignored local paths under
 `artifacts/` and `evidence/`. Secrets must stay out of scripts, env files, and
 Git history.
 
+## First Infrastructure Pipeline
+
+The first GitLab CI infrastructure automation pipeline lives in:
+
+```text
+platform/infrastructure/ansible-automation
+```
+
+It is intentionally validation-only. It does not create infrastructure, modify
+hosts, read secrets, or call Vault with a token.
+
+The pipeline uses the dedicated runner tags:
+
+```text
+gf, infra, ansible
+```
+
+Current stages:
+
+| Stage | Purpose |
+| --- | --- |
+| `lint` | shell/YAML hygiene and optional `ansible-lint` when available |
+| `validate` | protected CI context checks, inventory parsing, and playbook syntax checks |
+
+Protected non-secret CI variables:
+
+| Key | Purpose |
+| --- | --- |
+| `GREENFIELD_DOMAIN` | greenfield DNS base domain |
+| `GREENFIELD_GITLAB_URL` | internal GitLab URL |
+| `GREENFIELD_VAULT_ADDR` | Vault API address |
+| `GREENFIELD_EXECUTION_MODEL` | must be `gitlab-ci` |
+
+These values are not secrets. Future secret-bearing jobs must retrieve values
+from Vault through an approved short-lived pattern and must be protected/manual
+until the related service phase is approved.
+
+Validated pipeline:
+
+```text
+platform/infrastructure/ansible-automation pipeline 4
+```
+
+Both jobs passed:
+
+```text
+lint:shell-and-yaml-hygiene
+validate:ansible
+```
+
 ## Network Config
 
 ```yaml
