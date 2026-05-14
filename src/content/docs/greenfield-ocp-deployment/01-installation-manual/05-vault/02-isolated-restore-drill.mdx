@@ -1,0 +1,50 @@
+---
+title: "Installation Manual - 05b Vault isolated restore drill"
+sidebar_label: "05b Isolated restore drill"
+description: "The validated isolated restore process for Vault Raft snapshots without touching the live Raft data path."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+An isolated restore drill verifies that MinIO snapshots are usable without
+modifying the live Vault cluster.
+
+## Drill Result
+
+The restore drill passed on `2026-05-14`.
+
+Restored object:
+
+```text
+vault-raft-snapshots/20260514T203917Z/gf-ocp-vault-01.snap
+```
+
+The snapshot size was `25976` bytes.
+
+## Isolation Model
+
+The restore ran on `gf-ocp-vault-01` using:
+
+- a temporary Vault listener bound only to `127.0.0.1:18200`;
+- a temporary Raft path under `/var/tmp/vault-restore-drill`;
+- the same transit seal configuration as the main Vault cluster;
+- no writes to `/var/lib/vault/raft`.
+
+## Validation Performed
+
+The drill confirmed:
+
+- snapshot and checksum were retrieved from MinIO;
+- checksum matched;
+- snapshot restored into the isolated Vault process;
+- restored object-storage metadata was readable;
+- restored `vault-snapshot` metadata was readable;
+- temporary process stopped;
+- temporary restore path was removed;
+- live Vault remained active, initialized, unsealed, and backed by Raft.
+
+## Operating Rule
+
+Do not promote a retention policy until at least one restore drill passes.
+For production cadence, run a restore drill after any material change to Vault,
+MinIO, snapshot automation, TLS, or seal configuration.

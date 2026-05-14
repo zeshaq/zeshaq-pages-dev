@@ -1,0 +1,75 @@
+---
+title: "Installation Manual - 05c Vault leader failover drill"
+sidebar_label: "05c Leader failover drill"
+description: "The controlled Vault Raft leader failover procedure and validated result."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+The leader failover drill proves that the three-node Raft cluster can elect a
+new leader and keep serving traffic when the active node steps down.
+
+## Drill Result
+
+The controlled failover drill passed on `2026-05-14`.
+
+Before the drill:
+
+```text
+Leader: gf-ocp-vault-01
+Voters: gf-ocp-vault-01, gf-ocp-vault-02, gf-ocp-vault-03
+```
+
+The active node was stepped down with `vault operator step-down`.
+
+After the drill:
+
+```text
+Leader: gf-ocp-vault-02
+Voters: gf-ocp-vault-01, gf-ocp-vault-02, gf-ocp-vault-03
+Autopilot healthy: true
+Failure tolerance: 1
+```
+
+The former leader `gf-ocp-vault-01` was restarted after leadership moved. It
+rejoined as an unsealed voter.
+
+## Repeat Procedure
+
+Determine the current leader:
+
+```bash
+token=$(jq -r '.root_token' /home/ze/codex-opp-agent/secrets/greenfield-vault/main-vault-init.json)
+printf '%s\n' "$token" | ssh ze@30.30.200.31 \
+  'read -r root_token;
+   export VAULT_ADDR=https://gf-ocp-vault-01.v7.comptech-lab.com:8200;
+   export VAULT_CACERT=/etc/vault.d/tls/ca.crt;
+   export VAULT_TOKEN="$root_token";
+   vault operator raft list-peers'
+unset token
+```
+
+Step down the current leader by pointing `VAULT_ADDR` at that active node:
+
+```bash
+vault operator step-down
+```
+
+Validate from the new leader:
+
+```bash
+vault operator raft list-peers
+vault operator raft autopilot state
+```
+
+The expected result is three voters, one leader, Autopilot healthy, and failure
+tolerance `1`.
+
+## Safety Notes
+
+- Run this only during an approved maintenance window.
+- Use `step-down` for the normal drill because it exercises election without
+  forcing a crash.
+- Restart the former leader after the election to prove transit auto-unseal and
+  Raft rejoin still work.
+- Do not print root tokens or recovery keys while running the drill.

@@ -1,0 +1,85 @@
+---
+title: "Installation Manual - 05a Vault snapshot backups"
+sidebar_label: "05a Snapshot backups"
+description: "How Vault Raft snapshots are produced and uploaded to the greenfield MinIO object store."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+Vault Raft snapshots protect the main three-node Vault cluster from data loss.
+They are written from `gf-ocp-vault-01` to MinIO bucket
+`vault-raft-snapshots`.
+
+## Installed Components
+
+The backup job is installed only on `gf-ocp-vault-01`:
+
+```text
+/usr/local/sbin/vault-raft-snapshot-to-minio
+/etc/vault-snapshot/raft-snapshot.env
+/etc/systemd/system/vault-raft-snapshot.service
+/etc/systemd/system/vault-raft-snapshot.timer
+```
+
+The systemd timer runs daily at `02:15 UTC` with a randomized delay of up to
+`15m`.
+
+## Credential Model
+
+The environment file contains the scoped Vault automation token and non-secret
+settings. It does not contain MinIO credentials.
+
+At runtime, the script reads the MinIO `vault-snapshot` service credential from
+Vault:
+
+```text
+secret/greenfield/object-storage/minio/users/vault-snapshot
+```
+
+The MinIO user is scoped to the `vault-raft-snapshots` bucket.
+
+## Object Layout
+
+Each run creates a timestamped snapshot and checksum:
+
+```text
+vault-raft-snapshots/YYYYMMDDTHHMMSSZ/gf-ocp-vault-01.snap
+vault-raft-snapshots/YYYYMMDDTHHMMSSZ/gf-ocp-vault-01.snap.sha256
+```
+
+The first successful snapshot was:
+
+```text
+vault-raft-snapshots/20260514T203917Z/gf-ocp-vault-01.snap
+vault-raft-snapshots/20260514T203917Z/gf-ocp-vault-01.snap.sha256
+```
+
+## Operations
+
+Check the timer:
+
+```bash
+ssh ze@30.30.200.31 'sudo systemctl list-timers vault-raft-snapshot.timer --no-pager'
+```
+
+Run a manual snapshot:
+
+```bash
+ssh ze@30.30.200.31 'sudo systemctl start vault-raft-snapshot.service'
+```
+
+Check the latest snapshot log:
+
+```bash
+ssh ze@30.30.200.31 'sudo tail -20 /var/log/vault-snapshot/raft-snapshot.log'
+```
+
+## Validation Standard
+
+A successful run must show:
+
+- systemd service exits successfully;
+- snapshot object exists in MinIO;
+- checksum object exists in MinIO;
+- checksum matches when downloaded during restore testing;
+- live Vault remains initialized, unsealed, and healthy.

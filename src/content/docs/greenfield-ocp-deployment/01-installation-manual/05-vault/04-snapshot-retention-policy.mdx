@@ -1,0 +1,55 @@
+---
+title: "Installation Manual - 05d Vault snapshot retention policy"
+sidebar_label: "05d Snapshot retention"
+description: "The defined lifecycle and recovery policy for greenfield Vault Raft snapshots."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+Vault snapshot retention is now defined after both required proof points passed:
+the isolated restore drill and the leader failover drill.
+
+## Policy
+
+For the current greenfield bootstrap stage:
+
+- snapshot schedule: daily at `02:15 UTC`;
+- retention window: `30` days;
+- bucket: `vault-raft-snapshots`;
+- object versions: expire current and noncurrent versions after `30` days;
+- restore drill cadence: monthly during active buildout, then quarterly;
+- restore drill trigger: also run after Vault, MinIO, TLS, seal, or snapshot
+  automation changes.
+
+This gives roughly 30 daily recovery points while the platform is still being
+built. Increase the window before onboarding production workloads with stricter
+recovery requirements.
+
+## MinIO Lifecycle Target
+
+The desired lifecycle rule for the bucket is:
+
+```bash
+mc ilm rule add \
+  --expire-days 30 \
+  --noncurrent-expire-days 30 \
+  --expire-delete-marker \
+  gf-local/vault-raft-snapshots
+```
+
+Validate the applied rule:
+
+```bash
+mc ilm rule ls gf-local/vault-raft-snapshots
+```
+
+## Production Follow-Up
+
+Before this becomes the long-term production policy, add:
+
+- alert when the daily timer fails;
+- alert when no snapshot exists from the last 26 hours;
+- alert when restore drill is overdue;
+- MinIO backup or replication for the object store itself;
+- Git-driven automation for lifecycle policies rather than manual `mc`
+  commands.

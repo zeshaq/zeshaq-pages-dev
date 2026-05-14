@@ -179,7 +179,7 @@ Expected high-level result:
 - seal type is `transit`;
 - node returns as standby unless leadership moved.
 
-## Bootstrap Gaps
+## Post-Installation Tasks
 
 Raft snapshot backup to MinIO is configured with a scoped Vault policy/token,
 systemd service, and daily timer on `gf-ocp-vault-01`.
@@ -191,13 +191,19 @@ vault-raft-snapshots/YYYYMMDDTHHMMSSZ/gf-ocp-vault-01.snap
 vault-raft-snapshots/YYYYMMDDTHHMMSSZ/gf-ocp-vault-01.snap.sha256
 ```
 
-Remaining gaps:
+Detailed post-installation pages:
 
-- A leader failover drill still needs to be run.
+- [05a Vault snapshot backups](/docs/greenfield-ocp-deployment/installation-manual/vault/snapshot-backups/)
+- [05b Vault isolated restore drill](/docs/greenfield-ocp-deployment/installation-manual/vault/isolated-restore-drill/)
+- [05c Vault leader failover drill](/docs/greenfield-ocp-deployment/installation-manual/vault/leader-failover-drill/)
+- [05d Vault snapshot retention policy](/docs/greenfield-ocp-deployment/installation-manual/vault/snapshot-retention-policy/)
+
+Remaining bootstrap gaps:
+
 - GitLab credentials and bootstrap tokens still need to be moved into Vault.
 - OpenShift Kubernetes auth mounts should wait until the new clusters exist.
 
-## Restore Drill
+## Completed Drills
 
 An isolated restore drill passed on `2026-05-14`.
 
@@ -205,3 +211,8 @@ The latest MinIO snapshot was restored into a throwaway Vault process on
 `gf-ocp-vault-01` with a localhost-only listener and a separate temporary Raft
 path. The restored metadata was readable, the temporary process and data path
 were removed, and the live Vault cluster remained active and unsealed.
+
+A controlled leader failover drill also passed on `2026-05-14`.
+`gf-ocp-vault-01` stepped down, `gf-ocp-vault-02` became leader, the former
+leader restarted cleanly, and Autopilot remained healthy with failure tolerance
+`1`.
