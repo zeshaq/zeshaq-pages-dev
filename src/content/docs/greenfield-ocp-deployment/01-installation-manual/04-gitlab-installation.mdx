@@ -150,6 +150,50 @@ service tokens should use:
 secret/greenfield/gitlab/pats/<owner-or-purpose>
 ```
 
+## MinIO Backups
+
+GitLab backups upload to the greenfield MinIO object store through scoped credentials stored in Vault:
+
+```text
+secret/greenfield/object-storage/minio/users/gitlab-backup
+```
+
+The backup target is:
+
+| Item | Value |
+| --- | --- |
+| Bucket | `gitlab-backups` |
+| Internal endpoint | `http://30.30.200.1:9000` |
+| GitLab retention | `604800` seconds |
+
+The GitLab object-storage backup settings live in a root-only include file:
+
+```text
+/etc/gitlab/gitlab-backup-object-storage.rb
+```
+
+`/etc/gitlab/gitlab.rb` includes that file:
+
+```ruby
+from_file "/etc/gitlab/gitlab-backup-object-storage.rb"
+```
+
+Do not print or commit the include file because it contains the scoped MinIO secret key.
+
+Run a manual backup:
+
+```bash
+ssh ze@30.30.200.20 'sudo gitlab-backup create STRATEGY=copy'
+```
+
+Validated backup object:
+
+```text
+gitlab-backups/1778793572_2026_05_14_18.11.3_gitlab_backup.tar
+```
+
+Important restore note: GitLab backup archives do not include `/etc/gitlab/gitlab.rb`, `/etc/gitlab/gitlab-secrets.json`, or the root-only backup include file. Those files must be backed up through the infrastructure secret/config workflow before GitLab is considered restore-ready.
+
 ## Validation
 
 Confirm DNS:
@@ -251,15 +295,13 @@ Expected result:
 
 Before using GitLab as the durable operational source of truth:
 
-- configure object-storage backups to MinIO;
-- run a backup job;
 - document restore into a fresh VM;
 - create required PATs or service tokens and store them in Vault;
 - create operational groups and repositories;
 - register GitLab runners.
 
 - TLS is not enabled yet.
-- Backups to object storage are not configured yet.
-- Root password must be moved into Vault and rotated.
+- GitLab config and secrets file backup still needs a restore-ready custody workflow.
+- Root password must be rotated after first operational login.
 - Initial groups, projects, protected branches, and CI variables still need to be created.
 - GitLab runners still need to be registered.
