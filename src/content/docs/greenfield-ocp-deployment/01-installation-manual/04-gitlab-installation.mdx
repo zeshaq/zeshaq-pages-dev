@@ -48,6 +48,28 @@ The bootstrap flow is:
 10. Preserve the generated root password in local secret custody without printing it.
 11. Validate UI, redirect behavior, GitLab internal checks, SSH hardening, and firewall posture.
 
+## Human Operator Scripts
+
+The repository provides a small operator script entry point so humans do not
+have to copy long command blocks from the manual:
+
+```bash
+./scripts/gfctl.sh preflight
+./scripts/gfctl.sh prepare-cloud-init --execute <vm-name>
+./scripts/gfctl.sh cloud-init-iso --execute <vm-name>
+cp scripts/vms/<vm-name>.env.example scripts/vms/<vm-name>.env
+./scripts/gfctl.sh create-vm --execute scripts/vms/<vm-name>.env
+./scripts/gfctl.sh validate-vm --execute ze@<vm-ip>
+```
+
+Commands that create local artifacts or infrastructure default to dry-run.
+Operators must pass `--execute` and type `EXECUTE` at the prompt after the
+matching issue, phase, and ADR gate are approved.
+
+Prepared cloud-init files and evidence logs stay in ignored local paths under
+`artifacts/` and `evidence/`. Secrets must stay out of scripts, env files, and
+Git history.
+
 ## Network Config
 
 ```yaml
