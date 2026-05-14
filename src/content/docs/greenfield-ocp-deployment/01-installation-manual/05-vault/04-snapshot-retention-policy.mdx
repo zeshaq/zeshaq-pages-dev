@@ -25,14 +25,26 @@ This gives roughly 30 daily recovery points while the platform is still being
 built. Increase the window before onboarding production workloads with stricter
 recovery requirements.
 
-## MinIO Lifecycle Target
+## MinIO Lifecycle State
 
-The desired lifecycle rule for the bucket is:
+The lifecycle policy was applied on `2026-05-14`.
+
+MinIO requires delete-marker expiration as a separate rule from day-based
+expiration. The applied state is:
+
+- current object versions expire after `30` days;
+- noncurrent object versions expire after `30` days;
+- delete markers expire through a separate enabled rule.
+
+Applied commands:
 
 ```bash
 mc ilm rule add \
   --expire-days 30 \
   --noncurrent-expire-days 30 \
+  gf-local/vault-raft-snapshots
+
+mc ilm rule add \
   --expire-delete-marker \
   gf-local/vault-raft-snapshots
 ```
@@ -43,6 +55,13 @@ Validate the applied rule:
 mc ilm rule ls gf-local/vault-raft-snapshots
 ```
 
+Expected validation output shows:
+
+- one enabled `Expiration` rule with `DAYS TO EXPIRE` set to `30`;
+- one enabled `NoncurrentVersionExpiration` rule with `DAYS TO EXPIRE` set to
+  `30`;
+- one enabled delete-marker expiration rule.
+
 ## Production Follow-Up
 
 Before this becomes the long-term production policy, add:
@@ -51,5 +70,5 @@ Before this becomes the long-term production policy, add:
 - alert when no snapshot exists from the last 26 hours;
 - alert when restore drill is overdue;
 - MinIO backup or replication for the object store itself;
-- Git-driven automation for lifecycle policies rather than manual `mc`
-  commands.
+- Git-driven automation for lifecycle policy management rather than manual
+  `mc` commands.
