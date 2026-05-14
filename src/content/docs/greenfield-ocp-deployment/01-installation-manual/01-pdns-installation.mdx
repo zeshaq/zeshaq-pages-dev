@@ -1,0 +1,225 @@
+---
+title: "Installation Manual — 01 PDNS installation"
+sidebar_label: "01 PDNS installation"
+description: "How the gf-ocp PowerDNS VM is created with cloud-init, configured, delegated, and validated for the v7 platform DNS foundation."
+last_reviewed: 2026-05-14
+draft: false
+---
+
+PowerDNS is the first infrastructure service in the greenfield platform because every later service needs stable names before automation can become repeatable. This chapter documents the bootstrap DNS VM, the cloud-init pattern used to create it, the authoritative and recursive DNS configuration, and the validation commands.
+
+## Target State
+
+The DNS foundation starts with one VM:
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-pdns-01` |
+| Public authoritative DNS IP | `59.153.29.101` |
+| Private recursive resolver IP | `30.30.200.53` |
+| Authoritative zone | `v7.comptech-lab.com` |
+| Public DNS name | `pdns.v7.comptech-lab.com` |
+| Future edge DNS name | `haproxy.v7.comptech-lab.com` |
+| Future edge public IP | `59.153.29.102` |
+
+The initial authoritative records are:
+
+| Record | Type | Target |
+| --- | --- | --- |
+| `ns1.v7.comptech-lab.com` | A | `59.153.29.101` |
+| `ns2.v7.comptech-lab.com` | A | `59.153.29.101` |
+| `pdns.v7.comptech-lab.com` | A | `59.153.29.101` |
+| `haproxy.v7.comptech-lab.com` | A | `59.153.29.102` |
+
+`ns1` and `ns2` intentionally point to the same bootstrap VM for the first phase. Replace this with real DNS HA once the second DNS node or a proper HA design is built.
+
+## Creation Flow
+
+The VM is created from an Ubuntu 24.04 cloud image on the hypervisor. The build uses a cloud-init seed ISO so the VM starts with the correct hostname, user, SSH posture, packages, PowerDNS configuration, recursor configuration, and guest agent.
+
+The expected VM creation sequence is:
+
+1. Place the base cloud image on the hypervisor image store.
+2. Create a qcow2 overlay or cloned disk for `gf-ocp-pdns-01`.
+3. Resize the disk to the planned size.
+4. Generate a NoCloud seed ISO with `user-data` and `meta-data`.
+5. Attach the VM to the public and private bridge networks.
+6. Boot the VM and wait for `cloud-init status --wait`.
+7. Validate SSH key login for the `ze` operator account.
+8. Validate `pdns`, `pdns-recursor`, `qemu-guest-agent`, `chrony`, and `fail2ban`.
+
+The cloud-init file is source-controlled as an example template, not as a secret-bearing final file. API keys, Cloudflare tokens, private keys, passwords, and pull secrets must come from Vault or protected CI variables.
+
+## Cloud-Init User Data
+
+The user-data file sets the hostname and hardens access:
+
+```yaml
+#cloud-config
+hostname: gf-ocp-pdns-01
+fqdn: pdns.v7.comptech-lab.com
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+```
+
+It creates the operator account with SSH key authentication only:
+
+```yaml
+users:
+  - name: ze
+    groups: [adm, sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY"
+```
+
+It installs the required packages:
+
+```yaml
+packages:
+  - pdns-server
+  - pdns-backend-sqlite3
+  - pdns-tools
+  - pdns-recursor
+  - sqlite3
+  - qemu-guest-agent
+  - cloud-guest-utils
+  - dnsutils
+  - chrony
+  - curl
+  - jq
+  - fail2ban
+```
+
+Use `write_files` for multi-line service configuration. Avoid embedding large heredocs inside `runcmd`; invalid indentation or shell quoting can make the entire cloud-init document invalid before the VM is usable.
+
+## Authoritative DNS Configuration
+
+PowerDNS Authoritative uses the sqlite backend and listens on the public DNS address plus localhost:
+
+```text
+include-dir=/etc/powerdns/pdns.d
+launch=gsqlite3
+security-poll-suffix=
+webserver=yes
+api=yes
+api-key=REPLACE_FROM_VAULT_OR_PROTECTED_CI
+webserver-port=8081
+webserver-address=127.0.0.1
+webserver-allow-from=127.0.0.1,::1
+default-soa-content=ns1.v7.comptech-lab.com hostmaster.v7.comptech-lab.com 0 10800 3600 604800 3600
+gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+gsqlite3-pragma-synchronous=0
+local-address=127.0.0.1,59.153.29.101
+dnsupdate=yes
+```
+
+The API listener stays local on `127.0.0.1:8081`. Automation should reach it through SSH, a local runner, or a protected control path. Do not expose the API on the public interface.
+
+## Recursive Resolver Configuration
+
+PowerDNS Recursor listens only on the private resolver address:
+
+```text
+local-address=30.30.200.53
+local-port=53
+allow-from=127.0.0.0/8,30.30.0.0/16
+forward-zones=v7.comptech-lab.com=127.0.0.1:53
+forward-zones-recurse=.=1.1.1.1;8.8.8.8
+```
+
+This gives internal clients one resolver for both platform names and internet names. Queries for `v7.comptech-lab.com` are forwarded to the local authoritative service. Other queries recurse through upstream public resolvers.
+
+## Zone Setup
+
+After the VM is online, create the zone and records with `pdnsutil`:
+
+```bash
+sudo pdnsutil create-zone v7.comptech-lab.com ns1.v7.comptech-lab.com
+sudo pdnsutil replace-rrset v7.comptech-lab.com ns1 A 300 59.153.29.101
+sudo pdnsutil replace-rrset v7.comptech-lab.com ns2 A 300 59.153.29.101
+sudo pdnsutil replace-rrset v7.comptech-lab.com pdns A 300 59.153.29.101
+sudo pdnsutil replace-rrset v7.comptech-lab.com haproxy A 300 59.153.29.102
+sudo pdnsutil increase-serial v7.comptech-lab.com
+```
+
+The parent DNS zone must delegate `v7.comptech-lab.com` to the new nameservers. The parent-zone records are:
+
+```text
+v7.comptech-lab.com NS ns1.v7.comptech-lab.com
+v7.comptech-lab.com NS ns2.v7.comptech-lab.com
+ns1.v7.comptech-lab.com A 59.153.29.101
+ns2.v7.comptech-lab.com A 59.153.29.101
+pdns.v7.comptech-lab.com A 59.153.29.101
+haproxy.v7.comptech-lab.com A 59.153.29.102
+```
+
+Create the parent-zone records through protected automation. Do not place the DNS provider token in shell history, public docs, or repository files.
+
+## How Resolution Works
+
+Public clients resolve `*.v7.comptech-lab.com` through the parent-zone delegation. The parent zone points at `ns1.v7.comptech-lab.com` and `ns2.v7.comptech-lab.com`; those names resolve to `59.153.29.101`; PowerDNS Authoritative answers for the `v7.comptech-lab.com` zone.
+
+Private clients use `30.30.200.53` as their resolver. The recursor forwards `v7.comptech-lab.com` queries to the local authoritative server and forwards all other recursive queries upstream.
+
+## Validation
+
+Run these checks from a host that can reach the DNS VM:
+
+```bash
+dig @59.153.29.101 v7.comptech-lab.com SOA +short
+dig @59.153.29.101 pdns.v7.comptech-lab.com A +short
+dig @59.153.29.101 haproxy.v7.comptech-lab.com A +short
+dig @30.30.200.53 haproxy.v7.comptech-lab.com A +short
+dig @30.30.200.53 google.com A +short
+dig @1.1.1.1 pdns.v7.comptech-lab.com A +short
+dig @1.1.1.1 haproxy.v7.comptech-lab.com A +short
+```
+
+Expected results:
+
+- SOA is served by `ns1.v7.comptech-lab.com`.
+- `pdns.v7.comptech-lab.com` returns `59.153.29.101`.
+- `haproxy.v7.comptech-lab.com` returns `59.153.29.102`.
+- The private resolver answers both local platform names and internet names.
+- Public resolvers can follow the parent-zone delegation.
+
+## Operations
+
+List all zones:
+
+```bash
+ssh ze@pdns.v7.comptech-lab.com 'sudo pdnsutil list-all-zones'
+```
+
+Show the v7 zone:
+
+```bash
+ssh ze@pdns.v7.comptech-lab.com \
+  'sudo pdnsutil list-zone v7.comptech-lab.com'
+```
+
+Add or replace an A record:
+
+```bash
+ssh ze@pdns.v7.comptech-lab.com \
+  'sudo pdnsutil replace-rrset v7.comptech-lab.com gitlab A 300 59.153.29.103 && sudo pdnsutil increase-serial v7.comptech-lab.com'
+```
+
+Check services:
+
+```bash
+ssh ze@pdns.v7.comptech-lab.com \
+  'systemctl --no-pager --full status pdns pdns-recursor qemu-guest-agent chrony fail2ban'
+```
+
+## Production Hardening Backlog
+
+- Add a second authoritative DNS node before treating `ns1` and `ns2` as HA.
+- Move the PDNS API key into Vault or protected CI variables.
+- Drive zone changes from the operational GitLab automation instead of manual `pdnsutil` commands.
+- Add DNS monitoring for SOA, key records, recursion, service health, serial changes, and provider delegation drift.
+- Decide whether later internal DNS updates should be expressed as Git-managed data files, Terraform-managed DNS records, or a dedicated DNS controller workflow.
