@@ -1,0 +1,131 @@
+---
+title: "Adding an enterprise service bus"
+sidebar_label: "06 — Enterprise service bus"
+description: "WSO2 Micro Integrator as a second podman container on a shared network. One synapse API, name-based routing, and end-to-end verification."
+estimated_minutes: 60
+last_updated: 2026-05-15
+prereqs: ["05 — Source control and the VM as canonical workspace"]
+---
+
+This is where the project gets its first integration surface. We add a **second container** to the VM — a WSO2 Micro Integrator runtime — and route HTTP traffic through it into the Liberty app. Same VM, same git repo, separate runtime.
+
+## What an ESB is (and isn't) in 2026
+
+The "enterprise service bus" pattern came out of mid-2000s SOA. Today most teams reach for it when:
+
+- Outbound integrations get noisy enough to deserve a separate config tree, a separate release cadence, and a separate ops surface from the main application.
+- Multiple consuming services need the same routing/transformation logic, and embedding it in each one would mean copying.
+- A central place to attach **API gateway** concerns (auth, throttling, logging, observability) buys more than it costs.
+
+What an ESB **isn't** is a free lunch. It is a second runtime to deploy, monitor, and version. For a single application with a couple of HTTP integrations, **Apache Camel embedded** in the Liberty app is often a better fit. Pick the ESB when the separation pays for itself.
+
+## The shortlist
+
+| Option | License | Footprint | When it fits |
+| --- | --- | --- | --- |
+| **Apache Camel** (embedded) | Apache 2.0 | Library, in-process | Routing logic that belongs in *the* app |
+| **WSO2 Micro Integrator** | Apache 2.0 | ~150 MB image, ~5 s startup | Container-native ESB, separate runtime |
+| **MuleSoft Anypoint** | Commercial | Separate Mule runtime + Anypoint platform | An integration *practice*, not one app |
+| **IBM App Connect Enterprise** | Commercial | Heavier still | IBM Cloud Paks shop |
+
+We pick **WSO2 MI**. It's actually open-source (not a feature-gated community edition), it's container-native, and it runs cleanly side-by-side with our Liberty container.
+
+## The runtime topology
+
+Two containers, one shared user-defined podman network. The Liberty app keeps its 9080/9443. The MI listens on 8290/8253. Both publish to the host so we can `curl` from the VM shell for smoke tests, but inside the network they refer to each other by container name.
+
+```
+laptop ──ssh──> hypervisor ──ProxyJump──> VM
+                                          ├── container: insurance-app   :9080
+                                          └── container: insurance-mi    :8290
+                                              │
+                                              └── insurance-net (10.89.0.0/24)
+```
+
+## The Containerfile for MI
+
+```dockerfile
+FROM docker.io/wso2/wso2mi:4.4.0
+
+# Drop our synapse configs into the default config dir.
+COPY --chown=wso2carbon:wso2 synapse-config/api/ \
+     /home/wso2carbon/wso2mi-4.4.0/repository/deployment/server/synapse-configs/default/api/
+
+EXPOSE 8290 8253
+```
+
+That's it. The base image starts MI when the container starts, and any synapse XML you drop into `synapse-configs/default/<kind>/` is loaded at boot.
+
+## One synapse API
+
+`mi/synapse-config/api/InsurancePingAPI.xml`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<api context="/insurance" name="InsurancePingAPI"
+     xmlns="http://ws.apache.org/ns/synapse">
+    <resource methods="GET" uri-template="/ping">
+        <inSequence>
+            <call>
+                <endpoint>
+                    <http method="get"
+                          uri-template="http://insurance-app:9080/api/ping"/>
+                </endpoint>
+            </call>
+            <respond/>
+        </inSequence>
+        <faultSequence/>
+    </resource>
+</api>
+```
+
+`<call>` + `<respond/>` is the modern synchronous request/response pattern in synapse — cleaner than the older `<send/>` + `<outSequence>` style. The endpoint URI uses the **container name** `insurance-app`, not an IP — possible because both containers attach to the same podman network with DNS enabled.
+
+## Wiring it up
+
+```bash
+# Create the shared network (once)
+podman network create insurance-net
+
+# Build the MI image
+cd ~/insurance-app
+podman build --network=host -t insurance-mi:dev -f mi/Containerfile mi/
+
+# (Re)start both containers on the shared network
+podman run -d --replace --name insurance-app --network insurance-net \
+  -p 9080:9080 -p 9443:9443 insurance-app:dev
+
+podman run -d --replace --name insurance-mi --network insurance-net \
+  -p 8290:8290 -p 8253:8253 insurance-mi:dev
+```
+
+The `--replace` flag is gold — it stops any existing container with the same name and starts the new one, no manual `podman rm` ceremony.
+
+## Verifying the path
+
+```bash
+# Direct to Liberty
+curl http://localhost:9080/api/ping
+# {"status":"ok"}
+
+# Through MI
+curl http://localhost:8290/insurance/ping
+# {"status":"ok"}
+```
+
+Both return the same JSON. The second one took a slightly longer path: laptop → SSH → VM → MI container → bridge network → Liberty container → and back.
+
+## A topology nuance: name-based routing
+
+Switching the network from `--network host` to a user-defined bridge (`insurance-net`) is what enabled `http://insurance-app:9080/...` in the synapse config. Podman's user-defined bridges have **embedded DNS**; the default `podman` bridge does not, and `--network host` doesn't even have an isolated network at all. If you ever switch back to `host`, the synapse endpoint URI must change to `localhost:9080` and MI loses the cleaner abstraction.
+
+## What you have
+
+- Two containers running side by side under one rootless podman.
+- A shared bridge network with name-based routing.
+- One synapse API that demonstrates the ESB pattern end-to-end.
+- A platform you can extend by dropping more synapse files into `mi/synapse-config/`.
+
+The roadmap from here is module 07.
+
+Next: [07 — What's next →](/learn/openliberty/whats-next)

@@ -1,0 +1,82 @@
+---
+title: "The toolchain"
+sidebar_label: "02 — The toolchain"
+description: "JDK 21, Maven, and rootless podman on the VM — plus the one systemd-logind setting that keeps your containers alive across SSH disconnects."
+estimated_minutes: 30
+last_updated: 2026-05-15
+prereqs: ["01 — Infrastructure: the VM"]
+---
+
+The VM is up. Now we make it useful. Three things go on: a Java runtime, a build tool, and a container engine. Plus one small piece of system tuning that becomes load-bearing later.
+
+## What we're installing and why
+
+| Tool | Why |
+| --- | --- |
+| **OpenJDK 21** | Long-term support, what Open Liberty's recent images target |
+| **Maven** | The Open Liberty Maven plugin (`liberty-maven-plugin`) is the most polished build experience for Liberty |
+| **Podman + buildah** | Rootless OCI builds and runs without a daemon; aligns with the Red Hat / OpenShift ecosystem |
+| **Uidmap / slirp4netns / fuse-overlayfs** | Rootless podman's plumbing; needed for user-namespace builds |
+
+We're skipping Docker. Podman has the same CLI surface, doesn't require a privileged daemon, and OpenShift uses CRI-O which speaks the same OCI runtime contract.
+
+## The install command
+
+```bash
+sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  openjdk-21-jdk maven podman buildah \
+  uidmap slirp4netns fuse-overlayfs ca-certificates curl
+```
+
+Verify:
+
+```bash
+java -version
+mvn -v
+podman --version
+```
+
+You should see Java 21.x, Maven 3.8.x or 3.9.x, podman 4.x or 5.x.
+
+## A note on Java vendors
+
+The Liberty container images use IBM **Semeru** (OpenJ9). On the host we install Eclipse **Temurin** or Ubuntu's default **OpenJDK** because the image will swap to Semeru for us — and IDE / IDE-like tools prefer mainline HotSpot. Don't fight this; the runtime inside the container is what counts.
+
+## Maven 3.8 quirks on JDK 21
+
+Ubuntu 24.04 ships Maven 3.8.7. It works on JDK 21 with **one caveat**: it defaults to plugin versions from 2011 that don't, and `maven-war-plugin:2.2` in particular dies with a `Cannot access defaults field of Properties` error. Module 04 pins modern plugin versions in the `pom.xml` so this never bites you.
+
+## Rootless podman: a quick smoke test
+
+After install, pull a small image and run a one-shot:
+
+```bash
+podman run --rm docker.io/library/alpine:3.20 echo hello
+```
+
+If that prints `hello`, rootless podman is wired up correctly. If it complains about `newuidmap` or `subuid`/`subgid`, check `/etc/subuid` and `/etc/subgid` — your user should have a 65536-id allocation in each.
+
+## Lingering: the one detail you must not skip
+
+Rootless podman runs as a child of your **systemd-logind user session**. When your last SSH session ends, logind tears down the session — and every rootless container goes with it. You will discover this the next morning when `curl` to your service hangs with `Connection refused`.
+
+Fix:
+
+```bash
+sudo loginctl enable-linger ze
+loginctl show-user ze | grep Linger
+```
+
+The output should say `Linger=yes`. From now on, your user's systemd manager survives logout, and rootless podman containers keep running.
+
+This single command is in our memory as a "load-bearing system setting" — the kind of thing that's invisible when it works and unmistakable when it doesn't.
+
+## What you have
+
+- A JDK, a build tool, and a container engine.
+- A rootless podman setup that survives SSH disconnects.
+
+Module 03 writes the first Liberty application against this toolchain.
+
+Next: [03 — Your first Liberty application →](/learn/openliberty/first-liberty-app)

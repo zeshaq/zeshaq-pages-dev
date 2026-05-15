@@ -1,0 +1,78 @@
+---
+title: "Overview"
+sidebar_label: "00 — Overview"
+description: "What this track covers, who it's for, and how to use it."
+estimated_minutes: 8
+last_updated: 2026-05-15
+---
+
+This is a self-paced, opinionated track on building a real Java application with **Open Liberty** — from the moment you have an empty VM through to running an enterprise service bus next to your app. By the end you will have provisioned a development host, written a Jakarta EE 10 / MicroProfile 6.1 service, packaged it into a container, set up a git workflow that survives across machines, and integrated through a separate WSO2 Micro Integrator runtime.
+
+The track is opinionated. It teaches the choices a Liberty team would actually make today — kernel-vs-full image, web profile vs full Jakarta EE, rootless podman, single-VM development, ESB as a sidecar container. Where alternatives exist, I name them and say why we didn't pick them.
+
+## Who this is for
+
+Engineers who:
+
+- Know Java — generics, annotations, lambdas, the basics of CDI or a DI container.
+- Have used Maven (or Gradle) for a project. We won't dwell on Maven fundamentals.
+- Are comfortable on a Unix shell — SSH, basic systemd, `ps`/`grep`/`curl`.
+- Are *not* trying to become a JVM internals expert or a Liberty performance tuner. This is the surface-area version.
+
+If you've never written a Java service that listens on a port, work through a Spring Boot or vanilla JAX-RS quickstart first. An hour; come back.
+
+## What you'll build
+
+A small REST service called `insurance-app`:
+
+- **Jakarta EE 10 web profile + MicroProfile 6.1**, running on **Open Liberty**.
+- Packaged as a **podman container** based on the official `open-liberty` image.
+- Sits **behind a WSO2 Micro Integrator** that routes `/insurance/*` traffic to it.
+- **Source tracked in git**, with the VM (not the laptop) as the canonical workspace.
+
+The application logic itself stays deliberately thin — one `/api/ping` endpoint. The track's value is in everything around the endpoint: how you wire it, where you run it, how you change it. By the end you'll have the skeleton on which a real insurance application — claims, underwriting, fraud — could be built.
+
+## The 8-module map
+
+| # | Module | What you build |
+| --- | --- | --- |
+| 00 | Overview *(this page)* | — |
+| 01 | Infrastructure: the development VM | A KVM guest on a private bridge, reachable via ProxyJump |
+| 02 | The toolchain | JDK 21, Maven, podman on the VM, with linger for long-running services |
+| 03 | Your first Liberty application | `pom.xml`, `server.xml`, a JAX-RS resource, `mvn package` |
+| 04 | Containerizing with podman | A `Containerfile`, the gotchas that trip first-timers, run + verify |
+| 05 | Source control and the VM as canonical workspace | GitHub, ADRs, why the VM owns the source |
+| 06 | Adding an enterprise service bus | WSO2 MI as a second container, a shared podman network, name-based routing |
+| 07 | What's next | Persistence, security, observability, the OCP migration — the roadmap beyond the track |
+
+Each module assumes the previous ones. Expect 45–90 minutes per module if you do the steps on a real VM.
+
+## How to use this track
+
+Three patterns work:
+
+- **Sequential.** Start at 01, walk to 06. Best for first-timers.
+- **Reference.** Jump to the module you need from the sidebar. Best if you already have a Liberty app and want one piece.
+- **Pair-programming.** Open the track on one monitor, your shell on another, and execute as you go.
+
+## Prerequisites and setup
+
+- A **Linux host** you can run KVM / libvirt on. Module 01 walks through the install.
+- **SSH from your laptop** to that host. A jump host is fine — module 01 covers the ProxyJump pattern explicitly.
+- A **GitHub account**. You'll push the project from inside the VM in module 05.
+- **No Java or Open Liberty installed up front.** Module 02 installs everything on the VM.
+
+## A note on what's *not* here
+
+This track doesn't cover:
+
+- **Open Liberty performance tuning.** Different discipline. Use the official Liberty performance docs.
+- **EJB or the full Jakarta EE platform profile.** We use the web profile deliberately — module 04 explains why.
+- **Cloud deployment.** Module 07 sketches the OpenShift path; building it out is a separate track.
+- **Spring Boot.** Adjacent ecosystem. Mentioned where the comparison helps.
+
+The goal: get you fluent in the **full developer loop** for a Liberty service. Not just the code — the host, the container, the network, the workflow.
+
+Ready? Module 01 is the VM. Let's go.
+
+Next: [01 — Infrastructure: the development VM →](/learn/openliberty/infrastructure-the-vm)

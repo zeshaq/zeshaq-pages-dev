@@ -18,6 +18,7 @@ export const TRACK_TITLES: Record<string, string> = {
   "acm-multicluster": "ACM Multicluster",
   "kubeflow": "Kubeflow",
   "devsecops": "DevSecOps",
+  "openliberty": "Hands-On Open Liberty",
 };
 
 export const TRACK_TAGLINES: Record<string, string> = {
@@ -31,6 +32,8 @@ export const TRACK_TAGLINES: Record<string, string> = {
     "The platform layer for the ML workflow on Kubernetes. Upstream Kubeflow end-to-end — notebooks, KFP pipelines, distributed training, Katib HPO, KServe model serving, multi-tenancy with Profiles, and production-grade install patterns.",
   "devsecops":
     "Shift security left into the SDLC, automate the gates at every stage, and treat security as a property of every commit. Threat modeling, SAST/SCA, container and supply-chain security (SLSA, SBOM, cosign), IaC scanning, runtime detection (RHACS, Falco), secrets, zero trust, compliance, and SIEM — ending in a fully gated deployment pipeline.",
+  "openliberty":
+    "End-to-end application development with Open Liberty. Provision a development VM, install the toolchain, write a Jakarta EE 10 / MicroProfile 6.1 service, containerize it with podman, run a git workflow that survives across machines, and wire in a WSO2 Micro Integrator as an enterprise service bus. The walk-through to give a class before pointing them at a real codebase.",
 };
 
 export function trackTitle(id: string): string {

@@ -1,0 +1,107 @@
+---
+title: "Source control and the VM as canonical workspace"
+sidebar_label: "05 — Source control"
+description: "Where the source lives, who owns it, and how to push from inside a private-network VM via a deploy key on GitHub. Plus the ADR that documents the choice."
+estimated_minutes: 45
+last_updated: 2026-05-15
+prereqs: ["04 — Containerizing with podman"]
+---
+
+We've been doing all the work on the VM. Now we put it under git, and make a choice that's worth writing an ADR about: where does source code live, the laptop or the VM?
+
+## The two-copy problem
+
+The interim shape — source on the laptop, rsync to the VM, build on the VM — has a foot-gun. If you ever fix a bug on the VM (because that's where the logs are), the next `rsync --delete` silently undoes it. One side has to be canonical, and rsync's `--delete` will helpfully enforce whichever one you point at.
+
+## Option A — laptop is canonical (the interim)
+
+- **Editor.** Anything you like on the laptop.
+- **Sync.** `rsync -avz --delete -e "ssh -J ze@hypervisor" . ze@vm:/home/ze/insurance-app/`
+- **Trade.** Fastest to start. Brittle because any edit on the VM is destroyed.
+
+## Option B — VM is canonical (recommended)
+
+- **Editor.** Vim/Neovim on the VM, or VS Code Remote-SSH over ProxyJump, or JetBrains Gateway. All of these *appear* to edit on the laptop while files actually live on the VM.
+- **Sync.** None. Git is the bridge.
+- **Trade.** The VM needs a way to push to GitHub. Solvable once with an SSH key.
+
+We're going with B. The earlier you commit to one writable copy, the less surprise later.
+
+## Setting up git on the VM
+
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+git config --global init.defaultBranch main
+```
+
+Generate an SSH key for GitHub access:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "ze@insurance-app-vm" -f ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+```
+
+Add the public key to GitHub as either:
+
+- **A personal SSH key** under `https://github.com/settings/keys` — uses your account credentials for any repo.
+- **A deploy key** on the specific repository — scoped to that repo only. Pick this for shared/long-lived VMs.
+
+Verify:
+
+```bash
+ssh -T git@github.com
+# Hi <handle>! You've successfully authenticated, but GitHub does not provide shell access.
+```
+
+## Creating the repo and the first push
+
+If the project is already on GitHub (you set it up earlier from the laptop), just clone it:
+
+```bash
+cd ~
+git clone git@github.com:<you>/insurance-app.git
+cd insurance-app
+```
+
+If you're starting fresh:
+
+```bash
+cd ~/insurance-app
+git init -b main
+gh repo create insurance-app --private --source=. --push    # if you have gh installed
+# or:
+git remote add origin git@github.com:<you>/insurance-app.git
+git add -A && git commit -m "chore: scaffold insurance-app"
+git push -u origin main
+```
+
+From now on, every git operation happens on the VM. The laptop's copy is at best a `git pull` mirror you use to browse the code in a different editor.
+
+## Write ADR 0002
+
+ADR 0001 covered SSH access. ADR 0002 covers "where does source code live, and why":
+
+```
+docs/adr/
+  0001-ssh-access-to-insurance-app-vm.md
+  0002-development-on-vm.md
+```
+
+The Decision section says one thing: **the VM is the canonical workspace for this project**. The Rationale lists the two-copy hazard, the tooling-vs-source split, and the fact that everything else (logs, container, network) is already on the VM. The Revisit-when section names the future events that would make you reopen this — a CI runner taking over builds, the VM becoming ephemeral.
+
+## Common stumbles
+
+- **`Permission denied (publickey)`** on first push. The SSH key on the VM is not on GitHub yet, or you added it to the wrong account.
+- **`Host key verification failed`** on first clone. Run `ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts`.
+- **Pushing from the laptop after switching.** Don't. Stale commits from the laptop overwrite the VM's authoritative history.
+
+## What you have
+
+- A git repo on GitHub.
+- A working tree at `~/insurance-app` on the VM, with `origin` set.
+- An ADR that documents the canonical-workspace choice.
+
+Module 06 adds a second container to this setup — an enterprise service bus.
+
+Next: [06 — Adding an enterprise service bus →](/learn/openliberty/enterprise-service-bus)

@@ -1,0 +1,177 @@
+---
+title: "Infrastructure: the development VM"
+sidebar_label: "01 — Infrastructure: the VM"
+description: "Provision a KVM guest on a private bridge with cloud-init, reach it via ProxyJump, and write the first ADR."
+estimated_minutes: 60
+last_updated: 2026-05-15
+---
+
+This is where the track starts being hands-on. By the end of this module you will have:
+
+- A KVM virtual machine called `insurance-app-vm` (16 vCPU, 32 GB RAM, 300 GB disk).
+- An IP on a **private bridge** so the VM is never accidentally exposed to the internet.
+- **SSH access via ProxyJump** from your laptop, public-key only.
+- An **ADR** that documents the access pattern for future-you and your teammates.
+
+You'll do all of this from your laptop, talking to a hypervisor host over SSH. The hypervisor can be a dl385-class server, a workstation with KVM extensions enabled, or any Linux box with libvirt and a working bridge interface — what matters is that you can run `virt-install` on it.
+
+## Why a dedicated VM (and not the laptop)
+
+A laptop is great for editing code. It is bad for running the same workload your app will run in production. Three reasons:
+
+- **Networking.** Your real environment isn't going to be a NAT'd Wi-Fi network with a half-implemented host firewall. Get your service onto a real bridge with a real IP from day one.
+- **Reproducibility.** "Works on my Mac" is the most expensive sentence in software. A VM you can rebuild from a script means every teammate has the same environment, every time.
+- **Long-running services.** You'll have a Liberty container, an ESB container, and later a database — all needing to stay up while you sleep. Your laptop's lid should not be the kill switch.
+
+The split we adopt: the laptop is your editor for a while, the VM is your runtime. In module 05 the laptop falls away entirely — source moves onto the VM and the laptop becomes a git mirror at best.
+
+## The host you'll be talking to
+
+You need a Linux host with:
+
+- **KVM and libvirt** installed: `apt install qemu-kvm libvirt-daemon-system libvirt-clients virt-install cloud-image-utils`.
+- A **bridge interface** that connects to your private network. On Ubuntu this is configured in `/etc/netplan/`. We will call the bridge `br0` throughout the track — substitute your own bridge name.
+- **At least 32 GB of free RAM and 300 GB of free disk.** If you're squeezed, drop the VM to 8 vCPU / 16 GB / 100 GB; everything in the track still fits.
+- **Outbound internet access**, so the VM can pull container images and Maven dependencies later.
+
+If you do not have a host like that, three reasonable paths:
+
+1. Buy or repurpose a workstation; everything in this track was developed on a single dual-socket server.
+2. Use a cloud VM as the hypervisor. Bare-metal cloud is fine; nested-virt (KVM-on-KVM) works with a performance hit.
+3. Drop the bridge and use the default libvirt NAT network. You lose the "looks like production" property but keep the workflow.
+
+## The cloud-init recipe
+
+We are not going to click through an Ubuntu installer. **Cloud-init** handles hostname, network, user, SSH key, and package updates. The first time you do this it feels excessive; by the third VM it is faster than reaching for the installer.
+
+Two files go onto a small ISO that we attach to the VM as a CD-ROM.
+
+`user-data`:
+
+```yaml
+#cloud-config
+hostname: insurance-app-vm
+fqdn: insurance-app-vm
+manage_etc_hosts: true
+users:
+  - name: ze
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... your-laptop-public-key
+ssh_pwauth: false
+disable_root: true
+package_update: true
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+```
+
+`network-config`:
+
+```yaml
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "en*"
+    dhcp4: false
+    addresses:
+      - 10.10.20.10/24
+    routes:
+      - to: default
+        via: 10.10.20.1
+    nameservers:
+      addresses: [8.8.8.8, 1.1.1.1]
+```
+
+Substitute your own bridge's subnet for `10.10.20.0/24`. Build the seed ISO with `cloud-localds`:
+
+```bash
+sudo cloud-localds -N network-config \
+  /var/lib/libvirt/images/insurance-app-vm-seed.iso \
+  user-data
+```
+
+## Provisioning the VM
+
+Start from an Ubuntu 24.04 cloud image, copy it for this VM, and resize to the disk you want:
+
+```bash
+cd /var/lib/libvirt/images
+sudo wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+sudo cp --reflink=auto noble-server-cloudimg-amd64.img insurance-app-vm.qcow2
+sudo qemu-img resize insurance-app-vm.qcow2 300G
+```
+
+Then `virt-install` does the rest:
+
+```bash
+sudo virt-install \
+  --name insurance-app-vm \
+  --memory 32768 \
+  --vcpus 16 \
+  --cpu host-passthrough \
+  --os-variant ubuntu24.04 \
+  --disk path=/var/lib/libvirt/images/insurance-app-vm.qcow2,format=qcow2,bus=virtio \
+  --disk path=/var/lib/libvirt/images/insurance-app-vm-seed.iso,device=cdrom \
+  --network bridge=br0,model=virtio \
+  --graphics none --console pty,target_type=serial \
+  --import --noautoconsole
+```
+
+Roughly 60 seconds after this command, `sudo virsh dominfo insurance-app-vm` reports `State: running` and `ping 10.10.20.10` succeeds from the hypervisor.
+
+## Reaching the VM: ProxyJump
+
+The IP we gave the VM is on a private bridge. Your laptop is not on that bridge. Two options:
+
+- **VPN onto the bridge.** Overkill for one VM, fine for a fleet.
+- **Use the hypervisor as a jump host.** This is the right answer for development.
+
+In `~/.ssh/config` on your laptop:
+
+```
+Host insurance-app-vm
+  HostName 10.10.20.10
+  User ze
+  ProxyJump ze@your-hypervisor.example.com
+```
+
+Then `ssh insurance-app-vm` Just Works. Behind the scenes this is identical to running `ssh -J ze@your-hypervisor.example.com ze@10.10.20.10` — the hypervisor opens a tunnel for the second hop, and your laptop's key authenticates to both.
+
+The first connection will prompt to accept the VM's host key. Accept it; the laptop now has a permanent record.
+
+## Writing the first ADR
+
+Architecture Decision Records are a habit worth forming on day one. The first ADR for this project documents what you just built: **why** ProxyJump over a VPN, **what** the IP / bridge / hostname are, **when** you would revisit (a second VM joining, the network changing).
+
+A two-page ADR now saves four meetings later when someone asks "how do you SSH into this thing?"
+
+A reasonable layout in your project:
+
+```
+docs/adr/
+  0001-ssh-access-to-insurance-app-vm.md
+```
+
+Status / Context / Decision / Consequences / Alternatives / Revisit-when. Keep each section short — ADRs are read in two minutes or not at all.
+
+## Common stumbles
+
+- **Host key conflicts after rebuilds.** If you `virsh destroy` and re-provision, your laptop's `~/.ssh/known_hosts` still has the old key. Delete the offending line or run `ssh-keygen -R 10.10.20.10`.
+- **The seed ISO not being read.** Cloud-init only runs once per VM instance-id. If you change the seed and re-attach, run `sudo cloud-init clean` inside the VM before rebooting.
+- **Bridges with no IP on the host.** A bridge interface without an address is a switch with no uplink. Make sure the bridge has an IP on the host so the host can reach the VM (and vice versa) for the ProxyJump.
+
+## What you have
+
+- A reproducible recipe for building the VM (cloud-init + virt-install).
+- An IP on a private bridge.
+- A ProxyJump pattern that survives laptop reinstalls.
+- One ADR.
+
+Module 02 installs the toolchain inside this VM.
+
+Next: [02 — The toolchain →](/learn/openliberty/toolchain)

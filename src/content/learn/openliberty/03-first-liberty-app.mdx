@@ -1,0 +1,137 @@
+---
+title: "Your first Liberty application"
+sidebar_label: "03 — Your first Liberty app"
+description: "A minimal Jakarta EE 10 + MicroProfile 6.1 service: pom.xml, server.xml, one JAX-RS resource. Built with mvn package, run on Open Liberty."
+estimated_minutes: 60
+last_updated: 2026-05-15
+prereqs: ["02 — The toolchain"]
+---
+
+This module turns the empty VM into something that responds to an HTTP request. You'll write a Maven project, a single REST resource, and a Liberty `server.xml` that the container image will use in module 04.
+
+## The Liberty mental model
+
+Open Liberty is a Jakarta EE / MicroProfile **server** whose configuration is driven by a single `server.xml`. You enable features (`jakartaee-10.0`, `microProfile-6.1`, `mpHealth-4.0`, …) and Liberty wires up exactly those — no more. The build's job is to:
+
+1. Compile your code into a WAR.
+2. Bundle a `server.xml` that knows how to host it.
+3. Hand both to a runtime — either a local Liberty installation (via `liberty-maven-plugin`) or a container image (module 04).
+
+## Project layout
+
+```
+insurance-app/
+├── pom.xml
+└── src/
+    └── main/
+        ├── java/com/example/insurance/
+        │   ├── InsuranceApplication.java
+        │   └── api/PingResource.java
+        └── liberty/config/
+            └── server.xml
+```
+
+## The pom.xml
+
+The key parts:
+
+- Packaging is `war`.
+- `provided`-scope dependencies for `jakarta.jakartaee-api` 10 and the MicroProfile aggregator.
+- `liberty-maven-plugin` 3.10.x pulling in `openliberty-kernel` 24.0.0.12 (or newer).
+- **Explicit pins** for `maven-war-plugin` (3.4.0+) and `maven-compiler-plugin` (3.13.0+) — without these, Maven 3.8 picks 2011-vintage versions that crash on JDK 21.
+
+The `<properties>` block sets `maven.compiler.source` and `target` to `21`, which is also the version your Liberty image will run.
+
+## The server.xml
+
+```xml
+<server description="insurance-app">
+    <featureManager>
+        <feature>webProfile-10.0</feature>
+        <feature>microProfile-6.1</feature>
+    </featureManager>
+
+    <variable name="http.port" defaultValue="9080"/>
+    <variable name="https.port" defaultValue="9443"/>
+
+    <httpEndpoint id="defaultHttpEndpoint"
+                  host="*"
+                  httpPort="${http.port}"
+                  httpsPort="${https.port}"/>
+
+    <webApplication contextRoot="/" location="insurance-app.war"/>
+</server>
+```
+
+Two choices that matter:
+
+- **`webProfile-10.0`, not `jakartaee-10.0`.** The full platform profile pulls in EJB / ORB / messaging and demands a user registry — without one, the JVM crashes ~10 seconds into startup with `CWWKS9660E`. Module 04 returns to this.
+- **`<variable>` defaults for the ports.** When the `liberty-maven-plugin` packages a server it substitutes `${http.port}` from the pom, but when you copy `server.xml` straight into a container image (module 04) that substitution doesn't run. Defaults belong in the file.
+
+## The JAX-RS plumbing
+
+`InsuranceApplication.java`:
+
+```java
+package com.example.insurance;
+
+import jakarta.ws.rs.ApplicationPath;
+import jakarta.ws.rs.core.Application;
+
+@ApplicationPath("/api")
+public class InsuranceApplication extends Application {
+}
+```
+
+`PingResource.java`:
+
+```java
+package com.example.insurance.api;
+
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.MediaType;
+import java.util.Map;
+
+@Path("/ping")
+@Produces(MediaType.APPLICATION_JSON)
+public class PingResource {
+    @GET
+    public Map<String, String> ping() {
+        return Map.of("status", "ok");
+    }
+}
+```
+
+Note `jakarta.*`, never `javax.*`. Jakarta EE 9 was the rename; 10 is the version we're on. If you copy code from older tutorials, the `javax.*` imports will compile and then fail at runtime with `ClassNotFoundException`.
+
+## Build it
+
+```bash
+mvn -B package
+```
+
+The first build pulls Maven dependencies and the Liberty kernel; expect 2–4 minutes. Subsequent builds are seconds. The output is `target/insurance-app.war` — a ~5 KB WAR. The WAR is small because the framework lives in the runtime image, not in the artifact.
+
+## Run it (optional, the container is what we'll actually use)
+
+If you want to verify the app runs *without* a container, point the Liberty Maven plugin at it:
+
+```bash
+mvn -B liberty:run
+```
+
+This downloads a full Liberty runtime under `target/liberty/`, drops your WAR into it, and starts the server. `curl http://localhost:9080/api/ping` returns `{"status":"ok"}`. Stop with Ctrl-C.
+
+For development iteration there's also `mvn liberty:dev` — hot-reloads code and config without restarting Liberty. We won't use it in this track because module 04 moves us to containers, but it's the killer feature when you're iterating fast on one feature.
+
+## What you have
+
+- A Maven project that builds to a 5 KB WAR.
+- A `server.xml` with the right feature set for a REST service.
+- A `/api/ping` endpoint, verifiable in seconds with `mvn liberty:run`.
+
+Module 04 wraps this WAR in a podman image.
+
+Next: [04 — Containerizing with podman →](/learn/openliberty/containerizing-with-podman)

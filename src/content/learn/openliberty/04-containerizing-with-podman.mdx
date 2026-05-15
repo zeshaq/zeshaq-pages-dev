@@ -1,0 +1,105 @@
+---
+title: "Containerizing with podman"
+sidebar_label: "04 — Containerizing"
+description: "A minimal Containerfile on the official open-liberty image, the rootless-build gotchas, and the four pins that make the difference between a 30-minute success and a 3-hour scavenger hunt."
+estimated_minutes: 75
+last_updated: 2026-05-15
+prereqs: ["03 — Your first Liberty application"]
+---
+
+Same WAR. Different runtime. By the end of this module, `curl http://localhost:9080/api/ping` on the VM returns `{"status":"ok"}` from a process that came out of `podman run`.
+
+## Why containerize at all
+
+You can run Liberty as a regular process under systemd. It works. The reason to containerize at this stage of the project:
+
+- **The image you build here is the deployment artifact for OpenShift later.** Modules 06+ assume containers.
+- **One-line rollback.** `podman pull` an older tag, `podman run` it, done.
+- **Same image in dev and prod.** Whatever bug exists, it exists everywhere.
+
+## The official Open Liberty image family
+
+IBM publishes Liberty images under `icr.io/appcafe/open-liberty`. Two flavors matter:
+
+| Tag pattern | Size | What's in it |
+| --- | --- | --- |
+| `kernel-slim-java21-openj9-ubi-minimal` | ~200 MB | Kernel only; `features.sh` downloads features at build time from Maven Central |
+| `full-java21-openj9-ubi-minimal` | ~700 MB | All common features pre-installed |
+
+The **slim** image looks tempting. It is also where most people get stuck. `features.sh` runs at image-build time and pulls feature JARs from Maven Central, and Maven Central rate-limits aggressively (HTTP 429). Build a slim image three times in a row and the fourth fails. We pick the **full** image and skip the problem.
+
+## The Containerfile
+
+```dockerfile
+FROM icr.io/appcafe/open-liberty:full-java21-openj9-ubi-minimal
+
+ARG VERSION=0.1.0-SNAPSHOT
+
+COPY --chown=1001:0 src/main/liberty/config/server.xml /config/server.xml
+COPY --chown=1001:0 target/insurance-app.war /config/apps/insurance-app.war
+
+RUN configure.sh
+
+EXPOSE 9080 9443
+```
+
+`configure.sh` is provided by the base image; it bakes the WAR + config into Liberty's startup paths and pre-warms the OpenJ9 shared-class cache, which roughly halves cold-start time.
+
+## Build it — and the `--network=host` detail
+
+```bash
+mvn -B package
+podman build --network=host -t insurance-app:dev -f Containerfile .
+```
+
+The `--network=host` flag matters. Rootless podman's default build network uses slirp4netns, which on some hosts has half-broken IPv6 routing — the build container resolves names but fails to connect. The host network bypasses the issue.
+
+(`podman run` containers do not have this problem, because they get a usable network stack from slirp4netns. It is specifically the build-time `RUN` steps that suffer.)
+
+## Run it
+
+```bash
+podman run -d --name insurance-app \
+  -p 9080:9080 -p 9443:9443 \
+  insurance-app:dev
+```
+
+Wait for the server to be ready (look for `CWWKF0011I` in the logs):
+
+```bash
+podman logs -f insurance-app | grep "ready to run a smarter planet"
+```
+
+Then hit it:
+
+```bash
+curl http://localhost:9080/api/ping
+# {"status":"ok"}
+```
+
+If you get `Connection refused` instead, the most common cause is that you forgot the `<variable>` defaults for `http.port` in `server.xml` — the placeholder never resolves, no endpoint starts. Module 03 covered the fix.
+
+## The four pins, explained
+
+Recapping the load-bearing decisions across modules 03 and 04. None are obvious; every one of them is a workaround for a specific failure mode:
+
+1. **`maven-war-plugin` pinned to 3.4.0+ in pom.xml.** Without the pin, Maven 3.8 picks 2.2 which crashes on JDK 21.
+2. **`open-liberty:full-*` base image instead of `kernel-slim`.** Slim runs `features.sh` against Maven Central at build time, and rate limits make that flaky.
+3. **`webProfile-10.0` instead of `jakartaee-10.0`** in server.xml. The full profile pulls in ORB/EJB, demands a user registry, and crashes the JVM ~10 seconds into startup.
+4. **`<variable>` defaults for `http.port` and `https.port`** in server.xml. Variable substitution depends on the `liberty-maven-plugin`; bypassing the plugin (as the container does) means defaults must live in the file.
+
+If you ever revisit one of these — say, switching back to the slim image — replace the workaround with its alternative (a local Maven mirror, in that case). Don't just remove it.
+
+## A note on image size
+
+950 MB is unapologetic. The `kernel-slim` path with a local Maven repository proxy gets you under 300 MB, and `openliberty-mavenrepo` is a real published artifact you can mirror behind your firewall. For the scope of this track the trade is "30 minutes of mirror setup vs. 700 MB of disk." The disk wins, every time.
+
+## What you have
+
+- A 950 MB image tagged `insurance-app:dev`.
+- A running Liberty container, port-forwarded to the VM's localhost.
+- A verifiable `/api/ping` endpoint.
+
+Module 05 puts this codebase under git in a way that survives moving between laptop and VM.
+
+Next: [05 — Source control and the VM as canonical →](/learn/openliberty/source-control-and-the-vm)
