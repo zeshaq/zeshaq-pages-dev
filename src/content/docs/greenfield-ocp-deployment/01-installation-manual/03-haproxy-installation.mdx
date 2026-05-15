@@ -1,8 +1,8 @@
 ---
 title: "Installation Manual - 03 HAProxy installation"
 sidebar_label: "03 HAProxy installation"
-description: "How the gf-ocp HAProxy edge VM is created with cloud-init, configured as the first single-node edge endpoint, and validated."
-last_reviewed: 2026-05-14
+description: "How the gf-ocp HAProxy edge VM is created with cloud-init, configured as the first single-node edge endpoint, issued a wildcard certificate, and validated."
+last_reviewed: 2026-05-15
 draft: false
 ---
 
@@ -120,25 +120,67 @@ packages:
 
 ## HAProxy Bootstrap Config
 
-The initial HAProxy config exposes a public readiness response and a private stats page. It does not yet proxy GitLab, Vault, Quay, NetBox, OpenShift API, or OpenShift apps traffic.
+The initial HAProxy config exposed a public readiness response and a private stats page. The current bootstrap config also routes GitLab, MinIO, and NetBox through the private backend network.
 
 ```text
-frontend fe_http_public
-    bind 59.153.29.102:80
-    mode http
-    http-request return status 200 content-type text/plain string "gf-ocp-haproxy-01 ready\n" if { path /healthz }
-    http-request return status 200 content-type text/plain string "gf-ocp-haproxy-01 ready\n" if { path / }
-    http-request return status 503 content-type text/plain string "No backend configured yet\n"
-
-listen stats_private
-    bind 30.30.200.102:8404
-    mode http
-    stats enable
-    stats uri /stats
-    stats refresh 10s
+scripts/services/haproxy/haproxy.cfg
 ```
 
 The stats listener is private only. Add authentication or restrict it further before exposing it outside the management network.
+
+## Wildcard Edge Certificate
+
+The v7 edge uses one Let's Encrypt wildcard certificate for all current and future app hostnames:
+
+```text
+Certificate: *.v7.comptech-lab.com
+Additional SAN: v7.comptech-lab.com
+HAProxy PEM: /etc/haproxy/certs/v7-wildcard.pem
+```
+
+The certificate is issued with DNS-01 against PowerDNS. Certbot runs on `gf-ocp-haproxy-01`, publishes `_acme-challenge.v7.comptech-lab.com` TXT records on `gf-ocp-pdns-01`, then cleans them up after validation.
+
+Hook files:
+
+```text
+/usr/local/sbin/certbot-pdns-auth.sh
+/usr/local/sbin/certbot-pdns-cleanup.sh
+/etc/letsencrypt/pdns-known-hosts
+/etc/letsencrypt/renewal-hooks/deploy/haproxy-v7-wildcard-pem.sh
+```
+
+The PowerDNS VM allows the hook user to run only `/usr/bin/pdnsutil` through sudo. The hook SSH key, ACME account material, and private certificate key stay on the servers and are not committed to Git.
+
+Issue the wildcard certificate:
+
+```bash
+ssh ze@30.30.200.102 'sudo certbot certonly \
+  --manual \
+  --preferred-challenges dns \
+  --manual-auth-hook /usr/local/sbin/certbot-pdns-auth.sh \
+  --manual-cleanup-hook /usr/local/sbin/certbot-pdns-cleanup.sh \
+  --cert-name v7-wildcard \
+  --non-interactive \
+  --agree-tos \
+  --register-unsafely-without-email \
+  -d "*.v7.comptech-lab.com" \
+  -d v7.comptech-lab.com'
+```
+
+Validate renewal:
+
+```bash
+ssh ze@30.30.200.102 \
+  'sudo certbot renew --cert-name v7-wildcard --dry-run'
+```
+
+Only the wildcard PEM should remain active in HAProxy's certificate directory:
+
+```text
+/etc/haproxy/certs/v7-wildcard.pem
+```
+
+Older per-host PEMs belong in `/etc/haproxy/certs-disabled/`, and older per-host Certbot renewal configs belong in `/etc/letsencrypt/renewal-disabled/`.
 
 ## Validation
 
@@ -211,7 +253,7 @@ Check listeners:
 
 ```bash
 ssh ze@haproxy.v7.comptech-lab.com \
-  'sudo ss -ltnp | egrep ":(22|80|8404)"'
+  'sudo ss -ltnp | egrep ":(22|80|443|8404)"'
 ```
 
 Check core services:
@@ -225,19 +267,15 @@ ssh ze@haproxy.v7.comptech-lab.com \
 
 Add concrete frontends and backends when each target service exists:
 
-- GitLab
 - Vault
 - Quay or Harbor
-- NetBox
 - OpenShift API
 - OpenShift apps wildcard
-- MinIO through edge TLS if required
 
 ## Production Hardening Backlog
 
 - Add `gf-ocp-haproxy-02`.
 - Add Keepalived or an equivalent VIP mechanism.
 - Move HAProxy config into GitLab-managed automation.
-- Add TLS certificate management.
 - Add backend health checks, logs, metrics, and alerting.
 - Protect the stats endpoint with authentication or tighter network controls.

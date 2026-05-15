@@ -1,7 +1,7 @@
 ---
 title: "Installation Manual - 06 NetBox installation"
 sidebar_label: "06 NetBox installation"
-description: "How the gf-ocp NetBox VM host, application, and backup/restore model are installed and validated."
+description: "How the gf-ocp NetBox VM host, application, backup/restore model, and HAProxy exposure are installed and validated."
 last_reviewed: 2026-05-15
 draft: false
 ---
@@ -27,10 +27,16 @@ NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs,
 | Credential custody | `secret/greenfield/netbox/application/gf-ocp-netbox-01` |
 | Backup credential custody | `secret/greenfield/object-storage/minio/users/netbox-backup` |
 
-DNS points the NetBox host name to the private VM IP:
+Internal DNS initially points the NetBox host name to the private VM IP during host validation:
 
 ```text
 netbox.v7.comptech-lab.com A 30.30.200.23
+```
+
+After HAProxy exposure, public DNS points the same host name to the edge IP:
+
+```text
+netbox.v7.comptech-lab.com A 59.153.29.102
 ```
 
 ## Creation Flow
@@ -82,7 +88,7 @@ Autostart:      enable
 
 ## Current Boundary
 
-This phase creates the VM host, installs the initial NetBox application, and configures a validated backup/restore path. It does not expose NetBox publicly through HAProxy yet.
+This phase creates the VM host, installs the initial NetBox application, configures a validated backup/restore path, and exposes NetBox through HAProxy after backup validation is complete.
 
 ## Application Install
 
@@ -253,10 +259,72 @@ Validate with:
 mc ilm rule ls gf-local/netbox-backups
 ```
 
+## HAProxy Exposure
+
+NetBox is exposed through the v7 HAProxy edge after backup, restore validation, and retention are in place.
+
+Public DNS:
+
+```text
+netbox.v7.comptech-lab.com A 59.153.29.102
+```
+
+Private backend:
+
+```text
+gf-ocp-netbox-01 / 30.30.200.23:80
+```
+
+NetBox application proxy settings:
+
+```python
+CSRF_TRUSTED_ORIGINS = ['https://netbox.v7.comptech-lab.com']
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+```
+
+The NetBox-side Nginx config forwards `X-Forwarded-Proto https` to avoid contradictory scheme headers between HAProxy, Nginx, and Gunicorn.
+
+The edge certificate is the shared v7 wildcard PEM on HAProxy:
+
+```text
+/etc/haproxy/certs/v7-wildcard.pem
+```
+
+Validation:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' \
+  http://netbox.v7.comptech-lab.com/
+
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -L https://netbox.v7.comptech-lab.com/login/
+
+echo | openssl s_client \
+  -connect netbox.v7.comptech-lab.com:443 \
+  -servername netbox.v7.comptech-lab.com 2>/dev/null |
+  openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+```
+
+Expected result:
+
+```text
+301 https://netbox.v7.comptech-lab.com/
+200
+subject=CN = *.v7.comptech-lab.com
+X509v3 Subject Alternative Name:
+    DNS:*.v7.comptech-lab.com, DNS:v7.comptech-lab.com
+```
+
+Direct access to `30.30.200.23` from outside HAProxy should time out or return `000`.
+
+Post-exposure backup and restore validation passed on 2026-05-15 with:
+
+```text
+netbox-backups/netbox/20260515T084335Z/netbox-20260515T084335Z.tar.gz.enc
+```
+
 ## Next Phase
 
-The next NetBox phase should cover controlled exposure and data modeling:
+The next NetBox phase should cover source-of-truth data modeling:
 
-- HAProxy route for `netbox.v7.comptech-lab.com`.
-- Public reachability validation.
 - Initial source-of-truth data model for sites, prefixes, VLANs, VMs, and service ownership.
