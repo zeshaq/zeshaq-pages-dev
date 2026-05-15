@@ -187,6 +187,7 @@ Namespaces:
 Initial repositories:
 
 - `openshift-release/release-images`
+- `openshift-release/openshift/release-images`
 - `openshift-release/release-metadata`
 - `openshift-operators/redhat-operator-index`
 - `openshift-operators/certified-operator-index`
@@ -230,6 +231,35 @@ The release and operator mirror robots are members of namespace-local
 `mirror-creators` teams with the Quay `creator` role. This is required because
 `oc-mirror` creates destination repositories from source image paths.
 
+Quay must be configured with extended repository names enabled:
+
+```yaml
+FEATURE_EXTENDED_REPOSITORY_NAMES: true
+```
+
+This is required for oc-mirror v2. The release mirror writes nested paths such
+as `openshift-release/openshift/release-images`, and operator mirrors include
+deep paths such as `openshift-operators/appcafe/open-liberty/samples/getting-started`.
+
+Before the production operator mirror, pre-create repositories from the
+oc-mirror dry-run mapping and grant the mirror robot write access:
+
+```bash
+scp scripts/services/quay/seed-oc-mirror-repositories-from-mapping.sh \
+  artifacts/oc-mirror/production-operators/working-dir/dry-run/mapping.txt \
+  ze@30.30.200.40:/tmp/
+ssh ze@30.30.200.40 \
+  'sudo install -m 0755 /tmp/seed-oc-mirror-repositories-from-mapping.sh /usr/local/sbin/seed-oc-mirror-repositories-from-mapping.sh &&
+   sudo /usr/local/sbin/seed-oc-mirror-repositories-from-mapping.sh \
+     --mapping /tmp/mapping.txt \
+     --organization openshift-operators \
+     --robot openshift-operators+ocp_mirror'
+```
+
+The May 15, 2026 production run seeded `501` operator destination
+repositories, then completed `193 / 193` release images, `582 / 582` operator
+images, and `4 / 4` additional images.
+
 ## Lessons Captured
 
 - Upstream Project Quay image tags use the numeric form, for example `3.17.1`,
@@ -240,3 +270,6 @@ The release and operator mirror robots are members of namespace-local
   through the public HAProxy route.
 - Validate the scoped MinIO user with `mc` before starting Quay.
 - Use unique organization email aliases in the Quay bootstrap model.
+- Enable extended repository names before running oc-mirror.
+- Pre-seed operator repositories from the oc-mirror dry-run mapping before the
+  long production operator mirror.
