@@ -69,14 +69,18 @@ Create the VM only after the issue gate is approved:
 Install the pinned tools on the bootstrap VM:
 
 ```bash
+./scripts/gfctl.sh enable-bootstrap-rpm-repos --execute
+./scripts/gfctl.sh install-bootstrap-hardening-tools --execute
 ./scripts/gfctl.sh install-openshift-tools --execute
 ```
 
 The preserved RHEL guest image can boot without enabled package repositories.
-In that case `oc`, `kubectl`, `openshift-install`, `oc-mirror`, and `butane`
-still install from the pinned client downloads, but RPM-backed packages such as
-`git`, `tmux`, `podman`, `skopeo`, and `nmstate` need RHSM registration or a
-local RPM repository before package installation can complete.
+For this bootstrap host, public UBI 9 repositories provide `git`, `podman`,
+`skopeo`, `nmstate`, and `jq` without storing Red Hat credentials. The
+hardening script temporarily enables EPEL 9 only for `fail2ban-server`, then
+removes the repo file. `tmux` was not available from the approved public UBI
+repo path or the checked EPEL 9 metadata; leave it out unless a later issue
+approves a trusted package source.
 
 ## Install Input Flow
 
