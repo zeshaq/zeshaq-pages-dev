@@ -68,6 +68,7 @@ data/oc-mirror/imageset-4.20-template.yaml
 data/oc-mirror/imageset-v7-baseline-release.yaml
 data/oc-mirror/imageset-v7-baseline-operators.yaml
 scripts/services/oc-mirror/build-authfile-from-vault.sh
+scripts/services/oc-mirror/generate-nexus-replay-copy-list.py
 scripts/services/oc-mirror/run-smoke-mirror.sh
 scripts/services/oc-mirror/run-production-mirror.sh
 runbooks/oc-mirror-v7.md
@@ -119,8 +120,46 @@ Each run generated an `ImageTagMirrorSet` artifact under its smoke workspace.
   mirror credential is approved.
 - Store generated pull-secret material and cluster mirror manifests in Vault or
   the operational GitLab, not in public GitHub.
-- Do not run a full mirror from the smoke issue. Create a separate approved
-  issue for production mirror execution.
+- Prefer replaying from the local Nexus mirror backup over downloading the
+  same image set again.
+- Use direct Red Hat download only if the local replay path is unavailable or
+  replay validation fails.
+
+## No-Redownload Replay
+
+The production path should first reuse the existing local mirror content.
+
+Available local sources:
+
+```text
+/home/ze/rebuild/oc-mirror-archive/20260514-130143-oc-mirror-workspace/
+/home/ze/rebuild/nexus-backups/20260514-130143-nexus-mirror/
+```
+
+The workspace archive has the successful full run metadata and generated
+cluster resources, but no `mirror_seq*.tar` import archives. The registry
+content is in the Nexus mirror VM backup. Restore or temporarily start that VM,
+then copy from the restored Nexus registry into Quay.
+
+Generate the replay copy list:
+
+```bash
+./scripts/services/oc-mirror/generate-nexus-replay-copy-list.py \
+  --mapping /home/ze/rebuild/oc-mirror-archive/20260514-130143-oc-mirror-workspace/workspace/rhoai-dryrun-20260510-134935/working-dir/dry-run/mapping.txt \
+  --output artifacts/oc-mirror/replay/replay-from-nexus-to-quay.sh
+```
+
+Run it only after review and approval:
+
+```bash
+export SRC_AUTHFILE=/secure/path/restored-nexus-auth.json
+export DEST_AUTHFILE=/secure/path/quay-auth.json
+artifacts/oc-mirror/replay/replay-from-nexus-to-quay.sh
+```
+
+The generated replay sends release paths to
+`quay.v7.comptech-lab.com/openshift-release/...` and operator/additional paths
+to `quay.v7.comptech-lab.com/openshift-operators/...`.
 
 ## V7 Baseline
 
