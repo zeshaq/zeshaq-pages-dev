@@ -1,12 +1,12 @@
 ---
-title: "Installation Manual - 06 NetBox host foundation"
-sidebar_label: "06 NetBox host foundation"
-description: "How the gf-ocp NetBox VM host is created and validated before installing the NetBox application."
+title: "Installation Manual - 06 NetBox installation"
+sidebar_label: "06 NetBox installation"
+description: "How the gf-ocp NetBox VM host and initial NetBox application are installed and validated."
 last_reviewed: 2026-05-15
 draft: false
 ---
 
-NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs, prefixes, and service ownership. At this stage only the VM host foundation is installed. The NetBox application, PostgreSQL, Redis, backups, and HAProxy route are handled by a later approved phase.
+NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs, prefixes, and service ownership. The current foundation install runs NetBox on a private VM with local PostgreSQL and local Redis. HAProxy public exposure and backup/restore automation are handled by later approved phases.
 
 ## Target State
 
@@ -23,6 +23,8 @@ NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs,
 | RAM | `8 GiB` |
 | Disk | `100 GiB` qcow2 overlay |
 | Base image | `/var/lib/libvirt/images/ubuntu-24.04-base.qcow2` |
+| NetBox version | `v4.6.0` |
+| Credential custody | `secret/greenfield/netbox/application/gf-ocp-netbox-01` |
 
 DNS points the NetBox host name to the private VM IP:
 
@@ -79,13 +81,76 @@ Autostart:      enable
 
 ## Current Boundary
 
-This phase creates the VM host only. Do not treat it as a running NetBox service yet.
+This phase creates the VM host and installs the initial NetBox application only. It does not expose NetBox publicly through HAProxy and it does not yet establish the production backup/restore model.
 
-The next NetBox phase must decide:
+## Application Install
 
-- PostgreSQL placement.
-- Redis placement.
-- Vault secret paths.
-- Backup destination and restore drill.
-- HAProxy exposure policy.
-- Initial NetBox data model for sites, racks, prefixes, VLANs, VMs, and service ownership.
+The installation follows the official NetBox stack: PostgreSQL, Redis, NetBox components, Gunicorn/systemd, and an HTTP server. For this foundation phase, PostgreSQL and Redis are local to `gf-ocp-netbox-01`.
+
+Installed services:
+
+```text
+postgresql
+redis-server
+netbox
+netbox-rq
+nginx
+```
+
+The NetBox configuration is stored locally at:
+
+```text
+/opt/netbox/netbox/netbox/configuration.py
+```
+
+The file is owned by `root:netbox` and mode `0640` because it contains service credentials. Do not print or commit it.
+
+Secrets are stored in Vault at:
+
+```text
+secret/greenfield/netbox/application/gf-ocp-netbox-01
+```
+
+The path contains the database password, Redis password, NetBox secret key, API token pepper, admin username, admin password, admin email, and installed NetBox version.
+
+## Application Validation
+
+Run:
+
+```bash
+ssh ze@30.30.200.23 'systemctl is-active postgresql redis-server netbox netbox-rq nginx'
+ssh ze@30.30.200.23 'systemctl --failed --no-pager'
+ssh ze@30.30.200.23 'sudo nginx -t'
+ssh ze@30.30.200.23 'sudo -u postgres psql -tAc "SELECT datname FROM pg_database WHERE datname = '\''netbox'\'';"'
+ssh ze@30.30.200.23 'sudo /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py check'
+ssh ze@30.30.200.23 'curl -fsS -o /tmp/netbox-login-page.out -w "%{http_code}\n" http://127.0.0.1/login/'
+ssh ze@30.30.200.102 'curl -fsS -o /tmp/netbox-backend.out -w "%{http_code}\n" -H "Host: netbox.v7.comptech-lab.com" http://30.30.200.23/'
+```
+
+Expected posture:
+
+```text
+active
+active
+active
+active
+active
+0 loaded units listed.
+netbox
+System check identified no issues
+200
+302
+```
+
+Direct HTTP access from arbitrary hosts is intentionally blocked by UFW. The VM firewall allows NetBox HTTP/HTTPS only from HAProxy `30.30.200.102`.
+
+## Next Phase
+
+The next NetBox phase should cover:
+
+- PostgreSQL dump to MinIO.
+- NetBox media/config archive to MinIO.
+- Scoped MinIO service user.
+- Restore drill.
+- HAProxy route only after backup validation.
+- Initial source-of-truth data model for sites, prefixes, VLANs, VMs, and service ownership.
