@@ -1,0 +1,117 @@
+---
+title: "Installation Manual - 08 oc-mirror"
+sidebar_label: "08 oc-mirror"
+description: "How the greenfield OpenShift release and operator mirror workflow is planned, credentialed, and smoke-tested into Quay."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+`oc-mirror` is the image-supply mechanism for the greenfield OpenShift
+deployment. The registry foundation is Quay, and the mirror workflow uses
+`oc-mirror` plugin v2.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Tool | `oc-mirror` plugin v2 |
+| Installed plugin version | 4.20 stream plugin matching the local `oc` 4.20 client |
+| Release mirror target | `quay.v7.comptech-lab.com/openshift-release` |
+| Operator mirror target | `quay.v7.comptech-lab.com/openshift-operators` |
+| Release robot | `openshift-release+ocp_mirror` |
+| Operator robot | `openshift-operators+ocp_mirror` |
+| Smoke image | `registry.access.redhat.com/ubi9/ubi-micro:latest` |
+| Authfile artifacts | `artifacts/oc-mirror/auth/` |
+| Workspace artifacts | `artifacts/oc-mirror/smoke-release/`, `artifacts/oc-mirror/smoke-operators/` |
+
+Red Hat documents `oc-mirror` plugin v2 for disconnected OpenShift
+installations in OpenShift Container Platform 4.20. The v2 command is used
+with the `--v2` flag.
+
+## Credential Model
+
+Docker auth is selected by registry hostname. Because both targets use
+`quay.v7.comptech-lab.com`, the workflow is intentionally split into two
+separate mirror runs:
+
+- release run with `openshift-release+ocp_mirror`;
+- operator run with `openshift-operators+ocp_mirror`.
+
+The scripts read these Vault paths:
+
+```text
+secret/greenfield/bootstrap/openshift/pull-secret
+secret/greenfield/quay/robots/openshift-release/ocp_mirror
+secret/greenfield/quay/robots/openshift-operators/ocp_mirror
+```
+
+Generated authfiles are ignored Git artifacts and must stay mode `0600`.
+
+## Quay Permission Model
+
+Each mirror robot is a member of a namespace-local `mirror-creators` team with
+the Quay `creator` role:
+
+```text
+openshift-release/mirror-creators
+openshift-operators/mirror-creators
+```
+
+This is required because `oc-mirror` creates destination repositories based on
+the source image paths. Repo-scoped write permission alone is not sufficient.
+
+## Source Files
+
+```text
+data/oc-mirror/imageset-smoke-additional.yaml
+data/oc-mirror/imageset-4.20-template.yaml
+scripts/services/oc-mirror/build-authfile-from-vault.sh
+scripts/services/oc-mirror/run-smoke-mirror.sh
+runbooks/oc-mirror-v7.md
+```
+
+The smoke config mirrors only `ubi9/ubi-micro`. The full OpenShift release and
+operator template is a starting point and must be reviewed before production
+execution.
+
+## Smoke Validation
+
+Set Vault environment variables:
+
+```bash
+export VAULT_ADDR=https://gf-ocp-vault-02.v7.comptech-lab.com:8200
+export VAULT_CACERT=/path/to/vault-ca.crt
+export VAULT_TOKEN=<redacted>
+```
+
+Run the release namespace smoke:
+
+```bash
+./scripts/services/oc-mirror/run-smoke-mirror.sh --profile release
+```
+
+Run the operator namespace smoke:
+
+```bash
+./scripts/services/oc-mirror/run-smoke-mirror.sh --profile operators
+```
+
+Validated mirror results:
+
+```text
+quay.v7.comptech-lab.com/openshift-release/ubi9/ubi-micro:latest
+quay.v7.comptech-lab.com/openshift-operators/ubi9/ubi-micro:latest
+```
+
+Each run generated an `ImageTagMirrorSet` artifact under its smoke workspace.
+
+## Production Mirror Rules
+
+- Pin the final OpenShift channel and z-stream before a full release mirror.
+- Review every operator package and channel before a full operator mirror.
+- Keep release and operator mirrors as separate runs unless a dedicated broader
+  mirror credential is approved.
+- Store generated pull-secret material and cluster mirror manifests in Vault or
+  the operational GitLab, not in public GitHub.
+- Do not run a full mirror from the smoke issue. Create a separate approved
+  issue for production mirror execution.
