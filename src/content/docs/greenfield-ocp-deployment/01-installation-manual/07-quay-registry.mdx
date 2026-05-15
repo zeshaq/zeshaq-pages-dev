@@ -1,0 +1,139 @@
+---
+title: "Installation Manual - 07 Quay registry"
+sidebar_label: "07 Quay registry"
+description: "How the gf-ocp Quay registry VM is created, connected to MinIO object storage, routed through HAProxy, and validated."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+Quay is the greenfield platform registry foundation. It is installed after
+MinIO, PowerDNS, HAProxy, GitLab, Vault, and NetBox because it depends on
+object storage, DNS, edge TLS, secret custody, and source-of-truth inventory.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-quay-01` |
+| FQDN | `quay.v7.comptech-lab.com` |
+| Private IP | `30.30.200.40/16` |
+| Gateway | `30.30.0.1` |
+| DNS | `30.30.200.53`, then `8.8.8.8` |
+| Bridge | `br33` |
+| MAC | `52:54:00:70:07:40` |
+| vCPU | `4` |
+| RAM | `16 GiB` |
+| Disk | `200 GiB` qcow2 overlay |
+| Quay version | `3.17.1` |
+| Edge route | HAProxy wildcard TLS to `30.30.200.40:8080` |
+| Blob storage | MinIO bucket `quay-storage` |
+| MinIO service user | `quay-storage-v2` |
+| Credential custody | `secret/greenfield/quay/application/gf-ocp-quay-01` |
+| Storage credential custody | `secret/greenfield/object-storage/minio/users/quay-storage` |
+
+PowerDNS records:
+
+```text
+quay.v7.comptech-lab.com         A 59.153.29.102
+quay-private.v7.comptech-lab.com A 30.30.200.40
+```
+
+## Creation Flow
+
+The operator entry point is the greenfield repository script wrapper:
+
+```bash
+./scripts/gfctl.sh prepare-cloud-init --execute gf-ocp-quay-01
+./scripts/gfctl.sh cloud-init-iso --execute gf-ocp-quay-01
+cp scripts/vms/gf-ocp-quay-01.env.example scripts/vms/gf-ocp-quay-01.env
+./scripts/gfctl.sh create-vm --execute scripts/vms/gf-ocp-quay-01.env
+```
+
+Before building the seed ISO, replace placeholder SSH public keys in:
+
+```text
+artifacts/cloud-init/gf-ocp-quay-01/user-data.yaml
+```
+
+The VM is private-only. HAProxy is the only public entry point.
+
+## Runtime Install
+
+The install script is:
+
+```text
+/usr/local/sbin/install-quay-standalone.sh
+```
+
+It installs and enables:
+
+- local PostgreSQL 16;
+- local Redis 7 with authentication;
+- Podman;
+- Project Quay container `quay.io/projectquay/quay:3.17.1`;
+- `quay.service`;
+- Quay standalone config at `/etc/quay/config/config.yaml`.
+
+The runtime env file is root-only:
+
+```text
+/etc/quay/quay.env
+```
+
+It is generated from Vault-held values and must never be committed or printed.
+
+## Object Storage
+
+Quay uses `RadosGWStorage` because MinIO is S3-compatible. The registry talks
+to MinIO over the private service network:
+
+```text
+http://30.30.200.1:9000
+```
+
+Client-facing TLS remains on HAProxy. Quay is configured with
+`EXTERNAL_TLS_TERMINATION: true`, `PREFERRED_URL_SCHEME: https`, and
+`SESSION_COOKIE_SECURE: true`.
+
+## HAProxy Route
+
+HAProxy redirects HTTP to HTTPS for `quay.v7.comptech-lab.com` and forwards the
+HTTPS route to:
+
+```text
+30.30.200.40:8080
+```
+
+The public certificate is the shared wildcard certificate for
+`*.v7.comptech-lab.com`.
+
+## Validation
+
+Run local validation on the VM:
+
+```bash
+ssh ze@30.30.200.40 'sudo /usr/local/sbin/validate-quay-standalone.sh /etc/quay/quay.env'
+```
+
+Run edge validation from an operator host:
+
+```bash
+curl -fsS https://quay.v7.comptech-lab.com/api/v1/discovery >/dev/null
+```
+
+The first authenticated push/pull smoke test used the initialized `zahid`
+administrator account and pushed:
+
+```text
+quay.v7.comptech-lab.com/zahid/smoke:op-gf-quay1
+```
+
+## Lessons Captured
+
+- Upstream Project Quay image tags use the numeric form, for example `3.17.1`,
+  not `v3.17.1`.
+- URL-encode the PostgreSQL password inside `DB_URI`.
+- Quote generated secret values in YAML.
+- Keep internal S3 traffic on the private MinIO endpoint instead of sending it
+  through the public HAProxy route.
+- Validate the scoped MinIO user with `mc` before starting Quay.
