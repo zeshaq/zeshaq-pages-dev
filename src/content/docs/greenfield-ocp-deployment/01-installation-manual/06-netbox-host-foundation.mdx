@@ -1,0 +1,91 @@
+---
+title: "Installation Manual - 06 NetBox host foundation"
+sidebar_label: "06 NetBox host foundation"
+description: "How the gf-ocp NetBox VM host is created and validated before installing the NetBox application."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs, prefixes, and service ownership. At this stage only the VM host foundation is installed. The NetBox application, PostgreSQL, Redis, backups, and HAProxy route are handled by a later approved phase.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-netbox-01` |
+| FQDN | `netbox.v7.comptech-lab.com` |
+| Private IP | `30.30.200.23/16` |
+| Gateway | `30.30.0.1` |
+| DNS | `30.30.200.53`, then `8.8.8.8` |
+| Bridge | `br33` |
+| MAC | `52:54:00:70:07:23` |
+| vCPU | `4` |
+| RAM | `8 GiB` |
+| Disk | `100 GiB` qcow2 overlay |
+| Base image | `/var/lib/libvirt/images/ubuntu-24.04-base.qcow2` |
+
+DNS points the NetBox host name to the private VM IP:
+
+```text
+netbox.v7.comptech-lab.com A 30.30.200.23
+```
+
+## Creation Flow
+
+The operator entry point is the greenfield repository script wrapper:
+
+```bash
+./scripts/gfctl.sh prepare-cloud-init --execute gf-ocp-netbox-01
+./scripts/gfctl.sh cloud-init-iso --execute gf-ocp-netbox-01
+cp scripts/vms/gf-ocp-netbox-01.env.example scripts/vms/gf-ocp-netbox-01.env
+./scripts/gfctl.sh create-vm --execute scripts/vms/gf-ocp-netbox-01.env
+./scripts/gfctl.sh validate-vm --execute ze@30.30.200.23
+```
+
+Before building the seed ISO, replace placeholder SSH public keys in:
+
+```text
+artifacts/cloud-init/gf-ocp-netbox-01/user-data.yaml
+```
+
+The VM creation wrapper uses `VM_BASE_IMAGE` to create a bootable qcow2 overlay from the Ubuntu cloud image. It also stages seed ISOs into `/var/lib/libvirt/cloud-init/` because hardened libvirt hosts cannot read ISO files directly from an operator home directory.
+
+## Validation
+
+Run:
+
+```bash
+dig @30.30.200.53 netbox.v7.comptech-lab.com A +short
+ssh ze@30.30.200.23 'cloud-init status'
+ssh ze@30.30.200.23 'systemctl is-active qemu-guest-agent chrony fail2ban ssh'
+ssh ze@30.30.200.23 'sudo sshd -T | awk "/^(passwordauthentication|permitrootlogin|pubkeyauthentication) /"'
+ssh ze@30.30.200.2 'sudo virsh dominfo gf-ocp-netbox-01 | grep Autostart'
+```
+
+Expected posture:
+
+```text
+30.30.200.23
+status: done
+active
+active
+active
+active
+permitrootlogin no
+pubkeyauthentication yes
+passwordauthentication no
+Autostart:      enable
+```
+
+## Current Boundary
+
+This phase creates the VM host only. Do not treat it as a running NetBox service yet.
+
+The next NetBox phase must decide:
+
+- PostgreSQL placement.
+- Redis placement.
+- Vault secret paths.
+- Backup destination and restore drill.
+- HAProxy exposure policy.
+- Initial NetBox data model for sites, racks, prefixes, VLANs, VMs, and service ownership.
