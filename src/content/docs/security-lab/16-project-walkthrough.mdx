@@ -1,0 +1,214 @@
+---
+title: "Security Lab — project walkthrough"
+sidebar_label: "Project walkthrough"
+description: "A plain-English walkthrough of what the security lab project built, why it was built, and how the pieces fit together."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+This page explains the whole project in plain language. It avoids passwords, private keys, and low-level command output. The goal is to make the project understandable to someone who wants to know what was built and why it matters.
+
+## The Simple Version
+
+We built a private hands-on technology lab.
+
+It is a small version of the kind of environment a real company might use to learn and test:
+
+- security operations;
+- vulnerability scanning;
+- incident response;
+- network monitoring;
+- data center networking;
+- GitOps-style operations;
+- backup and restore;
+- change validation before and after deployment.
+
+The lab is not a production system. It is a controlled learning environment where changes can be tested, broken, fixed, documented, and repeated without touching real customer or internet-facing systems.
+
+## Why We Built It
+
+The project started with a practical goal: build a safe place to learn real security and networking workflows instead of only reading theory.
+
+A useful lab needs more than one VM. It needs attackers, targets, monitoring tools, network devices, source-of-truth records, backups, and runbooks. It also needs a way to prove that the lab is healthy after changes.
+
+So the project evolved into a mini private-cloud operations lab:
+
+- one place to create network topologies;
+- one place to run SOC tools;
+- one place to store intended configuration;
+- one place to collect evidence;
+- one repeatable way to validate the result.
+
+## The Main Building Blocks
+
+| Building block | Plain-English role |
+| --- | --- |
+| `dl385` host | The physical server that runs the virtual machines |
+| EVE-NG | The network lab where virtual switches and routers run |
+| Nexus 9300v | Cisco virtual switches used to learn data center networking |
+| Security Onion | Network security monitoring and alert investigation |
+| Wazuh | Endpoint and log monitoring |
+| Greenbone | Vulnerability scanning |
+| Kali Linux | Offensive testing and validation workstation |
+| Juice Shop | Intentionally vulnerable web app target |
+| Nautobot | Source of truth for devices, IPs, and inventory |
+| Oxidized | Automatic network configuration backup |
+| Batfish | Network validation and policy analysis |
+| TheHive | Security case management |
+| Shuffle | Security automation and workflow testing |
+| MinIO | Object storage used for backup replication |
+| GitLab | Local Git server and CI runner for GitOps workflows |
+
+The important idea is that the tools are not isolated. They support each other. The network lab creates behavior, the SOC observes it, the source-of-truth records intent, the backup system protects state, and the validation scripts check that everything still works.
+
+## The Network Lab
+
+The network side uses EVE-NG with Cisco Nexus 9300v virtual switches.
+
+The built topology has:
+
+- two spine switches;
+- two leaf switches;
+- two border switches;
+- tenant networks;
+- EVPN/VXLAN overlay networking;
+- a services VRF;
+- route-leak controls;
+- validation scripts and failure drills.
+
+In plain terms, this is a small data center fabric. The spines and leaves move traffic inside the data center. The border switches connect the tenant network to outside or shared services. EVPN/VXLAN lets the lab practice modern cloud-style networking patterns instead of old flat VLAN-only designs.
+
+## What EVPN/VXLAN Means Here
+
+EVPN/VXLAN can sound complicated, but the practical idea is simple:
+
+- VXLAN stretches tenant networks across the fabric in a controlled way.
+- EVPN is the control plane that tells switches where things live.
+- BGP is the routing protocol that lets the switches exchange that information.
+
+This is the kind of pattern used in modern data centers because it scales better than manually stretching VLANs everywhere.
+
+The lab proves that tenant machines can talk across the fabric, route between tenant networks, and still keep unwanted prefixes out.
+
+## The Services VRF
+
+A VRF is like a separate routing table. It lets one physical or virtual network device carry multiple isolated routing worlds.
+
+The services VRF in this lab represents shared services that a tenant might need. The important part is control: only approved service routes should be shared into the tenant network. Management networks or test leak prefixes should not accidentally appear inside the tenant routing table.
+
+We built:
+
+- approved service route sharing;
+- denied route tests;
+- guard scripts that check for leaks;
+- drills that intentionally break and restore policy to prove the control works.
+
+That gives the lab a realistic networking safety pattern: not just "can traffic pass," but "can only the right traffic pass."
+
+## The SOC Side
+
+The security operations side is built around the idea of evidence.
+
+The lab has tools for:
+
+- detecting network activity;
+- collecting endpoint and log signals;
+- scanning for vulnerabilities;
+- opening and tracking security cases;
+- running security automation workflows;
+- summarizing whether current evidence passes or fails.
+
+Security Onion, Wazuh, Greenbone, TheHive, and Shuffle each cover part of the SOC workflow. Together, they let the lab practice a full loop: generate activity, detect it, collect evidence, create a case, and document the result.
+
+## GitOps And Source Of Truth
+
+A major part of the project was moving away from one-off manual changes.
+
+The lab now uses local GitLab repositories to hold the desired state for:
+
+- network source of truth;
+- SOC detection content;
+- runbooks;
+- service deployment files;
+- backup and restore jobs;
+- automation inventory.
+
+This means future changes should start in Git, get reviewed or validated, then be applied. If a live system drifts, the goal is to detect the drift and reconcile it back to the source of truth.
+
+In plain terms: Git becomes the memory and change-control system for the lab.
+
+## Backups And Evidence
+
+A lab is only useful if its work can be recovered and explained later.
+
+The project added:
+
+- local backups for key runtime services;
+- MinIO-backed backup replication;
+- Oxidized backups for Nexus configurations;
+- timestamped SOC evidence;
+- final replay evidence;
+- task logs for long-running work;
+- closeout documents for each major phase.
+
+This matters because the lab is not just a set of running VMs. It is a repeatable learning system with proof of what happened.
+
+## What "Done" Means For This Phase
+
+The current phase is considered complete because the final replay showed:
+
+- the Nexus fabric validates successfully;
+- tenant traffic works;
+- services VRF controls are healthy;
+- denied route leaks are blocked;
+- Oxidized and Nautobot agree on the Nexus devices;
+- SOC daily health is healthy;
+- the latest scenario evidence has no failed cases;
+- the key web endpoints respond;
+- the documentation and replay commands are committed.
+
+That is enough to treat the lab as ready for regular learning and operational practice.
+
+## What Is Still Not Done
+
+Some items are intentionally future work:
+
+- Nexus Dashboard and NDFC are not deployed yet.
+- ACI is not part of the current phase.
+- ISE, FTDv/FMCv, ASAv, Catalyst 8000V, and IOS XRv are future Cisco tracks.
+- StorageGRID host VMs exist, but StorageGRID software is not installed.
+- NetApp ONTAP work is paused until proper evaluation media and licensing are staged.
+- More log sources can be onboarded later.
+- More tenants and more complex policy tests can be added later.
+
+These are not failures. They are next phases.
+
+## How To Think About The Lab
+
+The easiest way to understand the lab is this:
+
+```text
+EVE-NG creates the network.
+Nexus switches move the traffic.
+Nautobot records what should exist.
+Oxidized backs up what actually exists.
+Batfish checks intended network behavior.
+Security Onion and Wazuh observe activity.
+Greenbone finds weaknesses.
+TheHive and Shuffle help model SOC response.
+GitLab stores the desired state.
+MinIO helps keep backups.
+The private agent repo records memory, evidence, and replay commands.
+```
+
+The result is a small but realistic environment for learning how infrastructure, networking, security operations, automation, and documentation fit together.
+
+## Where To Go Next
+
+Use these pages depending on the question:
+
+- [Operations dashboard](/docs/security-lab/operations-dashboard/) for daily commands and URLs.
+- [SOC and Nexus closeout](/docs/security-lab/soc-nexus-closeout/) for the current finished state.
+- [Reproducibility guide](/docs/security-lab/reproducibility-guide/) for how the lab can be rebuilt or replayed.
+- [Cisco Nexus track](/docs/security-lab/cisco-nexus-track/) for the networking learning path.
+- [GitOps-managed networking](/docs/security-lab/gitops-managed-data-center-networking/) for the operating model.
