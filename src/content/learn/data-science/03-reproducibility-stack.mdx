@@ -1,0 +1,292 @@
+---
+title: "The reproducibility stack"
+sidebar_label: "03 — Reproducibility stack"
+description: "Stand up MinIO as the S3-compatible object store, wire DVC for dataset versioning and MLflow for experiment tracking and a model registry, then ship a cookiecutter so every project starts wired in."
+estimated_minutes: 90
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- **MinIO** running as the S3-compatible object store on the GPU server, with separate buckets for `datasets`, `mlflow-artifacts`, and `dvc`.
+- **DVC** configured against MinIO so every dataset has a content hash, every checkout is byte-identical, and nothing big lives in git.
+- **MLflow** running as a tracking server with Postgres metadata and MinIO artifacts — and the **Model Registry** turned on, ready to promote models by stage in module 09.
+- A **cookiecutter template** that every project on the platform forks from — wired to `uv`, pre-commit, DVC, and MLflow on day one.
+- A third ADR pinning down *what gets versioned where* (git, DVC, MLflow, MinIO directly).
+
+This is the module that turns the platform from "a server with notebooks" into "a server that produces work you can actually reproduce."
+
+## Why these three together
+
+A reproducible ML project has three kinds of state that change at different rates:
+
+| State | Rate of change | Lives in |
+| --- | --- | --- |
+| **Code** | Every commit | Git (Gitea) |
+| **Data** | Slowly, but in big chunks | DVC, backed by MinIO |
+| **Experiments** | Every training run | MLflow, backed by Postgres + MinIO |
+
+Conflating these is the cardinal sin. Big files in git break clones. Code in DVC defeats the point of git. Experiment artifacts on the filesystem disappear the moment a notebook restarts. Each thing in its layer.
+
+## Step 1 — MinIO
+
+MinIO is a self-hosted S3-compatible object store. Anything that speaks S3 (boto3, `aws-cli`, MLflow, DVC, Spark, dbt, Trino, vLLM, Label Studio) talks to MinIO unchanged — you just point it at a different endpoint.
+
+`/opt/minio/docker-compose.yml`:
+
+```yaml
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=__change_me__
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - /srv/minio:/data
+```
+
+Bring it up:
+
+```bash
+sudo mkdir -p /srv/minio
+sudo docker compose -f /opt/minio/docker-compose.yml up -d
+```
+
+Open `http://<gpu-server>:9001` (or `https://minio.example.com` through the reverse proxy) and log in. Create three buckets and one service account:
+
+```bash
+# Easier on the CLI than clicking — install the `mc` client first:
+curl -sSLo /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x /usr/local/bin/mc
+mc alias set local http://localhost:9000 admin __change_me__
+
+mc mb local/datasets
+mc mb local/mlflow-artifacts
+mc mb local/dvc
+mc admin user svcacct add local admin --access-key platform --secret-key __platform_secret__
+```
+
+The service account `platform / __platform_secret__` is what MLflow and DVC will use. Keep the root `admin` credentials for break-glass use only.
+
+**Bucket policies.** Default to private. Each student gets a key pair scoped to their projects only (Identity → Access Keys, condition the policy on `aws:username`). For the duration of the course, a shared `platform` account is simpler; in real life, every user has their own.
+
+## Step 2 — DVC against MinIO
+
+DVC tracks large files by storing them in a remote (MinIO) and committing only a small `.dvc` pointer to git. The pointer is a content hash; `dvc pull` fetches the exact bytes that match the hash. This is what makes a clone of a 200 MB repo bring down 4 GB of data on the first `dvc pull`, instead of cloning a bloated repo every time.
+
+In any project repo:
+
+```bash
+uv add --dev dvc dvc-s3
+dvc init
+dvc remote add -d minio s3://dvc
+dvc remote modify minio endpointurl http://<gpu-server>:9000
+dvc remote modify minio access_key_id platform
+dvc remote modify minio secret_access_key __platform_secret__
+```
+
+To version a dataset:
+
+```bash
+dvc add data/raw/transactions.parquet      # creates data/raw/transactions.parquet.dvc
+git add data/raw/transactions.parquet.dvc .gitignore
+git commit -m "Track raw transactions"
+dvc push                                    # uploads bytes to MinIO
+```
+
+To pull the exact bytes someone else committed:
+
+```bash
+git pull
+dvc pull
+```
+
+`dvc.yaml` (which we generate in the cookiecutter) lets you define **stages** — `ingest → clean → features → train` — each with declared inputs and outputs. `dvc repro` then runs only the stages whose inputs changed. This is the same dependency graph idea as Make, applied to data.
+
+## Step 3 — MLflow tracking + registry
+
+MLflow runs as a stateless server: metadata in Postgres, artifacts in MinIO. Both are services we already have or can add cheaply.
+
+Add an `mlflow` database to the existing Gitea Postgres (or run a separate Postgres if you prefer the blast-radius separation):
+
+```bash
+docker exec -it gitea-postgres psql -U gitea -d postgres \
+  -c "CREATE DATABASE mlflow;"
+docker exec -it gitea-postgres psql -U gitea -d postgres \
+  -c "CREATE USER mlflow WITH PASSWORD '__mlflow_password__';"
+docker exec -it gitea-postgres psql -U gitea -d postgres \
+  -c "GRANT ALL PRIVILEGES ON DATABASE mlflow TO mlflow;"
+```
+
+`/opt/mlflow/docker-compose.yml`:
+
+```yaml
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.18.0
+    container_name: mlflow
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - AWS_ACCESS_KEY_ID=platform
+      - AWS_SECRET_ACCESS_KEY=__platform_secret__
+      - MLFLOW_S3_ENDPOINT_URL=http://localhost:9000
+    command: >
+      mlflow server
+      --backend-store-uri postgresql+psycopg2://mlflow:__mlflow_password__@localhost:5432/mlflow
+      --default-artifact-root s3://mlflow-artifacts
+      --host 0.0.0.0
+      --port 5000
+      --serve-artifacts
+```
+
+Bring it up:
+
+```bash
+sudo docker compose -f /opt/mlflow/docker-compose.yml up -d
+```
+
+Quick check from a notebook:
+
+```python
+import mlflow
+
+mlflow.set_tracking_uri("http://<gpu-server>:5000")
+mlflow.set_experiment("hello-mlflow")
+with mlflow.start_run():
+    mlflow.log_param("alpha", 0.01)
+    mlflow.log_metric("rmse", 0.42)
+    mlflow.log_text("hello from MLflow", "note.txt")
+```
+
+Open the MLflow UI. The run should be there. Click into it — the `note.txt` artifact should resolve from MinIO.
+
+### The Model Registry — turn it on now
+
+The registry is a separate UI tab in MLflow. It is the thing you promote to in module 09 (`Staging → Production`) and the thing every FastAPI service in module 10 will resolve a model URI against (`models:/churn/Production`). No setup is required beyond having the tracking server running with a Postgres backend; the registry uses the same DB.
+
+The convention we adopt:
+
+| Stage | Means |
+| --- | --- |
+| `None` | Just trained; not promoted |
+| `Staging` | Passes offline eval, deployed to a non-prod endpoint |
+| `Production` | Currently serving live traffic |
+| `Archived` | Was production, now superseded |
+
+Transitions are explicit. CI in module 15 promotes by tagging a git commit — no clicking through the UI in a hurry.
+
+## Step 4 — The cookiecutter template
+
+Every project on the platform forks from one template. The template gives them:
+
+- `pyproject.toml` with `uv` dependency groups (`base`, `dev`, `ml`, `eval`).
+- `.pre-commit-config.yaml` matching module 02.
+- `dvc.yaml` skeleton with `ingest → features → train → evaluate` stages.
+- An `mlflow_utils.py` helper that reads `MLFLOW_TRACKING_URI` from env and tags runs with the git SHA.
+- A `Dockerfile` derived from the JupyterHub spawner image (so a project's "build" is reproducible).
+- A `Makefile` with `make data`, `make features`, `make train`, `make eval`, `make serve`.
+- An `adr/` folder with the first project ADR pre-templated.
+
+The template lives in Gitea at `platform/cookiecutter-ds-project`. A student starts a new project with:
+
+```bash
+uvx cookiecutter http://<gpu-server>:3000/platform/cookiecutter-ds-project
+```
+
+You — the instructor — write this template once. The skeleton:
+
+```
+cookiecutter-ds-project/
+├── cookiecutter.json                       # prompts for project name, slug, author
+├── {{cookiecutter.slug}}/
+│   ├── pyproject.toml
+│   ├── .pre-commit-config.yaml
+│   ├── .gitignore
+│   ├── dvc.yaml
+│   ├── .dvc/config                          # MinIO remote pre-configured
+│   ├── Dockerfile
+│   ├── Makefile
+│   ├── README.md
+│   ├── adr/
+│   │   └── 0001-project-charter.md
+│   ├── data/
+│   │   ├── raw/.gitkeep
+│   │   └── processed/.gitkeep
+│   └── src/{{cookiecutter.slug}}/
+│       ├── __init__.py
+│       ├── data.py
+│       ├── features.py
+│       ├── train.py
+│       ├── evaluate.py
+│       └── mlflow_utils.py
+```
+
+Two design choices worth flagging:
+
+- **Per-project Dockerfile.** Inheriting from the JupyterHub spawner image means the project's "production" container starts where the developer's notebook left off — no `pip install` surprises in CI.
+- **ADR-first project layout.** The first commit of every project has ADR 0001 already drafted: "What is this project trying to do, what's in scope, what's deliberately not." The discipline of writing it forces alignment on day one.
+
+## ADR 0003 — Where does each kind of state live
+
+Drop this into `/srv/shared/adr/0003-state-locations.md`:
+
+```markdown
+# ADR 0003 — State locations across git, DVC, MLflow, and MinIO
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+With four storage layers active (git, DVC, MLflow, raw MinIO), we need a
+clear rule for where each kind of artifact lives. Otherwise: big files in
+git, training output not tracked, models reproducible "in theory."
+
+## Decision
+| Artifact | Lives in | Pointer in git? |
+|---|---|---|
+| Source code | Git | — |
+| Notebooks (curated) | Git, run outputs cleared | — |
+| Notebooks (scratch) | Not committed | — |
+| Raw datasets >1 MB | DVC (backed by MinIO `s3://datasets`) | Yes (`.dvc` file) |
+| Processed datasets | DVC outputs of pipeline stages | Yes (`dvc.lock`) |
+| Trained models | MLflow artifacts (backed by MinIO `s3://mlflow-artifacts`) | Run URI |
+| Pre-trained base models (LLMs, ViTs) | MinIO `s3://datasets/_base-models/` directly | Not in git |
+| Serving images | Gitea container registry | Image tag in deploy manifest |
+
+## Consequences
+- Anything matching the rules can be regenerated by `git clone && dvc pull
+  && mlflow runs:/<id>/model artifacts` — nothing lives only in someone's
+  notebook.
+- `.gitignore` and pre-commit's `check-added-large-files` (512 KB cap) keep
+  big files out of git mechanically, not by discipline.
+- Pre-trained base models are an explicit exception: they're too big and
+  too stable to put through DVC's hashing every time.
+
+## Alternatives considered
+- Putting datasets in MLflow artifacts. Rejected: MLflow's artifact model is
+  per-run, not per-dataset; you'd duplicate the dataset on every training run.
+- Skipping DVC and using raw MinIO with hand-managed paths. Rejected: loses
+  the "git pull && dvc pull → byte-identical checkout" property.
+```
+
+## Recap and what's next
+
+You now have:
+
+- A self-hosted S3-compatible object store with the three buckets the rest of the course assumes.
+- DVC giving every dataset a content hash.
+- An MLflow tracking server with a working artifact pipeline through MinIO, plus the Model Registry ready for promotion workflows.
+- A cookiecutter template every project will start from.
+
+The platform can now produce reproducible work. The next piece is fair sharing of the *compute* — making sure two students don't accidentally claim both L40S at the same time. That's Slurm.
+
+---
+
+Next: **[04 — GPU scheduling with Slurm](/learn/data-science/04-slurm)**.

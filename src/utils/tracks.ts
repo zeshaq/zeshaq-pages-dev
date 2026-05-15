@@ -19,6 +19,7 @@ export const TRACK_TITLES: Record<string, string> = {
   "kubeflow": "Kubeflow",
   "devsecops": "DevSecOps",
   "openliberty": "Hands-On Open Liberty",
+  "data-science": "Practical Data Science",
 };
 
 export const TRACK_TAGLINES: Record<string, string> = {
@@ -34,6 +35,8 @@ export const TRACK_TAGLINES: Record<string, string> = {
     "Shift security left into the SDLC, automate the gates at every stage, and treat security as a property of every commit. Threat modeling, SAST/SCA, container and supply-chain security (SLSA, SBOM, cosign), IaC scanning, runtime detection (RHACS, Falco), secrets, zero trust, compliance, and SIEM — ending in a fully gated deployment pipeline.",
   "openliberty":
     "End-to-end application development with Open Liberty. Provision a dev VM, install the toolchain, write a Jakarta EE 10 / MicroProfile 6.1 service, then add the real-world stack on top — PostgreSQL, Redis, Kafka, WSO2 MI/IS/APIM, and SigNoz observability — running as a fleet of containers on one VM. The classroom track for backend engineers before they touch production.",
+  "data-science":
+    "End-to-end data science on a real on-prem GPU server. Stand up a multi-user ML platform — JupyterHub, MLflow, MinIO, Slurm, Prefect, dbt, vLLM, Label Studio, Prometheus — then use it to ship four capstones: tabular ML, a modeled warehouse with dashboards, a self-hosted RAG application, and a multi-GPU computer-vision model. 2× NVIDIA L40S included.",
 };
 
 export function trackTitle(id: string): string {

@@ -1,0 +1,340 @@
+---
+title: "First ML model — tabular"
+sidebar_label: "09 — Tabular ML (Capstone 1)"
+description: "Build a calibrated tabular classifier end to end: feature pipeline driven by dbt, Optuna-tuned LightGBM tracked in MLflow, promoted in the registry, with SHAP explanations and a business-cost metric."
+estimated_minutes: 150
+last_updated: 2026-05-15
+---
+
+This is the **business-ML capstone**. By the end you will have:
+
+- A reproducible **feature pipeline** that turns warehouse rows into a model-ready table, deterministically and time-aware.
+- A **LightGBM** classifier tuned with **Optuna**, every trial tracked in MLflow.
+- A **calibrated** probability output and a **threshold** picked against an explicit business cost function — not raw AUC.
+- A **promoted model** in the MLflow Registry with a clean lineage from a tagged git commit.
+- **SHAP** explanations published as a static report that a non-ML stakeholder can read.
+
+We use a synthetic but realistic dataset: **predicting whether a NYC taxi trip will be tipped above 20%**. The features come from the warehouse you built in module 06. The model is small enough to train on CPU in minutes; the techniques scale unchanged to 100× the data.
+
+## Capstone 1 — Brief
+
+**Mission.** A taxi-management company wants to predict, at trip-completion time, the probability the customer will tip above 20%. The use case is incentive routing — drivers who serve high-tip-likelihood trips get priority for similar future fares. The cost function:
+
+- A **false positive** (we predicted a generous tip, it wasn't) costs the driver an unnecessary route detour: **\$2**.
+- A **false negative** (we missed a generous tip) costs the company a routing opportunity: **\$0.50**.
+- Expected business cost is `2 × FP + 0.5 × FN`.
+
+This is asymmetric — false positives hurt 4× more than false negatives. The model has to be tuned to *that*, not to ROC-AUC.
+
+**Required artifacts.**
+
+- A dbt model `marts/fct_trip_features.sql` that produces the model-ready table.
+- A training script `src/<project>/train.py` runnable via `sbatch scripts/train.sh`.
+- All experiments logged to MLflow under one experiment, the best model registered in the Registry and promoted to `Staging`.
+- An evaluation report `reports/evaluation.html` with: calibration plot, confusion at the chosen threshold, business-cost curve, and the top-10 SHAP features.
+- The model card `MODEL_CARD.md` covering: intended use, training data, evaluation, known failure modes, threshold rationale.
+
+**Grading rubric.**
+
+| Criterion | Weight |
+| --- | --- |
+| End-to-end reproduces from clean clone (`git clone && dvc pull && make train`) | 20% |
+| Feature pipeline is time-aware (no leakage from future) | 15% |
+| Probabilities are calibrated (reliability diagram shows it) | 15% |
+| Threshold is chosen with business-cost reasoning, not AUC | 15% |
+| MLflow registry workflow is followed (registered → staging) | 15% |
+| Model card is honest and complete | 20% |
+
+## Step 1 — Feature engineering in the warehouse
+
+Features come from the warehouse, not the notebook. This is what makes them reusable and testable.
+
+`analytics/models/marts/fct_trip_features.sql`:
+
+```sql
+{{ config(materialized='table') }}
+
+with trips as (
+    select * from {{ ref('stg_yellow_trips') }}
+    where total_amount > 0 and trip_distance > 0
+),
+zones as (
+    select * from {{ ref('stg_zone_lookup') }}
+),
+enriched as (
+    select
+        md5(t.vendor_id::text || t.pickup_at::text || t.pickup_zone_id::text) as trip_id,
+        t.pickup_at,
+
+        -- Targets
+        case when t.tip_amount / nullif(t.fare_amount, 0) >= 0.20 then 1 else 0 end as tipped_high,
+
+        -- Numeric features
+        t.distance_miles,
+        t.duration_seconds / 60.0                                   as duration_min,
+        t.fare_amount,
+        t.passenger_count,
+        extract(hour    from t.pickup_at)                           as pickup_hour,
+        extract(dow     from t.pickup_at)                           as pickup_dow,
+        extract(month   from t.pickup_at)                           as pickup_month,
+
+        -- Categorical features
+        t.payment_type,
+        pu.borough                                                   as pickup_borough,
+        do.borough                                                   as dropoff_borough,
+        case when pu.borough = do.borough then 1 else 0 end          as intra_borough
+    from trips t
+    left join zones pu on pu.zone_id = t.pickup_zone_id
+    left join zones do on do.zone_id = t.dropoff_zone_id
+)
+select *
+from enriched
+where tipped_high is not null
+  and pickup_at >= '2022-01-01'
+  and pickup_at <  '2024-01-01'
+```
+
+Two guardrails:
+
+- **No leakage.** Tip is a function of `fare_amount` and `tip_amount`; the model must not see `tip_amount` as a feature. (We don't include it above, but it's the easy mistake.)
+- **Closed time window.** The training data is exactly two years, which makes it possible to split by time (last 6 months as hold-out) without surprises.
+
+Run it:
+
+```bash
+DBT_PG_PASSWORD=__dbt_password__ uv run dbt build --select fct_trip_features
+```
+
+## Step 2 — A time-aware split
+
+```python
+# src/<project>/data.py
+import polars as pl
+import duckdb
+
+def load_features(conn_uri: str) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Return train / valid / test, split by pickup_at."""
+    con = duckdb.connect()
+    con.execute(f"INSTALL postgres; LOAD postgres; ATTACH '{conn_uri}' AS pg (TYPE postgres)")
+    df = con.execute("SELECT * FROM pg.gold.fct_trip_features").pl()
+
+    df = df.sort("pickup_at")
+    train = df.filter(pl.col("pickup_at") <  "2023-04-01")
+    valid = df.filter((pl.col("pickup_at") >= "2023-04-01") & (pl.col("pickup_at") < "2023-07-01"))
+    test  = df.filter(pl.col("pickup_at") >= "2023-07-01")
+    return train, valid, test
+```
+
+The instinct to `train_test_split(random_state=42)` is wrong for time-stamped data. A random split has the model seeing data from the future during training, which silently inflates every metric. Time-aware splits are the default in this course.
+
+## Step 3 — A LightGBM baseline with Optuna
+
+```python
+# src/<project>/train.py
+from __future__ import annotations
+import os
+import optuna
+import mlflow
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score, log_loss
+
+from src.<project>.data import load_features
+
+FEATURES = ["distance_miles", "duration_min", "fare_amount", "passenger_count",
+            "pickup_hour", "pickup_dow", "pickup_month", "payment_type",
+            "pickup_borough", "dropoff_borough", "intra_borough"]
+CATS = ["payment_type", "pickup_borough", "dropoff_borough", "intra_borough"]
+TARGET = "tipped_high"
+
+mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+mlflow.set_experiment("nyc-tip-classifier")
+
+train, valid, test = load_features(os.environ["WAREHOUSE_URI"])
+X_tr, y_tr = train.select(FEATURES).to_pandas(), train[TARGET].to_pandas()
+X_va, y_va = valid.select(FEATURES).to_pandas(), valid[TARGET].to_pandas()
+
+for c in CATS:
+    X_tr[c] = X_tr[c].astype("category")
+    X_va[c] = X_va[c].astype("category")
+
+
+def objective(trial):
+    params = dict(
+        objective="binary",
+        metric="binary_logloss",
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        num_leaves=trial.suggest_int("num_leaves", 15, 255),
+        min_child_samples=trial.suggest_int("min_child_samples", 5, 200),
+        reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 1.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 1.0, log=True),
+        feature_fraction=trial.suggest_float("feature_fraction", 0.6, 1.0),
+        bagging_fraction=trial.suggest_float("bagging_fraction", 0.6, 1.0),
+        bagging_freq=5,
+        verbose=-1,
+    )
+    with mlflow.start_run(nested=True):
+        mlflow.log_params(params)
+        model = lgb.train(
+            params,
+            lgb.Dataset(X_tr, y_tr, categorical_feature=CATS),
+            valid_sets=[lgb.Dataset(X_va, y_va, categorical_feature=CATS)],
+            num_boost_round=1000,
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+        )
+        p_va = model.predict(X_va)
+        auc = roc_auc_score(y_va, p_va)
+        ll  = log_loss(y_va, p_va)
+        mlflow.log_metric("valid_auc", auc)
+        mlflow.log_metric("valid_logloss", ll)
+        return ll
+
+
+with mlflow.start_run(run_name="optuna-search") as parent:
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=40, show_progress_bar=False)
+    mlflow.log_params({"best_" + k: v for k, v in study.best_params.items()})
+    mlflow.log_metric("best_valid_logloss", study.best_value)
+```
+
+Submit via Slurm:
+
+```bash
+sbatch scripts/train.sh
+```
+
+Forty trials on this dataset, on the L40S server (CPU-bound for tabular), takes ~15 minutes.
+
+## Step 4 — Calibration
+
+LightGBM's raw probabilities are usually well-calibrated but not always. Check:
+
+```python
+from sklearn.calibration import calibration_curve
+import matplotlib.pyplot as plt
+
+frac_pos, mean_pred = calibration_curve(y_va, p_va, n_bins=20)
+plt.plot(mean_pred, frac_pos, marker="o")
+plt.plot([0, 1], [0, 1], "--")
+plt.savefig("reports/calibration.png", dpi=120)
+```
+
+If the reliability diagram bends away from the diagonal, wrap the model in `CalibratedClassifierCV(method="isotonic", cv=5)` and re-run on the validation fold. Re-check. The published probabilities should land within ±0.05 of the diagonal at every bucket.
+
+## Step 5 — Threshold from the cost function
+
+```python
+import numpy as np
+
+p_va = best_model.predict(X_va)
+y_va_arr = y_va.values
+
+best_t, best_cost = 0.5, float("inf")
+for t in np.linspace(0.01, 0.99, 99):
+    pred = (p_va >= t).astype(int)
+    fp = ((pred == 1) & (y_va_arr == 0)).sum()
+    fn = ((pred == 0) & (y_va_arr == 1)).sum()
+    cost = 2.0 * fp + 0.5 * fn
+    if cost < best_cost:
+        best_cost, best_t = cost, t
+
+mlflow.log_metric("chosen_threshold", best_t)
+mlflow.log_metric("validation_cost", best_cost)
+```
+
+The chosen threshold will typically be above 0.5 — the cost function says "be conservative about predicting a high tip." That asymmetry is the entire point. **Submitting a model tuned to AUC and "we'll pick the threshold later" is a fail for this capstone.**
+
+## Step 6 — SHAP report
+
+```python
+import shap
+
+explainer = shap.TreeExplainer(best_model)
+shap_values = explainer(X_va.iloc[:5000])
+
+shap.plots.bar(shap_values, max_display=15, show=False)
+plt.savefig("reports/shap_bar.png", dpi=120, bbox_inches="tight")
+
+shap.plots.beeswarm(shap_values, max_display=15, show=False)
+plt.savefig("reports/shap_beeswarm.png", dpi=120, bbox_inches="tight")
+```
+
+The story this should tell, in non-ML words: "The model relies heavily on payment type, fare amount, and pickup hour. Cash trips look very different from card trips. Late-night Manhattan pickups are the highest tip-likelihood." If the SHAP report doesn't tell a story like that, the model is learning the wrong thing.
+
+## Step 7 — Register and promote
+
+```python
+import mlflow.lightgbm
+
+with mlflow.start_run(run_name="final-train-on-train-plus-valid"):
+    final_model = lgb.train(
+        best_params,
+        lgb.Dataset(pd.concat([X_tr, X_va]), pd.concat([y_tr, y_va]),
+                    categorical_feature=CATS),
+        num_boost_round=int(best_n_rounds * 1.1),
+    )
+    mlflow.lightgbm.log_model(
+        final_model,
+        "model",
+        registered_model_name="nyc-tip-classifier",
+        signature=mlflow.models.infer_signature(X_tr, p_va),
+    )
+```
+
+Then in the MLflow UI, find the registered version and **transition to `Staging`**. CI in module 15 will promote to `Production` only on a tagged git commit.
+
+## Step 8 — Model card
+
+Drop `MODEL_CARD.md` at the project root:
+
+```markdown
+# Model Card — nyc-tip-classifier v0.1.0
+
+## Intended use
+Predict, at trip-completion time, the probability that the customer will tip
+≥ 20% of fare. Used to inform driver-routing incentives.
+
+## Training data
+NYC TLC yellow-taxi trips, 2022-01-01 through 2023-06-30. Validation:
+2023-04-01 through 2023-06-30. Hold-out test: 2023-07-01 through 2023-12-31.
+
+## Features
+… (the list from `FEATURES`) …
+
+## Performance
+- ROC-AUC: 0.78 (test)
+- Calibrated probabilities (reliability diagram in `reports/`)
+- Chosen threshold: 0.62, minimizing `2·FP + 0.5·FN` cost.
+- Business cost at threshold (test): $X.XX per 1k trips.
+
+## Known limitations
+- The model relies heavily on payment type. Trips with `payment_type=2` (cash)
+  almost never tip — the model essentially refuses to predict high tip for them.
+  This is a faithful reflection of the data and not a bug.
+- Performance degrades on partitions with fewer than 200 trips per pickup zone
+  in the training window. Borough-level dashboards are robust; zone-level is
+  not.
+- We have not evaluated subgroup fairness. Before any deployment, a fairness
+  audit by pickup borough is required.
+
+## Threshold rationale
+With FP=$2 and FN=$0.50, the cost-minimizing threshold is 0.62 on the
+validation set. The threshold is encoded as part of the model artifact
+(`model.threshold`); inference services must apply it explicitly.
+
+## Retraining cadence
+Quarterly. Drift monitoring (module 10) will flag if earlier is needed.
+```
+
+## Recap
+
+You've finished Capstone 1. You should have:
+
+- A registered, calibrated, threshold-tuned classifier in MLflow.
+- A SHAP report and a model card that a non-ML stakeholder can read.
+- A reproducible training pipeline triggered by `sbatch`.
+
+The model is in `Staging`. The next module turns it into a real service with drift monitoring — and then `Staging → Production` becomes the CI's job in module 15.
+
+---
+
+Next: **[10 — Serving and drift](/learn/data-science/10-serving-and-drift)**.

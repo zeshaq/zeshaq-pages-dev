@@ -1,0 +1,339 @@
+---
+title: "Computer vision capstone"
+sidebar_label: "14 — Computer vision (Capstone 4)"
+description: "Annotate a custom image dataset in Label Studio, fine-tune a vision backbone with PyTorch DDP across both L40S, export to ONNX, and serve batched inference behind FastAPI."
+estimated_minutes: 180
+last_updated: 2026-05-15
+---
+
+This is the **computer-vision capstone**. By the end you will have:
+
+- A custom dataset of **≥500 hand-annotated images** in Label Studio, versioned in DVC.
+- A **fine-tuned vision backbone** (transfer learning from a `timm` model) trained with **DistributedDataParallel across both L40S**.
+- A working **evaluation report** with per-class metrics and the confusion matrix.
+- An **ONNX-exported** model and a **TensorRT** option benchmarked against it.
+- A **FastAPI inference endpoint** that batches incoming requests to keep the GPU fed.
+
+Pick a task: image classification, object detection, or fine-grained image search. Whichever you pick, the structure of this module applies.
+
+## Capstone 4 — Brief
+
+**Mission.** Pick a domain you can collect ≥500 images for (your kitchen counter, your bookshelf, sample wildlife, a custom-good-vs-defect dataset, screenshots of dashboards) and ship a real model.
+
+**Required artifacts.**
+
+- A Label-Studio project with ≥500 images annotated by *you*, exported to a standard format (COCO for detection, ImageFolder for classification).
+- A training script runnable via `sbatch scripts/train.sh` that uses both GPUs (DDP for classification, single-GPU is acceptable for detection).
+- A green `make eval` producing a per-class metrics report.
+- An ONNX export and a benchmark showing inference latency at batch sizes 1, 8, 32.
+- A FastAPI service at `/predict` that takes one or more images and returns predictions.
+- `MODEL_CARD.md` covering: intended use, dataset description, evaluation, failure modes.
+
+**Grading rubric.**
+
+| Criterion | Weight |
+| --- | --- |
+| Dataset is non-trivial (≥500 images, real, with non-obvious examples) | 20% |
+| Training reproduces from clean clone (`git clone && dvc pull && make train`) | 20% |
+| DDP actually utilizes both GPUs (Grafana panel confirms it) | 10% |
+| Eval reports per-class metrics, not just top-line accuracy | 15% |
+| ONNX export works and benchmark numbers are real | 15% |
+| Inference service batches requests, not one-at-a-time | 10% |
+| Model card is honest about failure modes | 10% |
+
+## Step 1 — Label Studio
+
+Run as a container, talk to it from any browser:
+
+```yaml
+# /opt/labelstudio/docker-compose.yml
+services:
+  label-studio:
+    image: heartexlabs/label-studio:latest
+    container_name: label-studio
+    restart: unless-stopped
+    environment:
+      - LABEL_STUDIO_HOST=https://labels.example.com
+    ports:
+      - "8086:8080"
+    volumes:
+      - /var/lib/label-studio:/label-studio/data
+      - /srv/shared/datasets/cv:/data
+```
+
+In the UI: create a project, pick the labeling template (Image Classification or Object Detection), import your images from `/srv/shared/datasets/cv/raw/`, and start labeling. **Annotate enough images yourself to know the schema before delegating any of it.** A confusing schema becomes thousands of inconsistent labels fast.
+
+Export to COCO (detection) or to a per-class folder structure (classification) when you're done. The export ends up in MinIO under `s3://datasets/silver/cv-mydataset/`, versioned via DVC.
+
+## Step 2 — Dataset and augmentation
+
+For classification (the simpler case):
+
+```python
+# src/<project>/cv/data.py
+from torchvision.datasets import ImageFolder
+from torchvision import transforms as T
+
+train_tf = T.Compose([
+    T.RandomResizedCrop(224, scale=(0.7, 1.0)),
+    T.RandomHorizontalFlip(),
+    T.ColorJitter(0.2, 0.2, 0.2),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+val_tf = T.Compose([
+    T.Resize(256),
+    T.CenterCrop(224),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+def make_datasets(root: str):
+    return (
+        ImageFolder(f"{root}/train", transform=train_tf),
+        ImageFolder(f"{root}/val", transform=val_tf),
+    )
+```
+
+A few practical augmentation notes:
+
+- **Don't augment validation.** Same images, same predictions, every epoch.
+- **Don't over-augment small datasets.** Heavy augmentation on ≤1k images can produce worse generalization, not better.
+- **Class imbalance**: use `WeightedRandomSampler` if your worst class has `<10%` of the most common class's count.
+
+## Step 3 — Model from `timm`
+
+`timm` is the canonical zoo of vision backbones. Reach for it before reinventing:
+
+```python
+import timm
+
+model = timm.create_model(
+    "convnext_small.fb_in22k_ft_in1k",
+    pretrained=True,
+    num_classes=NUM_CLASSES,
+)
+```
+
+For ≤500 images, freeze most of the network and train only the head for the first 5 epochs, then unfreeze. For ≥2000, train end-to-end with a discriminative learning rate (head 10×, backbone 1×).
+
+## Step 4 — DDP training across both L40S
+
+This is what makes this module a "real CV" module instead of a notebook tutorial. DDP launches one process per GPU, each holds its own copy of the model, gradients are all-reduced after each backward pass.
+
+```python
+# src/<project>/cv/train.py
+import os, mlflow
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+def setup():
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    torch.cuda.set_device(rank)
+    return rank
+
+def main():
+    rank = setup()
+    is_main = rank == 0
+
+    if is_main:
+        mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+        mlflow.set_experiment("cv-mydataset")
+        mlflow.start_run()
+
+    train_ds, val_ds = make_datasets(os.environ["DATA_ROOT"])
+    train_sampler = DistributedSampler(train_ds, shuffle=True)
+    val_sampler   = DistributedSampler(val_ds,   shuffle=False)
+
+    train_dl = DataLoader(train_ds, batch_size=64, num_workers=8,
+                          sampler=train_sampler, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size=128, num_workers=8,
+                          sampler=val_sampler,   pin_memory=True)
+
+    model = timm.create_model("convnext_small.fb_in22k_ft_in1k",
+                              pretrained=True, num_classes=NUM_CLASSES).cuda()
+    model = DDP(model, device_ids=[rank])
+
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.05)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=EPOCHS)
+    scaler = torch.amp.GradScaler("cuda")
+    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    for epoch in range(EPOCHS):
+        train_sampler.set_epoch(epoch)
+        model.train()
+        for x, y in train_dl:
+            x, y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                logits = model(x)
+                loss = loss_fn(logits, y)
+            optim.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+        sched.step()
+
+        if is_main:
+            acc = evaluate(model, val_dl)
+            mlflow.log_metrics({"val_acc": acc, "lr": sched.get_last_lr()[0]}, step=epoch)
+
+    if is_main:
+        torch.save(model.module.state_dict(), "/tmp/model.pt")
+        mlflow.log_artifact("/tmp/model.pt")
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Launch through Slurm with both GPUs:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=cv-train
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=06:00:00
+#SBATCH --ntasks-per-node=2
+#SBATCH --output=logs/%x-%j.out
+
+set -euo pipefail
+cd "$SLURM_SUBMIT_DIR"
+uv sync --frozen
+export MLFLOW_TRACKING_URI="http://<gpu-server>:5000"
+
+srun --nodes=1 --ntasks-per-node=2 \
+  bash -c 'export RANK=$SLURM_PROCID; export WORLD_SIZE=$SLURM_NTASKS; \
+           export LOCAL_RANK=$SLURM_LOCALID; \
+           export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n1); \
+           export MASTER_PORT=29500; \
+           uv run python -m src.<project>.cv.train'
+```
+
+In the Grafana dashboard from module 10, both L40S should hit ~95% utilization during training. If only one does, DDP isn't actually starting two processes — almost always a Slurm `srun` invocation issue.
+
+## Step 5 — Evaluation that's actually useful
+
+A single accuracy number is rarely enough. Report:
+
+```python
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+y_true, y_pred = run_full_val(model, val_dl)
+print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=3))
+
+cm = confusion_matrix(y_true, y_pred)
+fig, ax = plt.subplots(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt="d", xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
+plt.savefig("reports/confusion.png", dpi=120, bbox_inches="tight")
+```
+
+Look at the confusion matrix. Are two specific classes mixing up? That's a labeling-policy ambiguity or a model-capacity gap, and you address it differently. The model card should name the failure modes that the matrix surfaces.
+
+## Step 6 — ONNX export
+
+```python
+import torch.onnx
+example = torch.randn(1, 3, 224, 224, device="cuda")
+model.eval()
+torch.onnx.export(
+    model, example, "/tmp/model.onnx",
+    input_names=["input"], output_names=["logits"],
+    dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+    opset_version=17,
+)
+```
+
+Verify it still produces correct outputs:
+
+```python
+import onnxruntime as ort
+sess = ort.InferenceSession("/tmp/model.onnx", providers=["CUDAExecutionProvider"])
+out = sess.run(None, {"input": example.cpu().numpy()})
+torch_out = model(example).detach().cpu().numpy()
+import numpy as np
+np.testing.assert_allclose(out[0], torch_out, atol=1e-3)
+```
+
+The `dynamic_axes` argument is what lets you batch arbitrary sizes at inference. Without it, the export is locked to batch-1.
+
+## Step 7 — Batched inference service
+
+Single-image requests waste a GPU. A simple in-process batcher:
+
+```python
+# src/<project>/cv/serve.py
+import asyncio, io
+import numpy as np
+import onnxruntime as ort
+from fastapi import FastAPI, UploadFile
+from PIL import Image
+
+sess = ort.InferenceSession("/srv/shared/models/<project>/model.onnx",
+                            providers=["CUDAExecutionProvider"])
+
+class Batcher:
+    def __init__(self, max_batch=32, max_wait_ms=10):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.max_batch = max_batch
+        self.max_wait_ms = max_wait_ms
+
+    async def predict(self, x: np.ndarray) -> np.ndarray:
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        await self.queue.put((x, fut))
+        return await fut
+
+    async def run(self):
+        while True:
+            x_list, fut_list = [], []
+            x, fut = await self.queue.get()
+            x_list.append(x); fut_list.append(fut)
+            try:
+                while len(x_list) < self.max_batch:
+                    x, fut = await asyncio.wait_for(self.queue.get(),
+                                                    timeout=self.max_wait_ms / 1000)
+                    x_list.append(x); fut_list.append(fut)
+            except asyncio.TimeoutError:
+                pass
+            batch = np.stack(x_list, axis=0)
+            out = sess.run(None, {"input": batch})[0]
+            for i, f in enumerate(fut_list):
+                f.set_result(out[i])
+
+batcher = Batcher()
+app = FastAPI()
+
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(batcher.run())
+
+@app.post("/predict")
+async def predict(file: UploadFile):
+    img = Image.open(io.BytesIO(await file.read())).convert("RGB")
+    x = preprocess(img)
+    pred = await batcher.predict(x)
+    return {"class": CLASS_NAMES[int(np.argmax(pred))], "logits": pred.tolist()}
+```
+
+Two design choices:
+
+- **Dynamic batching at the service layer**, not at the model layer. This lets you batch across HTTP connections.
+- **10-ms wait window**. At low load each request still returns fast (under 15 ms); at high load batches fill quickly and throughput scales.
+
+Benchmark with `wrk` or a quick asyncio script. On one L40S with a 30M-parameter ConvNeXt-Small ONNX, expect ~1000 images/sec at batch=32.
+
+## Recap
+
+You've finished Capstone 4. The platform now has shipped capstones in all four major DS domains. What's left is the platform discipline that makes all four reproducibly deployable — CI/CD.
+
+---
+
+Next: **[15 — CI/CD with Gitea Actions](/learn/data-science/15-cicd)**.

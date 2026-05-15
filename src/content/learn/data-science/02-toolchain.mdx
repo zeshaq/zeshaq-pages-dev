@@ -1,0 +1,304 @@
+---
+title: "The toolchain"
+sidebar_label: "02 — The toolchain"
+description: "Stand up JupyterHub with the DockerSpawner so every student gets a containerized GPU-aware notebook, plus self-hosted Gitea, uv for environments, and pre-commit."
+estimated_minutes: 90
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- **JupyterHub** running on the GPU server, with each student getting their own Docker-isolated notebook container on login.
+- **GPU pass-through** wired into the spawner so a student can request a GPU at notebook-start time.
+- **Gitea** running as the source of truth for every repo in the course — the laptop's GitHub is a mirror at best.
+- **`uv`** for Python environment management inside notebook containers and on the shell.
+- **Pre-commit** wired into a per-student template repo, enforcing `ruff`, `mypy`, and trailing-whitespace on every commit.
+- A second ADR documenting *why* DockerSpawner over the simpler alternatives.
+
+This is a longer module than module 01. The toolchain is what every later module assumes — taking time here saves it twice over later.
+
+## Why JupyterHub, and why with the DockerSpawner
+
+There are three popular ways to give a cohort of students notebook access:
+
+| Option | What it is | When to pick it |
+| --- | --- | --- |
+| Shared user, one Jupyter | Everyone SSHes in as the same user and runs `jupyter lab` | Never for ≥2 students |
+| **TLJH** (The Littlest JupyterHub) | JupyterHub with the SystemdSpawner — per-user processes, shared kernels | Small cohorts, no GPU isolation, simplest install |
+| **JupyterHub + DockerSpawner** | Per-user containers, optional GPU pass-through | What we want — containerized isolation and per-user GPU bookings |
+
+We pick the DockerSpawner. The two reasons:
+
+- **Environment isolation.** A student who `pip install`s something weird only breaks their own container, never the platform.
+- **Per-notebook GPU bookings.** A student can spawn a "GPU notebook" image that gets `--gpus all`, or a "CPU-only" image that doesn't. This is the foundation of fair GPU sharing without Slurm getting involved for every quick experiment.
+
+## Step 1 — Install JupyterHub
+
+Run JupyterHub itself in a container, alongside the per-user containers it spawns. This keeps the host clean and makes upgrades a `docker compose pull && up -d`.
+
+Create `/opt/jupyterhub/docker-compose.yml`:
+
+```yaml
+services:
+  jupyterhub:
+    image: quay.io/jupyterhub/jupyterhub:5.1
+    container_name: jupyterhub
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/jupyterhub:/srv/jupyterhub
+      - /home:/home
+      - /srv/shared:/srv/shared
+    command: >
+      bash -c "pip install dockerspawner==13.0.0 jupyterhub-nativeauthenticator
+      && jupyterhub --config=/srv/jupyterhub/jupyterhub_config.py"
+```
+
+The hub container has the host's Docker socket bind-mounted — that's how it spawns per-user containers as siblings on the same Docker daemon. It also mounts `/home` and `/srv/shared` so the spawned notebook containers see the same per-user homes and shared assets you set up in module 01.
+
+Save the spawner config as `/opt/jupyterhub/jupyterhub_config.py`:
+
+```python
+import os
+
+c = get_config()                                             # noqa: F821
+
+c.JupyterHub.authenticator_class = "nativeauthenticator.NativeAuthenticator"
+c.Authenticator.admin_users = {"ze"}                          # the instructor
+c.Authenticator.allow_all = False
+
+c.JupyterHub.spawner_class = "dockerspawner.DockerSpawner"
+
+c.DockerSpawner.image = "quay.io/jupyter/scipy-notebook:2025-05-12"
+c.DockerSpawner.network_name = "host"
+c.DockerSpawner.remove = True
+c.DockerSpawner.notebook_dir = "/home/jovyan/work"
+c.DockerSpawner.volumes = {
+    "/home/{username}": "/home/jovyan/work",
+    "/srv/shared":     {"bind": "/srv/shared", "mode": "ro"},
+    "/srv/shared/scratch": "/srv/shared/scratch",
+}
+
+# Two profile choices the student picks at spawn time
+c.DockerSpawner.allowed_images = {
+    "CPU notebook":       "quay.io/jupyter/scipy-notebook:2025-05-12",
+    "GPU notebook (CUDA)": "quay.io/jupyter/pytorch-notebook:cuda12-2025-05-12",
+}
+
+def gpu_for_image(spawner):
+    if "pytorch" in spawner.user_options.get("image", ""):
+        spawner.extra_host_config = {"runtime": "nvidia",
+                                     "device_requests": [{
+                                         "Driver": "nvidia",
+                                         "Count": -1,
+                                         "Capabilities": [["gpu"]],
+                                     }]}
+c.Spawner.pre_spawn_hook = gpu_for_image
+```
+
+Start it:
+
+```bash
+cd /opt/jupyterhub
+sudo docker compose up -d
+sudo docker logs -f jupyterhub
+```
+
+JupyterHub is now serving on port 8000 of the GPU server. Through the jump host's reverse proxy (from module 01's ADR), students reach it at `https://hub.example.com`.
+
+## Step 2 — Confirm GPU pass-through
+
+Have one student log in, pick "GPU notebook (CUDA)" at the spawner page, and run in a notebook cell:
+
+```python
+import torch
+print(torch.cuda.device_count(), [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+```
+
+Expect `2 ['NVIDIA L40S', 'NVIDIA L40S']`. If you get `0`, three things to check in order: the spawner image actually has CUDA wheels (`pytorch-notebook:cuda12-*` does, the default `scipy-notebook` does not), the host Docker daemon has the NVIDIA runtime (`docker info | grep -i nvidia`), and the `device_requests` block landed in the spawned container (`docker inspect <container> | grep -i devicerequests`).
+
+**Important fair-use note.** With this config, *every* student who picks the GPU image gets `--gpus all`. For ≤6 students that's fine if you have a working convention ("don't kick off a 4-hour run during a live session"), but for serious multi-user GPU work, module 04's Slurm queue is the durable answer. JupyterHub GPU pass-through is for quick experiments and small training; long jobs go through Slurm.
+
+## Step 3 — Self-hosted git with Gitea
+
+GitHub is fine but every repo round-trips through the public internet, every secret has to be scanned, and you cannot kick a build off from a private Postgres trigger. Gitea fixes all three for the cost of one small container.
+
+`/opt/gitea/docker-compose.yml`:
+
+```yaml
+services:
+  gitea:
+    image: gitea/gitea:1.22
+    container_name: gitea
+    restart: unless-stopped
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=postgres:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=gitea
+      - GITEA__database__PASSWD=__gitea_db_password__
+    ports:
+      - "3000:3000"
+      - "2222:22"
+    volumes:
+      - /var/lib/gitea:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16
+    container_name: gitea-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=__gitea_db_password__
+      - POSTGRES_DB=gitea
+    volumes:
+      - /var/lib/gitea-postgres:/var/lib/postgresql/data
+```
+
+Bring it up and open the web UI at `http://<gpu-server>:3000`. The first user who registers becomes the admin — make that you, the instructor. Then under `Site Administration → Users`, invite each student by email (or `gitea admin user create` on the CLI).
+
+Two policies to set on day one, before students start pushing:
+
+- **Default branch protection** on `main`: require PR review, disallow force-push, require status checks. `Repository Settings → Branches`.
+- **Token scopes**: scope each personal access token to a single repo where possible. Gitea supports this; it's the difference between "one leaked token = one repo blast radius" and "one leaked token = your whole account."
+
+The Gitea Actions runner — for CI on every push — comes in module 15.
+
+## Step 4 — `uv` for Python environments
+
+Inside a notebook container the default `pip` and `venv` work fine for a quick experiment, but the moment a student wants a reproducible environment, `requirements.txt` is not enough.
+
+`uv` (by Astral) is the replacement. It is roughly 10–100× faster than `pip` and it generates a real lockfile (`uv.lock`) that pins every transitive. We use it both inside notebook containers and on the shell.
+
+Install in a JupyterHub terminal:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Create a project the way the rest of the track will:
+
+```bash
+mkdir ~/work/hello-uv && cd ~/work/hello-uv
+uv init --python 3.12
+uv add pandas polars duckdb scikit-learn xgboost lightgbm matplotlib seaborn
+uv run python -c "import polars as pl; print(pl.__version__)"
+```
+
+`pyproject.toml` now records the dependency intent, and `uv.lock` records the resolved versions. **Both files must be committed.** Forget the lockfile and reproducibility is gone the first time a transitive bumps.
+
+Why `uv` over conda? Two reasons: it's faster (a 60-package install is seconds), and the lockfile is real and cross-platform (conda lockfiles are environment-coupled in a way that breaks the moment you move machines). Conda still wins for non-Python binaries (CUDA-bundled distributions, R, BLAS), but for what this track does, `uv` is the better default.
+
+## Step 5 — Pre-commit
+
+Pre-commit is a tiny git hook framework that runs linters and formatters before every commit. The point isn't perfect code — it's that nobody pushes whitespace noise or an `import pdb` left in by accident.
+
+Inside the same `hello-uv` project:
+
+```bash
+uv add --dev pre-commit ruff mypy
+uv run pre-commit install
+```
+
+Create `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=512"]            # block accidental dataset commits
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        additional_dependencies: ["pandas-stubs"]
+```
+
+Note the `check-added-large-files` hook with a 512 KB ceiling — this stops the most expensive failure mode on a shared server, which is "a student `git add`s a 4 GB parquet, pushes, and now Gitea is full." Datasets go through DVC and MinIO (module 03), not git.
+
+## Step 6 — First repo end to end
+
+Have each student do this once, in a JupyterHub terminal:
+
+```bash
+cd ~/work
+gh-host="$(hostname)"                                            # or your gitea host
+uv init --python 3.12 first-repo
+cd first-repo
+git checkout -b main
+git add .
+git commit -m "Initial commit"
+git remote add origin http://<student>@$gh-host:3000/<student>/first-repo.git
+git push -u origin main
+```
+
+If the push fails on auth, generate a Gitea personal access token (`User Settings → Applications`) and use it as the password.
+
+That repo now exists in Gitea, it has a lockfile, it has pre-commit on every commit, and pushing it will (in module 15) trigger CI. It's the shape every project on the platform will take.
+
+## ADR 0002 — DockerSpawner over TLJH
+
+Drop this into `/srv/shared/adr/0002-jupyter-spawner.md`:
+
+```markdown
+# ADR 0002 — JupyterHub: DockerSpawner over TLJH / SystemdSpawner
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+The cohort needs per-user notebook environments on the shared GPU server.
+Three options were considered: TLJH (SystemdSpawner), DockerSpawner with
+allowed images, or KubeSpawner with a local k3s cluster.
+
+## Decision
+DockerSpawner with two allowed images (CPU and GPU). GPU pass-through is
+enabled via a pre_spawn_hook that adds the nvidia device-request when the
+GPU image is selected.
+
+## Consequences
+- Pro: per-user environment isolation; bad `pip install` cannot break the host.
+- Pro: GPU bookings are a checkbox at notebook-start time.
+- Con: pinning the spawner image means students cannot trivially install
+  system packages. Workaround: the cookiecutter (module 03) generates a
+  per-project Dockerfile that derives from the spawner image, used for
+  any project that needs extra OS-level deps.
+
+## Alternatives considered
+- TLJH / SystemdSpawner. Simpler, but no GPU isolation — every notebook would
+  see both L40S devices regardless of the user's intent.
+- KubeSpawner on k3s. Right answer for ≥20 students; overkill for ≤6.
+```
+
+## Recap and what's next
+
+You now have:
+
+- A multi-user notebook platform with two image profiles (CPU and GPU) and verified GPU pass-through.
+- A self-hosted git server with branch protection and scoped tokens.
+- A modern Python toolchain (`uv` + pre-commit) that every project will use.
+- A working first-repo recipe a student can run in five minutes.
+
+What you don't have yet: a place to put **data**, a way to **track experiments**, and a project **template** so every student isn't reinventing the layout. That's module 03 — the reproducibility stack.
+
+---
+
+Next: **[03 — The reproducibility stack](/learn/data-science/03-reproducibility-stack)**.

@@ -1,0 +1,281 @@
+---
+title: "Analytics with Superset"
+sidebar_label: "08 — Superset (Capstone 2)"
+description: "Stand up Apache Superset against the warehouse, build dashboards that answer real business questions, lock down row-level access, and ship Capstone 2 — the data-engineering capstone."
+estimated_minutes: 120
+last_updated: 2026-05-15
+---
+
+This is the **first capstone module** — the deliverable at the end is graded, not just inspected. By the end you will have:
+
+- **Apache Superset** running on the GPU server, connected to the analytics Postgres from module 06.
+- A working **dataset model** that wraps the dbt marts with friendly column names and a semantic layer.
+- A **dashboard** answering at least three concrete business questions on the NYC TLC data.
+- **Row-level security** so different roles see different slices of the warehouse.
+- The dashboard **embedded** behind the platform's reverse proxy with SSO if you have it, basic auth if you don't.
+
+This is the surface every other stakeholder will judge the platform by. Take the time to make it presentable.
+
+## Capstone 2 — Brief
+
+**Mission.** You are the data team at a fictional taxi-management company that buys TLC data to benchmark its own fleet. The CEO wants a one-page dashboard, updated daily, that lets her answer three things at a glance:
+
+1. **Revenue trend.** Is daily revenue growing, flat, or declining over the last 12 weeks? Broken down by borough.
+2. **Tip rate by payment type.** Are card payers tipping more than cash payers? Has the gap changed over time?
+3. **Top zones by revenue per trip.** Which 10 pickup zones have the highest revenue per trip, and how does that compare to citywide average?
+
+**Required artifacts.**
+
+- A green `dbt build` (no failing tests) producing the gold marts the dashboard reads.
+- A Prefect deployment scheduled daily that refreshes bronze + dbt + Superset's cache.
+- A Superset dashboard with the three answers above, *and* a 4th chart of your choice.
+- A short `WRITEUP.md` (≤500 words) in the project repo: the choices you made and what you'd build next.
+- The dashboard reachable at `https://superset.example.com/dashboard/<your-slug>/` through the platform's reverse proxy.
+
+**Grading rubric.**
+
+| Criterion | Weight |
+| --- | --- |
+| End-to-end runs from a clean clone (`git clone && dvc pull && make all && dashboard loads`) | 25% |
+| dbt tests are present, meaningful, and green | 20% |
+| Dashboard answers the three questions clearly (no ambiguity, no chart junk) | 25% |
+| Pipeline reliability (retries, alerts, no manual runs in the last week) | 15% |
+| Writeup quality | 15% |
+
+## Step 1 — Install Superset
+
+Superset has its own database (metadata about dashboards, users, queries) which is separate from the analytics DB it queries. Give it its own Postgres role:
+
+```bash
+docker exec -it gitea-postgres psql -U gitea -d postgres -c "
+  CREATE DATABASE superset;
+  CREATE USER superset WITH PASSWORD '__superset_password__';
+  GRANT ALL PRIVILEGES ON DATABASE superset TO superset;
+"
+```
+
+`/opt/superset/docker-compose.yml`:
+
+```yaml
+services:
+  superset:
+    image: apache/superset:4.0.2
+    container_name: superset
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - SUPERSET_SECRET_KEY=__a_long_random_value__
+      - DATABASE_URL=postgresql+psycopg2://superset:__superset_password__@localhost:5432/superset
+      - PYTHONPATH=/app/pythonpath
+    volumes:
+      - /opt/superset/pythonpath:/app/pythonpath
+      - /opt/superset/data:/app/superset_home
+    command: >
+      bash -c "superset db upgrade
+        && superset fab create-admin --username admin --firstname Admin --lastname User
+            --email admin@example.com --password __admin_password__ || true
+        && superset init
+        && /usr/bin/run-server.sh"
+
+  superset-redis:
+    image: redis:7-alpine
+    container_name: superset-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+```
+
+A minimal `superset_config.py` in `/opt/superset/pythonpath/`:
+
+```python
+import os
+from cachelib.redis import RedisCache
+
+CACHE_CONFIG = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_DEFAULT_TIMEOUT": 300,
+    "CACHE_KEY_PREFIX": "superset_",
+    "CACHE_REDIS_HOST": "localhost",
+    "CACHE_REDIS_PORT": 6379,
+}
+DATA_CACHE_CONFIG = CACHE_CONFIG
+
+FEATURE_FLAGS = {
+    "DASHBOARD_RBAC": True,
+    "EMBEDDED_SUPERSET": True,
+    "DASHBOARD_CACHE": True,
+}
+
+ROW_LIMIT = 100_000
+SQLLAB_TIMEOUT = 300
+```
+
+Bring it up:
+
+```bash
+sudo docker compose -f /opt/superset/docker-compose.yml up -d
+sudo docker logs -f superset
+```
+
+UI on `:8088`; route through the reverse proxy to `superset.example.com`.
+
+## Step 2 — Connect the warehouse
+
+Login → `Settings → Database Connections → + Database`. Use the SQLAlchemy URI:
+
+```
+postgresql+psycopg2://dbt:__dbt_password__@localhost:5432/analytics
+```
+
+Test connection. If it fails, the network namespace is wrong — Superset is running with `network_mode: host`, so `localhost` is the GPU server itself, not the container. That's intentional; if you switched to bridge networking, the URI is `host.docker.internal` or the bridge IP.
+
+Restrict the connection: in the connection settings, **uncheck DML allowed**. Superset users will write queries, not `INSERT`s. The dbt user is the one that writes; Superset reads via a read-only counterpart in real deployments (`CREATE USER superset_read WITH PASSWORD ... ; GRANT USAGE ON SCHEMA gold TO superset_read; GRANT SELECT ON ALL TABLES IN SCHEMA gold TO superset_read;`). For the course, the same `dbt` role with DML disabled in Superset is good enough.
+
+## Step 3 — Datasets, not "raw tables"
+
+In Superset, a **dataset** wraps a table or a SQL statement and adds friendly column names, metric definitions, and access policies. The dashboard reads datasets, not tables.
+
+Register three datasets pointing at the gold marts:
+
+- `agg_daily_borough_revenue` — your daily revenue table from module 06.
+- `fct_trips` — the trip-grain fact.
+- `dim_pickup_zone` — the zone dimension.
+
+In each dataset's `Edit → Metrics` tab, define metrics that the dashboard then uses by name:
+
+| Dataset | Metric | SQL |
+| --- | --- | --- |
+| `agg_daily_borough_revenue` | `revenue` | `SUM(revenue)` |
+| `agg_daily_borough_revenue` | `tip_rate` | `SUM(tip_amount) / NULLIF(SUM(fare_amount), 0)` |
+| `fct_trips` | `trips` | `COUNT(*)` |
+| `fct_trips` | `revenue_per_trip` | `SUM(total_amount) / NULLIF(COUNT(*), 0)` |
+
+The point of metrics is that the dashboard never re-implements them. If the definition of "tip rate" changes, you change it once in the metric — every chart that uses it updates.
+
+## Step 4 — Build the three charts
+
+### Chart 1 — Revenue trend by borough (line chart)
+
+- Dataset: `agg_daily_borough_revenue`
+- Time grain: Week
+- Time range: Last 12 weeks
+- Metrics: `revenue`
+- Dimensions: `borough` (color)
+
+Add an annotation: a vertical line at the date the dashboard was first published. Future-you will appreciate knowing when measurements started being trusted.
+
+### Chart 2 — Tip rate by payment type over time (area chart)
+
+- Dataset: `fct_trips`
+- Time grain: Month
+- Time range: Last 24 months
+- Metrics: `SUM(tip_amount) / NULLIF(SUM(fare_amount), 0)` as `tip_rate`
+- Dimensions: `payment_type` (with the integers mapped to "Card", "Cash", "No charge", "Dispute" via a `case` expression).
+
+Two patterns worth using: rename axes for human-readability ("Tip rate" not `tip_rate`), and format the y-axis as a percentage.
+
+### Chart 3 — Top-10 zones by revenue per trip (bar chart)
+
+- Dataset: `fct_trips` joined to `dim_pickup_zone` (write the SQL directly in a virtual dataset for this one).
+- Metrics: `revenue_per_trip`
+- Dimensions: `zone_name`
+- Top N: 10 by `revenue_per_trip`
+- Add a horizontal reference line at the citywide average for comparison.
+
+### Chart 4 — Your call
+
+Pick the one chart you'd want if you only had one. Common good picks: a heatmap of trips by hour-of-day × day-of-week, a calendar heatmap of daily revenue, a small-multiple of borough × month.
+
+## Step 5 — Assemble the dashboard
+
+`+ Dashboard → Drag in the four charts`. Two layout principles:
+
+- **The most important answer is top-left.** Eyes go there first.
+- **Filters across the top.** Date range, borough, payment type. The dashboard should be useful for 80% of questions without anyone editing the underlying charts.
+
+Add a markdown panel at the top with two sentences: what this dashboard is for and who owns it. The "who owns it" line is the part dashboards skip and regret.
+
+## Step 6 — Row-level security
+
+Two scenarios that motivate RLS:
+
+- Different students/analysts should see different boroughs.
+- The CEO's view is unrestricted; the borough manager's view is filtered to their borough.
+
+In Superset: `Settings → Row Level Security → + Rule`. Create a rule on `agg_daily_borough_revenue`:
+
+| Field | Value |
+| --- | --- |
+| Tables | `agg_daily_borough_revenue` |
+| Roles | `borough_manager` |
+| Group key | `borough_filter` |
+| Clause | `borough = '{{ current_user_email() \|\| "" }}'`-derived expression, or a lookup table join |
+
+The clause is a SQL fragment appended to every query. Audit a few queries in `SQL Lab → Saved queries` to confirm it's actually being applied — RLS that silently doesn't fire is worse than no RLS.
+
+## Step 7 — Schedule a daily refresh
+
+Three pieces refresh daily, in order:
+
+1. **Bronze ingestion + dbt build** — Prefect deployment from module 07, 04:00 UTC.
+2. **Superset chart cache** — Superset has its own scheduled refresh (`Charts → Schedule → Cron`). Set 05:00 UTC, after dbt finishes.
+3. **A dashboard email** to the stakeholder, sent by Superset, attaching the dashboard as a PDF. `Alerts & Reports → + Report`.
+
+Stakeholders open an email in the morning, not a URL.
+
+## Step 8 — Embed (optional, recommended)
+
+For a dashboard the public-ish company intranet should embed:
+
+- Generate a **guest token** via Superset's API.
+- The intranet page uses the `@superset-ui/embedded-sdk` JS library to load the dashboard.
+- The token is short-lived (30 min) and scoped to one dashboard.
+
+For a course this is optional polish but it's the pattern that becomes essential in any real org — dashboards almost never live on the BI tool's own domain.
+
+## ADR 0008 — Superset over Metabase
+
+`/srv/shared/adr/0008-bi-tool.md`:
+
+```markdown
+# ADR 0008 — BI tool: Superset over Metabase
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+The platform needs a BI tool to expose dbt marts as dashboards. Three real
+options on a self-hosted, open-source basis: Superset, Metabase, and Lightdash.
+
+## Decision
+Superset 4. Postgres metadata store, Redis cache, embedded enabled, RBAC and
+RLS on.
+
+## Consequences
+- Pro: deepest customization surface, JS embed support, role-based access,
+  per-dashboard RLS.
+- Pro: SQL Lab is genuinely good for ad-hoc exploration.
+- Con: install and config has more moving parts than Metabase's "one Docker
+  image and you're done" experience.
+- Con: chart-building UX is less friendly than Metabase for non-SQL users.
+
+## Alternatives considered
+- Metabase. Better for non-technical end-users; less powerful when you
+  need real metrics, RLS, or embed.
+- Lightdash. Native dbt integration is elegant; smaller ecosystem and
+  newer project. Revisit in a year.
+```
+
+## Recap
+
+You've finished Capstone 2. You should have:
+
+- Live dashboards behind a TLS-terminated proxy.
+- A scheduled, retry-bounded refresh chain (Prefect → dbt → Superset cache).
+- A writeup of choices and tradeoffs.
+
+The data-engineering half of the platform is now real. Next: the ML side. The first ML capstone — tabular — comes immediately, and reuses the warehouse you just built.
+
+---
+
+Next: **[09 — First ML model](/learn/data-science/09-tabular-ml-capstone)** *(Capstone 1)*.

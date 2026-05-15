@@ -1,0 +1,160 @@
+---
+title: "Overview"
+sidebar_label: "00 — Overview"
+description: "What this track covers, who it's for, and how to use it."
+estimated_minutes: 10
+last_updated: 2026-05-15
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+This is a self-paced, opinionated track on doing real **data science** — from an empty on-prem server with two GPUs through to four shipped capstones: a tracked tabular ML model behind a service endpoint, a modeled data warehouse driving live dashboards, a self-hosted RAG application running on a private LLM, and a multi-GPU computer-vision model trained on data you annotated yourself. By the end you will have stood up the platform a working data team would actually depend on, and used it to ship work in each of the four DS domains.
+
+The track is opinionated. It teaches the choices a small DS team would make today — **JupyterHub** for multi-user notebooks, **Slurm** for GPU scheduling, **MinIO** as the object store, **MLflow** for tracking and registry, **vLLM** for self-hosted inference, **Prefect** for orchestration, **dbt** for warehouse modeling, **Superset** for BI, **Label Studio** for annotation, **Prometheus + Grafana + Langfuse + Evidently** for observability. Where alternatives exist (Airflow, Kubeflow, KServe, Triton, Qdrant) I name them and say why we picked the other thing.
+
+## Who this is for
+
+Engineers and analysts who:
+
+- Write Python comfortably — packages, virtualenvs, basic typing, the difference between a script and a library.
+- Read and write SQL — joins, window functions, subqueries.
+- Are comfortable on a Linux shell — SSH, systemd, `ps`/`grep`/`curl`/`tmux`.
+- Have stats literacy — distributions, hypothesis tests, regression intuition. No measure theory required.
+- Are *not* trying to become a research ML scientist. This is the working-engineer's surface-area version of modern DS.
+
+If you've never trained a model or never written a SQL `GROUP BY`, work through a Kaggle "Titanic" tutorial and an intro SQL course first. A weekend; come back.
+
+## What you'll build
+
+A real platform, then four real projects on it. The platform:
+
+- **JupyterHub** with a DockerSpawner — per-user containers, GPU pass-through where requested.
+- **Gitea** for self-hosted git, PRs, and CI via Gitea Actions.
+- **MinIO** as an S3-compatible object store backing the data lake, MLflow artifacts, and DVC remotes.
+- **Postgres** as the shared metadata store, the warehouse, and the vector DB (via `pgvector`).
+- **MLflow** tracking server with the Model Registry promoted-by-tag pattern.
+- **Slurm** scheduling jobs across two **NVIDIA L40S** GPUs (48 GB VRAM each, 96 GB total).
+- **vLLM** serving a 7–14B LLM with an OpenAI-compatible API for the whole cohort.
+- **Prefect**, **dbt**, **Superset** for the data engineering and analytics stack.
+- **Label Studio** for image and text annotation.
+- **Prometheus + Grafana**, **Langfuse**, and **Evidently** for the three observability surfaces (system, LLM, drift).
+
+The four capstones — each one a real artifact, not a notebook demo:
+
+| # | Capstone | What it is |
+| --- | --- | --- |
+| 1 | **Tabular ML** | Calibrated churn/credit-risk model, tracked with Optuna in MLflow, promoted in the registry, served behind FastAPI with drift monitoring. |
+| 2 | **Data engineering + analytics** | Scheduled Prefect ingestion → bronze/silver/gold on MinIO + Postgres → dbt with tests and docs → Superset dashboards answering defined business questions. |
+| 3 | **NLP / LLM** | RAG application over a real corpus on a self-hosted vLLM endpoint, with hybrid retrieval, reranking, Langfuse tracing, and a ≥30-example offline eval set. |
+| 4 | **Computer vision** | Custom-annotated dataset (≥500 images in Label Studio), transfer-learned model trained via DDP across both L40S, exported to ONNX, served with batched FastAPI inference. |
+
+## The platform you'll stand up
+
+<Whiteboard client:load data={{
+  nodes: [
+    { id: "users",   position: { x: 80,  y: 0 },   data: { label: "Cohort (≤6 students)" }, style: { background: "#dbeafe", border: "1px solid #1d4ed8", borderRadius: 8, padding: 10, color: "#1e3a8a", width: 200, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+
+    { id: "hub",     position: { x: 0,   y: 100 }, data: { label: "JupyterHub" },           style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "gitea",   position: { x: 170, y: 100 }, data: { label: "Gitea (git + CI)" },     style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "super",   position: { x: 340, y: 100 }, data: { label: "Superset (BI)" },        style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "label",   position: { x: 510, y: 100 }, data: { label: "Label Studio" },         style: { background: "#e5e7eb", border: "1px solid #6b7280", borderRadius: 8, padding: 10, color: "#1f2937", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+
+    { id: "slurm",   position: { x: 0,   y: 220 }, data: { label: "Slurm scheduler" },      style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#78350f", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "mlflow",  position: { x: 170, y: 220 }, data: { label: "MLflow tracking + registry" }, style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#78350f", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "prefect", position: { x: 340, y: 220 }, data: { label: "Prefect + dbt" },        style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#78350f", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "vllm",    position: { x: 510, y: 220 }, data: { label: "vLLM (OpenAI-compat)" }, style: { background: "#fef3c7", border: "1px solid #b45309", borderRadius: 8, padding: 10, color: "#78350f", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+
+    { id: "minio",   position: { x: 0,   y: 340 }, data: { label: "MinIO (S3)" },           style: { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "pg",      position: { x: 170, y: 340 }, data: { label: "Postgres + pgvector" },  style: { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "dvc",     position: { x: 340, y: 340 }, data: { label: "DVC (data versions)" },  style: { background: "#dcfce7", border: "1px solid #15803d", borderRadius: 8, padding: 10, color: "#14532d", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+    { id: "gpus",    position: { x: 510, y: 340 }, data: { label: "2× NVIDIA L40S (96 GB)" }, style: { background: "#fee2e2", border: "1px solid #b91c1c", borderRadius: 8, padding: 10, color: "#7f1d1d", width: 200, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+
+    { id: "obs",     position: { x: 170, y: 460 }, data: { label: "Prometheus + Grafana · Langfuse · Evidently" }, style: { background: "#f3e8ff", border: "1px solid #7e22ce", borderRadius: 8, padding: 10, color: "#581c87", width: 380, textAlign: "center", fontWeight: 600, fontSize: 12 } },
+  ],
+  edges: [
+    { id: "u-hub",   source: "users", target: "hub",   style: { stroke: "#1f2937" } },
+    { id: "u-gitea", source: "users", target: "gitea", style: { stroke: "#1f2937" } },
+    { id: "u-super", source: "users", target: "super", style: { stroke: "#1f2937" } },
+    { id: "u-label", source: "users", target: "label", style: { stroke: "#1f2937" } },
+
+    { id: "hub-slurm",  source: "hub", target: "slurm",  style: { stroke: "#1f2937" } },
+    { id: "hub-mlflow", source: "hub", target: "mlflow", style: { stroke: "#1f2937" } },
+    { id: "hub-vllm",   source: "hub", target: "vllm",   style: { stroke: "#1f2937" } },
+    { id: "prefect-pg", source: "prefect", target: "pg", style: { stroke: "#1f2937" } },
+    { id: "prefect-minio", source: "prefect", target: "minio", style: { stroke: "#1f2937" } },
+
+    { id: "slurm-gpu",   source: "slurm",  target: "gpus",  style: { stroke: "#b91c1c", strokeDasharray: "6 6" }, animated: true },
+    { id: "vllm-gpu",    source: "vllm",   target: "gpus",  style: { stroke: "#b91c1c", strokeDasharray: "6 6" }, animated: true },
+    { id: "mlflow-minio",source: "mlflow", target: "minio", style: { stroke: "#1f2937" } },
+    { id: "mlflow-pg",   source: "mlflow", target: "pg",    style: { stroke: "#1f2937" } },
+    { id: "dvc-minio",   source: "dvc",    target: "minio", style: { stroke: "#1f2937" } },
+    { id: "super-pg",    source: "super",  target: "pg",    style: { stroke: "#1f2937" } },
+
+    { id: "obs-hub",     source: "obs", target: "hub",     style: { stroke: "#6b7280", strokeDasharray: "4 4" } },
+    { id: "obs-slurm",   source: "obs", target: "slurm",   style: { stroke: "#6b7280", strokeDasharray: "4 4" } },
+    { id: "obs-vllm",    source: "obs", target: "vllm",    style: { stroke: "#6b7280", strokeDasharray: "4 4" } },
+    { id: "obs-prefect", source: "obs", target: "prefect", style: { stroke: "#6b7280", strokeDasharray: "4 4" } },
+  ],
+}} height={560} />
+
+**Reading the diagram:**
+
+- **Blue layer** — cohort-facing surfaces. Everything a student opens in a browser or pushes git to.
+- **Grey layer** — the four self-service entry points: notebooks, code, dashboards, annotations.
+- **Amber layer** — platform services. Schedulers, registries, pipelines, and the LLM endpoint.
+- **Green / red layer** — state and compute. Object store, metadata DB, dataset versions, and the two GPUs.
+- **Purple layer** — observability, dotted-grey edges into everything it watches.
+- **Dashed red** — GPU consumption paths (Slurm jobs, vLLM inference).
+
+## The 17-module map
+
+| # | Module | What you build |
+| --- | --- | --- |
+| 00 | Overview *(this page)* | — |
+| 01 | Infrastructure: the GPU server | User accounts, ProxyJump SSH, GPU verification, shared-server etiquette, the first ADR |
+| 02 | The toolchain | JupyterHub multi-user, `uv` envs, Gitea, pre-commit, Docker basics |
+| 03 | The reproducibility stack | MinIO + DVC + MLflow tracking server + a cookiecutter project template |
+| 04 | GPU scheduling with Slurm | `gres:gpu`, `sbatch`/`srun`, fair-share, a working multi-user GPU queue |
+| 05 | The data lake: bronze ingestion | Parquet on MinIO, source connectors, partitioning, compaction |
+| 06 | The warehouse: Postgres + dbt | Staging → marts, tests and docs, snapshots, incremental models |
+| 07 | Orchestration with Prefect | Flows, retries, idempotency, backfills, observability of pipelines |
+| 08 | Analytics with Superset *(Capstone 2)* | Dashboards on the modeled warehouse — the data-engineering capstone |
+| 09 | First ML model *(Capstone 1)* | Tabular pipeline + Optuna + MLflow registry — the business-ML capstone |
+| 10 | Serving and drift | FastAPI + Evidently + Prometheus/Grafana wired to the production model |
+| 11 | Self-hosted LLM | vLLM on the L40S, model selection, quantization, OpenAI-compatible endpoint |
+| 12 | RAG application *(Capstone 3)* | pgvector + hybrid retrieval + reranker + Langfuse evals — the LLM capstone |
+| 13 | LoRA fine-tuning | QLoRA on a 7–8B base with `peft` and `trl`, task-specific eval harness |
+| 14 | Computer vision *(Capstone 4)* | PyTorch + Label Studio + DDP across both GPUs, ONNX export, batched serving |
+| 15 | CI/CD with Gitea Actions | Lint, test, train-on-tag, deploy-on-merge — for every project on the platform |
+| 16 | What's next | The roadmap — what we deliberately left out and where to find it |
+
+Each module assumes the previous ones. Expect 45–90 minutes per module on a real server; capstone modules (08, 09, 12, 14) run longer because they end in a shipped artifact.
+
+## How to use this track
+
+Three patterns work:
+
+- **Sequential.** Start at 01, walk to 14, then ship one project to production in 15. Best for a first-time cohort.
+- **Reference.** Jump to the module you need from the sidebar. Best if you already have a platform and want one specific layer (e.g., "I have JupyterHub, I just need vLLM").
+- **Instructor-led + async student work.** Walk through one module per session live; students execute the steps on their own accounts between sessions.
+
+## Prerequisites and setup
+
+- A **Linux host** with **2× NVIDIA L40S** (or any modern dual-GPU box with ≥48 GB total VRAM). Smaller setups work for everything except module 13 (LoRA fine-tuning) and module 14 (DDP CV training).
+- **Root or sudo** on that host to provision user accounts and install services in module 01.
+- **SSH from each student's laptop** to that host. A jump host is fine — module 01 covers the ProxyJump pattern.
+- A **GitHub account** per student. Used initially to ssh in; switches to **Gitea** on the server in module 02.
+- **No Python, no CUDA, no Docker installed up front.** Module 02 installs the toolchain.
+
+## A note on what's *not* here
+
+This track is deliberately focused on **doing data science on a single shared server**. The following are out of scope and live in adjacent tracks:
+
+- **Kubernetes-based ML platforms.** Kubeflow, KServe, and the multi-cluster scaling story have their own track ([Kubeflow](/learn/kubeflow)).
+- **Cloud-native MLOps.** SageMaker, Vertex AI, Databricks. The patterns transfer, but this track is intentionally on-prem.
+- **Deep theory.** No proofs, minimal derivations. We pick the best practical default and point at the paper for the curious.
+- **Pure data science (no platform).** If you want to read CSVs into a notebook and call it a day, this track is overkill — go through a Kaggle competition first.
+
+---
+
+Next: **[01 — Infrastructure: the GPU server](/learn/data-science/01-infrastructure-the-gpu-server)**.

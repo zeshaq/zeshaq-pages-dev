@@ -1,0 +1,104 @@
+---
+title: "What's next"
+sidebar_label: "16 — What's next"
+description: "The roadmap — what we deliberately left out of this track and where to find it when you need it. The cohort retrospective questions. The track-graduate's next moves."
+estimated_minutes: 20
+last_updated: 2026-05-15
+---
+
+You've finished the track. By now you should have:
+
+- A working multi-user ML platform on the GPU server.
+- Four shipped capstones (tabular ML, data engineering, RAG, computer vision).
+- A CI/CD discipline that deploys every project repeatably.
+- A small library of ADRs documenting the choices the platform is built on.
+
+This last module is two things: an honest list of what was deliberately *out* of scope, and a roadmap for where to go next.
+
+## What this track deliberately did not cover
+
+The track had a strong scoping bias: **one server, six students, four real capstones, the practices that make those real**. Things outside that frame:
+
+### Kubernetes-native ML
+
+We ran Slurm, not Kubernetes. The right answer at ≥20 users or multiple hosts is k8s + a GPU operator + Kueue or Volcano + Argo Workflows. The [Kubeflow track](/learn/kubeflow) covers the full upstream Kubeflow story (KFP, Katib, KServe, multi-tenancy with Profiles). Pick that next if your team is already on OpenShift or EKS.
+
+### Streaming and real-time
+
+Everything in this track is batch or on-request — no Kafka, no streaming feature stores, no real-time scoring at message-bus throughput. If you need feature-store streaming, look at Feast + Redis or Tecton; for full streaming pipelines, look at Kafka + Flink or Materialize. The Open Liberty track covers a Kafka-on-one-VM pattern that transfers to the DS side cleanly.
+
+### Distributed training across hosts
+
+DDP across two GPUs on one host (module 14) is one thing; DDP across two hosts (or `FSDP` for 70B+ models) is another. The pattern is similar but the networking — NCCL over Infiniband or 100 GbE, sometimes UCX — is its own discipline. Start with [PyTorch's FSDP docs](https://docs.pytorch.org/docs/stable/fsdp.html) when you need it.
+
+### Multi-model serving and routing
+
+We serve one LLM at a time, with adapters as the swap unit. Real production teams hosting many distinct models want a routing layer (Triton's model repository, BentoML, LMDeploy's multi-model serving). The skills transfer; the operational surface is bigger.
+
+### Fairness and bias auditing
+
+The capstones produce models with measurable performance. They do **not** include a subgroup-fairness audit, an adversarial-bias evaluation, or a model-card audit-trail. For real deployments, see Microsoft's `fairlearn`, Aequitas, or Holistic AI's framework. The DevSecOps track covers the supply-chain side of model integrity (SBOMs, signed models).
+
+### Privacy-preserving ML
+
+No differential privacy, federated learning, or secure aggregation. If you're training on PII, what you learned here is necessary but not sufficient.
+
+### Causal inference
+
+The track is squarely predictive — "what's the probability X?" We did not cover causal estimation, A/B test analysis, uplift modeling, or DAG-based reasoning about interventions. For a working analyst, this is the most impactful gap. Recommend: *Causal Inference for the Brave and True* (Matheus Facure, free online), then *The Effect* (Nick Huntington-Klein).
+
+### Time-series forecasting
+
+Tabular ML covered point-in-time classification. Forecasting (Prophet, sktime, GluonTS, Nixtla's mlforecast, foundation models like Chronos) is its own domain. The infrastructure you built transfers; the modeling techniques are different.
+
+### Agents and tool-using LLMs
+
+We built a RAG application (retrieval + generation), not an agentic application (planning, looping, tool use). For that: the [Agentic AI track](/learn/agentic-ai) covers the agent loop, MCP, planning, evaluation, and production. The vLLM endpoint you built supports tool-calling out of the box — agents are the next thing to wire to it.
+
+### Productionizing the platform itself
+
+The platform you built is *production-shaped* but not *operationally hardened*. Missing:
+
+- Off-site backup of MinIO, MLflow Postgres, Gitea.
+- Disaster recovery runbook ("the GPU server's NVMe failed — restore by...").
+- Real authentication for every service (we used basic auth and shared keys). LDAP/OIDC/SSO with Authelia or Keycloak is the next step.
+- Network segmentation. The GPU server runs ~20 services on `localhost`; in a real org these split across hosts with mTLS.
+- Audit logging across the platform.
+
+These are *easy* to learn, important to do, and out of scope here.
+
+## Cohort retrospective
+
+End of course: spend one session as a group answering these. Capture the answers in a shared doc that becomes input to the next cohort.
+
+1. **Which module was harder than expected, and why?** Adjust the syllabus.
+2. **Which module was easier, and why?** Tighten or expand.
+3. **Which tools fought us the most?** (Common picks across cohorts: Slurm install, MLflow's S3 endpoint quirks, vLLM's first-run warmup, Label Studio's annotator UX.)
+4. **What did students wish they'd had before module 01?** Prerequisite material.
+5. **What would graduates' first three months of "real work" look like, and is the track preparing them for that?** If not, add a capstone-after-the-capstone.
+6. **Which capstone produced the strongest portfolio piece?** Bias future cohorts toward that one for the half who only get to do one.
+
+## What a track graduate should do next
+
+Three good paths, depending on where the student is heading:
+
+- **DS engineer at a data-mature org.** Read *Designing Machine Learning Systems* (Chip Huyen). Then ship one more capstone — your choice of domain — through a public Gitea/GitHub repo with a writeup.
+- **DS engineer at an early-stage company.** Read *Fundamentals of Data Engineering* (Reis & Housley). Build the same platform on a cloud VM and run it as a side project; the operational lessons are different.
+- **ML researcher / applied scientist.** The infrastructure piece is now a non-issue. Spend the next quarter on a research direction — interpretability, scaling laws, alignment, your domain's specific open problems. The [Agentic AI track](/learn/agentic-ai) is the next-step content here.
+
+## A short list of reading worth keeping
+
+- **General DS:** *Hands-On Machine Learning* (Géron) — still the best survey textbook; *Approaching (Almost) Any ML Problem* (Thakur) — the engineer's playbook.
+- **Data engineering:** *Fundamentals of Data Engineering* (Reis & Housley); the dbt and Prefect docs in full.
+- **MLOps:** *Designing Machine Learning Systems* (Huyen); *Reliable Machine Learning* (Chen et al.).
+- **LLMs:** *Hands-On Large Language Models* (Alammar & Grootendorst); the vLLM and Langfuse docs.
+- **Computer vision:** *Deep Learning with PyTorch* (Stevens et al.); the `timm` and Ultralytics docs.
+- **Statistics intuition (a gap students often have):** *Statistical Rethinking* (McElreath) — accessible, foundational.
+
+## Closing
+
+This track is opinionated and incomplete. Both on purpose. An opinionated curriculum gives students choices they can defend; an incomplete one leaves room for the things they'll learn on the job. Use it as a starting point for your own cohort, fork it, change the choices, and tell me what you'd do differently — that's how the next version gets better.
+
+---
+
+← Back to **[the track home](/learn/data-science)**.

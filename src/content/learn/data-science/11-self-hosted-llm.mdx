@@ -1,0 +1,290 @@
+---
+title: "Self-hosted LLM with vLLM"
+sidebar_label: "11 — Self-hosted LLM (vLLM)"
+description: "Run a 7–14B-parameter LLM on one L40S with vLLM, behind an OpenAI-compatible API the whole cohort uses. Model selection, quantization, batching, and the load test that decides which model wins."
+estimated_minutes: 90
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- **vLLM** serving a 7–14B-parameter LLM on **one L40S** (leaving the other for training jobs).
+- An **OpenAI-compatible endpoint** that any LangChain, LlamaIndex, or raw `openai` SDK call points at, with **no code changes** from "use GPT-4 in dev" to "use the platform model in prod."
+- A clear understanding of **AWQ vs. GPTQ vs. FP16** tradeoffs on this hardware, with measured numbers from your own machine.
+- A **load test** showing the server's tokens-per-second and concurrency ceiling for the chosen model.
+- A **shared embedding endpoint** for the RAG capstone in module 12.
+
+## Why vLLM, not Ollama or text-generation-inference
+
+Three serious options:
+
+| Option | Strengths | Weaknesses |
+| --- | --- | --- |
+| **vLLM** | Industry-best throughput via PagedAttention; OpenAI-compatible API; strong quantization support; production-grade | Slightly less friendly for "I want to try 10 models in an afternoon" |
+| **Ollama** | Trivial install, friendly model library, great laptop story | Lower throughput; weaker OpenAI compatibility; single-user assumptions |
+| **HF TGI** | Polished, similar throughput goals | Less momentum than vLLM right now; commercial license friction |
+
+For a multi-user course where six people are hitting the endpoint concurrently and we want concurrency-correct batching, vLLM wins. For "try a new model on my laptop for an hour" use Ollama and don't apologize.
+
+## Step 1 — Pick the model
+
+The choice you make here is the model the whole cohort uses for the next two modules. Optimize for:
+
+- **Fits comfortably on one L40S.** 48 GB VRAM is enough for 14B models at FP16, 30B at 4-bit. We leave headroom for the KV cache.
+- **Strong instruction following.** This is RAG and tool-using territory; raw next-token quality matters less than "does it follow the schema."
+- **Permissive license.** Don't pick something the cohort can't redistribute their results from.
+
+Three reasonable picks as of mid-2026:
+
+| Model | Params | Best fit | License |
+| --- | --- | --- | --- |
+| **Qwen2.5-14B-Instruct** | 14B | FP16 fits, strong tool use | Apache 2.0 |
+| **Llama-3.1-8B-Instruct** | 8B | FP16 plenty of headroom for big context | Llama community license |
+| **Mistral-Small-3-24B-Instruct** | 24B | AWQ 4-bit fits with room | Apache 2.0 |
+
+We'll use **Qwen2.5-14B-Instruct** as the default in the rest of the track because it's a sweet-spot on this hardware. Substitute freely.
+
+## Step 2 — Cache the weights
+
+Download once into `/srv/shared/models/`. That way every restart is fast and the cohort isn't pulling 30 GB from HuggingFace six times:
+
+```bash
+sudo -u <hf_user> bash -lc "
+  pip install --upgrade huggingface_hub
+  huggingface-cli login                                  # paste a read token
+  huggingface-cli download Qwen/Qwen2.5-14B-Instruct \
+    --local-dir /srv/shared/models/Qwen2.5-14B-Instruct
+"
+```
+
+`/srv/shared/models/` is the lake's `_base-models/` exception from ADR 0003 — not in DVC, not in git, but stable enough to live on disk.
+
+## Step 3 — Run vLLM
+
+The simplest possible config. `/opt/vllm/docker-compose.yml`:
+
+```yaml
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.6.5
+    container_name: vllm
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=__hf_token__
+      - VLLM_API_KEY=__platform_internal_key__
+    volumes:
+      - /srv/shared/models:/models
+    ipc: host
+    ports:
+      - "8000:8000"
+    command: >
+      --model /models/Qwen2.5-14B-Instruct
+      --served-model-name qwen2.5-14b
+      --gpu-memory-utilization 0.85
+      --max-model-len 32768
+      --enable-prefix-caching
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']                          # pin to GPU 0
+              capabilities: [gpu]
+```
+
+Five choices worth understanding:
+
+- **`--gpu-memory-utilization 0.85`** leaves ~7 GB free for the KV cache to grow. Higher values mean OOM during a long-context request.
+- **`--max-model-len 32768`** caps context. vLLM allocates KV cache for this length — if you set 128k, the KV cache will eat your VRAM. Tune to your real use.
+- **`--enable-prefix-caching`** is free latency for RAG. If 100 requests share a 5 K-token system prompt, vLLM caches it once.
+- **`device_ids: ['0']`** pins vLLM to GPU 0. GPU 1 stays free for Slurm training jobs.
+- **`VLLM_API_KEY`** turns on the OpenAI-style `Authorization: Bearer ...` requirement. Use it; never run an open endpoint on a shared server.
+
+Bring it up:
+
+```bash
+sudo docker compose -f /opt/vllm/docker-compose.yml up -d
+sudo docker logs -f vllm
+```
+
+First start takes ~60 seconds to load the FP16 weights. The log line `Application startup complete.` means it's ready.
+
+## Step 4 — Use it
+
+From any notebook or shell:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://<gpu-server>:8000/v1",
+    api_key="__platform_internal_key__",
+)
+
+resp = client.chat.completions.create(
+    model="qwen2.5-14b",
+    messages=[
+        {"role": "system", "content": "You are a concise SQL analyst."},
+        {"role": "user", "content": "Write a SQL query that returns the top 5 boroughs by average tip rate from a table called fct_trips with columns total_amount, fare_amount, tip_amount, pickup_borough."}
+    ],
+    temperature=0.2,
+)
+print(resp.choices[0].message.content)
+```
+
+The whole cohort uses this endpoint by setting `OPENAI_BASE_URL` and `OPENAI_API_KEY` env vars. Any code that already speaks the OpenAI API (LangChain, LlamaIndex, raw SDK calls) works untouched.
+
+## Step 5 — AWQ / GPTQ when you need more VRAM headroom
+
+FP16 of a 14B model is ~28 GB. On an L40S with 48 GB you have room for a healthy KV cache. The moment you want a 30B+ model, quantize.
+
+Two reasonable quantization formats:
+
+- **AWQ** — Activation-aware Weight Quantization, 4-bit, very good preserved quality.
+- **GPTQ** — older, similar idea, slightly broader model availability.
+
+Run a pre-quantized AWQ version of a bigger model:
+
+```yaml
+command: >
+  --model Qwen/Qwen2.5-32B-Instruct-AWQ
+  --served-model-name qwen2.5-32b-awq
+  --quantization awq
+  --gpu-memory-utilization 0.85
+  --max-model-len 16384
+```
+
+Expect ~70% of FP16 throughput at ~25% of the weight memory. For most RAG and chat use cases the quality drop is imperceptible.
+
+## Step 6 — Load test
+
+The right number for "how many concurrent users can we serve" comes from actually testing. The `vllm/vllm-bench` image makes this easy:
+
+```bash
+docker run --rm --net host -e OPENAI_API_KEY=__platform_internal_key__ \
+  vllm/vllm-openai:v0.6.5 \
+  python -m vllm.entrypoints.openai.api_server.bench \
+    --base-url http://localhost:8000/v1 \
+    --model qwen2.5-14b \
+    --concurrency 1,4,8,16,32 \
+    --num-prompts 200 \
+    --input-len 256 --output-len 256
+```
+
+Expected on one L40S with Qwen2.5-14B FP16:
+
+| Concurrency | Throughput (tok/s) | p50 latency | p99 latency |
+| --- | --- | --- | --- |
+| 1 | ~70 | 3.6 s | 4.0 s |
+| 8 | ~520 | 4.1 s | 5.5 s |
+| 32 | ~1100 | 7.5 s | 11.0 s |
+
+Aggregate throughput scales nicely (vLLM's continuous batching is doing real work); per-request latency creeps up. The number to remember is *your* per-request latency at *your* expected concurrency — quote it in the runbook.
+
+## Step 7 — Embedding endpoint
+
+RAG needs an embedding model. Run a second small vLLM (or a dedicated `text-embeddings-inference` container) for `bge-large-en-v1.5` or `Qwen3-Embedding-0.6B`:
+
+```yaml
+  embedding:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    container_name: embedding
+    restart: unless-stopped
+    environment:
+      - HF_TOKEN=__hf_token__
+    ports:
+      - "8001:80"
+    volumes:
+      - /srv/shared/models:/data
+    command: >
+      --model-id /data/bge-large-en-v1.5
+      --port 80
+```
+
+Embedding models are small (under 2 GB at FP32) — running on CPU is fine and frees both GPUs.
+
+Test:
+
+```bash
+curl -s -X POST http://localhost:8001/embed \
+  -H 'Content-Type: application/json' \
+  -d '{"inputs": ["taxi tip prediction", "borough revenue"]}' | jq '.[] | length'
+```
+
+Two 1024-dim vectors come back. The RAG capstone module turns this into something real.
+
+## Step 8 — Observability for vLLM
+
+vLLM exposes a Prometheus-compatible `/metrics` endpoint. Add it to your scrape config from module 10:
+
+```yaml
+  - job_name: 'vllm'
+    static_configs:
+      - targets: ['localhost:8000']
+        labels:
+          service: 'vllm-qwen'
+```
+
+The metrics worth charting in Grafana:
+
+| Metric | Why |
+| --- | --- |
+| `vllm:gpu_cache_usage_perc` | KV cache pressure. Above 90% means context overflow is near |
+| `vllm:num_running` | Concurrent active requests |
+| `vllm:num_waiting` | Queued requests — a non-zero standing queue means oversubscribed |
+| `vllm:prompt_tokens_total` | Input tokens consumed (cost proxy if you're billing internally) |
+| `vllm:generation_tokens_total` | Output tokens generated |
+| `vllm:e2e_request_latency_seconds` | End-to-end request latency histogram |
+
+## ADR 0011 — vLLM as the platform's LLM gateway
+
+`/srv/shared/adr/0011-vllm-platform.md`:
+
+```markdown
+# ADR 0011 — vLLM as the platform LLM endpoint
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+The platform needs a self-hosted LLM endpoint usable by every project, with
+strong throughput, an OpenAI-compatible API, and operational visibility.
+
+## Decision
+A single vLLM service pinned to GPU 0 of the GPU server, serving
+Qwen2.5-14B-Instruct FP16, with prefix caching and a 32k context window.
+Behind a Bearer-key auth. Exposed as `http://<gpu-server>:8000/v1`.
+
+A second container (`text-embeddings-inference`) on CPU serves
+`bge-large-en-v1.5` embeddings at `:8001`.
+
+## Consequences
+- Pro: one endpoint, one auth, one set of metrics. Every project's
+  `OPENAI_BASE_URL` points here.
+- Pro: GPU 1 remains available for Slurm training jobs.
+- Con: only one model served at a time. Swapping models is a restart.
+  For multi-model hosting at this scale, see Triton or LMDeploy.
+
+## Alternatives considered
+- Ollama. Easier install; weaker concurrency and lower throughput. Lost on
+  the load-test result at 8+ concurrency.
+- A separate endpoint per project. Ruled out as a memory waste — every
+  project would reload the same weights.
+```
+
+## Recap and what's next
+
+You now have:
+
+- A vLLM endpoint serving a real instruction-tuned model.
+- A measured ceiling on concurrency and latency.
+- An embedding endpoint for RAG.
+- Both wired into Prometheus.
+
+Time to use it. The RAG capstone — the LLM application module — comes next.
+
+---
+
+Next: **[12 — RAG application](/learn/data-science/12-rag-capstone)** *(Capstone 3)*.

@@ -1,0 +1,302 @@
+---
+title: "LoRA fine-tuning"
+sidebar_label: "13 — LoRA fine-tuning"
+description: "QLoRA-fine-tune a 7–8B base model on a task-specific dataset using one L40S. Build a real eval harness, register the adapter in MLflow, and serve it through vLLM behind a different model name."
+estimated_minutes: 120
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- A **QLoRA-fine-tuned** 7–8B model on a task-specific dataset (instruction-style or preference-style), trained on one L40S.
+- An **eval harness** that compares the fine-tuned model against the base model on tasks you care about — not MMLU.
+- The adapter weights **registered in MLflow** and uploaded to MinIO.
+- A **second vLLM endpoint** (or a switched model name on the existing one) serving your fine-tune.
+- A clear honest answer to the question "did the fine-tune help, and where?"
+
+This module is the moment students realize fine-tuning is an *engineering* problem (data prep, eval, plumbing) more than a science problem (loss math).
+
+## When fine-tune, when not
+
+The right reflex is "RAG first, fine-tune second." Fine-tuning is appropriate when:
+
+- You need a **specific output format** the base model won't reliably produce (a fixed JSON schema, a domain-specific markup).
+- You need to **encode a style or tone** prompting can't reliably elicit (a brand voice, a specific authorial style).
+- You need **task-specific patterns** that aren't in any context window economically (a long internal taxonomy applied to every request).
+
+If your problem is "the base model doesn't *know* something," that's RAG, not fine-tuning. Stuffing facts into model weights by fine-tuning is expensive and forgetful.
+
+For this module we use a **structured-output task**: turn a free-text trip description ("yellow taxi, midtown to JFK, 4 passengers, paid by card, complaint about taking too long") into the JSON schema the warehouse's `fct_trips` table expects. It's a task where:
+
+- RAG doesn't help (there's no corpus to retrieve from).
+- The base model already does it most of the time but fails on edge cases.
+- Success is checkable with a single JSON-schema validator.
+
+## Step 1 — Build the dataset
+
+The single biggest determinant of fine-tune quality is the dataset. Spend two-thirds of your time here.
+
+Format (Hugging Face datasets' instruction style):
+
+```jsonl
+{"instruction": "Convert this trip description to the trip JSON schema.", "input": "yellow taxi, midtown to JFK, 4 passengers, paid by card, $58 fare with $9 tip, 32 minutes", "output": "{\"vendor\": \"yellow\", \"pickup_zone\": \"Midtown\", \"dropoff_zone\": \"JFK\", \"passenger_count\": 4, \"payment_type\": 1, \"fare_amount\": 58, \"tip_amount\": 9, \"duration_minutes\": 32}"}
+```
+
+Target: **2000+ examples** for QLoRA on this scale of model. Sources:
+
+- **Synthetic-but-graded.** Sample 5000 real trips from `fct_trips`, generate descriptions with the base LLM, *then hand-review* the 2000 you keep.
+- **Diverse edge cases.** A dataset where 95% are easy and 5% are hard teaches the model to skip the hard 5%. Oversample hard cases.
+- **Held-out test set.** 200+ examples never seen in training, never seen during dev-tuning. The number that goes in your writeup.
+
+Save splits to MinIO under `s3://datasets/silver/finetune-trip-extraction/{train,validation,test}.jsonl` and version them via DVC.
+
+## Step 2 — The training script
+
+We use `trl`'s `SFTTrainer` over Hugging Face Transformers with PEFT (LoRA). QLoRA = LoRA on top of a 4-bit-quantized base, which is what lets a 7–8B model train comfortably on one L40S.
+
+```python
+# src/<project>/finetune/train.py
+import os, json
+from dataclasses import dataclass
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from trl import SFTConfig, SFTTrainer
+import mlflow
+
+BASE = "Qwen/Qwen2.5-7B-Instruct"
+mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+mlflow.set_experiment("trip-extractor-lora")
+
+tokenizer = AutoTokenizer.from_pretrained(BASE)
+tokenizer.pad_token = tokenizer.eos_token
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype="bfloat16",
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    BASE, quantization_config=bnb, device_map="auto",
+)
+
+peft_config = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    bias="none", task_type="CAUSAL_LM",
+)
+
+def format_chat(ex):
+    msgs = [
+        {"role": "system", "content": "You convert trip descriptions to JSON."},
+        {"role": "user",   "content": f"{ex['instruction']}\n\n{ex['input']}"},
+        {"role": "assistant", "content": ex["output"]},
+    ]
+    return tokenizer.apply_chat_template(msgs, tokenize=False)
+
+dataset = load_dataset("json", data_files={
+    "train": "/srv/shared/datasets/finetune-trip-extraction/train.jsonl",
+    "validation": "/srv/shared/datasets/finetune-trip-extraction/validation.jsonl",
+})
+dataset = dataset.map(lambda ex: {"text": format_chat(ex)})
+
+cfg = SFTConfig(
+    output_dir="/tmp/lora-out",
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,
+    warmup_ratio=0.03,
+    lr_scheduler_type="cosine",
+    bf16=True,
+    logging_steps=20,
+    save_steps=200,
+    eval_strategy="steps", eval_steps=200,
+    max_seq_length=1024,
+    packing=False,
+    report_to=[],
+)
+
+with mlflow.start_run():
+    mlflow.log_params({
+        "base_model": BASE, "lora_r": 16, "lora_alpha": 32,
+        "lr": 2e-4, "epochs": 3, "batch": 4, "ga": 4,
+    })
+    trainer = SFTTrainer(
+        model=model, args=cfg,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"],
+        peft_config=peft_config,
+        tokenizer=tokenizer,
+    )
+    trainer.train()
+    trainer.save_model("/tmp/lora-out")
+    mlflow.log_artifacts("/tmp/lora-out", artifact_path="adapter")
+```
+
+Submit via Slurm with `--gres=gpu:1 --time=03:00:00`. On one L40S with 2000 training examples and 3 epochs, expect ~90 minutes wall time.
+
+## Step 3 — Watch the loss curve, don't trust it alone
+
+MLflow's UI shows train and eval loss per logging step. The typical shapes:
+
+- **Both falling, eval flattening:** healthy. Stop at the flattening point.
+- **Train falling, eval rising:** overfitting. Reduce epochs, increase dropout, or shrink the model's effective capacity (lower LoRA `r`).
+- **Both flat from step one:** the model already does the task; you don't need to fine-tune.
+
+Loss is necessary but insufficient. The real test is the eval harness in step 4.
+
+## Step 4 — A task-specific eval harness
+
+MMLU and HellaSwag tell you nothing about your task. Write your own.
+
+```python
+# src/<project>/finetune/eval.py
+import json
+import jsonschema
+from openai import OpenAI
+
+SCHEMA = json.load(open("schemas/trip.json"))
+cases = [json.loads(l) for l in open("/srv/shared/datasets/finetune-trip-extraction/test.jsonl")]
+
+def score(client, model):
+    n_valid_schema = 0
+    n_field_match = 0
+    n_total = 0
+    field_acc = {k: 0 for k in SCHEMA["properties"]}
+    for c in cases:
+        resp = client.chat.completions.create(
+            model=model, temperature=0.0,
+            messages=[
+                {"role": "system", "content": "You convert trip descriptions to JSON."},
+                {"role": "user", "content": f"{c['instruction']}\n\n{c['input']}"},
+            ],
+        )
+        text = resp.choices[0].message.content.strip()
+        try:
+            pred = json.loads(text)
+        except json.JSONDecodeError:
+            n_total += 1
+            continue
+        try:
+            jsonschema.validate(pred, SCHEMA)
+            n_valid_schema += 1
+        except jsonschema.ValidationError:
+            n_total += 1
+            continue
+        expected = json.loads(c["output"])
+        if pred == expected:
+            n_field_match += 1
+        for k in field_acc:
+            if pred.get(k) == expected.get(k):
+                field_acc[k] += 1
+        n_total += 1
+    return {
+        "schema_valid_rate": n_valid_schema / n_total,
+        "exact_match_rate": n_field_match / n_total,
+        "field_accuracy": {k: v / n_total for k, v in field_acc.items()},
+    }
+
+base    = OpenAI(base_url="http://<gpu-server>:8000/v1", api_key=os.environ["VLLM_KEY"])
+tuned   = OpenAI(base_url="http://<gpu-server>:8000/v1", api_key=os.environ["VLLM_KEY"])
+
+print("Base:",  score(base,  "qwen2.5-14b"))
+print("Tuned:", score(tuned, "trip-extractor-lora-v1"))
+```
+
+Three metrics, each measuring something different:
+
+- **schema_valid_rate** — does the output even parse and match the schema?
+- **exact_match_rate** — does every field match the truth?
+- **field_accuracy** — which fields does the model get right, broken out. The bottom-3 are your next data-collection target.
+
+A respectable fine-tune lifts schema-valid-rate from ~85% (base) to >99% (tuned), with exact-match doubling on tricky fields. If your fine-tune doesn't move the metrics, the answer is more or better data, not more epochs.
+
+## Step 5 — Serve the adapter through vLLM
+
+vLLM supports LoRA adapters natively. Two approaches:
+
+- **Merge the adapter into the base weights**, push the merged model to MinIO, and serve as a normal vLLM model. Simpler; loses the option to swap adapters at runtime.
+- **Serve the base with `--enable-lora`** and load named adapters at request time. Lets multiple students serve different adapters off one model — the right answer for a course.
+
+Update the vLLM service from module 11:
+
+```yaml
+command: >
+  --model /models/Qwen2.5-7B-Instruct
+  --served-model-name qwen2.5-7b
+  --enable-lora
+  --max-loras 4
+  --max-lora-rank 16
+  --lora-modules trip-extractor-v1=/models/lora/trip-extractor-v1
+  --gpu-memory-utilization 0.85
+  --max-model-len 8192
+```
+
+Restart vLLM. The adapter is now reachable as `model="trip-extractor-v1"` in the OpenAI client. The base remains `qwen2.5-7b`. Switching is a single field in the request.
+
+## Step 6 — Register the model
+
+In MLflow, the run already has the adapter as an artifact. Register it:
+
+```python
+mlflow.register_model(
+    f"runs:/{run_id}/adapter",
+    "trip-extractor-lora",
+)
+```
+
+Promote to `Staging`. Module 15's CI promotes to `Production` on tag. From then on, deploying a new adapter is a `git tag v1.1.0 && git push --tags`.
+
+## ADR 0013 — QLoRA over full fine-tuning
+
+`/srv/shared/adr/0013-qlora.md`:
+
+```markdown
+# ADR 0013 — Fine-tuning: QLoRA over full fine-tuning
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+Adapting a 7–8B base model to a domain task. The two real options were full
+fine-tuning (update all weights) and LoRA/QLoRA (a tiny adapter on top).
+
+## Decision
+QLoRA: 4-bit base + LoRA r=16 on q/k/v/o projections. Adapters served via
+vLLM `--enable-lora` so multiple fine-tunes can share one base instance.
+
+## Consequences
+- Pro: training fits on one L40S in under 2 hours per run, leaving the
+  second GPU free for serving and inference experiments.
+- Pro: adapters are ~50–200 MB instead of multi-GB merged weights — fast
+  to upload, fast to swap.
+- Pro: many students can train and serve their own adapters from one
+  base model in parallel.
+- Con: QLoRA adapter quality is consistently *very close* to full
+  fine-tune but rarely identical. For squeezing the last percentage
+  point, full fine-tune still wins.
+
+## Alternatives considered
+- Full fine-tune. Rejected for course scale: 7B full fine-tune fits but
+  uses the whole server and takes 6+ hours.
+- DPO / RLHF. Useful when you have preference data. Deferred — most
+  course tasks are SFT-shaped.
+```
+
+## Recap and what's next
+
+You now have:
+
+- A working QLoRA fine-tune of a 7–8B base on a task-specific dataset.
+- A task-specific eval harness with three meaningful metrics.
+- The adapter served through vLLM, swappable by name.
+- The adapter registered in MLflow and ready for CI-driven promotion.
+
+The last technical module is the computer-vision capstone. Different stack (PyTorch, Label Studio, DDP across both GPUs), same disciplines (versioning, reproducibility, real eval).
+
+---
+
+Next: **[14 — Computer vision](/learn/data-science/14-computer-vision-capstone)** *(Capstone 4)*.

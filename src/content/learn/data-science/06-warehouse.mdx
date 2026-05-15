@@ -1,0 +1,368 @@
+---
+title: "The warehouse: Postgres + dbt"
+sidebar_label: "06 — The warehouse"
+description: "Stand up the analytics warehouse on Postgres, foreign-table the lake's bronze layer, model silver and gold with dbt, and treat the dbt project like any other software repo."
+estimated_minutes: 90
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- A dedicated **Postgres** database for analytics — separate from the metadata DB Gitea and MLflow use.
+- Bronze Parquet on MinIO **foreign-tabled** into Postgres via `parquet_s3_fdw`, so SQL queries hit the lake without copying.
+- A **dbt** project that models silver and gold layers as views and tables, with tests and auto-generated docs.
+- **Snapshots** for slowly-changing dimensions, and an **incremental model** for the high-volume fact table.
+- An ADR pinning down the warehouse boundary — what's a dbt model vs. what's a Prefect job.
+
+The capstone deliverable (in module 08) is a dashboard answering real business questions. The data-shaping that backs the dashboard happens here.
+
+## Why a warehouse on top of the lake
+
+The lake (module 05) is the right shape for ingestion, ML, and long retention. It is the wrong shape for "compare last quarter to this quarter, segmented by borough." Three reasons a SQL warehouse beats raw Parquet for analytics:
+
+- **Stable contracts.** A `gold.fact_trips` table has a documented schema, tests, a description. Analysts and dashboards depend on the contract, not on a path that may change.
+- **Cached aggregates.** Materialized tables for the heavy-hit aggregations; queries that would take 30 seconds against Parquet return in 50 ms against the materialized gold table.
+- **Familiarity.** SQL is the lingua franca. The analyst who wants to add a chart can write a `SELECT` against the warehouse; they should not have to learn DuckDB-on-S3 syntax to do it.
+
+For this course we run Postgres. At 10×–100× the data scale, the same dbt project moves to Trino-on-the-lake, Snowflake, BigQuery, or Redshift without rewriting the models — only the connection profile changes.
+
+## Step 1 — A dedicated Postgres
+
+Reuse the Postgres image already running for Gitea/MLflow, but with its own database role:
+
+```bash
+docker exec -it gitea-postgres psql -U gitea -d postgres -c "
+  CREATE DATABASE analytics;
+  CREATE USER dbt WITH PASSWORD '__dbt_password__';
+  GRANT ALL PRIVILEGES ON DATABASE analytics TO dbt;
+"
+
+docker exec -it gitea-postgres psql -U dbt -d analytics -c "
+  CREATE SCHEMA bronze;
+  CREATE SCHEMA silver;
+  CREATE SCHEMA gold;
+"
+```
+
+For a real production setup, run the analytics Postgres on its own volume and tune it for analytics workloads (larger `shared_buffers`, `work_mem`, `maintenance_work_mem`). For a course-scale 1–10 GB of data, the defaults are fine.
+
+## Step 2 — Foreign-table the lake
+
+`parquet_s3_fdw` lets Postgres treat a Parquet file in MinIO as a regular table — no copy required. Install it once on the Postgres host (a `pgxn` install or build from source); then in the warehouse DB:
+
+```sql
+CREATE EXTENSION parquet_s3_fdw;
+
+CREATE SERVER lake FOREIGN DATA WRAPPER parquet_s3_fdw OPTIONS (
+  endpoint '<gpu-server>:9000',
+  use_ssl 'false',
+  use_minio 'true'
+);
+
+CREATE USER MAPPING FOR dbt SERVER lake OPTIONS (
+  user 'platform',
+  password '__platform_secret__'
+);
+
+CREATE FOREIGN TABLE bronze.nyc_yellow_trips (
+  vendor_id              integer,
+  pickup_at              timestamp,
+  dropoff_at             timestamp,
+  passenger_count        integer,
+  trip_distance          double precision,
+  rate_code_id           integer,
+  store_and_fwd_flag     text,
+  pu_location_id         integer,
+  do_location_id         integer,
+  payment_type           integer,
+  fare_amount            double precision,
+  tip_amount             double precision,
+  total_amount           double precision,
+  dt                     text                                  -- partition key
+) SERVER lake OPTIONS (
+  dirname  's3://datasets/bronze/nyc_tlc/yellow_tripdata',
+  use_threads 'true',
+  use_mmap 'false'
+);
+```
+
+A `SELECT count(*) FROM bronze.nyc_yellow_trips WHERE dt = '2023-07'` should return as fast as the DuckDB version did. If it doesn't, partition predicate pushdown isn't kicking in — `EXPLAIN ANALYZE` and check that the plan shows partition pruning.
+
+**Alternative.** If `parquet_s3_fdw` is too much to install, use the **duckdb-fdw** extension or simply have a Prefect job land the bronze partitions into a real Postgres staging table on a schedule. Both work; the foreign-data-wrapper is the cleanest because nothing duplicates.
+
+## Step 3 — Install dbt
+
+In a project repo (forked from the cookiecutter):
+
+```bash
+uv add --dev dbt-core dbt-postgres
+mkdir -p analytics/{models/staging,models/marts,seeds,tests,snapshots,macros}
+cd analytics
+uv run dbt init   # accepts defaults
+```
+
+`~/.dbt/profiles.yml` on the GPU server (per-student or shared service account — both are fine for a course):
+
+```yaml
+analytics:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: dbt
+      password: "{{ env_var('DBT_PG_PASSWORD') }}"
+      dbname: analytics
+      schema: dbt_{{ env_var('USER') }}        # per-user dev schemas
+      threads: 4
+    prod:
+      type: postgres
+      host: localhost
+      port: 5432
+      user: dbt
+      password: "{{ env_var('DBT_PG_PASSWORD') }}"
+      dbname: analytics
+      schema: gold                              # prod writes the real marts
+      threads: 8
+```
+
+Why per-user dev schemas? So two students can both run `dbt run` against the same DB without trampling each other. The `prod` target is what CI runs (module 15) when a PR merges to `main`.
+
+## Step 4 — Layer the models
+
+dbt projects in this track follow a strict three-layer convention. The convention is what keeps the project legible at 200 models.
+
+```
+analytics/models/
+├── staging/                         (1 view per source table, light renames + types)
+│   ├── _sources.yml
+│   ├── stg_yellow_trips.sql
+│   └── stg_zone_lookup.sql
+├── intermediate/                    (joins and filters; rarely materialized)
+│   └── int_trips_with_zones.sql
+└── marts/                            (the consumable surface, materialized as tables)
+    ├── _marts.yml
+    ├── fct_trips.sql                 (the grain: one row per trip)
+    ├── dim_pickup_zone.sql
+    └── agg_daily_borough_revenue.sql (the dashboard's main backing table)
+```
+
+`models/staging/_sources.yml` — declares the foreign tables we created in step 2:
+
+```yaml
+version: 2
+
+sources:
+  - name: bronze
+    schema: bronze
+    tables:
+      - name: nyc_yellow_trips
+        description: "Raw NYC TLC yellow taxi trip records, foreign-tabled from MinIO."
+        columns:
+          - name: pickup_at
+            tests: [not_null]
+          - name: dropoff_at
+            tests: [not_null]
+          - name: trip_distance
+            tests:
+              - dbt_utils.accepted_range:
+                  min_value: 0
+                  max_value: 200
+```
+
+`models/staging/stg_yellow_trips.sql`:
+
+```sql
+{{ config(materialized='view') }}
+
+select
+    vendor_id                              as vendor_id,
+    pickup_at,
+    dropoff_at,
+    extract(epoch from (dropoff_at - pickup_at)) as duration_seconds,
+    passenger_count,
+    trip_distance                          as distance_miles,
+    pu_location_id                         as pickup_zone_id,
+    do_location_id                         as dropoff_zone_id,
+    payment_type,
+    fare_amount,
+    tip_amount,
+    total_amount,
+    dt                                     as partition_month
+from {{ source('bronze', 'nyc_yellow_trips') }}
+where pickup_at is not null
+  and dropoff_at >= pickup_at
+  and trip_distance between 0 and 200
+```
+
+The staging layer is where you wash data. Trips with negative durations, impossible distances, missing timestamps — filtered here, never seen by the marts.
+
+`models/marts/agg_daily_borough_revenue.sql`:
+
+```sql
+{{ config(materialized='table') }}
+
+with trips as (
+    select * from {{ ref('stg_yellow_trips') }}
+),
+zones as (
+    select * from {{ ref('stg_zone_lookup') }}
+)
+select
+    date_trunc('day', trips.pickup_at)::date     as trip_date,
+    zones.borough,
+    count(*)                                      as trips,
+    sum(trips.total_amount)                       as revenue,
+    sum(trips.tip_amount) / nullif(sum(trips.fare_amount), 0) as tip_rate,
+    avg(trips.distance_miles)                     as avg_distance
+from trips
+join zones on zones.zone_id = trips.pickup_zone_id
+group by 1, 2
+```
+
+## Step 5 — Tests and docs
+
+dbt's test framework is what makes the warehouse a *contract* and not "a folder of SQL files." Add tests to the marts:
+
+`models/marts/_marts.yml`:
+
+```yaml
+version: 2
+
+models:
+  - name: agg_daily_borough_revenue
+    description: "Daily revenue and tip rate by pickup borough — the main dashboard table."
+    columns:
+      - name: trip_date
+        tests: [not_null]
+      - name: borough
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['Manhattan', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island', 'EWR', 'Unknown']
+      - name: revenue
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "revenue >= 0"
+```
+
+Run the project:
+
+```bash
+DBT_PG_PASSWORD=__dbt_password__ uv run dbt build
+```
+
+`dbt build` is the command. It runs `seed`, `run`, `snapshot`, and `test` in dependency order. Anything red fails the build — and in CI, fails the PR.
+
+Generate docs:
+
+```bash
+uv run dbt docs generate
+uv run dbt docs serve --port 8080
+```
+
+The docs site shows every model, every column, the lineage graph, and the test status. It's the second-most-useful artifact your warehouse produces, after the data itself.
+
+## Step 6 — Snapshots for slowly-changing dimensions
+
+The TLC zone-lookup table changes occasionally — a borough rename, a new airport zone. To capture history, write a snapshot:
+
+`snapshots/snap_zone_lookup.sql`:
+
+```sql
+{% snapshot snap_zone_lookup %}
+
+{{ config(
+    target_schema='silver',
+    unique_key='zone_id',
+    strategy='check',
+    check_cols=['borough', 'zone_name', 'service_zone'],
+) %}
+
+select * from {{ source('bronze', 'zone_lookup') }}
+
+{% endsnapshot %}
+```
+
+`dbt snapshot` keeps a row history with `dbt_valid_from` and `dbt_valid_to` columns. Queries that need point-in-time correctness (what was the borough for zone 42 on 2024-03-15?) join against this.
+
+## Step 7 — Incremental for the fact
+
+`fct_trips` reads the whole bronze fact table on every `dbt build`. For 10 million rows that's tolerable; for 100 million it's not. The incremental pattern:
+
+`models/marts/fct_trips.sql`:
+
+```sql
+{{ config(
+    materialized='incremental',
+    unique_key='trip_id',
+    on_schema_change='append_new_columns'
+) }}
+
+with new_rows as (
+    select
+        md5(vendor_id::text || pickup_at::text || pickup_zone_id::text) as trip_id,
+        *
+    from {{ ref('stg_yellow_trips') }}
+
+    {% if is_incremental() %}
+      where pickup_at > (select coalesce(max(pickup_at), '1900-01-01') from {{ this }})
+    {% endif %}
+)
+select * from new_rows
+```
+
+`is_incremental()` is true after the first run. From then on, each `dbt build` only reads bronze rows newer than the latest already-loaded trip. The hash-derived `trip_id` is what makes the unique-key dedup work safely.
+
+## ADR 0006 — Where the warehouse boundary lives
+
+`/srv/shared/adr/0006-warehouse-boundary.md`:
+
+```markdown
+# ADR 0006 — Warehouse boundary: dbt vs. Prefect
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+With both dbt (SQL transformations in the warehouse) and Prefect (Python
+orchestration outside it), it is easy to bleed business logic across both
+and end up with a project no one can reason about.
+
+## Decision
+- Anything that is a SELECT, JOIN, GROUP BY, or window function is a dbt model.
+- Anything that is data movement (S3 to S3, API to S3, S3 to Postgres),
+  conditional retries, sensor-based scheduling, or anything that calls
+  a non-SQL service is a Prefect task.
+- Prefect triggers dbt by running `dbt build` — not by reimplementing
+  joins in Python.
+- Tests on warehouse data live in dbt (`schema.yml`). Tests on ingestion
+  liveness live in Prefect.
+
+## Consequences
+- The data warehouse can be reasoned about with `dbt docs` alone.
+- Prefect flows stay thin — almost every flow is `extract → land → trigger
+  dbt → notify`.
+- Cross-DB joins are not allowed at the orchestration layer. If you need
+  them, foreign-table the second source into the same warehouse.
+
+## Alternatives considered
+- Pure dbt with `dbt run --vars`. Loses retries, sensors, alerting.
+- Pure Prefect with embedded SQL. Loses dbt's documentation, lineage,
+  and test ergonomics.
+```
+
+## Recap and what's next
+
+You now have:
+
+- A dedicated analytics Postgres with bronze foreign-tabled in.
+- A dbt project with staging/intermediate/marts, tests, docs, snapshots, and an incremental model.
+- A clear contract for what's a dbt model vs. a Prefect task.
+
+The warehouse can be built by hand for now. To make it survive contact with a real schedule — daily refreshes, retries, alerts — you need orchestration. That's module 07.
+
+---
+
+Next: **[07 — Orchestration with Prefect](/learn/data-science/07-prefect)**.

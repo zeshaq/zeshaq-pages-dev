@@ -1,0 +1,317 @@
+---
+title: "CI/CD with Gitea Actions"
+sidebar_label: "15 — CI/CD with Gitea Actions"
+description: "Turn every project on the platform into a CI/CD-driven artifact: lint and test on every push, train and register on a tagged commit, deploy on a green tag — using Gitea's GitHub-Actions-compatible runner."
+estimated_minutes: 90
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- A **Gitea Actions runner** registered on the GPU server with a `gpu` label.
+- A **standard CI workflow** for every project: lint → test → build container → push to Gitea's registry.
+- A **CD workflow** triggered by **git tags**: train, evaluate, promote in MLflow, redeploy the serving container.
+- A clean separation between **shared platform credentials** (Gitea secrets) and **per-project secrets**.
+- An ADR pinning the CI choice and the tag-driven promotion pattern.
+
+This is the module that turns "I shipped a capstone" into "the platform ships every capstone, repeatedly, without me at the keyboard."
+
+## Why Gitea Actions, not GitHub Actions or Jenkins
+
+Gitea Actions is wire-compatible with GitHub Actions — same `.yml` syntax, same marketplace actions work (`actions/checkout@v4`, `actions/setup-python@v5`, etc.). The compatibility means:
+
+- Students learn the GitHub Actions skill they'll use at any future job.
+- You can lift workflows from public repos without rewriting them.
+- The runner runs *on the GPU server*, with access to MinIO, MLflow, the model registry, and (crucially) Slurm.
+
+Jenkins still works; it just requires more babysitting per pipeline than is justified for a six-student cohort.
+
+## Step 1 — Install the runner
+
+```bash
+sudo useradd -m -s /bin/bash gitea-runner
+sudo usermod -a -G docker gitea-runner
+
+sudo -u gitea-runner mkdir -p /home/gitea-runner/runner
+cd /home/gitea-runner/runner
+
+curl -sLo act_runner https://gitea.com/gitea/act_runner/releases/download/v0.2.11/act_runner-0.2.11-linux-amd64
+chmod +x act_runner
+```
+
+Register against the Gitea server. From the Gitea UI: `Site Administration → Actions → Runners → Create new Runner` — copy the token. Then:
+
+```bash
+sudo -u gitea-runner /home/gitea-runner/runner/act_runner register \
+  --no-interactive \
+  --instance http://localhost:3000 \
+  --token <registration-token> \
+  --name gpu-runner-01 \
+  --labels gpu,cpu,docker
+```
+
+The `gpu` label is the one workflows will target with `runs-on: gpu` to land jobs on this host. The `cpu` and `docker` labels are aliases for the same runner so generic CI jobs also land here.
+
+Install as a systemd unit:
+
+```bash
+sudo tee /etc/systemd/system/act-runner.service > /dev/null <<'UNIT'
+[Unit]
+Description=Gitea Actions Runner
+After=network.target
+
+[Service]
+User=gitea-runner
+WorkingDirectory=/home/gitea-runner/runner
+ExecStart=/home/gitea-runner/runner/act_runner daemon
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl enable --now act-runner
+sudo systemctl status act-runner
+```
+
+The runner now appears in the Gitea UI as Online.
+
+## Step 2 — A standard `ci.yml`
+
+Every project on the platform forks the cookiecutter from module 03 and gets `.gitea/workflows/ci.yml`:
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: docker
+    container:
+      image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: uv sync --frozen --all-extras
+
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy src/
+
+      - name: Tests
+        run: uv run pytest -x --cov=src --cov-report=term-missing
+
+      - name: dbt build (if project has analytics/)
+        if: hashFiles('analytics/dbt_project.yml') != ''
+        env:
+          DBT_PG_PASSWORD: ${{ secrets.DBT_PG_PASSWORD }}
+        run: |
+          cd analytics
+          uv run dbt build --profiles-dir ../.dbt
+
+  build-image:
+    needs: lint-and-test
+    runs-on: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Gitea registry
+        run: echo "${{ secrets.GITEA_TOKEN }}" | docker login http://gitea.example.com:3000 -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push
+        run: |
+          IMAGE="gitea.example.com:3000/${{ github.repository }}:${{ github.sha }}"
+          docker build -t $IMAGE .
+          docker push $IMAGE
+          docker tag $IMAGE "gitea.example.com:3000/${{ github.repository }}:latest"
+          docker push "gitea.example.com:3000/${{ github.repository }}:latest"
+```
+
+Two patterns worth understanding:
+
+- **The image gets the commit SHA as a tag**, not just `latest`. This is what makes "roll back to last week" a docker command, not a re-build.
+- **dbt build runs in CI** if the project has an `analytics/` directory. The same workflow handles tabular ML projects, RAG projects, and DE projects — no per-project drift.
+
+## Step 3 — A `release.yml` triggered by tags
+
+Tagged releases do the heavy work: training, eval, registry promotion, deploy. This is the **promote-by-tag** pattern.
+
+```yaml
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  train-and-promote:
+    runs-on: gpu                                          # the runner with GPU access
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: uv sync --frozen
+
+      - name: dbt build prod
+        env:
+          DBT_PG_PASSWORD: ${{ secrets.DBT_PG_PASSWORD }}
+        run: cd analytics && uv run dbt build --target prod
+
+      - name: Submit training to Slurm
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          sbatch --wait scripts/train.sh
+
+      - name: Evaluate against hold-out
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: uv run python -m src.eval --threshold reports/release_threshold.json
+
+      - name: Promote to Production
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          uv run python -c "
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          client = MlflowClient()
+          mv = client.search_model_versions(\"name='${{ vars.MODEL_NAME }}'\")
+          latest = max(mv, key=lambda v: int(v.version))
+          client.set_registered_model_alias(
+              name='${{ vars.MODEL_NAME }}', alias='production', version=latest.version)
+          "
+
+      - name: Restart serving container
+        run: ssh deployer@<gpu-server> 'docker compose -f /opt/${{ vars.SERVICE_NAME }}/docker-compose.yml pull && docker compose -f /opt/${{ vars.SERVICE_NAME }}/docker-compose.yml up -d'
+```
+
+The `sbatch --wait` is what makes Slurm "real" in CI — the workflow blocks on the queued GPU job and only continues when it succeeds. Evaluation has to *pass a threshold* before the promotion step runs; a regression on the hold-out set fails the workflow and the model stays at `Staging`.
+
+For a model service, the `Restart serving container` step is the deploy. For a RAG service, it's the same. For an embedding model swap, the same. Every deploy is a `docker compose pull && up -d` after a registry alias flips.
+
+## Step 4 — Shared platform secrets vs. per-project
+
+Gitea supports both. The convention:
+
+| Scope | Lives in | Examples |
+| --- | --- | --- |
+| **Platform-wide** | Organization-level secrets (`platform` org in Gitea) | `MLFLOW_TRACKING_URI`, `MINIO_ENDPOINT`, `WAREHOUSE_URI`, `PLATFORM_ACCESS_KEY`, `PLATFORM_SECRET` |
+| **Per-project** | Repo-level secrets | Anything specific to one model or one customer corpus |
+| **Variables** (non-secret) | Org or repo `vars` | `MODEL_NAME`, `SERVICE_NAME`, `DEPLOY_HOST` |
+
+Rotate platform credentials every 90 days. The runner pulls fresh secrets at job start, so rotation is invisible to in-flight workflows.
+
+## Step 5 — Branch protection that pairs with CI
+
+In each project's Gitea settings under `Branches → main → Protection`:
+
+- **Require pull request before merging.**
+- **Require status check: `lint-and-test` must pass.**
+- **Disallow force-push.**
+
+This is what makes "merge to main" mean "passed CI." Without it, broken main is a recurring problem.
+
+## Step 6 — Reusable workflows
+
+Once you've written a clean CI workflow you'll want to reuse it. Gitea supports reusable workflows the same way GitHub does:
+
+`.gitea/workflows/reusable-ds-ci.yml` in `platform/ci-templates`:
+
+```yaml
+on:
+  workflow_call:
+    inputs:
+      project-dir:
+        type: string
+        default: "."
+
+jobs:
+  lint-and-test:
+    runs-on: docker
+    container: { image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim }
+    steps:
+      - uses: actions/checkout@v4
+      - run: uv sync --frozen --all-extras
+        working-directory: ${{ inputs.project-dir }}
+      - run: uv run ruff check .
+      - run: uv run pytest -x
+```
+
+A project's own workflow shrinks to:
+
+```yaml
+jobs:
+  ci:
+    uses: platform/ci-templates/.gitea/workflows/reusable-ds-ci.yml@main
+```
+
+This is the practical end-state — every project is one line of CI configuration. Improvements to the template benefit every project on the next push.
+
+## ADR 0015 — Promote-by-tag
+
+`/srv/shared/adr/0015-promote-by-tag.md`:
+
+```markdown
+# ADR 0015 — Model promotion by git tag
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+Manual promotion of models in the MLflow UI is error-prone — there is no
+record of *what code* produced the promoted model, only "version 7". This
+breaks reproducibility audits.
+
+## Decision
+Production promotion happens only on a git tag matching `v*.*.*`. The
+release workflow:
+
+1. Runs against the tag's commit.
+2. Submits training to Slurm via `sbatch --wait`.
+3. Evaluates the resulting model against a hold-out set.
+4. Promotes the MLflow Registry model only if eval passes.
+5. Triggers a deploy.
+
+A failed eval fails the workflow; the tag remains, the model does not
+get promoted.
+
+## Consequences
+- Pro: `git tag v1.4.2` is the audit trail. The model in Production is
+  always traceable to a tagged commit.
+- Pro: rollback is "promote the previous version's MLflow alias."
+- Con: Slurm cluster health is now in the critical path for releases.
+  Mitigation: a release that fails because Slurm is down can be re-run
+  by re-pushing the same tag once Slurm recovers.
+
+## Alternatives considered
+- UI-driven promotion. Rejected: no audit trail.
+- Auto-promotion on every successful train. Rejected: removes the
+  human-in-the-loop decision.
+```
+
+## Recap
+
+You now have:
+
+- A registered Gitea Actions runner with `gpu` access.
+- A CI workflow that runs lint, test, dbt build, and image push on every PR and main push.
+- A tag-driven CD workflow that handles train → eval → promote → deploy.
+- A clean secret-and-variable convention.
+
+The last module is the look-back and the look-forward — what we deliberately skipped and where to find it.
+
+---
+
+Next: **[16 — What's next](/learn/data-science/16-whats-next)**.

@@ -1,0 +1,299 @@
+---
+title: "GPU scheduling with Slurm"
+sidebar_label: "04 — GPU scheduling with Slurm"
+description: "Install Slurm on the GPU server, expose the two L40S as gres:gpu resources, and teach the cohort the sbatch / srun / squeue muscle memory that ends GPU contention."
+estimated_minutes: 75
+last_updated: 2026-05-15
+---
+
+By the end of this module you will have:
+
+- **Slurm** installed on the GPU server as a single-node "cluster" (controller and compute on the same host).
+- The two **L40S** GPUs exposed as `gres:gpu:l40s:2`, schedulable per-job.
+- A working **fair-share** policy so one student running a 4-hour fine-tune cannot block five others' 5-minute experiments.
+- The four commands every student needs in muscle memory: `sbatch`, `srun`, `squeue`, `scancel`.
+- An example batch script the cookiecutter (from module 03) will reference for the rest of the course.
+
+JupyterHub's GPU pass-through from module 02 is fine for quick interactive work. The moment a student wants to kick off a multi-hour training run, you want it queued by Slurm, not occupying a notebook container.
+
+## Why Slurm — and why not Ray, k8s, or "just use tmux"
+
+For ≤6 students sharing 2 GPUs, the options:
+
+| Option | What it is | Why we picked / didn't pick |
+| --- | --- | --- |
+| **Slurm** | Job scheduler used by ~every HPC site on Earth | Picked. Battle-tested, GRES handles GPUs cleanly, every student should know `sbatch` anyway |
+| Ray | Pythonic distributed compute | Great for serving and elastic clusters; weak as a sole job queue, and adds a stack to babysit |
+| Kubernetes + GPU operator | k8s-native scheduling | Right answer at 30+ users; overkill at 6 |
+| Hand-rolled `flock`+`tmux` | "Whoever's tmux session has the lock owns the GPU" | Works for 2 people, falls apart at 3 |
+
+The thing Slurm gives you that the others don't, for free: a **queue**. A student submits a job, gets a job ID, walks away. Slurm dispatches when a GPU frees up. No "is the GPU free right now?" Slack messages.
+
+## Step 1 — Install Slurm in single-node mode
+
+Slurm has three daemons: `slurmctld` (controller), `slurmd` (compute node), and `slurmdbd` (accounting). For a single host we run all three on the same box, but logically separated:
+
+```bash
+sudo apt update
+sudo apt install -y slurm-wlm slurm-wlm-doc slurmdbd
+```
+
+The package creates a `slurm` system user, the `/etc/slurm/` config directory, and stubs out the three systemd units. We will replace `slurm.conf` and `gres.conf` with the right contents below, then enable the daemons.
+
+A small MariaDB is needed for `slurmdbd` (the accounting DB):
+
+```bash
+sudo apt install -y mariadb-server
+sudo mysql_secure_installation                # set a root password
+sudo mysql -u root -p <<'SQL'
+CREATE DATABASE slurm_acct_db;
+CREATE USER 'slurm'@'localhost' IDENTIFIED BY '__slurm_db_password__';
+GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+```
+
+## Step 2 — `slurm.conf` for this server
+
+`/etc/slurm/slurm.conf`:
+
+```ini
+ClusterName=gpu-server
+SlurmctldHost=<gpu-server>
+
+# Mostly defaults are fine; the bits that matter:
+ProctrackType=proctrack/cgroup
+TaskPlugin=task/cgroup,task/affinity
+GresTypes=gpu
+
+SchedulerType=sched/backfill
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+
+# Accounting → MariaDB via slurmdbd
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageEnforce=associations,limits,qos
+JobAcctGatherType=jobacct_gather/cgroup
+
+# Fair-share — half-life over 7 days; the longer you run, the lower your priority
+PriorityType=priority/multifactor
+PriorityDecayHalfLife=7-0
+PriorityWeightFairshare=10000
+PriorityWeightAge=1000
+PriorityWeightJobSize=500
+
+# A single QoS that everyone uses for now; can split later (interactive vs batch)
+NodeName=<gpu-server> CPUs=32 RealMemory=128000 \
+  Gres=gpu:l40s:2 State=UNKNOWN
+PartitionName=gpu Nodes=<gpu-server> Default=YES \
+  MaxTime=24:00:00 State=UP
+```
+
+A few opinionated choices:
+
+- **`cons_tres` plus `CR_Core_Memory`** is the modern way to do "I want 8 cores, 32 GB, and one GPU." Older Slurm docs you'll find online use `cons_res`; ignore them.
+- **`PriorityWeightFairshare=10000`** dominates the score, so a student who ran a 4-hour job an hour ago will sit behind a student who hasn't run anything today. This is the policy lever you'll tweak the most.
+- **`MaxTime=24:00:00`** caps any single job at 24 hours. Override with `--time=...` up to that, or raise the cap for a specific QoS.
+
+## Step 3 — Tell Slurm about the GPUs
+
+`/etc/slurm/gres.conf`:
+
+```ini
+Name=gpu Type=l40s File=/dev/nvidia0
+Name=gpu Type=l40s File=/dev/nvidia1
+```
+
+Cgroup config — `/etc/slurm/cgroup.conf`:
+
+```ini
+ConstrainCores=yes
+ConstrainRAMSpace=yes
+ConstrainDevices=yes
+```
+
+`ConstrainDevices=yes` is what makes a `--gres=gpu:1` job see exactly one GPU device inside its cgroup. Without it, the job binary can `nvidia-smi` and see both even though Slurm intended to assign one.
+
+## Step 4 — Bring up the daemons
+
+```bash
+sudo systemctl enable --now slurmdbd
+sudo systemctl enable --now slurmctld
+sudo systemctl enable --now slurmd
+
+sudo sinfo                              # one node listed, state IDLE
+sudo scontrol show node <gpu-server>    # Gres=gpu:l40s:2 listed
+```
+
+If `sinfo` shows the node as `DOWN*`, the `slurmd` log (`/var/log/slurm/slurmd.log`) almost always names the culprit — usually a mismatch between `NodeName` in `slurm.conf` and the host's actual hostname, or a missing cgroup mount.
+
+## Step 5 — Add the cohort to Slurm accounting
+
+Slurm has its own user/account/association tree, separate from Linux users. Three commands per student:
+
+```bash
+sudo sacctmgr -i add account cohort \
+  Description="Course cohort" Organization="course"
+sudo sacctmgr -i add user alice DefaultAccount=cohort
+sudo sacctmgr -i modify user alice set Fairshare=100
+# … repeat for each student
+```
+
+Verify:
+
+```bash
+sacctmgr show association format=Account,User,Share,RawShares
+```
+
+Every student now sees themselves listed with `Fairshare=100`. The instructor's account gets a higher share if you want to be able to pre-empt during live sessions.
+
+## Step 6 — The four commands every student needs
+
+`srun` — interactive: "give me a shell on a GPU node, now, blocking until I exit":
+
+```bash
+srun --gres=gpu:1 --cpus-per-task=4 --mem=16G --time=01:00:00 --pty bash
+# Inside: nvidia-smi shows exactly one L40S
+```
+
+`sbatch` — queued: "run this script when a GPU is free, log the output, don't make me wait":
+
+```bash
+sbatch train.sh
+# Returns: Submitted batch job 42
+```
+
+`squeue` — what's in the queue:
+
+```bash
+squeue -u $USER                # my jobs
+squeue                         # everyone's, sorted by priority
+```
+
+`scancel` — kill a job:
+
+```bash
+scancel 42
+```
+
+`sacct` — what *was* in the queue (for last-night debugging):
+
+```bash
+sacct -u $USER --starttime today --format=JobID,JobName,State,Elapsed,MaxRSS
+```
+
+## Step 7 — A real `train.sh`
+
+The cookiecutter from module 03 ships this as `scripts/train.sh`. It's the script every project's "kick off a training run on the cluster" command resolves to:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=churn-train
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+
+set -euo pipefail
+
+# Resolve paths relative to the script — Slurm runs from the submission dir
+cd "$SLURM_SUBMIT_DIR"
+mkdir -p logs
+
+# Environment: every project carries its own uv lockfile
+uv sync --frozen
+
+# MLflow tracking comes from the platform; never hardcode in the script
+export MLFLOW_TRACKING_URI="http://<gpu-server>:5000"
+export MLFLOW_EXPERIMENT_NAME="churn-${SLURM_JOB_ID}"
+
+# The real work
+uv run python -m src.train \
+  --data data/processed/train.parquet \
+  --config configs/baseline.yaml
+```
+
+Two patterns worth noticing:
+
+- **`--gres=gpu:1`**, not `:2`. The reflex to grab "everything available" should be fought. Most training jobs want one GPU; the second is for module 14's DDP work or somebody else's job.
+- **`uv sync --frozen`** at job start. The lockfile is the contract; if it doesn't exist or is out of date, the job fails fast instead of resolving the latest random transitives.
+
+## Step 8 — A "GPU is free?" check students can run
+
+Drop this into `/srv/shared/bin/gpu-status`:
+
+```bash
+#!/usr/bin/env bash
+# Quick read of: who's holding GPUs, how loaded they are.
+echo "=== Slurm queue ==="
+squeue --format='%.7i %.9P %.16j %.10u %.8T %.10M %.4D %.5C %.7m %.6b'
+echo
+echo "=== nvidia-smi ==="
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total \
+           --format=csv,noheader
+```
+
+Make it executable and PATH-visible:
+
+```bash
+sudo chmod 755 /srv/shared/bin/gpu-status
+echo 'export PATH=/srv/shared/bin:$PATH' | sudo tee -a /etc/profile.d/platform.sh
+```
+
+Now any student can type `gpu-status` to see whether the cluster is busy. This single tiny script eliminates ~90% of "is the GPU free?" interruptions.
+
+## ADR 0004 — Slurm over k8s for compute scheduling
+
+`/srv/shared/adr/0004-slurm-scheduler.md`:
+
+```markdown
+# ADR 0004 — Compute scheduler: Slurm over Kubernetes
+
+## Status
+Accepted, 2026-05-15.
+
+## Context
+The platform needs a job queue that mediates ≤6 users' access to 2 GPUs.
+The two reasonable options were Slurm and Kubernetes with a GPU operator.
+
+## Decision
+Slurm in single-node mode. The two L40S are exposed as `gres:gpu:l40s:2`,
+scheduled via `cons_tres` with cgroup device constraint, and accounted with
+a fair-share decay over 7 days.
+
+## Consequences
+- Pro: every student leaves the course knowing `sbatch` / `srun` — a skill
+  that transfers to any HPC or academic GPU cluster they'll encounter.
+- Pro: queue semantics, fair-share, and per-job resource isolation are
+  built-in, not bolted on.
+- Con: Slurm config is genuinely arcane; the first install will surface
+  a cgroup or hostname mismatch that costs an hour.
+- Con: Scaling to a second host adds munge-key distribution and a real
+  network topology. Acceptable: course is single-node by design.
+
+## Alternatives considered
+- Kubernetes + GPU operator. Right answer at ≥20 users or multi-host.
+  Adds 3+ moving parts (k3s, GPU operator, KubeRay or Kueue) without
+  proportional value at 6 users.
+- Ray cluster only. Excellent for elastic distributed compute; lacks a
+  proper queue and accounting. We may add Ray on top of Slurm for module
+  14's DDP work, not replace it.
+```
+
+## Recap and what's next
+
+You now have:
+
+- A working single-node Slurm scheduler with both L40S as `gres` resources.
+- Fair-share configured so heavy users yield to light ones over a 7-day window.
+- A standard `train.sh` and a `gpu-status` command that the rest of the track will assume.
+- ADR pinning the choice for posterity.
+
+The platform now schedules compute fairly. Next we put real **data** on it — bronze ingestion to the lake, the start of the data-engineering capstone.
+
+---
+
+Next: **[05 — The data lake: bronze ingestion](/learn/data-science/05-data-lake)**.
