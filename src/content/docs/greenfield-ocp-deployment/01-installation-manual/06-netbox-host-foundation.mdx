@@ -215,6 +215,44 @@ restore_validation=passed object=netbox-backups/netbox/20260515T080609Z/netbox-2
 
 The `netbox-backup.timer` is enabled and active. No temporary restore validation database remained after the drill.
 
+### Retention Policy
+
+The initial NetBox backup retention policy is:
+
+- Daily backups from `netbox-backup.timer`.
+- Retain current object versions for `90` days.
+- Retain noncurrent object versions for `90` days.
+- Expire delete markers.
+- Run restore validation monthly during active buildout, then quarterly.
+- Run an extra restore validation after material NetBox, PostgreSQL, MinIO, backup script, encryption, or credential changes.
+
+Applied MinIO lifecycle state:
+
+```text
+current versions: 90 days
+noncurrent versions: 90 days
+delete markers: expire
+```
+
+MinIO requires delete-marker expiration as a separate rule from day-based expiration. The applied commands were:
+
+```bash
+mc ilm rule add \
+  --expire-days 90 \
+  --noncurrent-expire-days 90 \
+  gf-local/netbox-backups
+
+mc ilm rule add \
+  --expire-delete-marker \
+  gf-local/netbox-backups
+```
+
+Validate with:
+
+```bash
+mc ilm rule ls gf-local/netbox-backups
+```
+
 ## Next Phase
 
 The next NetBox phase should cover controlled exposure and data modeling:
