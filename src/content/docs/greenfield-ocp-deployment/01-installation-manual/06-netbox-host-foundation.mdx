@@ -323,8 +323,73 @@ Post-exposure backup and restore validation passed on 2026-05-15 with:
 netbox-backups/netbox/20260515T084335Z/netbox-20260515T084335Z.tar.gz.enc
 ```
 
+## Baseline Source Of Truth Seed
+
+The first NetBox source-of-truth baseline is seeded through the greenfield repo, not by manual UI entry:
+
+```text
+data/netbox/greenfield-baseline.json
+scripts/services/netbox/seed-baseline.py
+```
+
+The API token used by the loader is stored in Vault:
+
+```text
+secret/greenfield/netbox/api-tokens/baseline-seed
+```
+
+Do not print the token. Human operators should retrieve it into `NETBOX_TOKEN` from Vault and run:
+
+```bash
+NETBOX_TOKEN=<redacted> \
+  ./scripts/services/netbox/seed-baseline.py \
+  --url https://netbox.v7.comptech-lab.com
+```
+
+The loader is idempotent. Re-running it updates the baseline records instead of creating duplicates.
+
+Seeded records:
+
+- site `CompTech Greenfield v7`;
+- VLAN `br33 service VM network`;
+- prefixes `30.30.0.0/16`, `30.30.200.0/24`, and `59.153.29.96/27`;
+- physical devices `dl385-2` and `gf-ocp-minio-physical-01`;
+- libvirt cluster `gf-ocp-dl385-2-libvirt`;
+- foundation VMs:
+  - `gf-ocp-pdns-01`;
+  - `gf-ocp-haproxy-01`;
+  - `gf-ocp-gitlab-01`;
+  - `gf-ocp-gitlab-runner-01`;
+  - `gf-ocp-netbox-01`;
+  - `gf-ocp-vault-seed-01`;
+  - `gf-ocp-vault-01`;
+  - `gf-ocp-vault-02`;
+  - `gf-ocp-vault-03`;
+- reserved gateway IPs `30.30.0.1/16` and `59.153.29.97/27`.
+
+Validation on 2026-05-15:
+
+```text
+dcim/sites=1
+ipam/prefixes=3
+ipam/vlans=1
+dcim/devices=2
+virtualization/virtual-machines=9
+ipam/ip-addresses=15
+virtualization/clusters=1
+```
+
+Post-seed backup and restore validation passed with:
+
+```text
+netbox-backups/netbox/20260515T092837Z/netbox-20260515T092837Z.tar.gz.enc
+```
+
 ## Next Phase
 
-The next NetBox phase should cover source-of-truth data modeling:
+The next NetBox phase should expand the model after details are approved:
 
-- Initial source-of-truth data model for sites, prefixes, VLANs, VMs, and service ownership.
+- rack and rack-unit placement;
+- future OpenShift physical node inventory;
+- service ownership contacts;
+- approved IP/MAC allocation pools for the next VM wave.
