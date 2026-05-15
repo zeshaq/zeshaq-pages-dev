@@ -1,0 +1,87 @@
+---
+title: "Installation Manual - 10 Bootstrap artifacts"
+sidebar_label: "10 Bootstrap artifacts"
+description: "How bootstrap base images and Red Hat credential custody are handled before the first OpenShift cluster install."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+This chapter defines the bootstrap artifact boundary for the greenfield
+OpenShift build.
+
+The bootstrap VM is recreated from automation and fresh secrets. It is not
+restored from an old VM identity.
+
+## Preserved Base Image
+
+The preserved Red Hat artifact is the RHEL 9.6 guest image used as the
+bootstrap VM base image:
+
+```text
+Bucket: ci-evidence
+Object: bootstrap-artifacts/rhel/rhel-guest-image-9.6-20250909.4.x86_64.qcow2
+SHA256: 2b932eb0cecf7ea1124feffad5677bd85226d986908a7a2b1db05e11ad428353
+Size: 1215168512 bytes
+```
+
+No RHEL installer ISO was present in the rebuild custody bundle. The preserved
+artifact is a qcow2 cloud guest image, not a boot installer ISO.
+
+The source-of-truth metadata lives in:
+
+```text
+data/bootstrap-artifacts/rhel-base-image.json
+secret/greenfield/bootstrap/rhel/base-image
+```
+
+## Credential Boundary
+
+Do not store Red Hat credentials, Red Hat offline tokens, OpenShift pull
+secrets, or generated installer authfiles in MinIO or Git.
+
+The OpenShift pull secret is kept in Vault:
+
+```text
+secret/greenfield/bootstrap/openshift/pull-secret
+```
+
+Automation should read that path at runtime when it needs to create installer
+or mirror authfiles.
+
+## Validation
+
+Read the MinIO service credential from Vault without printing it:
+
+```text
+secret/greenfield/object-storage/minio/users/ci-evidence
+```
+
+Export the credential into the operator shell only for the validation process:
+
+```bash
+export MINIO_ENDPOINT=http://30.30.200.1:9000
+export MINIO_ACCESS_KEY=<redacted>
+export MINIO_SECRET_KEY=<redacted>
+```
+
+Validate the artifact:
+
+```bash
+./scripts/services/bootstrap/validate-rhel-base-image-artifact.sh --execute
+```
+
+The command checks the object size and checksum sidecar without printing
+credentials.
+
+## Future Bootstrap VM Rule
+
+The future `gf-ocp-bootstrap-01` VM should be built with:
+
+- FIPS enabled;
+- vTPM enabled where the hypervisor supports it;
+- OpenShift tools pinned to the approved v7 release;
+- pull secret loaded from Vault at runtime;
+- mirror resources generated from the Quay-backed oc-mirror baseline.
+
+Do not reuse kubeconfigs, kubeadmin passwords, cluster auth directories, old
+SSH host keys, old VM identity, or old install workdirs.
