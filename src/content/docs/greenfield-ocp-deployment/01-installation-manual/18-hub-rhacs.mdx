@@ -1,0 +1,236 @@
+---
+title: "Installation Manual - 18 Hub RHACS"
+sidebar_label: "18 Hub RHACS"
+description: "How Red Hat Advanced Cluster Security is installed on the greenfield management hub through GitOps and Vault-backed secrets."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+This chapter installs Red Hat Advanced Cluster Security on `hub-dc-v7`. It
+creates RHACS Central and then secures the hub itself with a hub-local
+`SecuredCluster`.
+
+Do not import spokes in this gate. Spoke `SecuredCluster` resources and any
+policy tuning belong to later spoke onboarding work.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Operator namespace | `rhacs-operator` |
+| RHACS namespace | `stackrox` |
+| Package | `rhacs-operator` |
+| Channel | `stable` |
+| CSV | `rhacs-operator.v4.10.2` |
+| Catalog source | `cs-redhat-operator-index-v4-20` |
+| Central | `stackrox/stackrox-central-services` |
+| SecuredCluster | `stackrox/stackrox-secured-cluster-services` |
+| StorageClass | `lvms-vg1` |
+| Central route | `central-stackrox.apps.hub-dc-v7.v7.comptech-lab.com` |
+
+## GitOps Files
+
+Add the operator layer:
+
+```text
+clusters/hub-dc-v7/operators/rhacs-operator/
+```
+
+Add the security layer:
+
+```text
+clusters/hub-dc-v7/security/rhacs/
+```
+
+Then include both layers in:
+
+```text
+clusters/hub-dc-v7/kustomization.yaml
+```
+
+## Operator
+
+Create namespace `rhacs-operator`, an all-namespaces OperatorGroup, and a
+Subscription pinned to the reference version:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: rhacs-operator
+  namespace: rhacs-operator
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: rhacs-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: rhacs-operator.v4.10.2
+```
+
+## Vault Secrets
+
+Use fresh v7 secret material. Do not copy RHACS admin passwords or init bundles
+from older clusters.
+
+Required Vault paths:
+
+```text
+secret/greenfield/openshift/hub-dc-v7/rhacs/admin
+secret/greenfield/openshift/hub-dc-v7/rhacs/init-bundle
+```
+
+The admin path provides the `password` key for the
+`central-admin-password` Secret. The init-bundle path provides the generated
+TLS material for:
+
+```text
+collector-tls
+sensor-tls
+admission-control-tls
+```
+
+The `ClusterSecretStore/vault-platform` can read these paths through the
+`hub-dc-v7` Vault Kubernetes auth policy created in the External Secrets
+chapter.
+
+## Central
+
+Create `stackrox` and sync the Central admin password through External Secrets.
+Then create Central:
+
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: Central
+metadata:
+  name: stackrox-central-services
+  namespace: stackrox
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  central:
+    adminPasswordSecret:
+      name: central-admin-password
+    db:
+      persistence:
+        persistentVolumeClaim:
+          claimName: central-db
+          size: 100Gi
+          storageClassName: lvms-vg1
+    exposure:
+      route:
+        enabled: true
+  scannerV4:
+    scannerComponent: Enabled
+    db:
+      persistence:
+        persistentVolumeClaim:
+          claimName: scanner-v4-db
+          size: 100Gi
+```
+
+Wait for Central to become available before creating the init bundle.
+
+## Init Bundle
+
+Generate a fresh init bundle from the new Central. Store the generated secret
+fields in Vault and delete any temporary files immediately after seeding Vault.
+
+The GitOps layer must consume the bundle through External Secrets rather than
+committing generated Secret manifests.
+
+## SecuredCluster
+
+After the init-bundle ExternalSecrets are ready, create the hub-local secured
+cluster:
+
+```yaml
+apiVersion: platform.stackrox.io/v1alpha1
+kind: SecuredCluster
+metadata:
+  name: stackrox-secured-cluster-services
+  namespace: stackrox
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  clusterName: hub-dc-v7
+  centralEndpoint: central.stackrox.svc:443
+  admissionControl:
+    listenOnCreates: true
+    listenOnUpdates: true
+    listenOnEvents: true
+  scannerV4:
+    scannerComponent: AutoSense
+```
+
+## Reconcile
+
+Commit and push the Central layer first:
+
+```bash
+git add clusters/hub-dc-v7
+git commit -m "Install RHACS central on hub-dc-v7"
+git push origin main
+```
+
+After Central is available and the init bundle is seeded in Vault, commit and
+push the SecuredCluster layer:
+
+```bash
+git add clusters/hub-dc-v7/security/rhacs
+git commit -m "Add RHACS secured cluster for hub-dc-v7"
+git push origin main
+```
+
+Trigger a hard refresh if needed:
+
+```bash
+oc -n openshift-gitops annotate application.argoproj.io hub-dc-v7-bootstrap \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+## Validation
+
+Run from `gf-ocp-bootstrap-01`:
+
+```bash
+export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+
+oc get clusterversion
+oc get co | awk 'NR==1 || $3!="True" || $4=="True" || $5=="True"'
+
+oc -n openshift-gitops get application.argoproj.io hub-dc-v7-bootstrap \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REV:.status.sync.revision
+
+oc -n rhacs-operator get subscription.operators.coreos.com rhacs-operator \
+  -o custom-columns=NAME:.metadata.name,CHANNEL:.spec.channel,SOURCE:.spec.source,STATE:.status.state,CURRENTCSV:.status.currentCSV
+
+oc -n stackrox get externalsecret
+oc -n stackrox get central stackrox-central-services
+oc -n stackrox get securedcluster stackrox-secured-cluster-services
+oc -n stackrox get pods
+oc -n stackrox get route
+```
+
+Expected state:
+
+- root application is `Synced` and `Healthy`;
+- RHACS CSV is `rhacs-operator.v4.10.2` and `Succeeded`;
+- all four RHACS ExternalSecrets are `Ready=True`;
+- Central is `Available=True` and `Progressing=False`;
+- SecuredCluster is `Available=True` and `Progressing=False`;
+- all `stackrox` pods are Running;
+- Central route `/v1/ping` returns HTTP `200`.
+
+## Completion State
+
+For the recorded `hub-dc-v7` installation:
+
+- GitLab commits:
+  - `72c3050` `Install RHACS central on hub-dc-v7`
+  - `9e5c406` `Add RHACS secured cluster for hub-dc-v7`
+- Central route:
+  `central-stackrox.apps.hub-dc-v7.v7.comptech-lab.com`
+- Central and SecuredCluster both reported version `4.10.2`,
+  `Available=True`, and `Progressing=False`.
+- The authenticated Central metadata endpoint returned HTTP `200`.
