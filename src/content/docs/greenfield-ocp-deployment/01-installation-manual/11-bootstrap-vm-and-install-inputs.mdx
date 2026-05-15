@@ -42,6 +42,11 @@ Review the ignored files under:
 artifacts/cloud-init/gf-ocp-bootstrap-01/
 ```
 
+Keep bootstrap networking MAC-matched in `network-config.yaml`. The RHEL
+cloud-init sysconfig renderer accepts the default route as `0.0.0.0/0`; using
+`to: default` fails first-boot network rendering and leaves the VM without its
+static IP.
+
 Build the seed ISO:
 
 ```bash
@@ -66,6 +71,12 @@ Install the pinned tools on the bootstrap VM:
 ```bash
 ./scripts/gfctl.sh install-openshift-tools --execute
 ```
+
+The preserved RHEL guest image can boot without enabled package repositories.
+In that case `oc`, `kubectl`, `openshift-install`, `oc-mirror`, and `butane`
+still install from the pinned client downloads, but RPM-backed packages such as
+`git`, `tmux`, `podman`, `skopeo`, and `nmstate` need RHSM registration or a
+local RPM repository before package installation can complete.
 
 ## Install Input Flow
 
