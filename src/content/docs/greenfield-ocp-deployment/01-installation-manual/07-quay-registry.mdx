@@ -30,6 +30,8 @@ object storage, DNS, edge TLS, secret custody, and source-of-truth inventory.
 | MinIO service user | `quay-storage-v2` |
 | Credential custody | `secret/greenfield/quay/application/gf-ocp-quay-01` |
 | Storage credential custody | `secret/greenfield/object-storage/minio/users/quay-storage` |
+| Backup credential custody | `secret/greenfield/object-storage/minio/users/quay-backup` |
+| Robot credential custody | `secret/greenfield/quay/robots/<organization>/<shortname>` |
 
 PowerDNS records:
 
@@ -128,6 +130,102 @@ administrator account and pushed:
 quay.v7.comptech-lab.com/zahid/smoke:op-gf-quay1
 ```
 
+## Backup And Restore
+
+Quay backup artifacts are encrypted before upload to MinIO:
+
+```text
+quay-backups/quay/YYYYMMDDTHHMMSSZ/quay-YYYYMMDDTHHMMSSZ.tar.gz.enc
+quay-backups/quay/YYYYMMDDTHHMMSSZ/quay-YYYYMMDDTHHMMSSZ.tar.gz.enc.sha256
+```
+
+The backup includes the Quay PostgreSQL database dump, Quay config, systemd
+unit, and backup metadata. The backup credential and archive passphrase are
+stored at:
+
+```text
+secret/greenfield/object-storage/minio/users/quay-backup
+```
+
+Installed files on `gf-ocp-quay-01`:
+
+```text
+/etc/quay/quay-backup.env
+/usr/local/sbin/quay-backup-to-minio.sh
+/usr/local/sbin/quay-restore-validate.sh
+quay-backup.service
+quay-backup.timer
+```
+
+Validation:
+
+```bash
+ssh ze@30.30.200.40 'sudo /usr/local/sbin/quay-backup-to-minio.sh'
+ssh ze@30.30.200.40 'sudo /usr/local/sbin/quay-restore-validate.sh'
+ssh ze@30.30.200.40 'sudo systemctl list-timers quay-backup.timer --no-pager'
+```
+
+The `quay-backups` bucket has versioning enabled and a 90-day lifecycle policy
+for current and noncurrent backup objects.
+
+## Repository And Robot Model
+
+The source-of-truth bootstrap model is:
+
+```text
+data/quay/bootstrap-model.json
+```
+
+Namespaces:
+
+- `openshift-release`
+- `openshift-operators`
+- `platform`
+- `golden-images`
+- `tenants`
+
+Initial repositories:
+
+- `openshift-release/release-images`
+- `openshift-release/release-metadata`
+- `openshift-operators/redhat-operator-index`
+- `openshift-operators/certified-operator-index`
+- `platform/ci-tools`
+- `platform/smoke`
+- `golden-images/ubi9`
+
+Initial organization robots:
+
+- `openshift-release+ocp_mirror`
+- `openshift-operators+ocp_mirror`
+- `platform+ci_push`
+- `platform+read_only`
+- `golden-images+read_only`
+
+Apply the model during bootstrap from the Quay VM:
+
+```bash
+sudo /usr/local/sbin/seed-quay-internal-model.sh \
+  /etc/quay/bootstrap/bootstrap-model.json \
+  /root/quay-robot-tokens.json
+```
+
+The internal seeder is used during standalone bootstrap because the initial
+Quay user-initialize token does not provide the full organization, repository,
+robot, and permission API scope required for this model. After seeding, move
+robot credentials directly into Vault and remove any temporary local copies.
+
+Validated smoke tags:
+
+```text
+quay.v7.comptech-lab.com/openshift-release/release-metadata:op-gf-quay2-smoke
+quay.v7.comptech-lab.com/openshift-operators/certified-operator-index:op-gf-quay2-smoke
+quay.v7.comptech-lab.com/platform/smoke:op-gf-quay2-smoke
+```
+
+Future `oc-mirror` work should use the release and operator mirror robots and
+store generated pull-secret material in Vault, not Git.
+
 ## Lessons Captured
 
 - Upstream Project Quay image tags use the numeric form, for example `3.17.1`,
@@ -137,3 +235,4 @@ quay.v7.comptech-lab.com/zahid/smoke:op-gf-quay1
 - Keep internal S3 traffic on the private MinIO endpoint instead of sending it
   through the public HAProxy route.
 - Validate the scoped MinIO user with `mc` before starting Quay.
+- Use unique organization email aliases in the Quay bootstrap model.
