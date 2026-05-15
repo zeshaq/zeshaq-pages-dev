@@ -1,0 +1,224 @@
+---
+title: "Installation Manual - 17 Hub ACM and MCE"
+sidebar_label: "17 Hub ACM and MCE"
+description: "How Advanced Cluster Management and MultiCluster Engine are installed on the greenfield management hub through GitOps."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+This chapter installs Advanced Cluster Management on `hub-dc-v7`. The
+`MultiClusterHub` operand enables the embedded MultiCluster Engine component,
+which then installs MCE in its own namespace.
+
+Do not add spoke registration or workload placement in this gate. This chapter
+only establishes the hub management control plane.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| ACM namespace | `open-cluster-management` |
+| MCE namespace | `multicluster-engine` |
+| ACM package | `advanced-cluster-management` |
+| ACM channel | `release-2.16` |
+| ACM CSV | `advanced-cluster-management.v2.16.1` |
+| MCE package | `multicluster-engine` |
+| MCE channel | `stable-2.11` |
+| MCE CSV | `multicluster-engine.v2.11.1` |
+| Catalog source | `cs-redhat-operator-index-v4-20` |
+| MultiClusterHub | `open-cluster-management/multiclusterhub` |
+| MultiClusterEngine | `multiclusterengine` |
+
+## GitOps Files
+
+Add:
+
+```text
+clusters/hub-dc-v7/platform/acm/
+```
+
+Then include the ACM layer in:
+
+```text
+clusters/hub-dc-v7/kustomization.yaml
+```
+
+The layer contains:
+
+```text
+namespace.yaml
+operatorgroup.yaml
+subscription.yaml
+multiclusterhub.yaml
+kustomization.yaml
+```
+
+## ACM Operator
+
+Create namespace `open-cluster-management`:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: open-cluster-management
+  labels:
+    openshift.io/cluster-monitoring: "true"
+```
+
+Use a namespace-scoped OperatorGroup:
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: open-cluster-management
+  namespace: open-cluster-management
+spec:
+  targetNamespaces:
+    - open-cluster-management
+```
+
+Pin ACM to the same release family and CSV as the reference hub:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+spec:
+  channel: release-2.16
+  installPlanApproval: Automatic
+  name: advanced-cluster-management
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: advanced-cluster-management.v2.16.1
+```
+
+## MultiClusterHub
+
+Create the hub operand:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: MultiClusterHub
+metadata:
+  name: multiclusterhub
+  namespace: open-cluster-management
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true,ServerSideApply=true
+spec:
+  disableHubSelfManagement: false
+  overrides:
+    components:
+      - name: app-lifecycle
+        enabled: true
+      - name: cluster-lifecycle
+        enabled: true
+      - name: cluster-permission
+        enabled: true
+      - name: console
+        enabled: true
+      - name: grc
+        enabled: true
+      - name: multicluster-engine
+        enabled: true
+      - name: cluster-backup
+        enabled: false
+      - name: fine-grained-rbac
+        enabled: false
+      - name: insights
+        enabled: false
+      - name: multicluster-observability
+        enabled: false
+      - name: search
+        enabled: false
+      - name: siteconfig
+        enabled: false
+      - name: submariner-addon
+        enabled: false
+      - name: volsync
+        enabled: false
+```
+
+ACM manages the MCE subscription and creates the `MultiClusterEngine` operand.
+Do not create a separate MCE layer unless the architecture changes.
+
+## Reconcile
+
+Commit and push to the operational GitLab repo:
+
+```bash
+git add clusters/hub-dc-v7
+git commit -m "Install ACM on hub-dc-v7"
+git push origin main
+```
+
+Trigger a hard refresh if needed:
+
+```bash
+oc -n openshift-gitops annotate application.argoproj.io/hub-dc-v7-bootstrap \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+## Validation
+
+Validate the root application:
+
+```bash
+oc -n openshift-gitops get application.argoproj.io hub-dc-v7-bootstrap \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REV:.status.sync.revision
+```
+
+Expected state:
+
+```text
+hub-dc-v7-bootstrap   Synced   Healthy
+```
+
+Validate ACM:
+
+```bash
+oc get sub -n open-cluster-management
+oc get csv -n open-cluster-management advanced-cluster-management.v2.16.1
+oc -n open-cluster-management get mch multiclusterhub
+```
+
+Expected state:
+
+- subscription channel `release-2.16`;
+- CSV `advanced-cluster-management.v2.16.1` is `Succeeded`;
+- `MultiClusterHub` phase is `Running`;
+- current and desired ACM version are `2.16.1`.
+
+Validate MCE:
+
+```bash
+oc get sub -n multicluster-engine
+oc get csv -n multicluster-engine multicluster-engine.v2.11.1
+oc get multiclusterengine multiclusterengine
+```
+
+Expected state:
+
+- subscription channel `stable-2.11`;
+- CSV `multicluster-engine.v2.11.1` is `Succeeded`;
+- `MultiClusterEngine` phase is `Available`;
+- `MultiClusterHub` reports MCE current version `2.11.1` and compliant.
+
+Validate cluster health:
+
+```bash
+oc get co | awk 'NR==1 || $3!="True" || $4=="True" || $5=="True"'
+```
+
+Expected result: only the header.
+
+## Completion State
+
+After this chapter, `hub-dc-v7` has the ACM/MCE management layer installed but
+no spoke clusters are imported yet.
+
+The next gate should install RHACS on the hub. Spoke import and pull-model
+GitOps wiring should happen after the first spoke cluster exists.
