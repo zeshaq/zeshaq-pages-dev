@@ -1,0 +1,131 @@
+---
+title: "Installation Manual - 09 Nexus artifact repository"
+sidebar_label: "09 Nexus artifact repository"
+description: "How the gf-ocp Nexus VM is created, routed through HAProxy, and validated as a fresh non-OpenShift artifact proxy/cache."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+Nexus is the greenfield artifact proxy/cache for non-OpenShift developer and
+CI dependencies.
+
+OpenShift release images, operator catalogs, disconnected mirror payloads, and
+platform container images are Quay-owned. MinIO is used for backup/archive
+storage, not as a live Docker registry.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| VM name | `gf-ocp-nexus-01` |
+| FQDN | `nexus.v7.comptech-lab.com` |
+| Private IP | `30.30.200.41/16` |
+| Gateway | `30.30.0.1` |
+| DNS | `30.30.200.53`, then `8.8.8.8` |
+| Bridge | `br33` |
+| MAC | `52:54:00:70:07:41` |
+| vCPU | `4` |
+| RAM | `8 GiB` |
+| Disk | `250 GiB` qcow2 overlay |
+| Nexus version | `3.92.0` |
+| Edge route | HAProxy wildcard TLS to `30.30.200.41:8081` |
+| Local data | `/var/lib/nexus-data` |
+| Credential custody | `secret/greenfield/nexus/application/gf-ocp-nexus-01` |
+
+PowerDNS records:
+
+```text
+nexus.v7.comptech-lab.com         A 59.153.29.102
+nexus-private.v7.comptech-lab.com A 30.30.200.41
+```
+
+## Creation Flow
+
+The operator entry point is the greenfield repository script wrapper:
+
+```bash
+./scripts/gfctl.sh prepare-cloud-init --execute gf-ocp-nexus-01
+./scripts/gfctl.sh cloud-init-iso --execute gf-ocp-nexus-01
+cp scripts/vms/gf-ocp-nexus-01.env.example scripts/vms/gf-ocp-nexus-01.env
+./scripts/gfctl.sh create-vm --execute scripts/vms/gf-ocp-nexus-01.env
+```
+
+Before building the seed ISO, replace placeholder SSH public keys in:
+
+```text
+artifacts/cloud-init/gf-ocp-nexus-01/user-data.yaml
+```
+
+The VM is private-only. HAProxy is the only public entry point.
+
+## Runtime Install
+
+The install script is:
+
+```text
+/usr/local/sbin/install-nexus-standalone.sh
+```
+
+It installs and enables:
+
+- Podman;
+- Sonatype Nexus Repository container `sonatype/nexus3:3.92.0`;
+- `nexus.service`;
+- local Nexus data at `/var/lib/nexus-data`;
+- firewall access from HAProxy to port `8081`.
+
+The runtime env file is root-only:
+
+```text
+/etc/nexus/nexus.env
+```
+
+It is generated from Vault-held values and must never be committed or printed.
+
+## Repository Scope
+
+Use Nexus for non-OpenShift package caching where it helps CI and developer
+workflows, such as Maven, npm, PyPI, or RPM proxies.
+
+Do not use Nexus for:
+
+- OpenShift release images;
+- OpenShift operator catalogs;
+- disconnected cluster mirror payloads;
+- Quay-owned platform or tenant container images.
+
+## HAProxy Route
+
+HAProxy redirects HTTP to HTTPS for `nexus.v7.comptech-lab.com` and forwards
+the HTTPS route to:
+
+```text
+30.30.200.41:8081
+```
+
+The public certificate is the shared wildcard certificate for
+`*.v7.comptech-lab.com`.
+
+## Validation
+
+Run local validation on the VM:
+
+```bash
+ssh ze@30.30.200.41 'sudo /usr/local/sbin/validate-nexus-standalone.sh /etc/nexus/nexus.env'
+```
+
+Run edge validation from an operator host:
+
+```bash
+curl -sS -o /tmp/nexus-status.out -w '%{http_code}\n' \
+  https://nexus.v7.comptech-lab.com/service/rest/v1/status
+```
+
+Expected status: `200`.
+
+## Backup Posture
+
+Fresh Nexus starts with no old data migration. If non-OpenShift caches become
+valuable enough to preserve, back up the Nexus data directory to MinIO as a
+separate operational task. OpenShift image archives remain part of the Quay
+and `oc-mirror` workflow, not Nexus.
