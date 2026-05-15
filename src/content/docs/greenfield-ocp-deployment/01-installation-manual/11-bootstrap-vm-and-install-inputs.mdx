@@ -1,0 +1,121 @@
+---
+title: "Installation Manual - 11 Bootstrap VM and install inputs"
+sidebar_label: "11 Bootstrap VM and install inputs"
+description: "How the greenfield OpenShift bootstrap VM and first install inputs are rendered from source-controlled templates."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+This phase prepares the `gf-ocp-bootstrap-01` VM and the first OpenShift
+install input workdir. It does not create the cluster yet.
+
+## Source Files
+
+```text
+bootstrap/cloud-init/gf-ocp-bootstrap-01.user-data.example.yaml
+bootstrap/cloud-init/gf-ocp-bootstrap-01.network-config.example.yaml
+scripts/vms/gf-ocp-bootstrap-01.env.example
+bootstrap/openshift-install/cluster.env.example
+bootstrap/openshift-install/install-config.template.yaml
+bootstrap/openshift-install/agent-config.template.yaml
+data/openshift-install/v7-baseline.json
+scripts/services/bootstrap/install-openshift-tools.sh
+scripts/services/bootstrap/build-openshift-pull-secret-from-vault.sh
+scripts/services/bootstrap/render-openshift-install-inputs.sh
+```
+
+The first install baseline pins OpenShift to `4.20.18`, uses the Quay-backed
+release image, enables FIPS, and renders disconnected mirror resources from the
+committed `oc-mirror` output.
+
+## Bootstrap VM Flow
+
+Prepare cloud-init:
+
+```bash
+./scripts/gfctl.sh prepare-cloud-init --execute gf-ocp-bootstrap-01
+```
+
+Review the ignored files under:
+
+```text
+artifacts/cloud-init/gf-ocp-bootstrap-01/
+```
+
+Build the seed ISO:
+
+```bash
+./scripts/gfctl.sh cloud-init-iso --execute gf-ocp-bootstrap-01
+```
+
+Copy and review the VM env:
+
+```bash
+cp scripts/vms/gf-ocp-bootstrap-01.env.example \
+  scripts/vms/gf-ocp-bootstrap-01.env
+```
+
+Create the VM only after the issue gate is approved:
+
+```bash
+./scripts/gfctl.sh create-vm --execute scripts/vms/gf-ocp-bootstrap-01.env
+```
+
+Install the pinned tools on the bootstrap VM:
+
+```bash
+./scripts/gfctl.sh install-openshift-tools --execute
+```
+
+## Install Input Flow
+
+Create an ignored cluster workdir:
+
+```bash
+install -d artifacts/openshift/spoke-dc-v7
+cp bootstrap/openshift-install/cluster.env.example \
+  artifacts/openshift/spoke-dc-v7/cluster.env
+```
+
+Edit the cluster env for the actual IP plan, DNS, MAC addresses, root-device
+hints, and SSH key path.
+
+Build the runtime pull secret from Vault:
+
+```bash
+export VAULT_ADDR=https://gf-ocp-vault-02.v7.comptech-lab.com:8200
+export VAULT_CACERT=/path/to/vault-ca.crt
+export VAULT_TOKEN=<redacted>
+./scripts/services/bootstrap/build-openshift-pull-secret-from-vault.sh \
+  --output artifacts/openshift/spoke-dc-v7/pull-secret.json
+```
+
+Render install inputs:
+
+```bash
+./scripts/gfctl.sh render-openshift-install-inputs --execute \
+  --env artifacts/openshift/spoke-dc-v7/cluster.env \
+  --output-dir artifacts/openshift/spoke-dc-v7
+```
+
+Generated files remain ignored until reviewed:
+
+```text
+artifacts/openshift/spoke-dc-v7/install-config.yaml
+artifacts/openshift/spoke-dc-v7/agent-config.yaml
+artifacts/openshift/spoke-dc-v7/mirror-resources/
+```
+
+## Gates Before Cluster Creation
+
+- RHEL base image artifact checksum validation passes.
+- Bootstrap VM SSH and sudo validation passes.
+- `oc`, `kubectl`, `openshift-install`, and `oc-mirror` report the expected
+  pinned versions.
+- Pull secret authenticates to `quay.v7.comptech-lab.com`.
+- The pinned `4.20.18` release image resolves from Quay.
+- Operator catalog images resolve from Quay.
+- Rendered `install-config.yaml` has `fips: true`.
+- Rendered install inputs are reviewed for the actual IP plan, DNS plan, MAC
+  addresses, root-device hints, and cluster name.
+- No generated auth material is staged for Git commit.
