@@ -1,12 +1,12 @@
 ---
 title: "Installation Manual - 06 NetBox installation"
 sidebar_label: "06 NetBox installation"
-description: "How the gf-ocp NetBox VM host and initial NetBox application are installed and validated."
+description: "How the gf-ocp NetBox VM host, application, and backup/restore model are installed and validated."
 last_reviewed: 2026-05-15
 draft: false
 ---
 
-NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs, prefixes, and service ownership. The current foundation install runs NetBox on a private VM with local PostgreSQL and local Redis. HAProxy public exposure and backup/restore automation are handled by later approved phases.
+NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs, prefixes, and service ownership. The current foundation install runs NetBox on a private VM with local PostgreSQL and local Redis. Backup and restore automation is configured before HAProxy public exposure.
 
 ## Target State
 
@@ -25,6 +25,7 @@ NetBox is the planned source of truth for IPAM, DNS intent, racks, devices, VMs,
 | Base image | `/var/lib/libvirt/images/ubuntu-24.04-base.qcow2` |
 | NetBox version | `v4.6.0` |
 | Credential custody | `secret/greenfield/netbox/application/gf-ocp-netbox-01` |
+| Backup credential custody | `secret/greenfield/object-storage/minio/users/netbox-backup` |
 
 DNS points the NetBox host name to the private VM IP:
 
@@ -81,7 +82,7 @@ Autostart:      enable
 
 ## Current Boundary
 
-This phase creates the VM host and installs the initial NetBox application only. It does not expose NetBox publicly through HAProxy and it does not yet establish the production backup/restore model.
+This phase creates the VM host, installs the initial NetBox application, and configures a validated backup/restore path. It does not expose NetBox publicly through HAProxy yet.
 
 ## Application Install
 
@@ -144,13 +145,80 @@ System check identified no issues
 
 Direct HTTP access from arbitrary hosts is intentionally blocked by UFW. The VM firewall allows NetBox HTTP/HTTPS only from HAProxy `30.30.200.102`.
 
+## Backup And Restore
+
+NetBox backups are stored in the MinIO bucket `netbox-backups` using a scoped service user. The credential and archive encryption passphrase are stored in Vault at:
+
+```text
+secret/greenfield/object-storage/minio/users/netbox-backup
+```
+
+Installed files on `gf-ocp-netbox-01`:
+
+```text
+/etc/netbox/netbox-backup.env
+/usr/local/sbin/netbox-backup-to-minio.sh
+/usr/local/sbin/netbox-restore-validate.sh
+/etc/systemd/system/netbox-backup.service
+/etc/systemd/system/netbox-backup.timer
+```
+
+Source copies are kept in the greenfield repository:
+
+```text
+scripts/services/netbox/netbox-backup-to-minio.sh
+scripts/services/netbox/netbox-restore-validate.sh
+```
+
+The env file is `root:root` mode `0600`. Do not print or document its values.
+
+The backup includes:
+
+- PostgreSQL custom-format dump of database `netbox`.
+- NetBox media, reports, scripts, and configuration file when present.
+- A timestamped manifest.
+- AES-256-CBC encrypted compressed archive.
+- SHA-256 checksum uploaded beside the encrypted archive.
+
+Run a manual backup:
+
+```bash
+ssh ze@30.30.200.23 'sudo /usr/local/sbin/netbox-backup-to-minio.sh'
+```
+
+Expected output shape:
+
+```text
+backup_object=netbox-backups/netbox/YYYYMMDDTHHMMSSZ/netbox-YYYYMMDDTHHMMSSZ.tar.gz.enc
+```
+
+Run restore validation:
+
+```bash
+ssh ze@30.30.200.23 'sudo /usr/local/sbin/netbox-restore-validate.sh'
+```
+
+Expected output shape:
+
+```text
+restore_validation=passed object=netbox-backups/netbox/YYYYMMDDTHHMMSSZ/netbox-YYYYMMDDTHHMMSSZ.tar.gz.enc
+```
+
+The restore validator downloads the latest encrypted object, verifies the checksum, decrypts and extracts it, restores the dump into a temporary `netbox_restore_validation_*` database, checks the restored schema is readable, and drops the temporary database.
+
+Validation completed on 2026-05-15:
+
+```text
+backup_object=netbox-backups/netbox/20260515T080609Z/netbox-20260515T080609Z.tar.gz.enc
+restore_validation=passed object=netbox-backups/netbox/20260515T080609Z/netbox-20260515T080609Z.tar.gz.enc
+```
+
+The `netbox-backup.timer` is enabled and active. No temporary restore validation database remained after the drill.
+
 ## Next Phase
 
-The next NetBox phase should cover:
+The next NetBox phase should cover controlled exposure and data modeling:
 
-- PostgreSQL dump to MinIO.
-- NetBox media/config archive to MinIO.
-- Scoped MinIO service user.
-- Restore drill.
-- HAProxy route only after backup validation.
+- HAProxy route for `netbox.v7.comptech-lab.com`.
+- Public reachability validation.
 - Initial source-of-truth data model for sites, prefixes, VLANs, VMs, and service ownership.
