@@ -1,0 +1,122 @@
+---
+title: "API gateway with WSO2 API Manager"
+sidebar_label: "12 — API gateway"
+description: "WSO2 APIM in front of Liberty. Publish the policies API, attach throttling, generate a developer portal, and decouple the public surface from the implementation."
+estimated_minutes: 75
+last_updated: 2026-05-15
+prereqs: ["11 — Identity with WSO2 Identity Server"]
+---
+
+An API gateway is the **single entry point** for everything outside your network. The application stays focused on business logic; the gateway handles the cross-cutting concerns that don't belong inside the code — throttling, authentication, analytics, versioning, the developer portal, blue/green routing. WSO2 API Manager (APIM) is one cohesive runtime that does all of it.
+
+## Gateway vs ESB — why we have both
+
+Earlier in the track we added **WSO2 MI** as an enterprise service bus. APIM is a different shape:
+
+| Concern | ESB (WSO2 MI) | API gateway (WSO2 APIM) |
+| --- | --- | --- |
+| Direction | Mostly **outbound** integrations | Mostly **inbound** API exposure |
+| Audience | Internal services, partners over MQ/SOAP/JMS | External developers, mobile apps, browsers |
+| Operations | Routing, transformation, protocol bridging | Throttling, analytics, developer portal, plan management |
+| Lifecycle | Versioned with the services it integrates | Versioned per published API |
+
+Most shops run both: ESB for backend connectivity, gateway for front-of-the-house. They overlap at the routing seam; some teams pick one or the other and accept the gaps.
+
+## APIM in a container
+
+WSO2 APIM ships as a single all-in-one container (gateway + publisher + dev portal + key manager). It is a heavier image than IS — around 2 GB — but the runtime is the same.
+
+```bash
+podman run -d --replace --name wso2apim --network insurance-net \
+  -p 9446:9443 \
+  -p 8243:8243 \
+  -p 8280:8280 \
+  docker.io/wso2/wso2am:4.4.0
+```
+
+Port mapping:
+
+- `9443` → host `9446`: management consoles (admin + publisher + dev portal).
+- `8243`: HTTPS gateway listener — the public API surface.
+- `8280`: HTTP gateway listener — for dev / non-TLS testing.
+
+Allow 90–180 seconds for first boot, then `https://localhost:9446/publisher` for the API author UI, `https://localhost:9446/devportal` for the consumer-facing one, both `admin / admin` initially.
+
+## Telling APIM about Liberty
+
+In the **Publisher**:
+
+1. **Create API** → **From scratch**.
+2. Name: `Policies`. Context: `/policies`. Version: `1.0.0`.
+3. **Endpoints** → set the backend HTTP endpoint to `http://insurance-app:9080/api/policies`. Same network, container name.
+4. **Resources** → define `GET /` and `POST /` (the gateway-facing surface, which maps to Liberty's `/api/policies`).
+5. **Lifecycle** → `Publish`.
+
+Now requests to `https://gateway:8243/policies/1.0.0/` are proxied to `http://insurance-app:9080/api/policies`. The Liberty API path doesn't have to look anything like the public one — the gateway is the place to make the public contract clean even when the implementation is messy.
+
+## Subscriptions and tokens
+
+API consumers don't get to call APIM directly. They:
+
+1. Sign up in the **Developer Portal** (or have an account provisioned).
+2. Create an **Application** (a logical group of API subscriptions).
+3. Subscribe the Application to your `Policies` API at a **Throttling Tier** (`Bronze`, `Silver`, `Gold`, or custom).
+4. **Generate Keys** — APIM mints an OAuth client ID/secret tied to that Application.
+5. Exchange those for an access token, send it as `Authorization: Bearer ...`.
+
+That access token is **separate from the WSO2 IS token** from module 11 — APIM has its own key manager. In production you'd configure APIM to **delegate key management to WSO2 IS** (one place to manage users, one OIDC provider), but the default standalone setup works for getting the gateway path verified first.
+
+## Throttling
+
+Right out of the box:
+
+- **Application-level**: an application is allowed X requests/minute across all its subscribed APIs.
+- **Subscription-level**: a specific (Application, API) pair has its own cap.
+- **Resource-level**: `POST /policies/` can have a tighter cap than `GET /policies/` because writes are more expensive.
+
+Built-in tiers fit most needs (e.g. `Gold = 5000/minute`). Custom tiers live in the **Admin Portal**. The mistake to avoid is throttling at the application layer first — the gateway is the right place because it can reject before the request reaches Liberty.
+
+## What goes in the developer portal
+
+By default, the dev portal serves:
+
+- **API catalog** — every published API in your tenant.
+- **Documentation** — the OpenAPI spec APIM generated from your resources, plus any markdown you've added.
+- **Try-it-out** — a Swagger-UI-like form that signs requests with the portal's logged-in user.
+- **Application management** — create/edit Applications, regenerate keys, view usage analytics.
+
+This is the surface engineers integrating with your insurance APIs will actually see. Treat its description text and example payloads as customer-facing copy.
+
+## Verifying end to end
+
+```bash
+# Generate a token from APIM (Bearer for the gateway)
+TOKEN=$(curl -sk -u "<consumer_key>:<consumer_secret>" \
+  -d "grant_type=client_credentials&scope=default" \
+  https://localhost:9446/oauth2/token | jq -r .access_token)
+
+# Hit Liberty *through* the gateway
+curl -k https://localhost:8243/policies/1.0.0/ \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+In SigNoz, the trace shows a span on the gateway (if you've wired APIM's OTel exporter — out of scope here but supported) followed by spans on Liberty. The public-facing latency is `gateway_total = gateway_overhead + liberty_total`; APIM's overhead is typically 10–30 ms for a passthrough call.
+
+## A note on lifecycle
+
+Once an API is published at a version, its contract should not change. To evolve:
+
+- **Patch in place** for non-breaking changes (new optional fields, new resources).
+- **New version** for breaking changes — `/policies/2.0.0/` runs alongside `/policies/1.0.0/`, consumers migrate on their own clock. Deprecate the old one in the portal first.
+
+This is the discipline that makes a public API survive a re-implementation of the backend without breaking consumers. It is also the thing teams that "just spin up a quick endpoint" most often skip and most often regret.
+
+## What you have
+
+- A gateway in front of Liberty, with throttling and a dev portal.
+- A public API contract decoupled from the backend implementation.
+- Seven containers running on one VM: Liberty, MI, Postgres, SigNoz (a few sub-containers), Redis, Kafka, WSO2 IS, WSO2 APIM.
+
+Module 13 closes the track.
+
+Next: [13 — What's next →](/learn/openliberty/whats-next)

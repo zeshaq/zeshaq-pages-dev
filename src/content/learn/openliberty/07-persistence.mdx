@@ -1,0 +1,197 @@
+---
+title: "Persistence: PostgreSQL, Flyway, JPA"
+sidebar_label: "07 — Persistence"
+description: "A PostgreSQL container on the shared network, Flyway versioning the schema, and Jakarta Persistence wiring the data into Liberty. /api/ping graduates to /api/policies."
+estimated_minutes: 75
+last_updated: 2026-05-15
+prereqs: ["06 — Adding an enterprise service bus"]
+---
+
+So far the app has no state. Real insurance applications have very little code that isn't, in some way, reading from or writing to a database. This module adds the database and the plumbing around it.
+
+## Why we waited until module 07
+
+Adding persistence in module 03 would have meant teaching JPA *before* you'd seen Liberty itself respond to a single request. Persistence is the layer that benefits most from already-working scaffolding — `mvn liberty:dev` hot-reload, a running container, the ESB next door. Now is the right time.
+
+## The PostgreSQL container
+
+```bash
+podman run -d --replace --name postgres --network insurance-net \
+  -e POSTGRES_USER=insurance \
+  -e POSTGRES_PASSWORD=insurance \
+  -e POSTGRES_DB=insurance \
+  -p 5432:5432 \
+  docker.io/library/postgres:17-alpine
+```
+
+`insurance-net` is the same user-defined bridge from module 06. From inside any container on it (Liberty included), this database is reachable as `postgres:5432`. Publishing 5432 to the host is for your local `psql`/`pgcli` — not needed for the application path.
+
+A reasonable smoke test from the VM shell:
+
+```bash
+podman exec -it postgres psql -U insurance -d insurance -c "select version();"
+```
+
+## Schema as code: Flyway
+
+Schema migrations belong in git, not in a `psql` session. Add Flyway to `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-core</artifactId>
+    <version>10.20.0</version>
+</dependency>
+<dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-database-postgresql</artifactId>
+    <version>10.20.0</version>
+</dependency>
+```
+
+Migrations live in `src/main/resources/db/migration/` as `V1__init.sql`, `V2__add_premium.sql`, and so on. Flyway picks them up by filename and applies them in order, tracking what's already run in a `flyway_schema_history` table.
+
+For dev, run migrations on app startup with a `@Startup`-scoped CDI bean that calls `Flyway.configure().dataSource(...).load().migrate()`. For production you'd usually run migrations as a separate step before deployment — that decision is in scope for the CI/CD track, not this one.
+
+A reasonable `V1__init.sql`:
+
+```sql
+CREATE TABLE policy (
+    id           BIGSERIAL PRIMARY KEY,
+    policy_no    VARCHAR(32) UNIQUE NOT NULL,
+    holder_name  VARCHAR(120) NOT NULL,
+    premium      NUMERIC(12,2) NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+## Liberty's side: the JDBC feature + driver
+
+In `src/main/liberty/config/server.xml`:
+
+```xml
+<featureManager>
+    <feature>webProfile-10.0</feature>
+    <feature>microProfile-6.1</feature>
+    <feature>jdbc-4.3</feature>
+</featureManager>
+
+<library id="postgresql-driver">
+    <fileset dir="${shared.resource.dir}/postgresql" includes="*.jar"/>
+</library>
+
+<dataSource id="insuranceDS"
+            jndiName="jdbc/insuranceDS"
+            transactional="true">
+    <jdbcDriver libraryRef="postgresql-driver"/>
+    <properties.postgresql serverName="postgres"
+                           portNumber="5432"
+                           databaseName="insurance"
+                           user="insurance"
+                           password="insurance"/>
+</dataSource>
+```
+
+The Containerfile picks up the driver — drop `postgresql-42.7.4.jar` into `src/main/liberty/config/postgresql/` and add one COPY line that puts it at `/config/postgresql/`. Liberty's `${shared.resource.dir}` resolves to `/config/`.
+
+Hardcoded credentials in `server.xml` are an interim. Real apps inject them via MicroProfile Config from environment variables. We will revisit this when we add identity in module 11; for now, the literal values are fine for a dev container.
+
+## A first entity + REST endpoint
+
+`Policy.java`:
+
+```java
+@Entity
+@Table(name = "policy")
+public class Policy {
+    @Id @GeneratedValue
+    private Long id;
+
+    @Column(name = "policy_no", unique = true, nullable = false)
+    private String policyNo;
+
+    @Column(name = "holder_name", nullable = false)
+    private String holderName;
+
+    private BigDecimal premium;
+
+    // getters / setters
+}
+```
+
+`PolicyRepository.java`:
+
+```java
+@ApplicationScoped
+public class PolicyRepository {
+    @PersistenceContext(unitName = "insurance")
+    private EntityManager em;
+
+    @Transactional
+    public Policy create(Policy p) { em.persist(p); return p; }
+
+    public List<Policy> findAll() {
+        return em.createQuery("from Policy", Policy.class).getResultList();
+    }
+}
+```
+
+`PolicyResource.java` replaces `/api/ping` for the rest of the track:
+
+```java
+@Path("/policies")
+@Produces(MediaType.APPLICATION_JSON)
+public class PolicyResource {
+    @Inject PolicyRepository repo;
+
+    @GET
+    public List<Policy> list() { return repo.findAll(); }
+
+    @POST @Consumes(MediaType.APPLICATION_JSON)
+    public Policy create(Policy p) { return repo.create(p); }
+}
+```
+
+And the `persistence.xml` at `src/main/resources/META-INF/`:
+
+```xml
+<persistence xmlns="https://jakarta.ee/xml/ns/persistence" version="3.1">
+    <persistence-unit name="insurance" transaction-type="JTA">
+        <jta-data-source>jdbc/insuranceDS</jta-data-source>
+        <properties>
+            <property name="jakarta.persistence.schema-generation.database.action" value="none"/>
+        </properties>
+    </persistence-unit>
+</persistence>
+```
+
+Schema generation is **off** — Flyway owns the schema. Hibernate generating tables and Flyway generating tables is a race condition waiting to happen.
+
+## Verify
+
+```bash
+podman build --network=host -t insurance-app:dev .
+podman run -d --replace --name insurance-app --network insurance-net \
+  -p 9080:9080 -p 9443:9443 insurance-app:dev
+
+# Create a policy
+curl -X POST http://localhost:9080/api/policies \
+  -H "Content-Type: application/json" \
+  -d '{"policyNo":"P-001","holderName":"Alice","premium":420.00}'
+
+# Read it back
+curl http://localhost:9080/api/policies
+```
+
+You should see your row, plus the `flyway_schema_history` table in Postgres acknowledging migration V1.
+
+## What you have
+
+- A real datastore on the shared network.
+- A schema versioned in git.
+- A persisted entity, accessible over a REST endpoint.
+- The pattern for adding the next entity (claim, payment, document) without a brain refresh.
+
+Module 08 wires every signal — from this DB call onward — into SigNoz.
+
+Next: [08 — Observability with SigNoz →](/learn/openliberty/observability)

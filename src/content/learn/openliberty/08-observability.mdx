@@ -1,0 +1,131 @@
+---
+title: "Observability with SigNoz"
+sidebar_label: "08 — Observability"
+description: "SigNoz as a single pane for metrics, traces, and logs. MicroProfile Telemetry + Metrics in Liberty, OTLP export to the SigNoz collector, dashboards on the first request."
+estimated_minutes: 60
+last_updated: 2026-05-15
+prereqs: ["07 — Persistence: PostgreSQL, Flyway, JPA"]
+---
+
+We add observability *now*, before the rest of the track, so every subsequent container — Redis, Kafka, WSO2 IS, APIM — shows up in dashboards from the first request. Watching a trace fan out across services is the kind of feedback loop that turns students into engineers.
+
+## Why SigNoz over the Prometheus + Grafana + Tempo stack
+
+The traditional open-source observability stack is three tools — **Prometheus** for metrics, **Tempo** or **Jaeger** for traces, **Loki** or **ELK** for logs — glued together with **Grafana** as the UI. It works, and it is what most large shops run. For learning, it is too many moving parts.
+
+**SigNoz** bundles all three signals on top of **ClickHouse**, fronted by one UI, fed by one OpenTelemetry collector. One docker-compose, one URL, three signals. The trade is less mix-and-match flexibility; for the curriculum that's a feature, not a bug.
+
+## Architecture
+
+What you'll run on the VM:
+
+```
+   ┌───────────────────────────┐
+   │ Liberty (insurance-app)   │
+   │   exporters: OTLP gRPC    │
+   └───────────┬───────────────┘
+               │  :4317  (OTLP)
+               ▼
+   ┌───────────────────────────┐
+   │ otel-collector (SigNoz)   │
+   └───────────┬───────────────┘
+               │
+               ▼
+   ┌───────────────────────────┐
+   │ ClickHouse (storage)      │
+   └───────────┬───────────────┘
+               │
+               ▼
+   ┌───────────────────────────┐
+   │ SigNoz frontend  :3301    │
+   └───────────────────────────┘
+```
+
+Four containers in total. SigNoz publishes a compose file that wires them up; we adapt it to podman compose (or run them as individual `podman run` invocations on `insurance-net`).
+
+## Running SigNoz
+
+The shortest path is the upstream compose:
+
+```bash
+git clone -b main https://github.com/SigNoz/signoz.git
+cd signoz/deploy/docker
+podman compose --file docker-compose.yaml up -d
+```
+
+A few minutes later, `http://localhost:3301` on the VM serves the SigNoz UI. The OpenTelemetry collector is listening on `otel-collector:4317` (gRPC) and `otel-collector:4318` (HTTP) inside the network.
+
+Both are reachable from Liberty as long as Liberty is on the same network. If you used podman-compose's default network, attach `insurance-app` to it as well — or move SigNoz onto `insurance-net`. We'll assume the latter.
+
+## Liberty side: MicroProfile Telemetry + Metrics
+
+Open Liberty has had OpenTelemetry support since the **`mpTelemetry-1.1`** feature. Add it (and the metrics feature) to `server.xml`:
+
+```xml
+<featureManager>
+    <feature>webProfile-10.0</feature>
+    <feature>microProfile-6.1</feature>
+    <feature>jdbc-4.3</feature>
+    <feature>mpTelemetry-1.1</feature>
+    <feature>mpMetrics-5.1</feature>
+</featureManager>
+```
+
+Then export the OpenTelemetry environment variables to the container — these are the standard OTLP exporter env vars, and Liberty's `mpTelemetry` picks them up automatically:
+
+```bash
+podman run -d --replace --name insurance-app --network insurance-net \
+  -e OTEL_SERVICE_NAME=insurance-app \
+  -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
+  -e OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+  -e OTEL_METRICS_EXPORTER=otlp \
+  -e OTEL_TRACES_EXPORTER=otlp \
+  -e OTEL_LOGS_EXPORTER=otlp \
+  -e OTEL_SDK_DISABLED=false \
+  -p 9080:9080 -p 9443:9443 \
+  insurance-app:dev
+```
+
+`OTEL_SDK_DISABLED=false` is the magic flag — Liberty defaults `mpTelemetry` to disabled and turns it on when this is set. The opposite of every other framework, and the single thing most often missed.
+
+## A first trace
+
+```bash
+curl http://localhost:9080/api/policies
+```
+
+In the SigNoz UI, **Traces** → service `insurance-app` should show a span tree:
+
+- `GET /api/policies` (the JAX-RS resource)
+- → `PolicyRepository.findAll` (CDI bean method)
+- → `SELECT * from policy` (the JDBC call, instrumented by Liberty's data source)
+
+Three spans, one request. When module 09 adds Redis, you'll see one more. When module 10 adds Kafka, you'll see the producer span fan out into a separate trace on the consumer side, joined by trace context propagation. Every module past this point gets free observability.
+
+## Metrics worth turning to first
+
+In **Dashboards**, build (or import) panels for:
+
+- `http_server_request_duration_seconds` (request latency, by route)
+- `jvm_memory_used_bytes` (heap pressure)
+- `jvm_gc_pause_seconds` (GC time)
+- `db_connections_in_use` (HikariCP / Liberty connection pool — leak detector)
+
+A 15-second-resolution view of those four is enough to catch most of the things students will hit when they break their own code in the next modules.
+
+## Common stumbles
+
+- **No data showing up.** Almost always one of: `OTEL_SDK_DISABLED` not set to `false`, wrong network (Liberty can't resolve `otel-collector`), or the collector port (`4317` gRPC vs `4318` HTTP) doesn't match `OTEL_EXPORTER_OTLP_PROTOCOL`.
+- **Trace context not propagated.** When calling out to other services from Liberty, use a `MicroProfile Rest Client` — it propagates W3C trace context headers. Bare `URLConnection` calls drop them.
+- **Too much data.** SigNoz will happily store every span. For dev, that's fine; for staging, set `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with `OTEL_TRACES_SAMPLER_ARG=0.1` to keep 10%.
+
+## What you have
+
+- One UI, one process, three signals.
+- Liberty exporting OTLP to the SigNoz collector with two lines of `server.xml` and a few env vars.
+- A live trace tree on every request.
+- Free observability for every module past this one.
+
+Module 09 adds Redis and you'll see the cache-hit spans immediately.
+
+Next: [09 — Caching with Redis →](/learn/openliberty/caching)

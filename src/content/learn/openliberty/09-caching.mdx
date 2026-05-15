@@ -1,0 +1,159 @@
+---
+title: "Caching with Redis"
+sidebar_label: "09 — Caching"
+description: "Add Redis as the hot-path cache in front of PostgreSQL. A read-through pattern, TTLs, and the rule that turns 'caching is hard' into something teachable."
+estimated_minutes: 50
+last_updated: 2026-05-15
+prereqs: ["08 — Observability with SigNoz"]
+---
+
+Two requests asking for the same policy shouldn't hit the database twice. That's the entire content of caching, compressed. The remaining 90% is *invalidation* — knowing when the cached answer is stale — and that's the part teams get wrong.
+
+## When to cache
+
+Cache when one or more of these is true:
+
+- **The data changes much less often than it's read.** Policy details: yes. User session state: maybe. Real-time inventory: no.
+- **The database call is expensive** (joins, large result, network round trip).
+- **The endpoint is on a hot path** (homepage, login, search).
+
+Caching the wrong thing is worse than not caching — you pay the cache-coherence cost (invalidation, debugging stale reads) for no read-time win.
+
+## The Redis container
+
+```bash
+podman run -d --replace --name redis --network insurance-net \
+  -p 6379:6379 \
+  docker.io/library/redis:7-alpine \
+  redis-server --save 60 1 --appendonly no
+```
+
+The `--save 60 1` line tells Redis to snapshot to disk if at least 1 key changed in the last 60 seconds — overkill for a cache, but it means an accidental restart doesn't wipe everything mid-class. For a pure cache you would use `--save ""` to disable persistence entirely.
+
+## Liberty side: Lettuce as the client
+
+There are two reasonable paths from Liberty to Redis:
+
+| Path | What you write | When it's right |
+| --- | --- | --- |
+| **JCache + Redisson** | `@CacheResult` annotations, almost no Redis code | When 80% of caching is method-level memoization |
+| **Lettuce client directly** | Explicit `get`/`set` calls | When you want full control over keys, TTLs, scripting |
+
+We pick Lettuce — direct, transparent, and the keys/values are explicit in the trace.
+
+Add to `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>io.lettuce</groupId>
+    <artifactId>lettuce-core</artifactId>
+    <version>6.5.0.RELEASE</version>
+</dependency>
+```
+
+A small CDI producer:
+
+```java
+@ApplicationScoped
+public class RedisClientProducer {
+    private RedisClient client;
+    private StatefulRedisConnection<String, String> connection;
+
+    @PostConstruct
+    void init() {
+        client = RedisClient.create("redis://redis:6379");
+        connection = client.connect();
+    }
+
+    @Produces @ApplicationScoped
+    RedisCommands<String, String> commands() {
+        return connection.sync();
+    }
+
+    @PreDestroy
+    void close() { connection.close(); client.shutdown(); }
+}
+```
+
+`redis://redis:6379` — the hostname is the container name, reachable because both containers are on `insurance-net`.
+
+## Read-through caching
+
+A read-through cache fronts the repository: first check Redis; on a miss, query Postgres and populate Redis with a TTL.
+
+```java
+@ApplicationScoped
+public class PolicyService {
+    private static final Duration TTL = Duration.ofMinutes(5);
+
+    @Inject PolicyRepository repo;
+    @Inject RedisCommands<String, String> redis;
+    @Inject Jsonb jsonb;
+
+    public Policy getByNumber(String policyNo) {
+        String key = "policy:" + policyNo;
+        String cached = redis.get(key);
+        if (cached != null) {
+            return jsonb.fromJson(cached, Policy.class);
+        }
+        Policy fresh = repo.findByNumber(policyNo);
+        if (fresh != null) {
+            redis.setex(key, TTL.getSeconds(), jsonb.toJson(fresh));
+        }
+        return fresh;
+    }
+}
+```
+
+Wire it into `PolicyResource`:
+
+```java
+@GET @Path("/{no}")
+public Policy get(@PathParam("no") String no) {
+    return service.getByNumber(no);
+}
+```
+
+## The invalidation rule
+
+There is exactly one teachable rule for cache invalidation, and it is: **every write path that touches the underlying data must also drop the cache key**.
+
+```java
+@POST @Consumes(MediaType.APPLICATION_JSON)
+public Policy create(Policy p) {
+    Policy saved = repo.create(p);
+    redis.del("policy:" + saved.getPolicyNo());   // drop on write
+    return saved;
+}
+```
+
+The slight subtlety: TTL is your **belt**, write-invalidation is your **suspenders**. The TTL bounds how long stale data can be served if a write path forgets to invalidate. Five-minute TTLs are a sweet spot for most read-heavy entities — long enough to matter, short enough that a missed invalidation isn't a daylong incident.
+
+## Verifying
+
+```bash
+# Create a policy
+curl -X POST http://localhost:9080/api/policies \
+  -H "Content-Type: application/json" \
+  -d '{"policyNo":"P-001","holderName":"Alice","premium":420.00}'
+
+# First read - hits DB, populates Redis
+curl http://localhost:9080/api/policies/P-001
+# Second read - hits Redis only
+curl http://localhost:9080/api/policies/P-001
+
+# Inspect the key directly
+podman exec -it redis redis-cli get "policy:P-001"
+```
+
+In SigNoz, the first request's trace shows two spans (Redis GET miss + Postgres SELECT). The second shows one (Redis GET hit). That visible drop in span count is the entire payoff of the module.
+
+## What you have
+
+- A Redis container on the shared network.
+- A read-through cache in front of one entity, with explicit keys.
+- An invalidation rule that fits in one sentence and survives the day-2 bug report.
+
+Module 10 turns synchronous writes into asynchronous events.
+
+Next: [10 — Async messaging with Kafka →](/learn/openliberty/async-messaging)

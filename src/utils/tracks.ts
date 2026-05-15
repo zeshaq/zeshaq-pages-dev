@@ -33,7 +33,7 @@ export const TRACK_TAGLINES: Record<string, string> = {
   "devsecops":
     "Shift security left into the SDLC, automate the gates at every stage, and treat security as a property of every commit. Threat modeling, SAST/SCA, container and supply-chain security (SLSA, SBOM, cosign), IaC scanning, runtime detection (RHACS, Falco), secrets, zero trust, compliance, and SIEM — ending in a fully gated deployment pipeline.",
   "openliberty":
-    "End-to-end application development with Open Liberty. Provision a development VM, install the toolchain, write a Jakarta EE 10 / MicroProfile 6.1 service, containerize it with podman, run a git workflow that survives across machines, and wire in a WSO2 Micro Integrator as an enterprise service bus. The walk-through to give a class before pointing them at a real codebase.",
+    "End-to-end application development with Open Liberty. Provision a dev VM, install the toolchain, write a Jakarta EE 10 / MicroProfile 6.1 service, then add the real-world stack on top — PostgreSQL, Redis, Kafka, WSO2 MI/IS/APIM, and SigNoz observability — running as a fleet of containers on one VM. The classroom track for backend engineers before they touch production.",
 };
 
 export function trackTitle(id: string): string {

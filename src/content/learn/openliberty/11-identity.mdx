@@ -1,0 +1,140 @@
+---
+title: "Identity with WSO2 Identity Server"
+sidebar_label: "11 — Identity"
+description: "WSO2 IS as the OpenID Connect provider, MicroProfile JWT verifying access tokens in Liberty, and @RolesAllowed on every endpoint that needs to know who you are."
+estimated_minutes: 75
+last_updated: 2026-05-15
+prereqs: ["10 — Async messaging with Kafka"]
+---
+
+A REST endpoint with no authentication is a placeholder, not a service. This module attaches a real identity layer. **WSO2 Identity Server** issues tokens; Liberty validates them via **MicroProfile JWT**; the application enforces role-based authorization with `@RolesAllowed`.
+
+## The pattern, before the tools
+
+```
+client ─[1] login─────────► WSO2 IS  ── returns access_token (JWT)
+client ─[2] /api/...      ─► Liberty ── verifies signature, extracts claims
+                              │
+                              └── @RolesAllowed("policy-reader") gate
+```
+
+Two systems. Liberty never sees the password. WSO2 IS never sees the application data. The token is the only artifact that crosses the boundary, and it is signed.
+
+## WSO2 IS as a container
+
+```bash
+podman run -d --replace --name wso2is --network insurance-net \
+  -p 9444:9443 \
+  -p 9763:9763 \
+  docker.io/wso2/wso2is:7.0.0
+```
+
+Port 9443 inside the container is **remapped to 9444 on the host** — Liberty already uses 9443 for HTTPS, and a port conflict would just produce a confusing failure. Inside `insurance-net`, other containers reach WSO2 IS as `wso2is:9443` (the original port).
+
+First boot pulls and initializes the DB; allow 60–120 seconds. The admin console is at `https://localhost:9444/console`, default credentials `admin / admin` — change them in any non-dev setting.
+
+## Registering an OIDC application
+
+In the management console:
+
+1. **Applications** → **New Application** → **OIDC Web Application**.
+2. Name: `insurance-app`.
+3. Allowed grant types: **Authorization Code**, **Client Credentials** (for service-to-service later).
+4. Note the **Client ID** and **Client Secret** — you'll inject them as env vars.
+5. Add an **Authorized Redirect URL** that matches your test client (e.g. `http://localhost:8080/callback` from a curl-friendly OIDC tester).
+6. Under **User Attributes**, ensure `groups` is in the list — Liberty's `@RolesAllowed` will map JWT `groups` claim values to role names.
+
+## Liberty side: mpJwt
+
+In `server.xml`:
+
+```xml
+<featureManager>
+    <!-- existing features -->
+    <feature>mpJwt-2.1</feature>
+</featureManager>
+
+<mpJwt id="wso2is"
+       jwksUri="https://wso2is:9443/oauth2/jwks"
+       issuer="https://wso2is:9443/oauth2/token"
+       audiences="insurance-app"/>
+```
+
+Three things are happening:
+
+- **`jwksUri`** — Liberty fetches the public keys from WSO2 IS at startup (and on refresh) to verify token signatures. No shared-secret nonsense.
+- **`issuer`** — Tokens not minted by this IS are rejected, even if the signature is valid.
+- **`audiences`** — Tokens not intended for this service are rejected.
+
+You will need to import the WSO2 IS self-signed certificate into Liberty's truststore for the JWKS fetch to work — or, for dev only, set `trustStoreRef` to a permissive store. Production uses a real CA-signed cert.
+
+## Protecting endpoints
+
+```java
+@Path("/policies")
+@Produces(MediaType.APPLICATION_JSON)
+@RolesAllowed({"policy-reader"})
+public class PolicyResource {
+
+    @GET
+    public List<Policy> list() { return repo.findAll(); }
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @RolesAllowed({"policy-writer"})
+    public Policy create(Policy p) {
+        Policy saved = repo.create(p);
+        redis.del("policy:" + saved.getPolicyNo());
+        publisher.published(saved);
+        return saved;
+    }
+}
+```
+
+Two roles, two scopes of access. `policy-reader` can list; `policy-writer` can create. The `groups` claim in the JWT must contain the matching role names.
+
+## Trying it end to end
+
+Acquire a token (client-credentials flow — easiest for curl):
+
+```bash
+TOKEN=$(curl -sk -X POST \
+  -u "<client_id>:<client_secret>" \
+  -d "grant_type=client_credentials&scope=internal_application_mgt_view" \
+  https://localhost:9444/oauth2/token | jq -r .access_token)
+```
+
+Call Liberty with it:
+
+```bash
+curl http://localhost:9080/api/policies \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Without the header: `401 Unauthorized`. With a valid token but missing role: `403 Forbidden`. With a valid token and the right role: `200 OK` and the list of policies. Each outcome shows up in SigNoz as a distinct span attribute — a 403 trace looks exactly like a 200 trace with a different `http.status_code`.
+
+## Where the secrets go
+
+The client secret is currently a plaintext value living somewhere — env var, server.xml, or `microprofile-config.properties`. None of those are right for production. In production:
+
+- The secret comes from **Vault** (or whatever secret store the platform team runs).
+- WSO2 IS itself is fronted by HTTPS with a real certificate.
+- Logs scrub bearer tokens before they're emitted.
+
+We're out of scope for those here — they belong to the secrets-management module of a different track. For now, the literal value in dev is acceptable.
+
+## Common stumbles
+
+- **JWKS fetch fails at Liberty startup.** Truststore doesn't trust the WSO2 IS cert. For dev, the simplest fix is to extract the cert and add it to Liberty's `key.p12`.
+- **403 even with the right role.** WSO2 IS doesn't put `groups` into the access token by default; you have to map the user's roles into the JWT in the application's claim configuration.
+- **Token expiry surprises.** Default access-token lifetime is short (5–15 min). Set up refresh-token flow for any UI client.
+
+## What you have
+
+- WSO2 IS as the OIDC provider for the project.
+- Liberty validating JWTs without ever talking to IS at request time (just at startup).
+- Role-based authorization on every endpoint.
+
+Module 12 puts an API gateway in front of the whole thing.
+
+Next: [12 — API gateway with WSO2 API Manager →](/learn/openliberty/api-gateway)

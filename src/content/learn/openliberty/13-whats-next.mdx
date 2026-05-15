@@ -1,0 +1,75 @@
+---
+title: "What's next"
+sidebar_label: "13 — What's next"
+description: "What this track deliberately didn't cover, and where to go for each piece. The roadmap for the engineer who finished module 12."
+estimated_minutes: 10
+last_updated: 2026-05-15
+prereqs: ["12 — API gateway with WSO2 API Manager"]
+---
+
+The track ends here. What you've built is genuinely the shape of a small production backend: a Java application, persistence, cache, event bus, identity, gateway, mediator, full-stack observability — all running together on one host. Plenty of insurance startups have shipped real customer traffic on less.
+
+What this track **didn't** cover is intentional — every omission is either a separate course or a topic you can deepen alone now that you have the scaffolding.
+
+## CI/CD — separate track
+
+Building, scanning, signing, and deploying images belongs to its own course. The expected outline:
+
+- A `Containerfile` per service (you have these already).
+- A GitHub Actions or Tekton pipeline that lints, tests, builds the image, scans it, signs it (cosign), publishes to a registry (Quay/GHCR/Harbor).
+- A deploy step against a real environment.
+- Branch protections, required checks, supply-chain attestations.
+
+When the CI/CD track is published, the artifacts from this one are exactly its inputs.
+
+## Cloud / OpenShift deployment
+
+Everything here ran on one VM with rootless `podman`. Real production runs on a Kubernetes-shaped platform. The migration is mostly mechanical once the images exist:
+
+- Push the images to a registry your cluster can pull from.
+- Write a Helm chart or a Kustomize base per service.
+- Create `Deployments`, `Services`, `Routes` (on OpenShift) or `Ingresses`.
+- Use OpenShift's `Operator` model for stateful services (Postgres, Kafka, SigNoz all have operators).
+- Move secrets from env vars into `Secrets` or an external secret store.
+
+The hardest parts aren't the YAML; they're the operational ones — namespaces, network policies, registry credentials, persistent volumes, autoscaling. A separate track.
+
+## Deeper inside the app
+
+Topics that fit *into* this track but that we'd need a different cadence to do justice to:
+
+- **Domain modeling.** The `Policy` entity in module 07 is the simplest possible shape. Real insurance has Policy / Quote / Claim / Endorsement / Payment / Document / Party, each with its own lifecycle. Build them gradually; let the model emerge from the business processes.
+- **Testing.** REST Assured for API tests, Testcontainers for integration tests against a real Postgres, Pact for contract tests against APIM-defined contracts. None of these were in the track; all are essential.
+- **Concurrency and transactions.** What happens when two requests update the same policy at the same time? JPA's `@Version` for optimistic locking, plus careful transaction boundaries. The class of bugs that don't show up until you have ten users at once.
+- **Schema evolution.** Adding a NOT-NULL column to a 100M-row table. Backfilling. Zero-downtime migrations. Blue/green schema patterns. Easy to talk about, hard to do under load.
+
+## Secrets management
+
+The track left `postgres / insurance:insurance` in `server.xml` and the WSO2 IS client secret in env vars. Production replaces both with:
+
+- **HashiCorp Vault** (or an alternative like SOPS, Sealed Secrets, External Secrets Operator).
+- Liberty reads the secret through **MicroProfile Config** with a Vault config source.
+- Secret rotation happens out-of-band; the application reloads on next use.
+
+A standalone module because the choice of secret store cascades into how you deploy (Vault as a container vs. AWS Secrets Manager vs. the platform-provided one).
+
+## Service mesh
+
+When you have 8 services talking to each other on one network and you want mTLS, retries, traffic shifting, and authorization policies *between services* — not at the gateway — you reach for **Istio / OSSM** or **Linkerd**. Not relevant until your service count gets above ~10; very relevant once it does.
+
+## What I'd build next, in order
+
+If you're following this track and want a project arc beyond it:
+
+1. **A real domain model** — Policy + Quote + Claim, with state transitions modeled explicitly.
+2. **Tests at three levels** — unit, API (REST Assured), integration (Testcontainers).
+3. **A frontend** — React or Astro, hitting the APIM-published API with OIDC login.
+4. **CI/CD** (the other track), all the way to a real environment.
+
+By that point the artifact you have is no longer a learning exercise; it's a starting point for a real product.
+
+## Closing
+
+The thing this track tries hardest to teach is not any one tool — it is the **layered shape** of a real backend: the application is the smallest piece, surrounded by infrastructure that exists to make it useful. Most engineers learn the application code; few have a complete picture of the rest. Now you do.
+
+— *End of track.*
