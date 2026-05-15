@@ -22,6 +22,7 @@ data/openshift-install/v7-baseline.json
 scripts/services/bootstrap/install-openshift-tools.sh
 scripts/services/bootstrap/build-openshift-pull-secret-from-vault.sh
 scripts/services/bootstrap/render-openshift-install-inputs.sh
+scripts/services/bootstrap/validate-openshift-install-preflight.sh
 ```
 
 The first install baseline pins OpenShift to `4.20.18`, uses the Quay-backed
@@ -105,6 +106,12 @@ export VAULT_TOKEN=<redacted>
   --output artifacts/openshift/spoke-dc-v7/pull-secret.json
 ```
 
+The generated installer pull secret adds the `ocp_cluster_pull` Quay user
+credential from `secret/greenfield/quay/users/ocp_cluster_pull`. A normal Quay
+user is required because the cluster has one credential entry for
+`quay.v7.comptech-lab.com`, while release and operator content live in
+different Quay organizations.
+
 Render install inputs:
 
 ```bash
@@ -118,8 +125,22 @@ Generated files remain ignored until reviewed:
 ```text
 artifacts/openshift/spoke-dc-v7/install-config.yaml
 artifacts/openshift/spoke-dc-v7/agent-config.yaml
-artifacts/openshift/spoke-dc-v7/mirror-resources/
+artifacts/openshift/spoke-dc-v7/mirror-resources/release-*.yaml
+artifacts/openshift/spoke-dc-v7/mirror-resources/operators-*.yaml
 ```
+
+Run the disconnected preflight before creating install media:
+
+```bash
+./scripts/gfctl.sh validate-openshift-install-preflight --execute \
+  --env artifacts/openshift/spoke-dc-v7/cluster.env \
+  --input-dir artifacts/openshift/spoke-dc-v7
+```
+
+The preflight validates rendered YAML, FIPS, release digest mirrors, Quay
+release image access, operator catalog image access, and
+`openshift-install-fips agent create cluster-manifests` in a temporary copy. It
+does not create ISO, PXE files, or a cluster.
 
 ## Gates Before Cluster Creation
 
@@ -131,6 +152,10 @@ artifacts/openshift/spoke-dc-v7/mirror-resources/
 - The pinned `4.20.18` release image resolves from Quay.
 - Operator catalog images resolve from Quay.
 - Rendered `install-config.yaml` has `fips: true`.
+- Rendered `install-config.yaml` has release `imageDigestSources` pointing at
+  the greenfield Quay release mirrors.
 - Rendered install inputs are reviewed for the actual IP plan, DNS plan, MAC
   addresses, root-device hints, and cluster name.
 - No generated auth material is staged for Git commit.
+- No ISO, PXE files, or cluster creation commands run before the next explicit
+  issue gate.
