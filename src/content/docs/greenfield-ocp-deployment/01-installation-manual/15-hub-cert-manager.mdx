@@ -1,0 +1,168 @@
+---
+title: "Installation Manual - 15 Hub cert-manager"
+sidebar_label: "15 Hub cert-manager"
+description: "How the Red Hat cert-manager Operator is installed on the hub through GitOps and validated before issuers are configured."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+cert-manager is installed after GitOps and LVMS. This chapter installs only
+the Red Hat cert-manager Operator and operands. Issuers and certificates are a
+separate gate.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Operator namespace | `cert-manager-operator` |
+| Operand namespace | `cert-manager` |
+| Package | `openshift-cert-manager-operator` |
+| Channel | `stable-v1` |
+| Catalog source | `cs-redhat-operator-index-v4-20` |
+| CSV | `cert-manager-operator.v1.19.0` |
+| Install mode | all namespaces |
+
+## GitOps Files
+
+Add:
+
+```text
+clusters/hub-dc-v7/operators/cert-manager-operator/
+```
+
+Then include it in:
+
+```text
+clusters/hub-dc-v7/kustomization.yaml
+```
+
+The namespace:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager-operator
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+  labels:
+    openshift.io/cluster-monitoring: "true"
+```
+
+The OperatorGroup uses all-namespaces mode:
+
+```yaml
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: cert-manager-operator
+  namespace: cert-manager-operator
+spec: {}
+```
+
+The subscription:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: openshift-cert-manager-operator
+  namespace: cert-manager-operator
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    operatorframework.io/bundle-unpack-timeout: 30m
+spec:
+  channel: stable-v1
+  installPlanApproval: Automatic
+  name: openshift-cert-manager-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: cert-manager-operator.v1.19.0
+```
+
+## Reconcile
+
+Commit and push to the operational GitLab repo:
+
+```bash
+git add clusters/hub-dc-v7
+git commit -m "Install cert-manager on hub-dc-v7"
+git push origin main
+```
+
+Trigger a hard refresh if needed:
+
+```bash
+oc -n openshift-gitops annotate application.argoproj.io/hub-dc-v7-bootstrap \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+## Validation
+
+Validate the subscription:
+
+```bash
+oc get sub -n cert-manager-operator
+```
+
+Expected state:
+
+- package: `openshift-cert-manager-operator`;
+- channel: `stable-v1`;
+- source: `cs-redhat-operator-index-v4-20`;
+- installed CSV: `cert-manager-operator.v1.19.0`;
+- state: `AtLatestKnown`.
+
+Validate CSV:
+
+```bash
+oc get csv -n cert-manager-operator
+```
+
+Expected state:
+
+```text
+cert-manager-operator.v1.19.0   Succeeded
+```
+
+Validate pods and deployments:
+
+```bash
+oc get pods -n cert-manager
+oc get deploy -n cert-manager
+```
+
+Expected state:
+
+- `cert-manager` pod Running and deployment `1/1` available;
+- `cert-manager-cainjector` pod Running and deployment `1/1` available;
+- `cert-manager-webhook` pod Running and deployment `1/1` available.
+
+Validate Argo:
+
+```bash
+oc -n openshift-gitops get application.argoproj.io hub-dc-v7-bootstrap \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REV:.status.sync.revision
+```
+
+Expected state:
+
+```text
+hub-dc-v7-bootstrap   Synced   Healthy
+```
+
+Validate cluster health:
+
+```bash
+oc get co | awk 'NR==1 || $3!="True" || $4=="True" || $5=="True"'
+```
+
+Expected result: only the header.
+
+## Completion State
+
+After this chapter, cert-manager is available on the hub, but no issuers or
+certificates have been configured yet.
+
+The next dependency gate should install External Secrets and configure Vault
+Kubernetes auth for `hub-dc-v7`.

@@ -1,0 +1,200 @@
+---
+title: "Installation Manual - 14 Hub LVMS storage"
+sidebar_label: "14 Hub LVMS storage"
+description: "How LVMS is installed on the compact hub through GitOps and validated as the default local StorageClass."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+LVMS is the first platform operator added after GitOps. It provides local
+persistent storage for later management services running on the compact hub.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Operator namespace | `openshift-lvm-storage` |
+| Package | `lvms-operator` |
+| Channel | `stable-4.20` |
+| Catalog source | `cs-redhat-operator-index-v4-20` |
+| CSV | `lvms-operator.v4.20.0` |
+| LVMCluster | `openshift-lvm-storage/lvmcluster` |
+| Default StorageClass | `lvms-vg1` |
+| Provisioner | `topolvm.io` |
+| Binding mode | `WaitForFirstConsumer` |
+
+## Disk Preflight
+
+Before enabling LVMS, confirm each compact node has unused data disks:
+
+```bash
+for node in hub-dc-v7-master-0 hub-dc-v7-master-1 hub-dc-v7-master-2; do
+  echo "--- ${node}"
+  oc debug node/${node} -- chroot /host lsblk -dn -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+done
+```
+
+Expected disk shape:
+
+```text
+vda    300G disk
+vdb    500G disk
+vdc    500G disk
+vdd    500G disk
+```
+
+The boot disk is `vda`. The unused `vdb`, `vdc`, and `vdd` disks are available
+for LVMS.
+
+## GitOps Files
+
+Add:
+
+```text
+clusters/hub-dc-v7/operators/lvms-operator/
+clusters/hub-dc-v7/storage/lvms/
+```
+
+Then include both in:
+
+```text
+clusters/hub-dc-v7/kustomization.yaml
+```
+
+The operator layer includes:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: lvms-operator
+  namespace: openshift-lvm-storage
+spec:
+  channel: stable-4.20
+  installPlanApproval: Automatic
+  name: lvms-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: lvms-operator.v4.20.0
+```
+
+The storage layer includes:
+
+```yaml
+apiVersion: lvm.topolvm.io/v1alpha1
+kind: LVMCluster
+metadata:
+  name: lvmcluster
+  namespace: openshift-lvm-storage
+spec:
+  storage:
+    deviceClasses:
+      - name: vg1
+        default: true
+        thinPoolConfig:
+          name: thin-pool-1
+          sizePercent: 90
+          overprovisionRatio: 10
+        fstype: xfs
+```
+
+## Argo Difference Rule
+
+LVMS defaults thin-pool fields after the `LVMCluster` is created. Add this to
+the root application so Argo does not report permanent drift:
+
+```yaml
+ignoreDifferences:
+  - group: lvm.topolvm.io
+    kind: LVMCluster
+    jqPathExpressions:
+      - .spec.storage.deviceClasses[].thinPoolConfig.chunkSizeCalculationPolicy
+      - .spec.storage.deviceClasses[].thinPoolConfig.metadataSizeCalculationPolicy
+```
+
+## Reconcile
+
+Commit and push to the operational GitLab repo:
+
+```bash
+git add clusters/hub-dc-v7
+git commit -m "Install LVMS on hub-dc-v7"
+git push origin main
+```
+
+Trigger a hard refresh if needed:
+
+```bash
+oc -n openshift-gitops annotate application.argoproj.io/hub-dc-v7-bootstrap \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+## Validation
+
+Validate subscription and CSV:
+
+```bash
+oc get sub -n openshift-lvm-storage
+oc get csv -n openshift-lvm-storage
+```
+
+Expected state:
+
+- subscription is `AtLatestKnown`;
+- `lvms-operator.v4.20.0` is `Succeeded`.
+
+Validate the `LVMCluster`:
+
+```bash
+oc -n openshift-lvm-storage get lvmcluster lvmcluster -o yaml
+```
+
+Expected status:
+
+```text
+state: Ready
+ready: true
+ResourcesAvailable=True
+VolumeGroupsReady=True
+```
+
+Validate the StorageClass:
+
+```bash
+oc get sc
+```
+
+Expected StorageClass:
+
+```text
+lvms-vg1 (default)   topolvm.io   Delete   WaitForFirstConsumer   true
+```
+
+Validate pods:
+
+```bash
+oc -n openshift-lvm-storage get pods
+```
+
+Expected state:
+
+- `lvms-operator` pod is Running;
+- one `vg-manager` pod is Running per node.
+
+Validate Argo:
+
+```bash
+oc -n openshift-gitops get application.argoproj.io hub-dc-v7-bootstrap \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REV:.status.sync.revision
+```
+
+Expected state:
+
+```text
+hub-dc-v7-bootstrap   Synced   Healthy
+```
+
+## Completion State
+
+After this chapter, the compact hub has a default local StorageClass and is
+ready for storage-consuming management services.

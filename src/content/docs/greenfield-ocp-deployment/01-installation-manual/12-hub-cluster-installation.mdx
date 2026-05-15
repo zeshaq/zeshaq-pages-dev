@@ -1,0 +1,221 @@
+---
+title: "Installation Manual - 12 Hub cluster installation"
+sidebar_label: "12 Hub cluster installation"
+description: "How the first compact OpenShift management hub is installed from the greenfield bootstrap VM using the FIPS agent-based workflow."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+This chapter records the repeatable pattern for building the first compact
+management hub cluster.
+
+The hub is installed from the greenfield bootstrap VM using rendered
+agent-based install inputs, the mirrored OpenShift release in Quay, and FIPS
+enabled from the start.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Cluster name | `hub-dc-v7` |
+| Base domain | `v7.comptech-lab.com` |
+| OpenShift release | `4.20.18` |
+| Topology | compact 3-node control plane |
+| Workers | none |
+| FIPS | enabled |
+| API VIP | `30.30.210.10` |
+| Ingress VIP | `30.30.210.11` |
+| Rendezvous node | `hub-dc-v7-master-0` |
+| Install host | `gf-ocp-bootstrap-01` |
+| Hypervisor | `dl385-2` |
+| Image source | Quay-backed disconnected mirror |
+
+The node inventory is:
+
+| Node | IP | MAC | Install disk |
+| --- | --- | --- | --- |
+| `hub-dc-v7-master-0` | `30.30.210.13` | `52:54:00:21:00:00` | `/dev/vda` |
+| `hub-dc-v7-master-1` | `30.30.210.14` | `52:54:00:21:00:01` | `/dev/vda` |
+| `hub-dc-v7-master-2` | `30.30.210.15` | `52:54:00:21:00:02` | `/dev/vda` |
+
+Each VM has one 300 GiB boot disk and three 500 GiB data disks. The data disks
+are reserved for LVMS after the cluster is installed.
+
+## DNS
+
+Create the OpenShift API and wildcard app records before generating install
+media:
+
+```text
+api.hub-dc-v7.v7.comptech-lab.com     A 30.30.210.10
+api-int.hub-dc-v7.v7.comptech-lab.com A 30.30.210.10
+*.apps.hub-dc-v7.v7.comptech-lab.com  A 30.30.210.11
+```
+
+Validate from the bootstrap VM:
+
+```bash
+dig @30.30.200.53 api.hub-dc-v7.v7.comptech-lab.com A +short
+dig @30.30.200.53 api-int.hub-dc-v7.v7.comptech-lab.com A +short
+dig @30.30.200.53 test.apps.hub-dc-v7.v7.comptech-lab.com A +short
+```
+
+Expected results are `30.30.210.10`, `30.30.210.10`, and `30.30.210.11`.
+
+If records exist but the private resolver does not answer, restart or reload
+the resolver before continuing. Do not create install media while DNS is stale.
+
+## Render Install Inputs
+
+On `gf-ocp-bootstrap-01`, use the greenfield repository workdir:
+
+```bash
+cd /home/ze/ocp-greenfield-deployment
+```
+
+The rendered cluster workdir is:
+
+```text
+artifacts/openshift/hub-dc-v7/
+```
+
+The workdir contains:
+
+```text
+cluster.env
+install-config.yaml
+agent-config.yaml
+mirror-resources/
+```
+
+Build the runtime pull secret from Vault without printing secret material:
+
+```bash
+export VAULT_ADDR=https://gf-ocp-vault-02.v7.comptech-lab.com:8200
+export VAULT_CACERT=/path/to/vault-ca.crt
+export VAULT_TOKEN=<redacted>
+
+./scripts/services/bootstrap/build-openshift-pull-secret-from-vault.sh \
+  --output artifacts/openshift/hub-dc-v7/pull-secret.json
+```
+
+Render and validate:
+
+```bash
+./scripts/gfctl.sh render-openshift-install-inputs --execute \
+  --env artifacts/openshift/hub-dc-v7/cluster.env \
+  --output-dir artifacts/openshift/hub-dc-v7
+
+./scripts/gfctl.sh validate-openshift-install-preflight --execute \
+  --env artifacts/openshift/hub-dc-v7/cluster.env \
+  --input-dir artifacts/openshift/hub-dc-v7
+```
+
+The preflight must confirm:
+
+- `fips: true`;
+- exactly three compact master hosts;
+- release image `4.20.18` resolves from Quay;
+- Red Hat and certified catalog images resolve from Quay;
+- the pull secret contains Quay authentication;
+- `openshift-install-fips agent create cluster-manifests` succeeds in a
+  temporary copy.
+
+## Trust Bundle Rule
+
+The install input renderer must include public system CA roots plus the
+internal CA. This is required when Quay serves the shared Let's Encrypt
+wildcard certificate and internal services still need the internal CA.
+
+Validate the rendered trust bundle before ISO creation. The preflight should
+verify that the mirrored release image can be reached with the same bundle the
+installer will use.
+
+## VM Creation And ISO Boot
+
+Create the three compact control-plane VMs on the hypervisor with:
+
+- UEFI firmware;
+- TPM 2.0 emulator;
+- bridge `br33`;
+- static MACs matching `agent-config.yaml`;
+- one 300 GiB boot disk and three 500 GiB data disks.
+
+Create the FIPS agent ISO:
+
+```bash
+./scripts/gfctl.sh create-openshift-agent-iso --execute \
+  --env artifacts/openshift/hub-dc-v7/cluster.env \
+  --input-dir artifacts/openshift/hub-dc-v7
+```
+
+Copy the ISO to the hypervisor and attach it as a SATA CD-ROM. Use SATA for
+UEFI guest boot. The first install discovered that a SCSI CD-ROM attachment was
+not read by OVMF on this platform.
+
+After hosts write disks and reboot, remove the ISO from persistent VM config
+and boot from disk only. If an agent host loops back into the install ISO,
+detach the ISO and power-cycle the VM from disk.
+
+## Monitor Install
+
+From the bootstrap VM:
+
+```bash
+openshift-install-fips --dir artifacts/openshift/hub-dc-v7 agent wait-for bootstrap-complete --log-level=info
+openshift-install-fips --dir artifacts/openshift/hub-dc-v7 agent wait-for install-complete --log-level=info
+```
+
+Do not print `kubeadmin-password`, kubeconfigs, pull secrets, or installer
+state files in shared logs.
+
+## Validation
+
+Use the generated kubeconfig only from secure local custody:
+
+```bash
+export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+```
+
+Validate cluster health:
+
+```bash
+oc get nodes -o wide
+oc get clusterversion
+oc get co | awk 'NR==1 || $3!="True" || $4=="True" || $5=="True"'
+```
+
+Expected results:
+
+- all three nodes are `Ready`;
+- cluster version is `4.20.18`;
+- `Available=True`;
+- `Progressing=False`;
+- the unhealthy operator filter returns only the header.
+
+Validate the console route:
+
+```bash
+curl -k -sS -o /dev/null -w '%{http_code}\n' \
+  https://console-openshift-console.apps.hub-dc-v7.v7.comptech-lab.com
+```
+
+Expected result: `200`.
+
+Validate VM boot media:
+
+```bash
+virsh -c qemu:///system domblklist gf-ocp-hub-dc-v7-master-0
+virsh -c qemu:///system domblklist gf-ocp-hub-dc-v7-master-1
+virsh -c qemu:///system domblklist gf-ocp-hub-dc-v7-master-2
+```
+
+Expected result: no live or persistent agent ISO attached.
+
+## Completion State
+
+At this point the hub is only a clean OpenShift base cluster. It does not yet
+have platform GitOps, LVMS, cert-manager, External Secrets, ACM/MCE, or RHACS.
+
+Proceed to the GitOps bootstrap chapter before installing management
+operators.
