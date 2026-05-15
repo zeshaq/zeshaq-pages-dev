@@ -1,22 +1,47 @@
 ---
 title: "Security Lab — Cisco Nexus learning track"
 sidebar_label: "Cisco Nexus track"
-description: "NX-OS, MP-BGP EVPN, VXLAN, multisite, and Nexus Dashboard learning plan."
-last_reviewed: 2026-05-13
+description: "NX-OS, MP-BGP EVPN, VXLAN, services VRF, and Nexus Dashboard learning plan."
+last_reviewed: 2026-05-15
 draft: false
 ---
 
 The current Cisco data center track is NX-OS first. ACI should come later, after the manual control-plane and data-plane behavior is understood.
 
+## Current Built State
+
+The first Nexus phase is complete for lab use:
+
+- Cisco Nexus 9300v nodes are imported into EVE-NG.
+- The lab uses two spines, two leaves, and two tenant border nodes.
+- BGP underlay and MP-BGP EVPN overlay are working.
+- VXLAN tenant segments and inter-VLAN routing are validated.
+- Dual-border upstream reachability is validated.
+- Services VRF handoff is implemented with explicit route-leak controls.
+- Oxidized backs up all six Nexus nodes.
+- Nautobot seed data records the Nexus devices and key interfaces.
+- Batfish snapshots model the underlay, EVPN/VXLAN, dual-border handoff, and services VRF handoff.
+- Daily validation and guard scripts exist in the private lab repo.
+
 ## Recommended Order
+
+Completed:
 
 1. Build a single-site VXLAN EVPN fabric manually in EVE-NG.
 2. Add MP-BGP EVPN route exchange between spines and leaves.
 3. Add anycast gateway, VLAN-to-VNI mapping, and tenant VRFs.
-4. Extend to a multisite design with border gateways.
-5. Add Nexus Dashboard and Nexus Dashboard Fabric Controller.
-6. Compare manual NX-OS operations with NDFC-managed workflows.
-7. Add security tooling around the fabric: packet capture, telemetry, scanning, and detection notes.
+4. Add dual tenant border nodes and upstream reachability.
+5. Add services VRF route-leak controls and recovery drills.
+6. Add source-of-truth, config backup, validation, and SOC evidence loops.
+
+Next:
+
+1. Schedule the services VRF guard after several manual daily runs.
+2. Add Nexus Dashboard and Nexus Dashboard Fabric Controller.
+3. Compare manual NX-OS operations with NDFC-managed workflows.
+4. Expand from one tenant to multiple tenants.
+5. Add multisite EVPN behavior when the single-site dual-border model is enough for current learning.
+6. Add telemetry ingestion from Nexus and EVE-NG into the SOC path.
 
 ## Image Choices
 
@@ -56,3 +81,19 @@ Use `nexus9500v` only when the learning objective specifically needs chassis-sty
 Nexus Dashboard is worth installing because it appears in real Cisco data center operations. In the lab it is most useful after the manual NX-OS fabric works, because then NDFC can be evaluated against behavior already understood from the CLI.
 
 Do not run Nexus Dashboard inside the current EVE-NG VM. Nexus Dashboard 4.2.x has large KVM sizing requirements, so it should be deployed as a standalone libvirt appliance when the lab is ready for NDFC and dashboard workflows.
+
+## Validation Entry Points
+
+Run these from the private lab repo:
+
+```bash
+python3 runtime/nexus_2x2_validate_full_lab.py
+./scripts/run-nexus-services-vrf-guard.sh
+./scripts/run-final-nexus-soc-replay.sh
+```
+
+The expected final signals are:
+
+- `nexus_2x2_full_lab_validation_complete`
+- services VRF guard `ready: true`
+- Oxidized/Nautobot drift report `ready: true`

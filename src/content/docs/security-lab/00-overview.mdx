@@ -2,21 +2,42 @@
 title: "Security Lab — overview"
 sidebar_label: "Overview"
 description: "Purpose, boundaries, and current operating model for the private security lab."
-last_reviewed: 2026-05-13
+last_reviewed: 2026-05-15
 draft: false
 ---
 
-This lab is a private, host-local environment for learning security operations, vulnerability assessment, purple-team workflows, and Cisco data center networking. It runs on libvirt/KVM on `dl385`, with management access on `br30` and isolated test traffic on a separate lab network.
+This lab is a private, host-local environment for learning security operations, vulnerability assessment, purple-team workflows, GitOps operations, and Cisco data center networking. It runs on libvirt/KVM on `dl385`, with management access on `br30` and isolated test traffic on a separate lab network.
 
-The first phase is Linux and security focused:
+The current phase is operationally usable. The security tooling baseline is complete, the Nexus EVPN/VXLAN lab is working, and the daily validation model is GitOps-oriented.
 
 - Kali Linux for offensive tooling and validation.
 - Kali Purple for blue-team and purple-team packages.
 - EVE-NG for network emulation.
 - Security Onion, Wazuh, and Greenbone for detection, endpoint monitoring, and vulnerability management.
 - Linux and OWASP Juice Shop targets for scanning and controlled testing.
+- A dedicated security-lab runtime VM for Nautobot, Oxidized, Batfish, TheHive, Shuffle, backup jobs, and SOC integration tooling.
+- A six-node Nexus 9300v EVPN/VXLAN fabric with two spines, two leaves, and two tenant border nodes.
+- Nautobot, Oxidized, Batfish, detection-content, runbooks, and backup automation managed through local GitLab repositories.
 
 Windows Active Directory was intentionally skipped in the initial build. It can be added later from official Microsoft evaluation media if the lab needs domain identity, Kerberos, Group Policy, or Windows endpoint telemetry.
+
+## Current Operating State
+
+| Area | Status |
+| --- | --- |
+| SOC baseline | Complete for lab use |
+| Nexus EVPN/VXLAN | Complete for the current two-spine, two-leaf, dual-border lab |
+| Services VRF leak controls | Implemented and validated |
+| Daily validation | Full Nexus validation and SOC health reporting are available |
+| GitOps source of truth | Local GitLab `security-lab` group owns the desired state |
+| StorageGRID / NetApp | Grid-host VMs exist, but software installation is paused until official evaluation media and license are staged |
+
+The operational entrypoint is the private repo's resume command:
+
+```bash
+cd /home/ze/codex-security-lab-agent
+./scripts/resume-lab-session.sh
+```
 
 ## Boundaries
 
@@ -43,3 +64,11 @@ The GitHub repository for lab operating notes is private:
 ```text
 https://github.com/zeshaq/codex-security-lab-agent
 ```
+
+## Key Pages
+
+- [Current inventory](/docs/security-lab/current-inventory/)
+- [Operations dashboard](/docs/security-lab/operations-dashboard/)
+- [SOC and Nexus closeout](/docs/security-lab/soc-nexus-closeout/)
+- [Reproducibility guide](/docs/security-lab/reproducibility-guide/)
+- [GitOps-managed networking](/docs/security-lab/gitops-managed-data-center-networking/)

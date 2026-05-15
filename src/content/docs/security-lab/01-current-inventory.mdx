@@ -2,7 +2,7 @@
 title: "Security Lab — current inventory"
 sidebar_label: "Current inventory"
 description: "Current VM, network, and endpoint inventory for the security lab."
-last_reviewed: 2026-05-13
+last_reviewed: 2026-05-15
 draft: false
 ---
 
@@ -32,6 +32,40 @@ draft: false
 | `greenbone` | Vulnerability scanning | `30.30.30.65` | `https://30.30.30.65/` |
 | `linux-target-01` | Linux scan and hardening target | `30.30.30.68` | `http://30.30.30.68/` |
 | `juice-shop` | Web app target | `30.30.30.69` | `http://30.30.30.69:3000/` |
+| `security-lab-runtime-01` | GitOps-managed runtime services | `30.30.30.70` | SSH and service ports |
+
+Shared infrastructure used by the lab:
+
+| VM | Role | Notes |
+| --- | --- | --- |
+| `haproxy` | Shared edge proxy | Publishes selected lab services through `*.apps.sub.comptech-lab.com` |
+| `pdns` | Shared authoritative DNS and recursor | Provides wildcard app DNS and lab DNS services |
+| `minio` | Shared object storage | Dedicated security-lab bucket is used for backup replication |
+
+StorageGRID grid-host VMs also exist under `30.30.31.10-30.30.31.19`. They are Linux grid hosts only; StorageGRID software installation is paused until official evaluation media and license are staged.
+
+## Runtime Services
+
+| Service | Purpose | URL |
+| --- | --- | --- |
+| Nautobot | Source of truth and inventory seed target | `http://30.30.30.70:8080/` |
+| Oxidized | Network configuration backup | `http://30.30.30.70:8888/` |
+| Batfish | Network validation and policy analysis API | `http://30.30.30.70:9996/` |
+| TheHive | Case management | `https://thehive.apps.sub.comptech-lab.com/` |
+| Shuffle | SOAR workflow testing | `https://shuffle.apps.sub.comptech-lab.com/` |
+
+## Nexus EVPN/VXLAN Lab
+
+| Node | Role | Lab |
+| --- | --- | --- |
+| `spine-01` | EVPN route-reflector spine | EVE-NG |
+| `spine-02` | EVPN route-reflector spine | EVE-NG |
+| `leaf-01` | VTEP leaf | EVE-NG |
+| `leaf-02` | VTEP leaf | EVE-NG |
+| `border-01` | Tenant border | EVE-NG |
+| `border-02` | Tenant border | EVE-NG |
+
+The current topology has BGP underlay, MP-BGP EVPN overlay, VXLAN tenant segments, dual-border upstream reachability, and services VRF route-leak controls.
 
 ## Lab NICs
 
@@ -56,3 +90,5 @@ curl -kIs https://30.30.30.65/
 curl -Is http://30.30.30.68/
 curl -Is http://30.30.30.69:3000/
 ```
+
+Expected healthy results are HTTP responses from all endpoints, a clean Git state in the agent repo, and no unexpected Nexus validation sessions left in `tmux`.

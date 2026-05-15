@@ -1,0 +1,142 @@
+---
+title: "Security Lab — operations dashboard"
+sidebar_label: "Operations dashboard"
+description: "Daily operator dashboard for service URLs, health checks, evidence paths, timers, and triage."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+Use this page as the first daily operator view.
+
+## First Commands
+
+Run from the private lab repo:
+
+```bash
+cd /home/ze/codex-security-lab-agent
+./scripts/resume-lab-session.sh
+git status --short --branch
+tmux ls
+```
+
+## Service URLs
+
+| Area | Service | URL |
+| --- | --- | --- |
+| Network lab | EVE-NG | `https://eve-ng.apps.sub.comptech-lab.com/`, `http://30.30.30.62/` |
+| SOC | Security Onion | `https://30.30.30.63/` |
+| SOC | Wazuh | `https://30.30.30.64/` |
+| Vulnerability | Greenbone | `https://30.30.30.65/` |
+| Targets | Linux target | `http://30.30.30.68/` |
+| Targets | Juice Shop | `http://30.30.30.69:3000/` |
+| Source of truth | Nautobot | `http://30.30.30.70:8080/` |
+| Config backup | Oxidized | `http://30.30.30.70:8888/` |
+| Network analysis | Batfish API | `http://30.30.30.70:9996/` |
+| Case management | TheHive | `https://thehive.apps.sub.comptech-lab.com/` |
+| SOAR | Shuffle | `https://shuffle.apps.sub.comptech-lab.com/` |
+| Backup | MinIO console | `http://30.30.30.14:9001/` |
+
+## Daily Health Commands
+
+Run from `/home/ze/codex-security-lab-agent`:
+
+```bash
+./scripts/run-nexus-services-vrf-guard.sh
+./scripts/run-nexus-daily-validation.sh
+```
+
+Run from `/home/ze/security-lab-gitops/detection-content`:
+
+```bash
+python3 tools/soc_daily_health_report.py --live
+python3 tools/summarize_scenario_evidence.py \
+  --evidence-dir /home/ze/security-lab-evidence/soc-scenarios
+```
+
+Healthy output should show:
+
+- services VRF guard `ready: true`;
+- Oxidized/Nautobot drift report `ready: true`;
+- Nexus full validation complete;
+- SOC daily health `ready: true`;
+- no failed or partial scenario evidence.
+
+## Fast Endpoint Check
+
+```bash
+curl -Is http://30.30.30.62/
+curl -kIs https://30.30.30.64/
+curl -kIs https://30.30.30.65/
+curl -Is http://30.30.30.68/
+curl -Is http://30.30.30.69:3000/
+```
+
+Expected results:
+
+| Endpoint | Healthy response |
+| --- | --- |
+| EVE-NG | `200 OK` |
+| Wazuh | `302 Found` to login |
+| Greenbone | `200 OK` |
+| Linux target | `200 OK` |
+| Juice Shop | `200 OK` |
+
+## Evidence Paths
+
+| Evidence | Path |
+| --- | --- |
+| SOC scenarios | `/home/ze/security-lab-evidence/soc-scenarios/` |
+| Nexus services VRF guard | `/home/ze/security-lab-evidence/nexus-services-vrf-guard/` |
+| Final replay | `/home/ze/security-lab-evidence/final-replay/` |
+| Local command logs | `/home/ze/codex-security-lab-agent/logs/` |
+| Task notes | `/home/ze/codex-security-lab-agent/docs/task-log/` |
+
+## Timer Checks
+
+Host-side timer:
+
+```bash
+systemctl status security-lab-nexus-daily-validation.timer --no-pager
+systemctl list-timers 'security-lab-*' --no-pager
+```
+
+Runtime VM timers:
+
+```bash
+ssh 30.30.30.70 'sudo systemctl list-timers "security-lab-*" --no-pager'
+```
+
+Runtime services:
+
+```bash
+ssh 30.30.30.70 'sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
+```
+
+## Triage Order
+
+If EVE-NG or Nexus validation fails:
+
+1. Check EVE-NG reachability and node state.
+2. Inspect `tmux ls` for live validation sessions.
+3. Review the latest `logs/nexus-*` file.
+4. Run the services VRF guard to separate route-leak drift from broader fabric failure.
+
+If SOC daily health fails:
+
+1. Read the generated Markdown health report.
+2. Check rule sync, staged file drift, Oxidized status, and backup status first.
+3. Reconcile from Git-owned repos unless this is approved break-glass work.
+
+If backup status fails:
+
+1. Check local backup directories on `security-lab-runtime-01`.
+2. Check the MinIO/Restic environment file exists on the runtime VM.
+3. Re-run the backup-restore pipeline only after confirming secrets are present.
+
+## Guardrails
+
+- Do not install packages on `dl385`.
+- Do not use `docker-runtime-vm` for security-lab services.
+- Do not alter shared HAProxy, PowerDNS, or MinIO without explicit approval.
+- Do not publish credentials, private keys, generated passwords, ISO images, cloud images, logs, or VM disk images.
+- Do not resume NetApp or StorageGRID software installation until official evaluation media and license are staged.

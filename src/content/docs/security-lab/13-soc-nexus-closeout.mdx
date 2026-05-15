@@ -1,0 +1,70 @@
+---
+title: "Security Lab — SOC and Nexus closeout"
+sidebar_label: "SOC and Nexus closeout"
+description: "Final state of the SOC baseline and Cisco Nexus EVPN/VXLAN lab phase."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+The SOC baseline and Nexus EVPN/VXLAN phase are complete for lab operation.
+
+This does not mean the lab is production-grade or finished forever. It means the current phase has a reproducible operating model, source-of-truth repositories, validation commands, evidence output, and a clear next backlog.
+
+## What Is Built
+
+| Area | Current state |
+| --- | --- |
+| SOC services | Security Onion, Wazuh, Greenbone, TheHive, Shuffle, and supporting integration scripts are operational for lab use |
+| Runtime platform | Dedicated `security-lab-runtime-01` VM runs GitOps-managed services |
+| Source of truth | Nautobot seed data, Oxidized inventory, Batfish snapshots, and desired-state repos exist in local GitLab |
+| Nexus fabric | Two spines, two leaves, two tenant borders, EVPN/VXLAN, tenant routing, and services VRF handoff |
+| Config backup | Oxidized backs up the six Nexus nodes |
+| Validation | Full Nexus validation, services VRF guard, SOC daily health, and scenario evidence summary |
+| Backup | Local service backups and MinIO-backed Restic replication are documented and validated |
+
+## Final Validation Signals
+
+The final replay produced these healthy signals:
+
+| Check | Expected result |
+| --- | --- |
+| Nexus full validation | `nexus_2x2_full_lab_validation_complete` |
+| Services VRF guard | `ready: true` |
+| Oxidized / Nautobot drift report | `ready: true` |
+| SOC daily health | `ready: true` |
+| Scenario evidence | pass-only latest scenario set |
+| Endpoint checks | EVE-NG, Wazuh, Greenbone, Linux target, and Juice Shop return HTTP responses |
+
+## Services VRF Controls
+
+The services VRF handoff has explicit route-leak controls:
+
+- approved service prefixes are advertised into the tenant VRF;
+- denied management and test prefixes are intentionally present only where needed for leak testing;
+- border route policy controls what is exported toward the leaves;
+- guarded drills proved both failure and recovery behavior.
+
+The daily guard checks approved prefix visibility, denied prefix absence, route-map attachment, Oxidized backup markers, and Git-backed source-of-truth correlation.
+
+## GitOps Ownership
+
+| Repository | Responsibility |
+| --- | --- |
+| `network-source-of-truth` | Nautobot seed, Oxidized inventory, Batfish snapshots, Nexus intended state |
+| `detection-content` | SOC scenarios, telemetry mappings, rules, evidence models, health reports |
+| `runbooks` | Operator runbooks and acceptance procedures |
+| `compose-services` | Nautobot, Oxidized, Batfish, TheHive, Shuffle service deployment |
+| `backup-restore` | Backup jobs, MinIO/Restic support, restore drills |
+| `ansible-automation` | Security-lab inventory and host automation |
+
+## What Remains
+
+The next work is no longer baseline build-out. It is operations hardening:
+
+- schedule the services VRF guard;
+- add alerting for guard failures;
+- keep the operations dashboard current;
+- add Nexus Dashboard/NDFC when ready for Cisco controller workflows;
+- add more tenants and policy tests;
+- add broader log-source onboarding;
+- keep NetApp and StorageGRID paused until official evaluation media and license are staged.

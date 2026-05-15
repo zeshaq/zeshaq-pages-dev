@@ -1,0 +1,97 @@
+---
+title: "Security Lab — reproducibility guide"
+sidebar_label: "Reproducibility guide"
+description: "How the lab is made reproducible through GitOps, source of truth, validation, evidence, and runbooks."
+last_reviewed: 2026-05-15
+draft: false
+---
+
+The lab is reproducible because the important state is captured in Git, the runtime state is validated continuously, and manual actions are converted back into documented scripts or runbooks.
+
+## Reproducibility Model
+
+| Layer | Reproducibility mechanism |
+| --- | --- |
+| Operating memory | Private agent repo with resume script, task logs, ADRs, and durable memory |
+| Infrastructure inventory | Git-backed documentation and Nautobot seed data |
+| Network intended state | Batfish snapshots and Nexus config models |
+| Runtime service deployment | Local GitLab GitOps repos and CI pipelines |
+| Network backups | Oxidized output Git for Nexus configs |
+| SOC content | Detection-content repo with scenarios, mappings, rules, and health tooling |
+| Evidence | Timestamped scenario and final replay evidence directories |
+| Secrets | External secret files outside Git |
+
+## Main Rebuild Entry Points
+
+Run from the private agent repo:
+
+```bash
+./scripts/resume-lab-session.sh
+./scripts/run-final-nexus-soc-replay.sh
+```
+
+For Nexus validation:
+
+```bash
+python3 runtime/nexus_2x2_validate_full_lab.py
+./scripts/run-nexus-services-vrf-guard.sh
+```
+
+For SOC validation:
+
+```bash
+cd /home/ze/security-lab-gitops/detection-content
+python3 tools/soc_daily_health_report.py --live
+python3 tools/summarize_scenario_evidence.py \
+  --evidence-dir /home/ze/security-lab-evidence/soc-scenarios
+```
+
+## GitOps Repositories
+
+| Repo | Rebuild role |
+| --- | --- |
+| `network-source-of-truth` | Rebuilds intended network state, Nautobot seed, Oxidized inventory, and Batfish validation inputs |
+| `compose-services` | Rebuilds runtime service stacks |
+| `detection-content` | Rebuilds SOC content, evidence models, health checks, and rule sync |
+| `runbooks` | Rebuilds operator procedures |
+| `backup-restore` | Rebuilds backup jobs and restore drills |
+| `ansible-automation` | Rebuilds host automation and inventory |
+
+## What A Human Needs
+
+A human rebuilding the current phase needs:
+
+- access to the private lab repo;
+- access to the local GitLab `security-lab` group;
+- the external secret files under the approved secrets path;
+- the Cisco Nexus 9300v image already staged or re-downloaded through an entitled account;
+- EVE-NG reachable and sized for the Nexus topology;
+- runtime VM `security-lab-runtime-01` reachable;
+- shared HAProxy, PowerDNS, and MinIO available if public app URLs and backup replication are required.
+
+Do not put vendor images, secrets, generated passwords, VM disks, or backup repositories in Git.
+
+## Replay Criteria
+
+The lab is considered reproduced when:
+
+- all required VMs are running;
+- EVE-NG opens and the Nexus nodes are reachable;
+- full Nexus validation completes;
+- services VRF guard returns healthy;
+- SOC daily health returns healthy;
+- latest scenario evidence has no failures;
+- Oxidized contains all six Nexus nodes;
+- GitOps repos are clean or contain only known work-in-progress changes.
+
+## Current Limits
+
+The current reproducible state covers the SOC baseline and Nexus EVPN/VXLAN lab. It does not yet include:
+
+- Nexus Dashboard / NDFC workflows;
+- multi-tenant expansion beyond the current tenant model;
+- ACI, ISE, FTDv/FMCv, ASAv, Catalyst 8000V, or IOS XRv tracks;
+- StorageGRID software installation;
+- NetApp ONTAP simulator or ONTAP Select deployment.
+
+Those should be treated as future phases with their own evidence, ADRs, and closeout pages.
