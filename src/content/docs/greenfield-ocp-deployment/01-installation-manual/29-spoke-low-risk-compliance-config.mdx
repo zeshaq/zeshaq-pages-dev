@@ -1,0 +1,253 @@
+---
+title: "Installation Manual - 29 Spoke low-risk compliance config"
+sidebar_label: "29 Spoke low-risk compliance config"
+description: "How to apply the first low-risk spoke-dc-v7 compliance remediation batch through GitOps."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter records the first low-risk remediation batch after the
+`spoke-dc-v7` Compliance Operator findings triage. It intentionally avoids
+bulk generated `ComplianceRemediation` objects and avoids MachineConfig-backed
+node hardening.
+
+Use this gate to codify platform configuration that is safe to apply early and
+easy to validate through live OpenShift APIs.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Governance issue | `OP-GF-SPOKEDCV7-17`, issue `#363` |
+| Cluster | `spoke-dc-v7` |
+| GitOps repo | `/home/ze/greenfield-ops/openshift-gitops` |
+| GitOps commit | `374957b` |
+| Spoke app | `spoke-dc-v7-cluster-config` |
+| Scope | API audit profile, OAuth token settings, image registry allow lists, ingress TLS/default certificate, baseline namespace controls |
+
+## GitOps Layout
+
+Add two directories under `clusters/spoke-dc-v7` and include both from the
+cluster kustomization.
+
+```text
+clusters/spoke-dc-v7/
+  bootstrap/
+    configmap-baseline.yaml
+    kustomization.yaml
+    limitrange-defaults.yaml
+    namespace.yaml
+    networkpolicy-default-deny-ingress.yaml
+    resourcequota-bootstrap.yaml
+  security/
+    apiserver-cluster.yaml
+    image-config-allowed-registries.yaml
+    ingresscontroller-default-tls.yaml
+    kustomization.yaml
+    oauth-tokenconfig.yaml
+    oauthclients-inactivity.yaml
+```
+
+The managed spoke Argo CD controller also needs cluster-scoped permissions for
+these resources:
+
+- core `namespaces`, `limitranges`, `resourcequotas`, and `configmaps`;
+- `config.openshift.io` `apiservers`, `oauths`, and `images`;
+- `oauth.openshift.io` `oauthclients`;
+- `operator.openshift.io` `ingresscontrollers`.
+
+## Configuration
+
+Set the cluster API server to write request-body audit logging while keeping
+API encryption enabled:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: APIServer
+metadata:
+  name: cluster
+spec:
+  audit:
+    profile: WriteRequestBodies
+  encryption:
+    type: aesgcm
+```
+
+Set the cluster OAuth token policy:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  tokenConfig:
+    accessTokenInactivityTimeout: 15m0s
+    accessTokenMaxAgeSeconds: 86400
+```
+
+Keep the existing identity providers in the same object. For this deployment,
+the `htpasswd-ze` provider remained present after reconciliation.
+
+Set the four default OAuth clients to a 900 second inactivity timeout:
+
+```text
+console
+openshift-browser-client
+openshift-challenging-client
+openshift-cli-client
+```
+
+Restrict image registry sources to the approved greenfield registry set:
+
+```text
+quay.v7.comptech-lab.com
+image-registry.openshift-image-registry.svc:5000
+image-registry.openshift-image-registry.svc.cluster.local:5000
+registry.redhat.io
+registry.connect.redhat.com
+registry.access.redhat.com
+quay.io
+ghcr.io
+docker.io
+icr.io
+```
+
+Set the default ingress controller to a custom TLS profile with TLS 1.2
+minimum and an explicit default certificate reference:
+
+```yaml
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: default
+  namespace: openshift-ingress-operator
+spec:
+  defaultCertificate:
+    name: router-certs-default
+  tlsSecurityProfile:
+    type: Custom
+    custom:
+      minTLSVersion: VersionTLS12
+```
+
+`router-certs-default` is the operator-generated wildcard route certificate
+for `*.apps.spoke-dc-v7.v7.comptech-lab.com`. This is an explicit low-risk
+default-certificate stopgap. A future gate should replace it with the approved
+cert-manager or DNS-01 wildcard certificate pattern if public trust is required
+for application routes.
+
+Create the `spoke-platform-bootstrap` namespace with restricted Pod Security
+Admission labels, default `LimitRange`, `ResourceQuota`, default-deny ingress
+`NetworkPolicy`, and a baseline `ConfigMap`.
+
+## Render And Dry Run
+
+Render the spoke kustomization before pushing:
+
+```bash
+cd /home/ze/greenfield-ops/openshift-gitops
+oc kustomize clusters/spoke-dc-v7 >/tmp/spoke-dc-v7-kustomize.yaml
+git diff --check
+```
+
+Run a server-side dry run from `gf-ocp-bootstrap-01`:
+
+```bash
+export SPOKE_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" apply --dry-run=server \
+  -f /tmp/spoke-dc-v7-kustomize.yaml
+```
+
+If namespace-scoped bootstrap objects report `namespaces
+"spoke-platform-bootstrap" not found` during a single streamed server dry run,
+validate that the namespace is sync wave `-1` and the namespace-scoped
+bootstrap objects are sync wave `1`. Argo CD will apply the wave order during
+real reconciliation.
+
+## Reconcile
+
+Push the GitOps commit and hard-refresh the spoke application:
+
+```bash
+export HUB_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+
+oc --kubeconfig "$HUB_KUBECONFIG" -n openshift-gitops \
+  annotate application.argoproj.io/spoke-dc-v7-cluster-config \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+Wait for the application to return to `Synced` and `Healthy`:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" -n openshift-gitops \
+  get application.argoproj.io spoke-dc-v7-cluster-config
+```
+
+The API server rollout can make `kube-apiserver` report `Progressing=True`
+briefly. Wait for it to complete before moving on.
+
+## Validation
+
+Run these checks from the bootstrap host.
+
+```bash
+export HUB_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+export SPOKE_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+oc --kubeconfig "$HUB_KUBECONFIG" -n openshift-gitops \
+  get application.argoproj.io spoke-dc-v7-cluster-config
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get co --no-headers \
+  | awk '$3!="True" || $4!="False" || $5!="False" {print}'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get mcp
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get apiserver cluster -o json \
+  | jq -r '"apiserver audit=\(.spec.audit.profile) encryption=\(.spec.encryption.type)"'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get oauth cluster -o json \
+  | jq -r '"oauth inactivity=\(.spec.tokenConfig.accessTokenInactivityTimeout) maxAge=\(.spec.tokenConfig.accessTokenMaxAgeSeconds) idp=\(.spec.identityProviders[0].name)"'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" \
+  get oauthclient console openshift-browser-client openshift-challenging-client openshift-cli-client -o json \
+  | jq -r '.items[] | "oauthclient \(.metadata.name) inactivity=\(.accessTokenInactivityTimeoutSeconds)"'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get image.config.openshift.io cluster -o json \
+  | jq -r '"allowed=\(.spec.registrySources.allowedRegistries|join(","))"'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-ingress-operator \
+  get ingresscontroller default -o json \
+  | jq -r '"ingress tls=\(.spec.tlsSecurityProfile.type) cert=\(.spec.defaultCertificate.name) available=\([.status.conditions[]|select(.type=="Available")][0].status) degraded=\([.status.conditions[]|select(.type=="Degraded")][0].status)"'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get ns spoke-platform-bootstrap -o json \
+  | jq -r '"bootstrap namespace psa=\(.metadata.labels["pod-security.kubernetes.io/enforce"])"'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n spoke-platform-bootstrap \
+  get resourcequota,limitrange,networkpolicy,configmap
+```
+
+Expected:
+
+- `spoke-dc-v7-cluster-config` is `Synced` and `Healthy`;
+- no non-steady ClusterOperators are printed;
+- `master` and `worker` MCPs are updated, not updating, and not degraded;
+- API audit profile is `WriteRequestBodies`;
+- API encryption remains `aesgcm`;
+- OAuth inactivity is `15m0s` and max age is `86400`;
+- all four OAuth clients show inactivity `900`;
+- image registry allow lists contain only the approved registry set;
+- default ingress TLS profile is `Custom`, certificate is
+  `router-certs-default`, `Available=True`, and `Degraded=False`;
+- `spoke-platform-bootstrap` exists with restricted PSA baseline controls.
+
+## Lessons
+
+Use fully qualified resource names in validation commands. For example,
+`oc get image cluster` can resolve to the wrong API group; use
+`oc get image.config.openshift.io cluster`.
+
+Do not use the low-risk platform config gate for node hardening. Auditd,
+kernel module, sysctl, SSH, USB, disk encryption, and host banner remediations
+must remain in later narrow batches with MachineConfigPool rollout validation.
