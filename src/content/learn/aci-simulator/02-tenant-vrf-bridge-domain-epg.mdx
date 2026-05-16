@@ -1,0 +1,79 @@
+---
+title: "Tenant, VRF, bridge domain, and EPG"
+sidebar_label: "02 — Tenant / VRF / BD / EPG"
+description: "The core ACI application model: tenant, VRF, bridge domain, subnet, application profile, and endpoint group."
+estimated_minutes: 35
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const policyNode = { background: "#f8fafc", border: "1px solid #94a3b8", borderRadius: 8, padding: 10, color: "#0f172a", width: 170, textAlign: "center", fontSize: 12 };
+export const highlightNode = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const policyEdge = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const modelNodes = [
+  { id: "tenant", position: { x: 60, y: 80 }, data: { label: "Tenant\ncustomer or environment boundary" }, style: highlightNode },
+  { id: "vrf", position: { x: 300, y: 80 }, data: { label: "VRF\nrouting table" }, style: policyNode },
+  { id: "bd", position: { x: 540, y: 80 }, data: { label: "Bridge domain\nL2 boundary + subnet gateway" }, style: policyNode },
+  { id: "ap", position: { x: 300, y: 250 }, data: { label: "Application profile\napp container" }, style: policyNode },
+  { id: "epgweb", position: { x: 540, y: 210 }, data: { label: "Web EPG\nsimilar endpoints" }, style: highlightNode },
+  { id: "epgapp", position: { x: 760, y: 210 }, data: { label: "App EPG\nsimilar endpoints" }, style: highlightNode },
+  { id: "epgdb", position: { x: 540, y: 330 }, data: { label: "DB EPG\nsimilar endpoints" }, style: highlightNode },
+];
+
+export const modelEdges = [
+  { id: "e1", source: "tenant", target: "vrf", label: "contains", ...policyEdge },
+  { id: "e2", source: "vrf", target: "bd", label: "used by", ...policyEdge },
+  { id: "e3", source: "tenant", target: "ap", label: "contains", ...policyEdge },
+  { id: "e4", source: "ap", target: "epgweb", label: "groups", ...policyEdge },
+  { id: "e5", source: "ap", target: "epgapp", label: "groups", ...policyEdge },
+  { id: "e6", source: "ap", target: "epgdb", label: "groups", ...policyEdge },
+  { id: "e7", source: "bd", target: "epgweb", label: "mapped to", ...policyEdge },
+  { id: "e8", source: "bd", target: "epgdb", label: "mapped to", ...policyEdge },
+];
+
+Most ACI learning starts here. These objects form the basic application policy model.
+
+<Whiteboard client:load data={{ nodes: modelNodes, edges: modelEdges }} height={460} />
+
+## The objects
+
+| Object | Simple meaning |
+| --- | --- |
+| Tenant | A policy boundary for a customer, team, application, or environment |
+| VRF | A routing table |
+| Bridge domain | A layer-2 forwarding domain, usually with a subnet gateway |
+| Application profile | A container for EPGs that belong to an application |
+| EPG | A group of endpoints that share the same policy |
+
+An EPG is not simply a VLAN. It is a policy group. A VLAN can be one way to attach endpoints to an EPG, but the EPG is the thing APIC uses when applying contracts and endpoint policy.
+
+## A simple lab model
+
+Create a tenant named `lab-prod`.
+
+Inside it:
+
+| Object | Example |
+| --- | --- |
+| VRF | `prod-vrf` |
+| Bridge domain | `prod-bd` |
+| Subnet | `10.10.10.1/24` |
+| Application profile | `three-tier-app` |
+| EPGs | `web`, `app`, `db` |
+
+This gives you a clean three-tier application skeleton. You can then add contracts in the next module.
+
+## What to verify
+
+After building the objects, check:
+
+- The bridge domain points to the right VRF.
+- The subnet is on the bridge domain, not randomly attached elsewhere.
+- Each EPG is under the expected application profile.
+- Each EPG is associated with the intended bridge domain.
+- APIC shows no obvious faults for missing relationships.
+
+If the relationships feel verbose, that is normal. ACI makes implicit network assumptions explicit as policy objects.
+

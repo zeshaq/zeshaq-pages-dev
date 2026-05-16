@@ -14,6 +14,7 @@
 
 export const TRACK_TITLES: Record<string, string> = {
   "agentic-ai": "Agentic AI",
+  "aci-simulator": "ACI Simulator",
   "cloudflare": "Cloudflare",
   "acm-multicluster": "ACM Multicluster",
   "kubeflow": "Kubeflow",
@@ -25,6 +26,8 @@ export const TRACK_TITLES: Record<string, string> = {
 export const TRACK_TAGLINES: Record<string, string> = {
   "agentic-ai":
     "Build agents that loop, use tools, and produce results. From the agent loop and MCP to planning, evaluation, and production.",
+  "aci-simulator":
+    "Learn APIC policy, tenants, EPGs, contracts, access policies, and L3Out concepts before touching a real ACI fabric.",
   "cloudflare":
     "The unified network + edge + security + AI platform. Tunnels, Zero Trust, Magic networking, Workers, Pages, and the rest.",
   "acm-multicluster":

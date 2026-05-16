@@ -1,0 +1,62 @@
+---
+title: "Access policies and static paths"
+sidebar_label: "04 — Access policies"
+description: "How VLAN pools, domains, AEPs, interface policy groups, and static bindings connect endpoints to EPGs."
+estimated_minutes: 40
+last_updated: 2026-05-16
+---
+
+Access policy is where many ACI beginners get stuck. Tenant policy says **what the application model should be**. Access policy says **how physical or virtual interfaces can carry that application policy**.
+
+## The chain
+
+The usual mental chain is:
+
+| Layer | Object examples | Purpose |
+| --- | --- | --- |
+| VLAN allocation | VLAN pool | Defines which VLAN IDs can be used |
+| Attachment type | Physical domain or VMM domain | Says where those VLANs are valid |
+| Access entity | AEP | Connects domains to interface policy groups |
+| Interface behavior | Policy group, interface profile, switch profile | Defines how ports behave |
+| Tenant binding | Static path binding on EPG | Maps an EPG to a path and VLAN |
+
+It feels like many objects because ACI separates reusable infrastructure policy from tenant application policy.
+
+## Static path binding
+
+Static path binding is the place where an EPG is attached to a specific path.
+
+For example:
+
+| EPG | Path | Encapsulation |
+| --- | --- | --- |
+| `web` | leaf 101 interface 1/10 | VLAN 110 |
+| `app` | leaf 101 interface 1/11 | VLAN 120 |
+| `db` | leaf 102 interface 1/12 | VLAN 130 |
+
+The simulator can show these relationships, but it will not give you the same traffic validation as a real fabric.
+
+## What to practice
+
+Create a small access policy model:
+
+1. VLAN pool `lab-vlans` with VLANs 110-130.
+2. Physical domain `lab-phys`.
+3. AEP `lab-aep` associated with the physical domain.
+4. Interface policy group `lab-access-pg`.
+5. Interface profile for one simulated leaf.
+6. Static bindings from your EPGs to simulated paths.
+
+After each step, check faults. Most ACI access policy mistakes are missing links in this chain.
+
+## Common mistakes
+
+| Symptom | Likely cause |
+| --- | --- |
+| EPG binding fault | Missing domain association |
+| VLAN fault | VLAN not in the pool or wrong allocation mode |
+| Path does not appear | Wrong switch or interface profile |
+| Policy exists but does nothing | Object created but not attached to the chain |
+
+Do not memorize clicks. Draw the chain and verify each object has a reason to exist.
+

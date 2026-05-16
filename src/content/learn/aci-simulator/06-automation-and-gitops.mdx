@@ -1,0 +1,79 @@
+---
+title: "Automation and GitOps"
+sidebar_label: "06 — Automation"
+description: "How to approach APIC automation with Terraform, Ansible, Python, REST reads, exports, and reviewable policy changes."
+estimated_minutes: 35
+last_updated: 2026-05-16
+---
+
+ACI is API-first. The GUI is useful for learning and inspection, but serious operations should move toward repeatable automation.
+
+## The automation options
+
+| Tool | Best use |
+| --- | --- |
+| Terraform | Declarative policy objects such as tenants, VRFs, BDs, EPGs, contracts, and L3Outs |
+| Ansible | Procedural tasks, day-2 operations, checks, and integration with other network devices |
+| Python REST client | Custom reads, reports, validation, and small tools |
+| APIC export/import | Snapshots, comparison, migration assistance |
+| GitOps workflow | Review, approve, apply, and audit changes through Git |
+
+For learning, start with read-only API calls. Then automate one tenant. Then automate one small application model.
+
+## Safe first API read
+
+Use the APIC URL for your lab and credentials stored outside Git. A simple read-only call should list tenants:
+
+```bash
+curl -k -b cookie.txt https://apic.example.local/api/node/class/fvTenant.json
+```
+
+In practice, you authenticate first, store the session cookie, and keep usernames and passwords out of tracked files.
+
+## GitOps shape
+
+A practical repository shape:
+
+```text
+aci/
+  tenants/
+  contracts/
+  l3out/
+  access-policies/
+  scripts/
+  docs/
+```
+
+Each change should answer:
+
+- What object is being changed?
+- Why is it needed?
+- What application or tenant owns it?
+- What is the rollback?
+- How was it validated?
+
+## What to automate first
+
+Good first targets:
+
+- Tenant creation.
+- VRF and bridge domain creation.
+- Application profile and EPG creation.
+- Contracts and filters.
+- Read-only inventory reports.
+- Read-only fault reports.
+
+Save access policies and L3Out automation for after you understand the relationships. Those areas have more dependencies and more ways to create confusing partial state.
+
+## Simulator-specific advice
+
+The simulator is a good API target because mistakes are cheap. Use it to practice:
+
+- Exporting objects before and after changes.
+- Comparing GUI-created policy with code-created policy.
+- Building a small review workflow.
+- Deleting and recreating lab tenants.
+- Learning APIC object names and distinguished names.
+
+Do not publish credentials, session cookies, private hostnames, or local secrets into Git. The code should expect those values from environment variables or a secret store.
+

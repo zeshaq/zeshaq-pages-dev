@@ -1,0 +1,75 @@
+---
+title: "Contracts and filters"
+sidebar_label: "03 — Contracts"
+description: "How provider and consumer EPGs use contracts and filters to express application communication."
+estimated_minutes: 30
+last_updated: 2026-05-16
+---
+
+Contracts are how ACI expresses allowed communication between EPGs. Without a contract, EPGs are isolated from each other in the normal application policy model.
+
+## The simple version
+
+Think of it like this:
+
+| Concept | Meaning |
+| --- | --- |
+| Consumer EPG | The group that starts the connection |
+| Provider EPG | The group that offers the service |
+| Contract | The policy relationship between them |
+| Subject | A section inside a contract |
+| Filter | Protocol and port match, such as TCP 443 |
+
+For a web application:
+
+| Flow | Consumer | Provider | Filter |
+| --- | --- | --- | --- |
+| Users to web | external or web client EPG | `web` | TCP 443 |
+| Web to app | `web` | `app` | TCP 8080 |
+| App to database | `app` | `db` | TCP 5432 or TCP 3306 |
+
+## Provider and consumer direction
+
+Direction matters. If `web` consumes a contract provided by `app`, the intended model is **web talks to app**. If you reverse it, the GUI may still look valid, but the policy means something different.
+
+This is one of the most common beginner mistakes in ACI.
+
+## Filters are not firewall policy by themselves
+
+A filter defines what traffic a contract subject matches. It does not become useful until it is attached to a contract, and that contract is provided and consumed by EPGs.
+
+Good naming helps:
+
+| Filter name | Match |
+| --- | --- |
+| `https` | TCP 443 |
+| `app-tcp-8080` | TCP 8080 |
+| `postgres` | TCP 5432 |
+| `mysql` | TCP 3306 |
+
+## Practice task
+
+In your `three-tier-app` application profile:
+
+1. Create filter `https` for TCP 443.
+2. Create filter `app-tcp-8080` for TCP 8080.
+3. Create filter `postgres` for TCP 5432.
+4. Create contract `web-to-app` using the app filter.
+5. Create contract `app-to-db` using the database filter.
+6. Make `app` provide `web-to-app`.
+7. Make `web` consume `web-to-app`.
+8. Make `db` provide `app-to-db`.
+9. Make `app` consume `app-to-db`.
+
+## What to learn from the simulator
+
+The simulator is useful here because it forces you to think like APIC:
+
+- What object owns the contract?
+- Which EPG provides it?
+- Which EPG consumes it?
+- Which filter actually matches the traffic?
+- Are you modeling app intent or just copying firewall rules?
+
+In a real fabric, you would also verify traffic. In the simulator, focus on object relationships and faults.
+

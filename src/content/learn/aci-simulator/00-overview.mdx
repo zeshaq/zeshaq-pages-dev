@@ -1,0 +1,83 @@
+---
+title: "Overview"
+sidebar_label: "00 — Overview"
+description: "What Cisco ACI Simulator is, what it is not, and how to use it as a safe APIC policy classroom."
+estimated_minutes: 15
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const node = { background: "#f8fafc", border: "1px solid #94a3b8", borderRadius: 8, padding: 10, color: "#0f172a", width: 170, textAlign: "center", fontSize: 12 };
+export const apic = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const fabric = { background: "#ecfdf5", border: "1.5px solid #047857", borderRadius: 8, padding: 10, color: "#0f172a", width: 190, textAlign: "center", fontSize: 12 };
+export const lab = { background: "#fff7ed", border: "1px solid #c2410c", borderRadius: 8, padding: 10, color: "#0f172a", width: 190, textAlign: "center", fontSize: 12 };
+export const edge = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const dashed = { style: { stroke: "#c2410c", strokeWidth: 1.5, strokeDasharray: "5,5" }, markerEnd: { type: "arrowclosed", color: "#c2410c" }, labelStyle: { fill: "#c2410c", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const overviewNodes = [
+  { id: "browser", position: { x: 40, y: 70 }, data: { label: "Browser or API client" }, style: node },
+  { id: "proxy", position: { x: 270, y: 70 }, data: { label: "Reverse proxy or lab URL" }, style: node },
+  { id: "apic", position: { x: 520, y: 70 }, data: { label: "ACI Simulator\nAPIC UI + REST API" }, style: apic },
+  { id: "simfabric", position: { x: 760, y: 70 }, data: { label: "Simulated fabric\nspines, leaves, faults, inventory" }, style: fabric },
+  { id: "eveng", position: { x: 520, y: 240 }, data: { label: "EVE-NG lab\nreal virtual routers, switches, firewalls" }, style: lab },
+  { id: "real", position: { x: 760, y: 240 }, data: { label: "Real dataplane practice\nCLI, packets, adjacencies" }, style: lab },
+];
+
+export const overviewEdges = [
+  { id: "e1", source: "browser", target: "proxy", label: "HTTPS", ...edge },
+  { id: "e2", source: "proxy", target: "apic", label: "APIC access", ...edge },
+  { id: "e3", source: "apic", target: "simfabric", label: "policy model", ...edge },
+  { id: "e4", source: "apic", target: "eveng", label: "separate lab", ...dashed },
+  { id: "e5", source: "eveng", target: "real", label: "packet behavior", ...dashed },
+];
+
+Cisco ACI Simulator is a safe place to learn the **APIC policy model** before touching a production ACI fabric. You use the same APIC web UI and REST API style, but the fabric is simulated. That makes it excellent for learning tenants, VRFs, bridge domains, EPGs, contracts, access policies, faults, and the object tree.
+
+It is not a full packet-forwarding lab. You should treat it as the **control-plane and policy classroom**, then use EVE-NG with Nexus, IOS XR, FTDv, or Linux endpoints when you need real traffic, routing adjacencies, captures, and failure behavior.
+
+## Where it fits
+
+<Whiteboard client:load data={{ nodes: overviewNodes, edges: overviewEdges }} height={420} />
+
+The simulator teaches the APIC side:
+
+- How ACI objects relate to each other.
+- How policy is built in the GUI and API.
+- How tenants, VRFs, bridge domains, EPGs, contracts, and access policies fit together.
+- How APIC represents inventory, health, faults, and object dependencies.
+
+The EVE-NG side teaches the packet side:
+
+- Router and switch CLI behavior.
+- BGP, OSPF, VXLAN, firewall policy, NAT, and traffic captures.
+- Real endpoint connectivity and troubleshooting.
+- Data center edge and interconnect behavior.
+
+Use both. Do not expect one to replace the other.
+
+## What this track covers
+
+| # | Module | Goal |
+| --- | --- | --- |
+| 00 | Overview | Understand what the simulator is good for |
+| 01 | APIC orientation | Learn the dashboard, menus, object tree, faults, and inventory |
+| 02 | Tenant, VRF, BD, EPG | Build the core ACI policy model in your head |
+| 03 | Contracts and filters | Control communication between application tiers |
+| 04 | Access policies and static paths | Understand how VLANs, domains, AEPs, interfaces, and EPG bindings connect |
+| 05 | L3Out | Learn the external routing policy model |
+| 06 | Automation and GitOps | Read and manage APIC policy through repeatable automation |
+| 07 | Limitations and next labs | Know when to move from simulator to EVE-NG or physical gear |
+
+## First mental model
+
+Traditional networking starts with boxes and interfaces. ACI starts with **intent**:
+
+- This application belongs to this tenant.
+- This endpoint group lives in this bridge domain.
+- This bridge domain belongs to this VRF.
+- These endpoint groups can talk through this contract.
+- This external network is reachable through this L3Out.
+
+APIC turns that intent into device configuration. The simulator lets you practice that modeling without risking production.
+

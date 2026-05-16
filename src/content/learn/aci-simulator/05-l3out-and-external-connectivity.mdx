@@ -1,0 +1,61 @@
+---
+title: "L3Out and external connectivity"
+sidebar_label: "05 — L3Out"
+description: "How ACI models external routed connectivity with L3Outs, external EPGs, route control, and contracts."
+estimated_minutes: 35
+last_updated: 2026-05-16
+---
+
+L3Out is how ACI connects a tenant VRF to external routed networks. It is not just "turn on BGP on a port." It is a set of policy objects that describe where external routing happens, what routes are learned or advertised, and what external networks can access internal EPGs.
+
+## The objects
+
+| Object | Meaning |
+| --- | --- |
+| L3Out | External routed connection for a VRF |
+| Logical node profile | Which leaf nodes participate |
+| Logical interface profile | Which routed interfaces, subinterfaces, or SVIs participate |
+| External EPG | A policy object representing external prefixes |
+| Route control | What routes are imported, exported, or matched |
+| Contract | What external prefixes can access internally |
+
+The most important shift: external networks are also modeled as policy. An external EPG can consume or provide contracts like an internal EPG.
+
+## A simple design
+
+For a lab tenant:
+
+| Object | Example |
+| --- | --- |
+| VRF | `prod-vrf` |
+| L3Out | `prod-border-l3out` |
+| Routing protocol | OSPF or BGP |
+| External EPG | `outside-networks` |
+| External prefixes | `0.0.0.0/0` for default route learning, or a narrower test prefix |
+| Contract | `outside-to-web-https` |
+
+In a simulator, focus on how APIC asks you to model these pieces. In a real or EVE-NG lab, you also verify adjacency, routes, endpoint reachability, and packet captures.
+
+## What L3Out is good for
+
+Use L3Out to model:
+
+- Data center border connectivity.
+- Firewall insertion or external firewall zones.
+- WAN or campus routing into an ACI tenant.
+- Shared services that live outside the ACI fabric.
+- Route leaking patterns when combined carefully with VRFs and contracts.
+
+## What to avoid
+
+Avoid treating L3Out as a magic escape hatch. If every EPG gets broad access to every external prefix, you have recreated a flat network with more objects.
+
+Better:
+
+- Keep external EPGs explicit.
+- Use contracts intentionally.
+- Import and export only the routes you need.
+- Keep route control policy readable.
+
+The simulator helps you understand the object model. Use a packet lab later to learn the operational behavior.
+

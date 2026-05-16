@@ -1,0 +1,67 @@
+---
+title: "APIC orientation"
+sidebar_label: "01 — APIC orientation"
+description: "How to read the APIC UI: tenants, fabric, inventory, faults, health, and the managed object tree."
+estimated_minutes: 25
+last_updated: 2026-05-16
+---
+
+APIC is not just a switch manager. It is the controller that stores the policy model for the fabric. The simulator gives you the same basic navigation pattern you will use on a real fabric.
+
+## The areas to learn first
+
+Start with these sections:
+
+| Area | What to look for |
+| --- | --- |
+| Tenants | Application policy: VRFs, bridge domains, app profiles, EPGs, contracts |
+| Fabric | Switch inventory, fabric membership, health, faults |
+| System | Controller health, users, AAA, certificates, system settings |
+| Operations | Faults, events, audit logs, endpoint learning |
+| Admin | Authentication, RBAC, export/import, firmware-style administration |
+
+For learning, spend most of your time in **Tenants**, then use **Fabric** and **Operations** to understand what APIC thinks is happening.
+
+## Faults matter
+
+ACI exposes many errors as **faults**. This is one of the most useful habits to build early: after every policy change, check whether APIC raised a fault.
+
+Examples:
+
+- A domain is missing from an EPG.
+- A VLAN is not in the right pool.
+- A static path points to the wrong interface.
+- A contract exists but is not applied in the expected direction.
+- A policy object exists but is not attached to anything useful.
+
+In a real fabric, faults are often faster than guessing from CLI output. The simulator is a safe place to learn how APIC describes broken intent.
+
+## The object tree
+
+ACI is a managed object system. The GUI is just one view of it. Behind every screen is a tree of objects with distinguished names.
+
+Useful examples:
+
+| Object | Meaning |
+| --- | --- |
+| `fvTenant` | Tenant |
+| `fvCtx` | VRF |
+| `fvBD` | Bridge domain |
+| `fvAp` | Application profile |
+| `fvAEPg` | Endpoint group |
+| `vzBrCP` | Contract |
+| `vzFilter` | Filter |
+
+When you understand the object tree, automation becomes less mysterious. Terraform, Ansible, and direct REST calls are all creating or reading these same objects.
+
+## A good first tour
+
+1. Log in to APIC.
+2. Open **Tenants** and inspect the built-in tenants: `common`, `infra`, and `mgmt`.
+3. Open **Fabric** and inspect the simulated nodes.
+4. Open **Operations** and review faults and events.
+5. Use the search box to find a tenant, bridge domain, or contract.
+6. Open the API inspector if your APIC version exposes it, then make a simple GUI change and observe the generated API call.
+
+The goal is not to memorize the UI. The goal is to see that every GUI action changes an object in the APIC model.
+
