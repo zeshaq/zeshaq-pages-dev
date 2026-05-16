@@ -1,7 +1,7 @@
 ---
 title: "Lab 2: access policies + static path binding"
 sidebar_label: "09 — Lab 2"
-description: "Build the ACI Simulator access policy chain for Lab 1 EPGs using VLAN pool, physical domain, AEP, access port policy group, and conditional static path bindings."
+description: "Build the ACI Simulator access policy chain for Lab 1 EPGs using VLAN pool, physical domain, AEP, access port policy group, and static path bindings."
 estimated_minutes: 50
 last_updated: 2026-05-16
 ---
@@ -47,7 +47,7 @@ export const accessEdges = [
 
 Lab 2 extends the Lab 1 tenant model into the ACI access policy chain. Lab 1 created `lab-prod`, `three-tier-app`, and the `web`, `app`, and `db` EPGs. This lab makes those EPGs eligible to attach to leaf/interface paths through VLAN encapsulation.
 
-The important simulator caveat: the current simulator instance exposes no leaf/interface `fabricPathEp` objects. That means the access-policy objects and EPG domain associations can be built and verified, but static path bindings must wait until APIC exposes real paths. APIC Simulator teaches the policy objects, relationships, validation flow, and common faults. It does not prove real endpoint packet forwarding.
+The important simulator caveat: these are simulated fabric nodes and paths. They are useful for APIC policy, inventory, static path, and fault learning, but they do not prove real endpoint packet forwarding. Use EVE-NG or physical gear when you need packets, captures, and dataplane troubleshooting.
 
 ## Target model
 
@@ -62,11 +62,11 @@ The important simulator caveat: the current simulator instance exposes no leaf/i
 | Domain | Physical domain `lab-phys` |
 | AEP | `lab-aep` |
 | Access port policy group | `lab-access-pg` |
-| Path selection | A leaf and interface path, if your APIC Simulator inventory exposes one |
+| Path selection | Simulated leaf1 paths `eth1/10`, `eth1/11`, and `eth1/12` |
 | EPG domain association | Associate `web`, `app`, and `db` with `lab-phys` |
-| Future static path binding | `web` to VLAN `110` |
-| Future static path binding | `app` to VLAN `120` |
-| Future static path binding | `db` to VLAN `130` |
+| Static path binding | `web` to leaf1 `eth1/10`, VLAN `110` |
+| Static path binding | `app` to leaf1 `eth1/11`, VLAN `120` |
+| Static path binding | `db` to leaf1 `eth1/12`, VLAN `130` |
 
 ## Build the reusable access policy chain
 
@@ -90,13 +90,19 @@ At this point, the access policy chain should read:
 | Access entity | AEP `lab-aep` |
 | Interface behavior | Access port policy group `lab-access-pg` |
 
-## Check for leaf/interface paths
+## Select the leaf/interface paths
 
 Use a leaf and interface path that exists in your APIC Simulator inventory. The exact node and interface can vary by simulator version and discovered fabric inventory, so choose a valid path from the GUI rather than typing a made-up path.
 
-In the current lab, APIC reports zero fabric path endpoints. In that state, stop after creating the access-policy chain and EPG domain associations.
+In the current lab, the built-in simulated switches are registered and APIC exposes path endpoints. Use these beginner-safe paths:
 
-If paths exist in your simulator, then for each selected access port:
+| EPG | Path |
+| --- | --- |
+| `web` | `topology/pod-1/paths-101/pathep-[eth1/10]` |
+| `app` | `topology/pod-1/paths-101/pathep-[eth1/11]` |
+| `db` | `topology/pod-1/paths-101/pathep-[eth1/12]` |
+
+For each selected access port:
 
 1. Confirm the leaf appears in the simulator fabric inventory.
 2. Confirm the interface appears as a selectable path.
@@ -116,9 +122,9 @@ In tenant `lab-prod`, application profile `three-tier-app`:
 
 If you skip this step, APIC can show domain or deployment faults when you bind the EPG to a physical path.
 
-## Add static path bindings when paths exist
+## Add static path bindings
 
-Bind each EPG to the selected leaf/interface path with a different VLAN encapsulation only when APIC shows real path endpoints.
+Bind each EPG to the selected leaf/interface path with a different VLAN encapsulation.
 
 | EPG | Encapsulation |
 | --- | --- |
@@ -150,14 +156,12 @@ Check these in APIC before calling the lab complete:
 - EPG `db` is associated with `lab-phys`.
 - The tenant and access policy objects have no obvious APIC faults.
 
-If your simulator exposes fabric path endpoints, also verify:
-
 - The selected leaf/interface path exists in simulator inventory.
 - EPG `web` has a static path binding with VLAN `110`.
 - EPG `app` has a static path binding with VLAN `120`.
 - EPG `db` has a static path binding with VLAN `130`.
 
-In the current lab automation run, verification returned `ready: true`, `tenant_fault_count: 0`, `fabric_path_endpoint_count: 0`, and `static_bindings_skipped: 3`.
+In the current lab automation run, verification returned `ready: true`, `tenant_fault_count: 0`, `fabric_path_endpoint_count: 504`, and `static_bindings_skipped: 0`.
 
 ## What this lab teaches
 
