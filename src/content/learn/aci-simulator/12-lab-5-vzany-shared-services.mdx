@@ -1,0 +1,191 @@
+---
+title: "Lab 5: vzAny shared services"
+sidebar_label: "12 — Lab 5"
+description: "Use vzAny to model VRF-wide access to shared DNS and NTP services in ACI Simulator."
+estimated_minutes: 50
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const vrfStyle = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const epgStyle = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const serviceStyle = { background: "#fff7ed", border: "1.5px solid #c2410c", borderRadius: 8, padding: 10, color: "#0f172a", width: 185, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const contractStyle = { background: "#f8fafc", border: "1.5px solid #64748b", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const consumeEdge = { style: { stroke: "#0369a1", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#0369a1" }, labelStyle: { fill: "#0369a1", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const provideEdge = { style: { stroke: "#15803d", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const vzanyNodes = [
+  { id: "vrf", position: { x: 40, y: 70 }, data: { label: "VRF\nprod-vrf" }, style: vrfStyle },
+  { id: "vzany", position: { x: 280, y: 70 }, data: { label: "vzAny\nVRF-wide policy" }, style: vrfStyle },
+  { id: "web", position: { x: 40, y: 250 }, data: { label: "EPG\nweb" }, style: epgStyle },
+  { id: "app", position: { x: 40, y: 360 }, data: { label: "EPG\napp" }, style: epgStyle },
+  { id: "db", position: { x: 40, y: 470 }, data: { label: "EPG\ndb" }, style: epgStyle },
+  { id: "dns", position: { x: 560, y: 130 }, data: { label: "Contract\nshared-dns\nTCP/UDP 53" }, style: contractStyle },
+  { id: "ntp", position: { x: 560, y: 300 }, data: { label: "Contract\nshared-ntp\nUDP 123" }, style: contractStyle },
+  { id: "shared", position: { x: 860, y: 215 }, data: { label: "EPG\nshared-services\nprovider" }, style: serviceStyle },
+];
+
+export const vzanyEdges = [
+  { id: "e1", source: "vrf", target: "vzany", label: "contains", ...rel },
+  { id: "e2", source: "vrf", target: "web", label: "contains", ...rel },
+  { id: "e3", source: "vrf", target: "app", label: "contains", ...rel },
+  { id: "e4", source: "vrf", target: "db", label: "contains", ...rel },
+  { id: "e5", source: "vzany", target: "dns", label: "consumes", ...consumeEdge },
+  { id: "e6", source: "vzany", target: "ntp", label: "consumes", ...consumeEdge },
+  { id: "e7", source: "shared", target: "dns", label: "provides", ...provideEdge },
+  { id: "e8", source: "shared", target: "ntp", label: "provides", ...provideEdge },
+];
+
+Lab 5 introduces `vzAny`, a VRF-wide policy attachment point. Instead of adding the same DNS and NTP contracts to `web`, `app`, and `db` one by one, we attach those contracts once to `vzAny` under `prod-vrf`.
+
+The model is:
+
+```text
+prod-vrf vzAny -> shared-dns/shared-ntp contracts -> shared-services EPG
+```
+
+This is a common shared-services pattern. It is useful, but powerful enough that it should be used carefully.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: vzanyNodes, edges: vzanyEdges }} height={610} />
+
+## What you will create
+
+| Object | Name or value |
+| --- | --- |
+| Shared-services EPG | `shared-services` |
+| Bridge domain | `prod-bd` |
+| Filter | `shared-dns` |
+| DNS entries | UDP `53` and TCP `53` |
+| Filter | `shared-ntp` |
+| NTP entry | UDP `123` |
+| Contract | `shared-dns` |
+| Contract | `shared-ntp` |
+| Provider | `shared-services` provides both contracts |
+| Consumer | `vzAny` under `prod-vrf` consumes both contracts |
+
+## Understand vzAny
+
+`vzAny` represents all EPGs inside a VRF for contract purposes.
+
+If `vzAny` consumes a contract, every EPG in that VRF is effectively a consumer of that contract.
+
+That is useful for common services:
+
+```text
+DNS
+NTP
+logging
+monitoring
+package repositories
+identity services
+```
+
+It is risky for broad application access. If you attach a powerful contract to `vzAny`, you may allow more EPGs than intended.
+
+## Build the shared-services EPG
+
+Create EPG `shared-services` under application profile `three-tier-app`.
+
+Associate it with bridge domain `prod-bd`.
+
+This EPG represents a service segment where shared infrastructure services would live in a real fabric.
+
+## Build the DNS contract
+
+Create filter `shared-dns`.
+
+Add two entries:
+
+| Protocol | Destination port |
+| --- | --- |
+| UDP | `53` |
+| TCP | `53` |
+
+Create contract `shared-dns` and subject `allow-shared-dns`.
+
+Attach filter `shared-dns` to the subject.
+
+Make EPG `shared-services` provide contract `shared-dns`.
+
+## Build the NTP contract
+
+Create filter `shared-ntp`.
+
+Add one entry:
+
+| Protocol | Destination port |
+| --- | --- |
+| UDP | `123` |
+
+Create contract `shared-ntp` and subject `allow-shared-ntp`.
+
+Attach filter `shared-ntp` to the subject.
+
+Make EPG `shared-services` provide contract `shared-ntp`.
+
+## Attach contracts to vzAny
+
+Open VRF `prod-vrf` and find `vzAny`.
+
+Make `vzAny` consume:
+
+```text
+shared-dns
+shared-ntp
+```
+
+Now every EPG in `prod-vrf` can consume the shared DNS and NTP contracts without adding those contract relationships on each EPG.
+
+## Automation
+
+The lab repo has an idempotent script:
+
+```bash
+./scripts/configure-aci-lab-5-vzany-shared-services.sh
+```
+
+The latest run returned:
+
+```text
+ready: true
+tenant_fault_count: 0
+shared-services provides shared-dns and shared-ntp
+vzAny consumes shared-dns and shared-ntp
+DNS UDP/TCP 53 entries verified
+NTP UDP 123 entry verified
+```
+
+## Verification checklist
+
+In APIC, check these before calling the lab complete:
+
+- EPG `shared-services` exists.
+- EPG `shared-services` uses bridge domain `prod-bd`.
+- Filter `shared-dns` exists.
+- Filter `shared-dns` has UDP destination port `53`.
+- Filter `shared-dns` has TCP destination port `53`.
+- Filter `shared-ntp` exists.
+- Filter `shared-ntp` has UDP destination port `123`.
+- Contract `shared-dns` exists.
+- Contract `shared-ntp` exists.
+- EPG `shared-services` provides `shared-dns`.
+- EPG `shared-services` provides `shared-ntp`.
+- `vzAny` under `prod-vrf` consumes `shared-dns`.
+- `vzAny` under `prod-vrf` consumes `shared-ntp`.
+- Tenant `lab-prod` has no active faults.
+
+## What this lab teaches
+
+You should leave Lab 5 understanding:
+
+- `vzAny` applies contract relationships at the VRF level.
+- Shared services are a good use case for `vzAny`.
+- `vzAny` reduces repetitive per-EPG configuration.
+- `vzAny` can accidentally broaden access if used carelessly.
+- DNS and NTP are practical examples of common infrastructure services.
+
+This remains an APIC policy lab. It does not prove real DNS or NTP traffic. For packet tests, build the same shared-services pattern in EVE-NG with Linux endpoints and a real forwarding topology.
