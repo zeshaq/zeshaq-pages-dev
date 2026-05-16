@@ -1,0 +1,149 @@
+---
+title: "Lab 9: common tenant reusable policy"
+sidebar_label: "17 — Lab 9"
+description: "Use the ACI common tenant for reusable filters and contracts while keeping consumers explicitly approved."
+estimated_minutes: 45
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const commonStyle = { background: "#fef3c7", border: "1.5px solid #b45309", borderRadius: 8, padding: 10, color: "#0f172a", width: 210, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const policyStyle = { background: "#f8fafc", border: "1.5px solid #64748b", borderRadius: 8, padding: 10, color: "#0f172a", width: 220, textAlign: "center", fontSize: 12 };
+export const prodStyle = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 190, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const devStyle = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 190, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const prodEdge = { style: { stroke: "#0369a1", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#0369a1" }, labelStyle: { fill: "#0369a1", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const devEdge = { style: { stroke: "#15803d", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const commonNodes = [
+  { id: "common", position: { x: 430, y: 40 }, data: { label: "Tenant\ncommon\nreusable policy" }, style: commonStyle },
+  { id: "filters", position: { x: 280, y: 180 }, data: { label: "Filters\nlab-common-web-filter\nlab-common-api-filter" }, style: policyStyle },
+  { id: "contracts", position: { x: 620, y: 180 }, data: { label: "Contracts\nlab-common-web-access\nlab-common-api-access" }, style: policyStyle },
+  { id: "prodif", position: { x: 120, y: 330 }, data: { label: "lab-prod\nlocal interfaces\nweb access\napi access" }, style: prodStyle },
+  { id: "prodepgs", position: { x: 120, y: 480 }, data: { label: "Approved EPGs\nweb -> web access\napp -> API access" }, style: prodStyle },
+  { id: "devif", position: { x: 740, y: 330 }, data: { label: "lab-dev\nlocal interfaces\nweb access\napi access" }, style: devStyle },
+  { id: "devepgs", position: { x: 740, y: 480 }, data: { label: "Approved EPGs\nfrontend -> web access\napi -> API access" }, style: devStyle },
+];
+
+export const commonEdges = [
+  { id: "e1", source: "common", target: "filters", label: "owns", ...rel },
+  { id: "e2", source: "filters", target: "contracts", label: "used by", ...rel },
+  { id: "e3", source: "prodif", target: "contracts", label: "points to common", ...prodEdge },
+  { id: "e4", source: "prodepgs", target: "prodif", label: "consumes local interfaces", ...prodEdge },
+  { id: "e5", source: "devif", target: "contracts", label: "points to common", ...devEdge },
+  { id: "e6", source: "devepgs", target: "devif", label: "consumes local interfaces", ...devEdge },
+];
+
+Lab 9 uses the built-in ACI tenant:
+
+```text
+common
+```
+
+The `common` tenant is useful when several tenants should reuse the same filters or contracts. It is also risky if it becomes a shortcut for broad, unreviewed access.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: commonNodes, edges: commonEdges }} height={640} />
+
+## What you configure
+
+| Area | Value |
+| --- | --- |
+| Reusable policy tenant | `common` |
+| Web filter | `lab-common-web-filter` |
+| API filter | `lab-common-api-filter` |
+| Web contract | `lab-common-web-access` |
+| API contract | `lab-common-api-access` |
+
+The filters are simple on purpose:
+
+| Filter | Ports |
+| --- | --- |
+| `lab-common-web-filter` | TCP 80, TCP 443 |
+| `lab-common-api-filter` | TCP 8443 |
+
+## Consumer-side interfaces
+
+The reusable contracts live in `common`. The consuming tenants get local contract interfaces:
+
+| Consumer tenant | Interfaces |
+| --- | --- |
+| `lab-prod` | `lab-common-web-access-if`, `lab-common-api-access-if` |
+| `lab-dev` | `lab-common-web-access-if`, `lab-common-api-access-if` |
+
+Those local interfaces point back to the contracts in `common`.
+
+## Approved consumers
+
+The approved list is deliberately small:
+
+| Tenant | App profile | EPG | Contract interface |
+| --- | --- | --- | --- |
+| `lab-prod` | `three-tier-app` | `web` | `lab-common-web-access-if` |
+| `lab-prod` | `three-tier-app` | `app` | `lab-common-api-access-if` |
+| `lab-dev` | `dev-three-tier-app` | `frontend` | `lab-common-web-access-if` |
+| `lab-dev` | `dev-three-tier-app` | `api` | `lab-common-api-access-if` |
+
+There is no tenant-wide shortcut in this lab.
+
+## Automation
+
+The lab repo has an idempotent script:
+
+```bash
+./scripts/configure-aci-lab-9-common-tenant-reusable-policy.sh
+```
+
+The latest run returned:
+
+```text
+ready: true
+common_tenant common
+contracts lab-common-web-access, lab-common-api-access
+approved_consumer_count 4
+observed_consumer_count 4
+unexpected_common_interface_consumers []
+fault_counts lab-prod=0 lab-dev=0 common=0
+```
+
+## Verification checklist
+
+In APIC, check these before calling the lab complete:
+
+- Tenant `common` exists.
+- Filters `lab-common-web-filter` and `lab-common-api-filter` exist.
+- Contracts `lab-common-web-access` and `lab-common-api-access` exist.
+- `lab-prod` has local interfaces `lab-common-web-access-if` and `lab-common-api-access-if`.
+- `lab-dev` has local interfaces `lab-common-web-access-if` and `lab-common-api-access-if`.
+- Only the approved EPGs consume those interfaces.
+- `lab-prod`, `lab-dev`, and `common` have zero active faults.
+
+## Why this matters
+
+The `common` tenant is a shared namespace. That makes it powerful.
+
+It can standardize policy names such as:
+
+```text
+web access
+API access
+DNS access
+NTP access
+monitoring access
+```
+
+But if every team starts consuming common policy without review, the blast radius becomes hard to understand.
+
+## What this lab teaches
+
+You should leave Lab 9 understanding:
+
+- `common` is best for reusable policy building blocks.
+- A reusable contract still needs a clear owner and purpose.
+- Consumer-side contract interfaces make shared references visible.
+- Reuse should not mean broad access.
+- The dedicated shared-services tenant pattern and the `common` tenant pattern solve different problems.
+
+The next lab should compare contract scopes and show how scope changes policy blast radius.
