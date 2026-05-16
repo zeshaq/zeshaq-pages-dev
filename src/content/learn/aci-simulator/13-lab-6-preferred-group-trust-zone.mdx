@@ -1,0 +1,169 @@
+---
+title: "Lab 6: preferred group trust zone"
+sidebar_label: "13 — Lab 6"
+description: "Use ACI preferred groups to model a trusted app zone while keeping the database tier outside the broad trust boundary."
+estimated_minutes: 45
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const vrfStyle = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const preferredStyle = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const excludedStyle = { background: "#fff7ed", border: "1.5px solid #c2410c", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const noteStyle = { background: "#f8fafc", border: "1.5px solid #64748b", borderRadius: 8, padding: 10, color: "#0f172a", width: 210, textAlign: "center", fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const trustEdge = { style: { stroke: "#15803d", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const protectEdge = { style: { stroke: "#c2410c", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#c2410c" }, labelStyle: { fill: "#c2410c", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const preferredNodes = [
+  { id: "vrf", position: { x: 40, y: 80 }, data: { label: "VRF\nprod-vrf\npcEnfPref enforced" }, style: vrfStyle },
+  { id: "zone", position: { x: 320, y: 80 }, data: { label: "Preferred group\ntrusted app zone" }, style: noteStyle },
+  { id: "web", position: { x: 640, y: 40 }, data: { label: "EPG\nweb\ninclude" }, style: preferredStyle },
+  { id: "app", position: { x: 640, y: 170 }, data: { label: "EPG\napp\ninclude" }, style: preferredStyle },
+  { id: "shared", position: { x: 640, y: 300 }, data: { label: "EPG\nshared-services\ninclude" }, style: preferredStyle },
+  { id: "db", position: { x: 960, y: 170 }, data: { label: "EPG\ndb\nexclude" }, style: excludedStyle },
+  { id: "contract", position: { x: 960, y: 350 }, data: { label: "Explicit contracts\nstill protect db" }, style: noteStyle },
+];
+
+export const preferredEdges = [
+  { id: "e1", source: "vrf", target: "zone", label: "contains", ...rel },
+  { id: "e2", source: "zone", target: "web", label: "preferred member", ...trustEdge },
+  { id: "e3", source: "zone", target: "app", label: "preferred member", ...trustEdge },
+  { id: "e4", source: "zone", target: "shared", label: "preferred member", ...trustEdge },
+  { id: "e5", source: "zone", target: "db", label: "not included", ...protectEdge },
+  { id: "e6", source: "db", target: "contract", label: "uses explicit policy", ...protectEdge },
+];
+
+Lab 6 introduces ACI preferred groups. Preferred groups are a way to say: these selected EPGs inside a VRF are trusted enough to communicate more freely with each other.
+
+In this lab, the trusted app zone is:
+
+```text
+web
+app
+shared-services
+```
+
+The database tier stays outside that broad trust zone:
+
+```text
+db
+```
+
+That keeps the database dependent on explicit contracts.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: preferredNodes, edges: preferredEdges }} height={520} />
+
+## What you will configure
+
+| Object | Setting |
+| --- | --- |
+| VRF `prod-vrf` | Policy enforcement stays enabled |
+| EPG `web` | Preferred group membership `include` |
+| EPG `app` | Preferred group membership `include` |
+| EPG `shared-services` | Preferred group membership `include` |
+| EPG `db` | Preferred group membership `exclude` |
+
+## Why preferred groups matter
+
+Without preferred groups, EPGs normally need contracts to communicate in an enforced VRF.
+
+With preferred groups, selected EPGs can be treated as a trusted group. This reduces policy noise for closely related tiers.
+
+Preferred groups are useful for:
+
+```text
+small trusted app zones
+management services within a VRF
+shared tooling tiers
+temporary migration simplification
+```
+
+Preferred groups are risky for:
+
+```text
+database tiers
+regulated systems
+untrusted tenant workloads
+broad production networks
+```
+
+## Build the trust zone
+
+Keep VRF `prod-vrf` in enforced mode.
+
+Set these EPGs as preferred-group members:
+
+| EPG | Membership |
+| --- | --- |
+| `web` | `include` |
+| `app` | `include` |
+| `shared-services` | `include` |
+
+Then explicitly keep the sensitive tier out:
+
+| EPG | Membership |
+| --- | --- |
+| `db` | `exclude` |
+
+## How this compares with vzAny
+
+Lab 5 used `vzAny` to attach shared DNS and NTP contracts at the VRF level.
+
+Preferred group is different. It changes how included EPGs relate to each other inside the VRF.
+
+Use this rule of thumb:
+
+| Feature | Best for |
+| --- | --- |
+| `vzAny` | Common service contracts consumed by many EPGs |
+| Preferred group | A trusted zone of EPGs that can communicate more freely |
+
+Both are powerful. Both can accidentally make policy too broad.
+
+## Automation
+
+The lab repo has an idempotent script:
+
+```bash
+./scripts/configure-aci-lab-6-preferred-group.sh
+```
+
+The latest run returned:
+
+```text
+ready: true
+tenant_fault_count: 0
+prod-vrf pcEnfPref enforced
+web prefGrMemb include
+app prefGrMemb include
+shared-services prefGrMemb include
+db prefGrMemb exclude
+```
+
+## Verification checklist
+
+In APIC, check these before calling the lab complete:
+
+- VRF `prod-vrf` exists.
+- VRF `prod-vrf` policy enforcement remains enabled.
+- EPG `web` is a preferred-group member.
+- EPG `app` is a preferred-group member.
+- EPG `shared-services` is a preferred-group member.
+- EPG `db` is not a preferred-group member.
+- Tenant `lab-prod` has no active faults.
+
+## What this lab teaches
+
+You should leave Lab 6 understanding:
+
+- Preferred group is a trust-zone feature inside a VRF.
+- Membership is configured on EPGs.
+- Sensitive EPGs can be kept outside the preferred group.
+- Contracts still matter for non-preferred EPGs.
+- Preferred groups reduce policy complexity but can broaden access too much.
+
+This remains an APIC policy lab. It does not prove actual endpoint traffic. For packet tests, build the same trust-zone model in EVE-NG with Linux endpoints and a forwarding fabric.
