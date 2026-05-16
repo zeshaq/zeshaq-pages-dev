@@ -1,0 +1,157 @@
+---
+title: "Lab 7: multi-tenant isolation"
+sidebar_label: "14 — Lab 7"
+description: "Create a second isolated ACI tenant and verify that production and development policy remain separate."
+estimated_minutes: 45
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const tenantStyle = { background: "#eef2ff", border: "1.5px solid #4338ca", borderRadius: 8, padding: 10, color: "#0f172a", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const prodStyle = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const devStyle = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const contractStyle = { background: "#f8fafc", border: "1.5px solid #64748b", borderRadius: 8, padding: 10, color: "#0f172a", width: 210, textAlign: "center", fontSize: 12 };
+export const blockedStyle = { background: "#fff7ed", border: "1.5px solid #c2410c", borderRadius: 8, padding: 10, color: "#0f172a", width: 210, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const devEdge = { style: { stroke: "#15803d", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const blockEdge = { style: { stroke: "#c2410c", strokeWidth: 1.8, strokeDasharray: "5 5" }, markerEnd: { type: "arrowclosed", color: "#c2410c" }, labelStyle: { fill: "#c2410c", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const tenantNodes = [
+  { id: "prod", position: { x: 60, y: 90 }, data: { label: "Tenant\nlab-prod\nproduction policy" }, style: tenantStyle },
+  { id: "prodvrf", position: { x: 320, y: 90 }, data: { label: "VRF\nprod-vrf\nBD prod-bd" }, style: prodStyle },
+  { id: "prodepg", position: { x: 580, y: 90 }, data: { label: "EPGs\nweb app db\nshared-services" }, style: prodStyle },
+  { id: "dev", position: { x: 60, y: 310 }, data: { label: "Tenant\nlab-dev\ndevelopment policy" }, style: tenantStyle },
+  { id: "devvrf", position: { x: 320, y: 310 }, data: { label: "VRF\ndev-vrf\nBD dev-bd" }, style: devStyle },
+  { id: "frontend", position: { x: 580, y: 230 }, data: { label: "EPG\nfrontend\nconsumes API" }, style: devStyle },
+  { id: "api", position: { x: 820, y: 310 }, data: { label: "EPG\napi\nprovides API\nconsumes DB" }, style: devStyle },
+  { id: "database", position: { x: 1060, y: 390 }, data: { label: "EPG\ndatabase\nprovides DB" }, style: devStyle },
+  { id: "contracts", position: { x: 820, y: 120 }, data: { label: "No cross-tenant\ncontract refs" }, style: blockedStyle },
+];
+
+export const tenantEdges = [
+  { id: "e1", source: "prod", target: "prodvrf", label: "owns", ...rel },
+  { id: "e2", source: "prodvrf", target: "prodepg", label: "contains", ...rel },
+  { id: "e3", source: "dev", target: "devvrf", label: "owns", ...rel },
+  { id: "e4", source: "devvrf", target: "frontend", label: "contains", ...rel },
+  { id: "e5", source: "frontend", target: "api", label: "dev-frontend-to-api", ...devEdge },
+  { id: "e6", source: "api", target: "database", label: "dev-api-to-database", ...devEdge },
+  { id: "e7", source: "prodepg", target: "contracts", label: "no dev contracts", ...blockEdge },
+  { id: "e8", source: "frontend", target: "contracts", label: "no prod contracts", ...blockEdge },
+];
+
+Lab 7 adds a second tenant to the simulator.
+
+So far, the labs used one production-style tenant:
+
+```text
+lab-prod
+```
+
+Now you add a separate development tenant:
+
+```text
+lab-dev
+```
+
+The lesson is that an ACI tenant is a policy namespace. Production and development should not share policy by accident.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: tenantNodes, edges: tenantEdges }} height={560} />
+
+## What you will configure
+
+| Area | Production | Development |
+| --- | --- | --- |
+| Tenant | `lab-prod` | `lab-dev` |
+| VRF | `prod-vrf` | `dev-vrf` |
+| Bridge domain | `prod-bd` | `dev-bd` |
+| Subnet gateway | `10.10.10.1/24` | `10.20.10.1/24` |
+| App profile | `three-tier-app` | `dev-three-tier-app` |
+
+The development tenant has three EPGs:
+
+| EPG | Role |
+| --- | --- |
+| `frontend` | User-facing tier |
+| `api` | Application service tier |
+| `database` | Data tier |
+
+## Tenant-local contracts
+
+The development tenant gets its own contracts:
+
+| Contract | Consumer | Provider | Port |
+| --- | --- | --- | --- |
+| `dev-frontend-to-api` | `frontend` | `api` | TCP 8080 |
+| `dev-api-to-database` | `api` | `database` | TCP 5432 |
+
+The important part is what you do not configure:
+
+```text
+lab-prod does not consume lab-dev contracts
+lab-dev does not consume lab-prod contracts
+```
+
+## Automation
+
+The lab repo has an idempotent script:
+
+```bash
+./scripts/configure-aci-lab-7-multi-tenant-isolation.sh
+```
+
+The latest run returned:
+
+```text
+ready: true
+prod_tenant lab-prod
+dev_tenant lab-dev
+prod_tenant_fault_count 0
+dev_tenant_fault_count 0
+cross_tenant_contract_refs []
+```
+
+## Verification checklist
+
+In APIC, check these before calling the lab complete:
+
+- Tenant `lab-prod` still exists.
+- Tenant `lab-dev` exists.
+- `lab-dev` has VRF `dev-vrf`.
+- `lab-dev` has bridge domain `dev-bd`.
+- `dev-bd` has subnet `10.20.10.1/24`.
+- Application profile `dev-three-tier-app` exists.
+- EPGs `frontend`, `api`, and `database` exist.
+- Contracts `dev-frontend-to-api` and `dev-api-to-database` exist.
+- Tenant `lab-dev` has no active faults.
+- There are no intentional cross-tenant contract relationships yet.
+
+## Why this matters
+
+Multi-tenant ACI design should start from isolation.
+
+That means each tenant gets its own:
+
+```text
+VRF
+bridge domains
+EPGs
+contracts
+operating boundary
+```
+
+After isolation is clear, you can deliberately add shared services, L3Outs, or cross-tenant contract patterns. Doing that too early makes the policy hard to reason about.
+
+## What this lab teaches
+
+You should leave Lab 7 understanding:
+
+- Tenants are separate policy namespaces.
+- A second tenant can repeat the same application pattern without touching production.
+- Tenant-local contracts keep policy easier to audit.
+- Cross-tenant sharing should be explicit and documented.
+- The simulator proves policy shape, not real endpoint traffic.
+
+The next lab should introduce shared services across tenants carefully, with a clear provider, consumer, and audit trail.
