@@ -8,13 +8,12 @@ This file is for the **next AI agent** working on this repository. It captures t
 
 - **Public blog + docs + learning tracks** at `https://zeshaq.pages.dev`.
 - Built with **Astro 5**, **MDX**, **React islands** (`@xyflow/react` for diagrams), **Tailwind v4**, hosted on **Cloudflare Pages** via a GitHub Actions workflow.
-- The author is **Zahid** (`zeshaq@gmail.com`, GH handle `zeshaq`). The CF project is named `zeshaq` because `zahid.pages.dev` was globally taken at the time of creation — see [Blog ADR 0001](src/content/docs/06-architecture-decisions/12-blog/01-adr-0001-multi-collection-content-model.mdx) and the `project_zahid_blog.md` memory.
-- The site has four audiences, served by four content collections:
+- The author is **Zahid** (`zeshaq@gmail.com`, GH handle `zeshaq`). The CF project is named `zeshaq` because `zahid.pages.dev` was globally taken at the time of creation — see [Blog ADR 0001](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/01-adr-0001-multi-collection-content-model.mdx) and the `project_zahid_blog.md` memory.
+- The site has three audiences, served by three content collections:
   - **Blog posts** (`/blog/*`) — opinionated technical writing for the public.
-  - **Platform docs** (`/docs/*`) — internal-style documentation for the comptech OpenShift platform.
-  - **Learning tracks** (`/learn/<track>/<module>`) — self-paced curriculum (currently Agentic AI + Cloudflare).
-  - **Brac POC** (`/brac-poc/*`) — proof-of-concept work for the BRAC Bank engagement, with its own sidebar and TOC (Blog ADR 0006). Promoted out of `/docs/` so engagement readers and platform readers don't share a sidebar.
-- Plus a `/whiteboard` interactive editor and a `/rss.xml` feed.
+  - **Docs** (`/docs/*`) — long-form documentation, organised into **modules**. Today: `openshift-platform`, `brac-poc`, `greenfield-ocp-deployment`, `security-lab`. Each module has its own landing page, scoped sidebar, breadcrumb, and TOC.
+  - **Learning tracks** (`/learn/<track>/<module>`) — self-paced curriculum. Tracks are listed in `src/utils/tracks.ts`; today: `agentic-ai`, `aci-simulator`, `acm-multicluster`, `cloudflare`, `data-science`, `devsecops`, `kubeflow`, `openliberty`.
+- Plus a `/whiteboard` interactive editor, a `/rss.xml` feed, and site-wide search via Pagefind (`⌘K` anywhere, or the search icon in any sidebar).
 
 ## 2. Deploy + push workflow
 
@@ -41,42 +40,46 @@ This file is for the **next AI agent** working on this repository. It captures t
 │   ├── favicon.svg
 │   └── robots.txt                       ← allows all + sitemap pointer
 ├── src/
-│   ├── content.config.ts                ← three collections: blog, docs, learn (brac-poc retired; folded under docs/brac-poc/)
+│   ├── content.config.ts                ← three collections: blog, docs, learn
 │   ├── content/
 │   │   ├── blog/*.mdx                   ← posts (flat, category in frontmatter)
-│   │   ├── docs/<module>/NN-section/... ← master docs section; sub-modules openshift-platform/ and brac-poc/
+│   │   ├── docs/<module>/...            ← docs modules; each top-level folder is a module (openshift-platform, brac-poc, greenfield-ocp-deployment, security-lab)
 │   │   └── learn/<track>/NN-*.mdx       ← learn modules, numbered for sort
 │   ├── components/
 │   │   ├── Whiteboard.tsx               ← ReactFlow viewer (NO minimap)
 │   │   ├── WhiteboardEditor.tsx         ← /whiteboard interactive editor
 │   │   ├── ShapeNode.tsx                ← custom node for editor + viewer
-│   │   ├── Mermaid.tsx                  ← DO NOT USE — see §6
+│   │   ├── InteractiveDiagram.tsx       ← inline interactive ReactFlow island for MDX
+│   │   ├── DrawioEmbed.astro            ← embed for draw.io diagrams
+│   │   ├── CodeCopyButtons.astro        ← copy-to-clipboard buttons on code blocks
 │   │   ├── NavNode.astro                ← recursive sidebar tree renderer
 │   │   ├── Sidebar.astro                ← blog sidebar (with category groups)
-│   │   ├── DocsSidebar.astro            ← docs sidebar
-│   │   ├── LearnSidebar.astro           ← learn sidebar (with back-link)
-│   │   ├── BracPocSidebar.astro         ← brac-poc sidebar
+│   │   ├── DocsSidebar.astro            ← docs sidebar (module-aware: scopes the tree when inside a module)
+│   │   ├── LearnSidebar.astro           ← learn sidebar (with track back-link)
+│   │   ├── SectionNav.astro             ← cross-section icon row (Learn / Docs / Whiteboard / Search) atop every sidebar
+│   │   ├── Search.astro                 ← Pagefind modal + ⌘K trigger
 │   │   └── DocsTocNode.astro            ← reused by docs + learn TOC pages
 │   ├── layouts/
 │   │   ├── Layout.astro                 ← blog post + home layout
-│   │   ├── DocsLayout.astro             ← docs layout
+│   │   ├── DocsLayout.astro             ← docs layout (used by master + every module page)
 │   │   ├── LearnLayout.astro            ← learn layout
-│   │   ├── BracPocLayout.astro          ← brac-poc layout
 │   │   └── BareLayout.astro             ← whiteboard (full-window, no sidebar)
 │   ├── pages/
 │   │   ├── index.astro                  ← blog home (lists posts)
 │   │   ├── whiteboard.astro             ← /whiteboard
 │   │   ├── rss.xml.js                   ← RSS feed
 │   │   ├── blog/[...slug].astro
-│   │   ├── docs/index.astro             ← docs landing
-│   │   ├── docs/[...slug].astro
+│   │   ├── docs/index.astro             ← /docs — master landing (module cards)
+│   │   ├── docs/<module>/index.astro    ← /docs/<module>/ — module landing (breadcrumb + "Start here" + sections TOC)
+│   │   ├── docs/[...slug].astro         ← /docs/<module>/... — page content
 │   │   ├── learn/index.astro            ← /learn — track cards
 │   │   ├── learn/[track]/index.astro    ← /learn/<track>/ — per-track TOC
 │   │   └── learn/[...slug].astro        ← /learn/<track>/<module> — content
 │   ├── styles/
 │   │   └── global.css                   ← all CSS lives here; theme tokens at top
 │   └── utils/
-│       ├── navTree.ts                   ← buildTree, buildDocsTree, buildLearnTree, buildCategoryTree
+│       ├── navTree.ts                   ← buildTree, buildDocsTree, buildModuleTree, buildLearnTree, buildCategoryTree
+│       ├── docModules.ts                ← MODULE_TITLES + MODULE_TAGLINES + parseDocsPath (source of truth for docs modules)
 │       └── tracks.ts                    ← TRACK_TITLES + TRACK_TAGLINES + parseLearnPath
 ├── .github/workflows/deploy.yml
 └── memory/                              ← (lives outside repo, in ~/.claude/...)
@@ -97,28 +100,36 @@ Defined in `src/content.config.ts`.
 
 ### docs
 
-- URL: `/docs/<stripped-slug>` (numeric prefixes stripped from each path segment).
+- URL: `/docs/<module>/<stripped-slug>` (numeric prefixes stripped from each path segment).
 - Schema: `title`, `description?`, `sidebar_label?`, `last_reviewed?`, `draft?`.
-- Folder structure is hierarchical and is now organized into **sub-modules** under `src/content/docs/`:
-  - `openshift-platform/` — the comptech OpenShift platform docs (foundations, lab-infrastructure, cluster-topology, ADRs, etc.).
-  - `brac-poc/` — the BRAC Bank engagement POC docs (previously a top-level `brac-poc` collection, now folded back under `/docs/brac-poc/` so all reference material shares one collection and one routing tree).
-- Numeric prefixes (`NN-`) drive sort order; they're stripped from URLs by `stripIdPrefixes` in `navTree.ts`.
-- Blog-specific ADRs live under the openshift-platform sub-module at `src/content/docs/openshift-platform/06-architecture-decisions/12-blog/`.
+- Every top-level folder under `src/content/docs/` is a **module** — a first-class section with its own landing page, scoped sidebar, breadcrumb, and TOC. Current modules:
+  - `openshift-platform/` — operating manual for the comptech OpenShift platform (foundations, lab-infrastructure, fleet topology, GitOps, image supply, security, backup, ADRs).
+  - `brac-poc/` — BRAC Bank engagement POC docs (eight-panel SPA, payment microservice, jboss-chat, demo scope).
+  - `greenfield-ocp-deployment/` — source-of-truth guide for building a greenfield OpenShift platform with GitOps, VM provisioning, DNS, edge, registry, CI, observability.
+  - `security-lab/` — private security/networking lab notes (Cisco NX-OS fabric track, SIEM, vuln mgmt, EVE-NG, NetApp/StorageGRID roadmaps).
+- Module display titles and taglines live in `src/utils/docModules.ts` (`MODULE_TITLES`, `MODULE_TAGLINES`). That file is the source of truth for which modules render on the master `/docs/` landing.
+- Numeric prefixes (`NN-`) drive sort order; they're stripped from URLs by `stripIdPrefixes` in `navTree.ts`. Folder hierarchy inside a module is preserved (e.g., `openshift-platform/06-architecture-decisions/03-adr-0001-cluster-list.mdx` → `/docs/openshift-platform/architecture-decisions/adr-0001-cluster-list`).
+- Three-level navigation, mirroring `/learn`:
+  1. `/docs/` — module cards.
+  2. `/docs/<module>/` — per-module landing (breadcrumb, "Start here", sections TOC).
+  3. `/docs/<module>/...` — page content.
+- The `DocsSidebar` is module-aware: when the current URL is under `/docs/<module>/...` it scopes the tree to that module via `buildModuleTree()` and shows a "← back to all documentation" link.
+- Blog-specific ADRs live under the openshift-platform module at `src/content/docs/openshift-platform/06-architecture-decisions/12-blog/`.
 
 ### learn
 
 - URL: `/learn/<track>/<stripped-module-slug>`.
 - Schema: `title`, `description?`, `sidebar_label?`, `track?`, `estimated_minutes?`, `prereqs?`, `last_updated?`, `draft?`.
-- Top-level folders are tracks (`agentic-ai/`, `cloudflare/`); files inside are numbered modules.
+- Top-level folders are tracks; files inside are numbered modules. Current tracks: `agentic-ai`, `aci-simulator`, `acm-multicluster`, `cloudflare`, `data-science`, `devsecops`, `kubeflow`, `openliberty`.
 - Three-level navigation:
   1. `/learn/` — track cards.
   2. `/learn/<track>/` — per-track TOC.
   3. `/learn/<track>/<module>` — module content.
-- Track display titles + taglines live in `src/utils/tracks.ts` (`TRACK_TITLES`, `TRACK_TAGLINES`).
+- Track display titles + taglines live in `src/utils/tracks.ts` (`TRACK_TITLES`, `TRACK_TAGLINES`). That file is the source of truth for which tracks render on the master `/learn/` landing.
 
-### brac-poc (retired collection)
+### brac-poc (history)
 
-The standalone `brac-poc` content collection has been **retired**. All BRAC POC docs now live under the `docs` collection at `src/content/docs/brac-poc/`, reachable at `/docs/brac-poc/<page>`. Old `/brac-poc/*` URLs are 301-redirected via `public/_redirects`. See [Blog ADR 0007](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/07-adr-0007-docs-master-section.mdx) for the rationale; [Blog ADR 0006](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/06-adr-0006-brac-poc-collection.mdx) is marked superseded.
+The standalone `brac-poc` content collection (Blog ADR 0006) was **retired**, then the docs were absorbed as a first-class **module** under the `docs` collection at `src/content/docs/brac-poc/`, reachable at `/docs/brac-poc/...`. Old `/brac-poc/*` URLs are 301-redirected via `public/_redirects`. See [Blog ADR 0007](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/07-adr-0007-docs-master-section.mdx) for the rationale; [Blog ADR 0006](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/06-adr-0006-brac-poc-collection.mdx) is marked superseded.
 
 ## 5. Voice / writing style
 
@@ -156,7 +167,7 @@ Captured in the `feedback_post_voice.md` memory. Summary:
 
 ### Use only ReactFlow
 
-- **Never use Mermaid.** Captured as `feedback_no_mermaid.md`. The `<Mermaid>` component exists in the repo but is unused; do not reintroduce it. All previous mermaid was converted to ReactFlow.
+- **Never use Mermaid.** Captured as `feedback_no_mermaid.md`. The `<Mermaid>` component has been removed from the repo; do not reintroduce it. All previous mermaid was converted to ReactFlow.
 - Use the `<Whiteboard>` component from `src/components/Whiteboard.tsx`. It auto-includes pan, zoom, fullscreen — and **no MiniMap** (captured as `feedback_no_minimap.md`).
 
 ### Style primitives (per-post `export const`)
@@ -238,10 +249,10 @@ For radial diagrams, copy the `mkBranch()` helper used in many posts (see `src/c
 4. Follow the voice template from §5.
 5. Build (`npm run build`), commit, push.
 
-### Add a docs page (platform)
+### Add a docs page
 
-1. Decide which section: `src/content/docs/NN-section-name/`.
-2. Create `NN-page-name.mdx` (numeric prefix drives sort).
+1. Pick the module: `src/content/docs/<module>/` (today: `openshift-platform`, `brac-poc`, `greenfield-ocp-deployment`, `security-lab`).
+2. Drop the file in the right section folder (or at the module root for flatter modules): `NN-page-name.mdx`. Numeric prefix drives sort.
 3. Frontmatter:
    ```yaml
    ---
@@ -252,7 +263,7 @@ For radial diagrams, copy the `mkBranch()` helper used in many posts (see `src/c
    draft: false
    ---
    ```
-4. Build / commit / push.
+4. Build / commit / push. The module sidebar and the module landing's TOC pick it up automatically.
 
 ### Add a learning module
 
@@ -294,17 +305,33 @@ For radial diagrams, copy the `mkBranch()` helper used in many posts (see `src/c
 2. The sidebar's `buildCategoryTree` discovers it and adds a group.
 3. No code changes required.
 
-### Add a new section to docs
+### Add a new docs module
 
-1. Create `src/content/docs/NN-section-name/` (use the next available `NN`).
-2. Drop MDX files inside.
-3. The `buildDocsTree` picks up the new section automatically.
+1. Create `src/content/docs/<module-id>/` (no numeric prefix on the module folder itself — module ordering on the master `/docs/` landing comes from the order of keys in `docModules.ts`). Add MDX files inside (use `NN-name.mdx` for sort).
+2. Register the module in `src/utils/docModules.ts`:
+   ```ts
+   export const MODULE_TITLES = {
+     ...,
+     "<module-id>": "<Display Title>",
+   };
+   export const MODULE_TAGLINES = {
+     ...,
+     "<module-id>": "One-paragraph module summary.",
+   };
+   ```
+3. Create the module landing at `src/pages/docs/<module-id>/index.astro`. Copy `src/pages/docs/openshift-platform/index.astro` as a template; only the `moduleId` constant changes.
+4. Build / commit / push. The master `/docs/` landing, the module-scoped sidebar, and the catch-all `/docs/[...slug].astro` route pick it up automatically.
+
+### Add a new section inside a docs module
+
+1. Create `src/content/docs/<module>/NN-section-name/` (use the next available `NN` in that module).
+2. Drop MDX files inside. `buildModuleTree` picks up the new section automatically.
 
 ### Write a Blog ADR
 
-1. Create `src/content/docs/06-architecture-decisions/12-blog/NN-adr-NNNN-name.mdx`.
+1. Create `src/content/docs/openshift-platform/06-architecture-decisions/12-blog/NN-adr-NNNN-name.mdx`.
 2. Follow the existing ADR template — Status / Context / Decision / Consequences / Alternatives / Related.
-3. Update the overview at `12-blog/00-overview.mdx` with the new ADR in the table.
+3. Update the overview at `openshift-platform/06-architecture-decisions/12-blog/00-overview.mdx` with the new ADR in the table.
 
 ## 8. Memory rules — quick reference
 
@@ -323,10 +350,10 @@ When the user expresses a new preference that's likely to recur, **save it as a 
 
 ## 9. ADRs as historical record
 
-The repo has two ADR registries:
+The repo has two ADR registries, both inside the openshift-platform module:
 
-- **Comptech platform ADRs** at `src/content/docs/06-architecture-decisions/` (numbered 0001–0013, mostly placeholders for the platform's load-bearing decisions).
-- **Blog ADRs** at `src/content/docs/06-architecture-decisions/12-blog/` (substantive — Multi-collection model, ReactFlow over Mermaid, Category sidebar, Learn section structure, SEO baseline).
+- **Comptech platform ADRs** at `src/content/docs/openshift-platform/06-architecture-decisions/` — the platform's load-bearing decisions (cluster list, hub topology, network/ingress/PKI, oc-mirror, federated GitOps, IPv6 baseline, etc.).
+- **Blog ADRs** at `src/content/docs/openshift-platform/06-architecture-decisions/12-blog/` — decisions about this blog itself (multi-collection model, ReactFlow over Mermaid, category sidebar, learn section structure, SEO baseline, docs master section).
 
 If you make a non-trivial architectural change to the blog, write a new ADR. Format: Status / Context / Decision / Consequences / Alternatives / Related.
 
@@ -344,7 +371,7 @@ If you make a non-trivial architectural change to the blog, write a new ADR. For
 - Every layout (`Layout`, `DocsLayout`, `LearnLayout`, `BareLayout`) injects OG + Twitter Card meta + canonical URL.
 - Blog post pages also inject `BlogPosting` JSON-LD into `<head>` via a slot.
 - The default OG image is `public/og-default.svg` (1200×630). For per-post images, override via the layout's `image` prop.
-- See [Blog ADR 0005](src/content/docs/06-architecture-decisions/12-blog/05-adr-0005-seo-baseline.mdx) for the full setup.
+- See [Blog ADR 0005](src/content/docs/openshift-platform/06-architecture-decisions/12-blog/05-adr-0005-seo-baseline.mdx) for the full setup.
 
 ## 12. Things to never do
 
