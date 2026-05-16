@@ -1,0 +1,131 @@
+---
+title: "Lab 1: three-tier tenant"
+sidebar_label: "08 — Lab 1"
+description: "Build the first ACI Simulator lab: a lab-prod tenant with VRF, bridge domain, three EPGs, filters, and contracts."
+estimated_minutes: 45
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const box = { background: "#f8fafc", border: "1px solid #94a3b8", borderRadius: 8, padding: 10, color: "#0f172a", width: 165, textAlign: "center", fontSize: 12 };
+export const policy = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 175, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const epg = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 150, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const contract = { background: "#fff7ed", border: "1.5px solid #c2410c", borderRadius: 8, padding: 8, color: "#0f172a", width: 150, textAlign: "center", fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const allow = { style: { stroke: "#c2410c", strokeWidth: 1.7 }, markerEnd: { type: "arrowclosed", color: "#c2410c" }, labelStyle: { fill: "#c2410c", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const labNodes = [
+  { id: "tenant", position: { x: 40, y: 80 }, data: { label: "Tenant\nlab-prod" }, style: policy },
+  { id: "vrf", position: { x: 280, y: 40 }, data: { label: "VRF\nprod-vrf" }, style: box },
+  { id: "bd", position: { x: 520, y: 40 }, data: { label: "Bridge domain\nprod-bd\n10.10.10.1/24" }, style: box },
+  { id: "ap", position: { x: 280, y: 180 }, data: { label: "Application profile\nthree-tier-app" }, style: box },
+  { id: "web", position: { x: 520, y: 170 }, data: { label: "EPG\nweb" }, style: epg },
+  { id: "app", position: { x: 740, y: 170 }, data: { label: "EPG\napp" }, style: epg },
+  { id: "db", position: { x: 960, y: 170 }, data: { label: "EPG\ndb" }, style: epg },
+  { id: "c1", position: { x: 630, y: 300 }, data: { label: "Contract\nweb-to-app\nTCP 8080" }, style: contract },
+  { id: "c2", position: { x: 850, y: 300 }, data: { label: "Contract\napp-to-db\nTCP 5432" }, style: contract },
+];
+
+export const labEdges = [
+  { id: "e1", source: "tenant", target: "vrf", label: "contains", ...rel },
+  { id: "e2", source: "tenant", target: "ap", label: "contains", ...rel },
+  { id: "e3", source: "vrf", target: "bd", label: "used by", ...rel },
+  { id: "e4", source: "bd", target: "web", label: "BD", ...rel },
+  { id: "e5", source: "bd", target: "app", label: "BD", ...rel },
+  { id: "e6", source: "bd", target: "db", label: "BD", ...rel },
+  { id: "e7", source: "web", target: "app", label: "web-to-app", ...allow },
+  { id: "e8", source: "app", target: "db", label: "app-to-db", ...allow },
+  { id: "e9", source: "c1", target: "app", label: "provided", ...allow },
+  { id: "e10", source: "c2", target: "db", label: "provided", ...allow },
+];
+
+This is the first real lab in the ACI Simulator track. The goal is not packet forwarding yet. The goal is to build a clean APIC policy model that you can inspect, delete, recreate, and later automate.
+
+## Target topology
+
+<Whiteboard client:load data={{ nodes: labNodes, edges: labEdges }} height={460} />
+
+## What you will create
+
+| Object | Name or value |
+| --- | --- |
+| Tenant | `lab-prod` |
+| VRF | `prod-vrf` |
+| Bridge domain | `prod-bd` |
+| Subnet | `10.10.10.1/24` |
+| Application profile | `three-tier-app` |
+| EPGs | `web`, `app`, `db` |
+| Filter | `app-tcp-8080`, TCP destination port `8080` |
+| Filter | `postgres`, TCP destination port `5432` |
+| Contract | `web-to-app` |
+| Contract | `app-to-db` |
+
+## Policy relationships
+
+| Consumer | Contract | Provider |
+| --- | --- | --- |
+| `web` | `web-to-app` | `app` |
+| `app` | `app-to-db` | `db` |
+
+All three EPGs use bridge domain `prod-bd`. The bridge domain uses VRF `prod-vrf`.
+
+## Build it in the APIC GUI
+
+Use the APIC UI first. The point of Lab 1 is to understand the object relationships before hiding them behind automation.
+
+1. Create tenant `lab-prod`.
+2. Inside the tenant, create VRF `prod-vrf`.
+3. Create bridge domain `prod-bd`.
+4. Associate `prod-bd` with `prod-vrf`.
+5. Add subnet `10.10.10.1/24` to `prod-bd`.
+6. Create application profile `three-tier-app`.
+7. Create EPGs `web`, `app`, and `db`.
+8. Associate each EPG with bridge domain `prod-bd`.
+9. Create filter `app-tcp-8080` for TCP destination port `8080`.
+10. Create filter `postgres` for TCP destination port `5432`.
+11. Create contract `web-to-app` using filter `app-tcp-8080`.
+12. Create contract `app-to-db` using filter `postgres`.
+13. Make `web` consume `web-to-app`.
+14. Make `app` provide `web-to-app`.
+15. Make `app` consume `app-to-db`.
+16. Make `db` provide `app-to-db`.
+
+## Verify it
+
+In APIC, check:
+
+- Tenant `lab-prod` exists.
+- VRF `prod-vrf` exists under the tenant.
+- Bridge domain `prod-bd` points to `prod-vrf`.
+- Bridge domain `prod-bd` has subnet `10.10.10.1/24`.
+- Application profile `three-tier-app` contains EPGs `web`, `app`, and `db`.
+- `web` consumes contract `web-to-app`.
+- `app` provides `web-to-app` and consumes `app-to-db`.
+- `db` provides `app-to-db`.
+- The tenant has no obvious APIC faults.
+
+## Reproduce it with automation
+
+In the private lab automation repository, this lab is also represented by an idempotent APIC API script:
+
+```bash
+./scripts/configure-aci-first-lab.sh
+```
+
+The script reads APIC connection details from the local secret store, applies the tenant model, and verifies the expected objects through the APIC API. It should return `ready: true` when the lab is healthy.
+
+Do not put APIC credentials, session cookies, or private secret files into the blog or into Git.
+
+## What this lab teaches
+
+You should leave Lab 1 understanding:
+
+- A tenant is the policy boundary.
+- A VRF is the routing table.
+- A bridge domain is the subnet and layer-2 boundary.
+- An EPG is a policy group for similar endpoints.
+- A contract is the allowed relationship between EPGs.
+- A filter is the protocol and port match used by a contract.
+
+This is the minimum ACI vocabulary you need before moving into access policies, static path bindings, L3Outs, and real endpoint traffic.
