@@ -1,0 +1,330 @@
+---
+title: "Installation Manual - 23 Spoke LSO ODF Install"
+sidebar_label: "23 Spoke LSO ODF Install"
+description: "How to install Local Storage Operator and OpenShift Data Foundation on spoke-dc-v7 using the prepared RAID0 data devices."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter installs Local Storage Operator and OpenShift Data Foundation on
+`spoke-dc-v7`.
+
+The live deployment used the same ODF operator line as the previous platform
+where applicable:
+
+- Local Storage Operator:
+  `local-storage-operator.v4.20.0-202604140241`;
+- ODF and dependency operators: `v4.20.10-rhodf`;
+- mirrored catalog source: `cs-redhat-operator-index-v4-20`.
+
+## Important Lessons
+
+- Do not rely on broad disk discovery for this step. Use exact
+  `/dev/disk/by-id/wwn-*` paths so future standby or expansion disks are not
+  consumed accidentally.
+- The previous `spoke-dc-v6` StorageCluster requested three OSD device sets
+  plus separate monitor PVCs. That does not fit the `spoke-dc-v7` initial disk
+  decision, because only three data disks per worker are approved.
+- For `spoke-dc-v7`, reserve one disk per worker for `localfs` monitor PVCs
+  and use two disks per worker for `localblock` OSD PVCs.
+- The current greenfield kubeconfig is under the greenfield install artifact
+  path, not the old v6 `ocp-clusters` path.
+- This step was executed directly before pull-model GitOps import. In the
+  future repeatable flow, codify these resources in the operational GitOps
+  repo after the cluster is imported into the hub.
+
+## Target Layout
+
+| Purpose | StorageClass | Count | Device selection |
+| --- | --- | ---: | --- |
+| Ceph monitor PVCs | `localfs` | 3 | one exact WWN path per worker |
+| OSD PVCs | `localblock` | 6 | two exact WWN paths per worker |
+
+StorageCluster settings:
+
+- `resourceProfile: lean`;
+- `flexibleScaling: true`;
+- cluster-wide encryption enabled;
+- storage-class encryption enabled;
+- three monitors;
+- six OSDs;
+- default StorageClass: `ocs-storagecluster-ceph-rbd`.
+
+## Prerequisites
+
+- Chapter 22 RAID0 disk prep is complete.
+- All six nodes are `Ready`.
+- No existing LSO or ODF resources exist.
+- The mirrored Red Hat operator catalog image is available in Quay.
+- You have the exact WWN paths for the intended data devices.
+
+Set kubeconfig:
+
+```bash
+export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+```
+
+Validate cluster health:
+
+```bash
+oc get nodes
+oc get co | awk 'NR==1 || $3!="True" || $4!="False" || $5!="False"'
+oc get mcp
+```
+
+Validate no existing storage layer:
+
+```bash
+oc get csv,sub,ns -A | egrep -i '(local-storage|odf|ocs|rook|ceph)' || true
+oc get sc
+```
+
+## Apply Mirrored Catalog Source
+
+```bash
+oc apply -f \
+  /home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/mirror-resources/operators-cs-redhat-operator-index-v4-20.yaml
+
+oc get catalogsource -n openshift-marketplace cs-redhat-operator-index-v4-20
+```
+
+## Install Operators
+
+Create the namespaces, OperatorGroups, and Subscriptions for:
+
+- `local-storage-operator`;
+- `odf-operator`;
+- `cephcsi-operator`;
+- `mcg-operator`;
+- `ocs-client-operator`;
+- `ocs-operator`;
+- `odf-csi-addons-operator`;
+- `odf-dependencies`;
+- `odf-external-snapshotter-operator`;
+- `odf-prometheus-operator`;
+- `recipe`;
+- `rook-ceph-operator`.
+
+Use the same `startingCSV` values as the previous installation:
+
+```yaml
+local-storage-operator: local-storage-operator.v4.20.0-202604140241
+odf dependencies: v4.20.10-rhodf
+```
+
+Wait for CSVs:
+
+```bash
+oc get csv -n openshift-local-storage
+oc get csv -n openshift-storage
+```
+
+All CSVs must reach `Succeeded` before creating local PVs.
+
+## Create Exact-Path Local Volumes
+
+Use `LocalVolume`, not broad `LocalVolumeSet`, for this initial deployment.
+
+Example structure:
+
+```yaml
+apiVersion: local.storage.openshift.io/v1
+kind: LocalVolume
+metadata:
+  name: odf-localfs
+  namespace: openshift-local-storage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+  storageClassDevices:
+    - storageClassName: localfs
+      volumeMode: Filesystem
+      fsType: xfs
+      forceWipeDevicesAndDestroyAllData: true
+      devicePaths:
+        - /dev/disk/by-id/wwn-<worker-0-monitor-disk>
+        - /dev/disk/by-id/wwn-<worker-1-monitor-disk>
+        - /dev/disk/by-id/wwn-<worker-2-monitor-disk>
+---
+apiVersion: local.storage.openshift.io/v1
+kind: LocalVolume
+metadata:
+  name: odf-localblock
+  namespace: openshift-local-storage
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+  storageClassDevices:
+    - storageClassName: localblock
+      volumeMode: Block
+      forceWipeDevicesAndDestroyAllData: true
+      devicePaths:
+        - /dev/disk/by-id/wwn-<worker-0-osd-disk-1>
+        - /dev/disk/by-id/wwn-<worker-0-osd-disk-2>
+        - /dev/disk/by-id/wwn-<worker-1-osd-disk-1>
+        - /dev/disk/by-id/wwn-<worker-1-osd-disk-2>
+        - /dev/disk/by-id/wwn-<worker-2-osd-disk-1>
+        - /dev/disk/by-id/wwn-<worker-2-osd-disk-2>
+```
+
+Validate:
+
+```bash
+oc get localvolume -n openshift-local-storage
+oc get pv | egrep 'local(block|fs)|NAME'
+```
+
+Expected:
+
+- 3 available `localfs` PVs;
+- 6 available `localblock` PVs.
+
+## Create StorageCluster
+
+```yaml
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: ocs-storagecluster
+  namespace: openshift-storage
+spec:
+  resourceProfile: lean
+  encryption:
+    enable: true
+    clusterWide: true
+    storageClass: true
+    kms: {}
+  flexibleScaling: true
+  labelSelector:
+    matchExpressions:
+      - key: node-role.kubernetes.io/worker
+        operator: Exists
+  monPVCTemplate:
+    spec:
+      storageClassName: localfs
+      accessModes:
+        - ReadWriteOnce
+      volumeMode: Filesystem
+      resources:
+        requests:
+          storage: 50Gi
+  storageDeviceSets:
+    - name: ocs-deviceset
+      count: 2
+      replica: 3
+      portable: false
+      dataPVCTemplate:
+        spec:
+          storageClassName: localblock
+          accessModes:
+            - ReadWriteOnce
+          volumeMode: Block
+          resources:
+            requests:
+              storage: 1500Gi
+  managedResources:
+    cephBlockPools: {}
+    cephFilesystems: {}
+    cephObjectStores: {}
+```
+
+Wait for readiness:
+
+```bash
+oc get storagecluster -n openshift-storage ocs-storagecluster
+oc get cephcluster -n openshift-storage -o wide
+oc get noobaa -n openshift-storage -o wide
+oc get pods -n openshift-storage | grep -v -E '(Running|Completed|STATUS)' || true
+```
+
+Expected:
+
+- `StorageCluster` phase `Ready`;
+- CephCluster phase `Ready`;
+- Ceph health `HEALTH_OK`;
+- NooBaa phase `Ready`;
+- no non-running pods except transient rollout pods.
+
+## Set Default RBD StorageClass
+
+```bash
+oc patch storageclass ocs-storagecluster-ceph-rbd \
+  --type merge \
+  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+oc get sc
+```
+
+Expected:
+
+```text
+ocs-storagecluster-ceph-rbd (default)
+```
+
+## Smoke Test
+
+```bash
+oc create ns odf-smoke-test
+
+cat <<'EOF' | oc apply -n odf-smoke-test -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rbd-smoke-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+
+oc get pvc -n odf-smoke-test rbd-smoke-pvc
+```
+
+Expected:
+
+```text
+rbd-smoke-pvc   Bound
+```
+
+Clean up:
+
+```bash
+oc delete ns odf-smoke-test
+```
+
+## Final Validation
+
+```bash
+oc get storagecluster -n openshift-storage ocs-storagecluster
+oc get cephcluster -n openshift-storage -o wide
+oc get noobaa -n openshift-storage -o wide
+oc get pvc -n openshift-storage
+oc get sc
+oc get nodes
+oc get co | awk 'NR==1 || $3!="True" || $4!="False" || $5!="False"'
+oc get mcp
+```
+
+Final live result:
+
+- `StorageCluster/ocs-storagecluster` is `Ready`;
+- CephCluster is `Ready` with `HEALTH_OK`;
+- NooBaa is `Ready`;
+- all monitor and OSD PVCs are bound;
+- `ocs-storagecluster-ceph-rbd` is the default StorageClass;
+- all six OpenShift nodes are `Ready`;
+- no non-steady ClusterOperators were reported;
+- master and worker MCPs are updated and not degraded.
+
+## Follow-Up
+
+The next gate should import `spoke-dc-v7` into `hub-dc-v7` and codify this
+live LSO/ODF state in the operational GitOps repository.

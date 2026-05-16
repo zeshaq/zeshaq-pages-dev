@@ -1,0 +1,266 @@
+---
+title: "Installation Manual - 20 Spoke Day-Zero Security Hardening"
+sidebar_label: "20 Spoke Day-Zero Hardening"
+description: "How day-zero API encryption, OAuth timeout, and kubeadmin removal are applied and validated on spoke-dc-v7."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter applies the first security hardening controls to `spoke-dc-v7`
+after the HTPasswd admin identity is configured and validated.
+
+Do not start this chapter until the `ze` HTPasswd login works and has
+`cluster-admin`. Removing `kubeadmin` before validating a replacement admin
+path can lock operators out of the cluster.
+
+## Target State
+
+| Control | Target |
+| --- | --- |
+| API server encryption | `aesgcm` |
+| OAuth access-token inactivity timeout | `30m` |
+| Admin identity provider | `htpasswd-ze` |
+| Break-glass bootstrap user | `kubeadmin` removed |
+| ClusterOperators | all steady |
+| MachineConfigPools | updated, not degraded |
+
+## Prerequisites
+
+The previous chapter must be complete:
+
+- OAuth provider `htpasswd-ze` exists.
+- User `ze` can log in.
+- User `ze` has `cluster-admin`.
+- Authentication is healthy.
+
+Use the `spoke-dc-v7` installer kubeconfig on `gf-ocp-bootstrap-01` if it is
+still present:
+
+```bash
+export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+```
+
+If that generated installer kubeconfig has not been retained, create a
+temporary kubeconfig with the already validated `ze` HTPasswd account instead.
+Do not commit this file.
+
+```bash
+tmp="$(mktemp)"
+read -rsp "HTPasswd password for ze: " ZE_HTPASSWD_PASSWORD
+printf '\n'
+
+KUBECONFIG="$tmp" oc login \
+  https://api.spoke-dc-v7.v7.comptech-lab.com:6443 \
+  -u ze \
+  -p "$ZE_HTPASSWD_PASSWORD" \
+  --insecure-skip-tls-verify=true
+
+export KUBECONFIG="$tmp"
+unset ZE_HTPASSWD_PASSWORD
+```
+
+## Revalidate `ze` Access
+
+Before removing `kubeadmin`, validate the replacement access path with a
+temporary kubeconfig. Do not store the generated login token in Git.
+
+```bash
+read -rsp "HTPasswd password for ze: " ZE_HTPASSWD_PASSWORD
+printf '\n'
+
+server="$(ssh ze@30.30.200.60 "
+  export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+  oc whoami --show-server
+")"
+
+tmp="$(mktemp)"
+
+KUBECONFIG="$tmp" oc login "$server" \
+  -u ze \
+  -p "$ZE_HTPASSWD_PASSWORD" \
+  --insecure-skip-tls-verify=true
+
+KUBECONFIG="$tmp" oc whoami
+KUBECONFIG="$tmp" oc auth can-i '*' '*' --all-namespaces
+KUBECONFIG="$tmp" oc get nodes --no-headers | wc -l
+
+rm -f "$tmp"
+unset ZE_HTPASSWD_PASSWORD
+```
+
+Expected:
+
+```text
+ze
+yes
+6
+```
+
+## Configure OAuth Inactivity Timeout
+
+Set the OAuth access-token inactivity timeout.
+
+```bash
+ssh ze@30.30.200.60 "
+  set -euo pipefail
+  export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+  oc patch oauth cluster --type=merge -p '{
+    \"spec\": {
+      \"tokenConfig\": {
+        \"accessTokenInactivityTimeout\": \"30m\"
+      }
+    }
+  }'
+"
+```
+
+## Enable API Server Encryption
+
+Set API server encryption to `aesgcm`.
+
+```bash
+ssh ze@30.30.200.60 "
+  set -euo pipefail
+  export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+  oc patch apiserver cluster --type=merge -p '{
+    \"spec\": {
+      \"encryption\": {
+        \"type\": \"aesgcm\"
+      }
+    }
+  }'
+"
+```
+
+## Wait For Rollout
+
+The authentication, kube-apiserver, and openshift-apiserver operators may
+progress for several minutes. Wait until all operators and MachineConfigPools
+are steady.
+
+```bash
+ssh ze@30.30.200.60 "
+  set -euo pipefail
+  export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+  oc get co
+  oc get mcp
+  oc get nodes
+"
+```
+
+Expected:
+
+- all nodes are `Ready`;
+- ClusterOperators are `Available=True`, `Progressing=False`,
+  `Degraded=False`;
+- `master` and `worker` MCPs are `UPDATED=True`, `UPDATING=False`,
+  `DEGRADED=False`.
+
+## Remove `kubeadmin`
+
+Remove `kubeadmin` only after the rollout is stable and the `ze` login has
+already been validated.
+
+```bash
+ssh ze@30.30.200.60 "
+  set -euo pipefail
+  export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+  oc -n kube-system delete secret kubeadmin --ignore-not-found=true
+"
+```
+
+Immediately validate that `ze` still works with a temporary kubeconfig:
+
+```bash
+read -rsp "HTPasswd password for ze: " ZE_HTPASSWD_PASSWORD
+printf '\n'
+
+tmp="$(mktemp)"
+
+KUBECONFIG="$tmp" oc login "$server" \
+  -u ze \
+  -p "$ZE_HTPASSWD_PASSWORD" \
+  --insecure-skip-tls-verify=true
+
+KUBECONFIG="$tmp" oc whoami
+KUBECONFIG="$tmp" oc auth can-i '*' '*' --all-namespaces
+
+rm -f "$tmp"
+unset ZE_HTPASSWD_PASSWORD
+```
+
+If you created a temporary kubeconfig for this chapter, remove it after final
+validation:
+
+```bash
+rm -f "$tmp"
+unset KUBECONFIG
+```
+
+Expected:
+
+```text
+ze
+yes
+```
+
+## Final Validation
+
+Run the final validation from `gf-ocp-bootstrap-01`:
+
+```bash
+export KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+printf 'apiserverEncryption='
+oc get apiserver cluster -o jsonpath='{.spec.encryption.type}'
+printf '\n'
+
+printf 'oauthAccessTokenInactivityTimeout='
+oc get oauth cluster -o jsonpath='{.spec.tokenConfig.accessTokenInactivityTimeout}'
+printf '\n'
+
+if oc -n kube-system get secret kubeadmin >/dev/null 2>&1; then
+  echo 'kubeadminSecret=present'
+else
+  echo 'kubeadminSecret=absent'
+fi
+
+oc get nodes
+oc get clusterversion
+oc get co | awk 'NR==1 || $3!="True" || $4!="False" || $5!="False"'
+oc get mcp
+oc -n openshift-authentication get pods
+```
+
+Expected:
+
+```text
+apiserverEncryption=aesgcm
+oauthAccessTokenInactivityTimeout=30m
+kubeadminSecret=absent
+```
+
+Also expected:
+
+- all six nodes are `Ready`;
+- ClusterVersion is `Available=True`, `Progressing=False`, `Failing=False`;
+- the non-steady ClusterOperator command prints only the header or no operator
+  rows;
+- both MCPs are updated and not degraded;
+- OAuth pods are Running.
+
+## Completion State
+
+For the recorded `spoke-dc-v7` hardening:
+
+- issue: `OP-GF-SPOKEDCV7-7`;
+- API server encryption: `aesgcm`;
+- OAuth inactivity timeout: `30m`;
+- `kubeadmin` Secret: absent;
+- admin provider: `htpasswd-ze`;
+- validation report:
+  `reports/spoke-dc-v7-day-zero-hardening-final-20260516-145538.md`.

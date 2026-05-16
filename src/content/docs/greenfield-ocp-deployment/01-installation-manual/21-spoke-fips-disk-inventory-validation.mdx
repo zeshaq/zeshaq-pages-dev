@@ -1,0 +1,203 @@
+---
+title: "Installation Manual - 21 Spoke FIPS And Disk Inventory Validation"
+sidebar_label: "21 Spoke FIPS And Disk Inventory"
+description: "How to validate spoke-dc-v7 node-level FIPS and physical worker disk inventory before ODF planning."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter validates the installed `spoke-dc-v7` nodes before any ODF or LSO
+work is attempted.
+
+The checks are intentionally read-only. Do not format, wipe, label, or claim
+any disk in this chapter.
+
+## Target State
+
+| Area | Target |
+| --- | --- |
+| Cluster health | all nodes `Ready`, operators steady, MCPs healthy |
+| FIPS | every node reports `fips_enabled=1` |
+| Control-plane disks | VM boot disk only |
+| Worker OS disks | NVMe boot volume only |
+| ODF candidate disks | raw, unused physical disks explicitly proven |
+| ODF action | blocked unless raw disk presentation is proven |
+
+## Prerequisites
+
+The previous chapters must be complete:
+
+- `spoke-dc-v7` is installed.
+- HTPasswd admin access works.
+- Day-zero hardening is complete.
+- `kubeadmin` has been removed only after replacement admin access was
+  validated.
+
+Create a temporary kubeconfig with the `ze` admin identity. Do not commit this
+file.
+
+```bash
+tmp="$(mktemp)"
+read -rsp "HTPasswd password for ze: " ZE_HTPASSWD_PASSWORD
+printf '\n'
+
+KUBECONFIG="$tmp" oc login \
+  https://api.spoke-dc-v7.v7.comptech-lab.com:6443 \
+  -u ze \
+  -p "$ZE_HTPASSWD_PASSWORD" \
+  --insecure-skip-tls-verify=true
+
+export KUBECONFIG="$tmp"
+unset ZE_HTPASSWD_PASSWORD
+```
+
+Validate access:
+
+```bash
+oc whoami
+oc auth can-i '*' '*' --all-namespaces
+oc get nodes
+```
+
+Expected:
+
+```text
+ze
+yes
+```
+
+## Cluster Health Check
+
+```bash
+oc get nodes -o wide
+oc get clusterversion version
+oc get co | awk 'NR==1 || $3!="True" || $4!="False" || $5!="False"'
+oc get mcp
+```
+
+Expected:
+
+- all six nodes are `Ready`;
+- ClusterVersion is `Available=True`, `Progressing=False`;
+- the non-steady ClusterOperator check prints no operator rows;
+- both `master` and `worker` MCPs are updated and not degraded.
+
+## Node FIPS And Block Device Check
+
+Use `oc debug node` to inspect each host. This creates temporary debug pods and
+reads host state through `chroot /host`.
+
+```bash
+for node in $(oc get nodes -o name | sed 's#node/##' | sort); do
+  echo "### ${node}"
+  oc debug --quiet "node/${node}" -- chroot /host bash -c '
+    set -euo pipefail
+    echo "hostname=$(hostname)"
+    printf "fips_enabled="
+    cat /proc/sys/crypto/fips_enabled
+    printf "booted_kernel="
+    uname -r
+    printf "root_source="
+    findmnt -n -o SOURCE /
+    echo "cmdline=$(tr " " " " < /proc/cmdline)"
+    lsblk -b -o NAME,TYPE,SIZE,MODEL,SERIAL,ROTA,TRAN,WWN,PKNAME,MOUNTPOINTS,FSTYPE
+  '
+done
+```
+
+Expected FIPS result on every node:
+
+```text
+fips_enabled=1
+```
+
+Expected disk pattern:
+
+- VM control-plane nodes expose only their VM boot disk.
+- Physical workers boot from the `HPE NS204i-u Gen11 Boot Controller` NVMe
+  RAID1 volume.
+- ODF candidates must be separate unused raw disks, not the NVMe boot volume.
+
+## Redfish Physical Disk Proof
+
+Use Redfish/iLO to confirm whether the physical disks are exposed as raw disks
+or hidden behind a controller logical volume.
+
+The credentials must come from local secret custody or Vault. Do not put them
+in Git or shell history.
+
+```bash
+source /path/to/local/bmc.env
+
+for item in GOLD1 GOLD2 GPU1; do
+  host_var="${item}_BMC"
+  pass_var="${item}_PASS"
+  host="${!host_var}"
+  pass="${!pass_var}"
+
+  echo "### ${item}"
+  curl -sk -u "${BMC_USER}:${pass}" \
+    "https://${host}/redfish/v1/Systems/1/Storage" \
+    | jq -r '.Members[]?."@odata.id"'
+done
+```
+
+For each storage controller, inspect volumes and drives:
+
+```bash
+storage="/redfish/v1/Systems/1/Storage/<controller-id>"
+
+curl -sk -u "${BMC_USER}:${pass}" "https://${host}${storage}" \
+  | jq -r '
+      "Name=" + (.Name // ""),
+      "Drives=" + ((.Drives // []) | map(."@odata.id") | join(",")),
+      "Volumes=" + (.Volumes."@odata.id" // "")
+    '
+```
+
+## Recorded Result
+
+The recorded `spoke-dc-v7` validation passed FIPS but blocked ODF disk use:
+
+| Server | OS-visible storage | Redfish backing state | ODF readiness |
+| --- | --- | --- | --- |
+| Gold-1 | one 4.8 TB `MR408i-o Gen11` device | three enabled 2.4 TB HDDs behind RAID5, five standby-offline HDDs | blocked |
+| Gold-2 | one 4.8 TB `MR408i-o Gen11` device | three enabled 2.4 TB HDDs behind RAID5, five standby-offline HDDs | blocked |
+| GPU-1 | one 4.8 TB `MR408i-o Gen11` device | three enabled 2.4 TB HDDs behind RAID5, five absent bays | blocked |
+
+The NVMe boot volume on each physical worker is correct for the OS, but the
+4.8 TB `/dev/sda` device is a RAID5 logical volume. Do not point LSO or ODF at
+that device as if it were a raw OSD disk.
+
+## ODF Gate
+
+Before ODF, make an explicit storage decision:
+
+- reconfigure the `MR408i-o Gen11` controller for HBA/JBOD/raw disk
+  presentation, then revalidate the inventory; or
+- accept a controller logical-volume design only with an explicit ADR and ODF
+  supportability decision.
+
+The recorded deployment resolved this in the next chapter by creating one
+RAID0 logical volume per intended data disk. That gives RHCOS three separate
+2.4 TB devices per physical worker while leaving the NVMe boot controller
+untouched.
+
+## Cleanup
+
+Remove the temporary kubeconfig after validation.
+
+```bash
+rm -f "$tmp"
+unset KUBECONFIG
+```
+
+## Completion State
+
+For the recorded `spoke-dc-v7` validation:
+
+- issue: `OP-GF-SPOKEDCV7-8`;
+- FIPS: passed on all six nodes;
+- ODF disk readiness: blocked pending controller/raw-disk decision;
+- validation report:
+  `reports/spoke-dc-v7-fips-disk-inventory-20260516-153000.md`.

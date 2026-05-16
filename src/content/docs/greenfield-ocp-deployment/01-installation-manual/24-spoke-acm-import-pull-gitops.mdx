@@ -1,0 +1,209 @@
+---
+title: "Installation Manual - 24 Spoke ACM Import Pull GitOps"
+sidebar_label: "24 Spoke ACM Import Pull GitOps"
+description: "How to import spoke-dc-v7 into hub-dc-v7 ACM and enable the pull-model OpenShift GitOps flow."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter imports `spoke-dc-v7` into `hub-dc-v7` ACM and enables the
+pull-model GitOps pattern used for managed clusters.
+
+## Prerequisites
+
+- `hub-dc-v7` is healthy and ACM/MCE is running.
+- `spoke-dc-v7` is healthy.
+- LSO/ODF is already installed on the spoke.
+- The greenfield operational GitOps repo exists in GitLab:
+  `http://gitlab.v7.comptech-lab.com/platform/openshift/openshift-gitops.git`.
+- You can access both kubeconfigs from `gf-ocp-bootstrap-01`.
+
+Set kubeconfigs:
+
+```bash
+export HUB_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+export SPOKE_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+```
+
+Validate both clusters first:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" get clusterversion
+oc --kubeconfig "$HUB_KUBECONFIG" get nodes
+oc --kubeconfig "$HUB_KUBECONFIG" get multiclusterhub -n open-cluster-management
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get clusterversion
+oc --kubeconfig "$SPOKE_KUBECONFIG" get nodes
+```
+
+## Import The Spoke
+
+Create the hub-side import resources:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" create namespace spoke-dc-v7
+oc --kubeconfig "$HUB_KUBECONFIG" apply -f managedcluster-spoke-dc-v7.yaml
+oc --kubeconfig "$HUB_KUBECONFIG" apply -f klusterletaddonconfig-spoke-dc-v7.yaml
+```
+
+Important: if the import namespace is created at the same time as the
+`ManagedCluster`, ACM can terminate and recreate that namespace while generating
+bootstrap token content. If token generation fails with a namespace terminating
+or not-found error, recreate the namespace after the `ManagedCluster` exists,
+then recreate the `KlusterletAddonConfig`.
+
+Wait for the import secret:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" get secret -n spoke-dc-v7 spoke-dc-v7-import
+```
+
+Apply only the generated import manifests to the spoke. Do not print the secret
+contents:
+
+```bash
+workdir="$(mktemp -d)"
+oc --kubeconfig "$HUB_KUBECONFIG" get secret -n spoke-dc-v7 spoke-dc-v7-import \
+  -o jsonpath='{.data.crds\.yaml}' | base64 -d > "$workdir/crds.yaml"
+oc --kubeconfig "$HUB_KUBECONFIG" get secret -n spoke-dc-v7 spoke-dc-v7-import \
+  -o jsonpath='{.data.import\.yaml}' | base64 -d > "$workdir/import.yaml"
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" apply -f "$workdir/crds.yaml"
+oc --kubeconfig "$SPOKE_KUBECONFIG" apply -f "$workdir/import.yaml"
+rm -rf "$workdir"
+```
+
+Validate:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" get managedcluster spoke-dc-v7
+oc --kubeconfig "$HUB_KUBECONFIG" get managedclusteraddon -n spoke-dc-v7
+```
+
+Expected result:
+
+- `HUB ACCEPTED=true`;
+- `JOINED=True`;
+- `AVAILABLE=True`;
+- all expected add-ons report `Available=True`.
+
+## Codify Pull GitOps
+
+In the operational GitOps repo, add a hub fleet-registration slice:
+
+```text
+clusters/hub-dc-v7/platform/fleet-registration/
+```
+
+It must include:
+
+- `ManagedCluster/spoke-dc-v7`;
+- `KlusterletAddonConfig/spoke-dc-v7`;
+- `ManagedClusterSetBinding/default` in `openshift-gitops`;
+- `Placement/gitops-managed`;
+- `GitOpsCluster/gitops-managed`;
+- `ConfigMap/acm-placement`;
+- `Namespace/spoke-dc-v7`.
+
+Also add a hub GitOps control `ApplicationSet`:
+
+```text
+clusters/hub-dc-v7/gitops-control/applicationset-spoke-cluster-config-pull.yaml
+```
+
+Use the greenfield GitLab repo URL, not the previous environment URL:
+
+```yaml
+repoURL: http://gitlab.v7.comptech-lab.com/platform/openshift/openshift-gitops.git
+path: "clusters/{{name}}"
+```
+
+Create the spoke path:
+
+```text
+clusters/spoke-dc-v7/
+```
+
+For the initial takeover, codify the already-installed storage layer:
+
+- Local Storage Operator subscription;
+- ODF subscription;
+- exact-path `LocalVolume` resources;
+- `StorageCluster/ocs-storagecluster`;
+- default `ocs-storagecluster-ceph-rbd` StorageClass annotation.
+
+Render before pushing:
+
+```bash
+oc kustomize clusters/hub-dc-v7
+oc kustomize clusters/spoke-dc-v7
+git diff --check
+```
+
+Commit and push:
+
+```bash
+git add clusters/hub-dc-v7 clusters/spoke-dc-v7
+git commit -m "Register spoke-dc-v7 with ACM pull GitOps"
+git push origin main
+```
+
+Refresh the hub bootstrap app:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" annotate applications.argoproj.io \
+  -n openshift-gitops hub-dc-v7-bootstrap \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+## Seed Private Repo Access
+
+The generated spoke Argo instance runs on the managed cluster. It needs a
+repository credential to read the private GitLab repository.
+
+For the bootstrap run, create the repository credential directly in the spoke
+`openshift-gitops` namespace without printing the password or token. In the
+durable production flow, move this into the approved Vault/ESO or bootstrap
+secret-management process.
+
+Validate the credential by refreshing the spoke app:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" annotate applications.argoproj.io \
+  -n openshift-gitops spoke-dc-v7-cluster-config \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+## Final Validation
+
+Hub:
+
+```bash
+oc --kubeconfig "$HUB_KUBECONFIG" get applications.argoproj.io -n openshift-gitops hub-dc-v7-bootstrap
+oc --kubeconfig "$HUB_KUBECONFIG" get managedcluster spoke-dc-v7
+oc --kubeconfig "$HUB_KUBECONFIG" get managedclusteraddon -n spoke-dc-v7
+oc --kubeconfig "$HUB_KUBECONFIG" get placement -n openshift-gitops gitops-managed
+oc --kubeconfig "$HUB_KUBECONFIG" get gitopscluster -n openshift-gitops gitops-managed
+oc --kubeconfig "$HUB_KUBECONFIG" get applicationset -n openshift-gitops spoke-cluster-config-pull
+oc --kubeconfig "$HUB_KUBECONFIG" get applications.argoproj.io -n openshift-gitops spoke-dc-v7-cluster-config
+```
+
+Spoke:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get applications.argoproj.io -n openshift-gitops spoke-dc-v7-cluster-config
+oc --kubeconfig "$SPOKE_KUBECONFIG" get storagecluster -n openshift-storage ocs-storagecluster
+oc --kubeconfig "$SPOKE_KUBECONFIG" get cephcluster -n openshift-storage ocs-storagecluster-cephcluster
+oc --kubeconfig "$SPOKE_KUBECONFIG" get sc ocs-storagecluster-ceph-rbd
+```
+
+Expected final state:
+
+- hub bootstrap app: `Synced/Healthy`;
+- `ManagedCluster/spoke-dc-v7`: joined and available;
+- `gitops-addon`: available;
+- hub-generated spoke app: `Synced/Healthy`;
+- spoke-side `spoke-dc-v7-cluster-config`: `Synced/Healthy`;
+- `StorageCluster/ocs-storagecluster`: `Ready`;
+- Ceph: `HEALTH_OK`;
+- `ocs-storagecluster-ceph-rbd`: default StorageClass.

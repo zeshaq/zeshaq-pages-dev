@@ -1,0 +1,250 @@
+---
+title: "Installation Manual - 22 Spoke ODF RAID0 Disk Prep"
+sidebar_label: "22 Spoke ODF RAID0 Disk Prep"
+description: "How to prepare spoke-dc-v7 physical worker disks for ODF by creating one RAID0 volume per intended data disk."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter prepares the `spoke-dc-v7` physical worker disks for ODF.
+
+The previous validation found that each physical worker exposed one 4.8 TB
+RAID5 logical volume from the `HPE MR408i-o Gen11` controller. For this
+deployment, the chosen layout is one RAID0 logical volume per intended data
+disk, so RHCOS sees three separate 2.4 TB devices on each physical worker.
+
+Do not touch the `HPE NS204i-u Gen11 Boot Controller`. It contains the NVMe
+boot volume.
+
+## Target State
+
+| Worker | Data controller | Target data volumes |
+| --- | --- | --- |
+| Gold-1 / `spoke-dc-v7-worker-0` | `MR408i-o Gen11` | three one-disk RAID0 volumes |
+| Gold-2 / `spoke-dc-v7-worker-1` | `MR408i-o Gen11` | three one-disk RAID0 volumes |
+| GPU-1 / `spoke-dc-v7-worker-2` | `MR408i-o Gen11` | three one-disk RAID0 volumes |
+
+Expected RHCOS view on each physical worker:
+
+- `nvme0n1`: OS boot volume, mounted;
+- `sda`, `sdb`, `sdc`: 2.4 TB `MR408i-o Gen11` rotational data devices,
+  unmounted and unformatted.
+
+## Important Lessons
+
+- Redfish `RAIDType=None` was advertised but was not usable on this controller
+  in this environment.
+- One-disk `RAID0` volume creation worked and produced the desired separate
+  host-visible data devices.
+- After `Storage.ResetToDefaults`, the controller may need a reboot before
+  volume creation works reliably.
+- After reset, drive IDs can change. Re-read the controller drive list before
+  creating volumes.
+- Create and validate the layout one worker at a time.
+
+## Prerequisites
+
+- HTPasswd admin access works.
+- The cluster is healthy before starting.
+- BMC credentials are available from local secret custody or Vault.
+- No ODF data exists yet.
+- You have identified the intended three data disks per worker.
+
+Create a temporary admin kubeconfig:
+
+```bash
+tmp="$(mktemp)"
+read -rsp "HTPasswd password for ze: " ZE_HTPASSWD_PASSWORD
+printf '\n'
+
+KUBECONFIG="$tmp" oc login \
+  https://api.spoke-dc-v7.v7.comptech-lab.com:6443 \
+  -u ze \
+  -p "$ZE_HTPASSWD_PASSWORD" \
+  --insecure-skip-tls-verify=true
+
+export KUBECONFIG="$tmp"
+unset ZE_HTPASSWD_PASSWORD
+```
+
+Validate cluster health:
+
+```bash
+oc get nodes
+oc get co | awk 'NR==1 || $3!="True" || $4!="False" || $5!="False"'
+oc get mcp
+```
+
+## Worker Procedure
+
+Run the procedure one worker at a time.
+
+Map:
+
+| Server | Node | MR storage object | Initial target drives |
+| --- | --- | --- | --- |
+| Gold-1 | `spoke-dc-v7-worker-0` | `DE00C000` | `0`, `1`, `5` |
+| Gold-2 | `spoke-dc-v7-worker-1` | `DE00C000` | `0`, `1`, `2` |
+| GPU-1 | `spoke-dc-v7-worker-2` | `DE00B000` | `0`, `1`, `2` |
+
+After reset, confirm the drive IDs before creating RAID0 volumes.
+
+### Cordon And Drain
+
+```bash
+oc adm cordon "$NODE"
+oc adm drain "$NODE" \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --force \
+  --timeout=10m
+```
+
+### Reset Only The MR Data Controller
+
+Do not run this against the `DE009000` NS204i boot controller.
+
+```bash
+curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+  -H 'Content-Type: application/json' \
+  -X POST \
+  -d '{"ResetType":"ResetAll"}' \
+  "https://${BMC_HOST}/redfish/v1/Systems/1/Storage/${MR_STORAGE_ID}/Actions/Storage.ResetToDefaults"
+```
+
+Poll the task until complete:
+
+```bash
+curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+  "https://${BMC_HOST}/redfish/v1/TaskService/Tasks/1" \
+  | jq '{TaskState, TaskStatus, EndTime}'
+```
+
+### Reboot To Settle The Controller
+
+If the volume collection returns intermittent `405`, `503`, or internal
+errors, reboot the server while it is still cordoned and drained.
+
+```bash
+curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+  -H 'Content-Type: application/json' \
+  -X POST \
+  -d '{"ResetType":"GracefulRestart"}' \
+  "https://${BMC_HOST}/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+```
+
+Wait until the node returns `Ready,SchedulingDisabled`.
+
+```bash
+oc get node "$NODE" -w
+```
+
+### Re-Read Drive IDs
+
+```bash
+curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+  "https://${BMC_HOST}/redfish/v1/Systems/1/Storage/${MR_STORAGE_ID}" \
+  | jq -r '.Drives[]?."@odata.id"'
+```
+
+Inspect each intended drive:
+
+```bash
+curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+  "https://${BMC_HOST}/redfish/v1/Chassis/${MR_STORAGE_ID}/Drives/${DRIVE_ID}" \
+  | jq '{Id, Name, CapacityBytes, Status, PhysicalLocation}'
+```
+
+### Create One RAID0 Volume Per Data Disk
+
+```bash
+for drive in "${DRIVES[@]}"; do
+  uri="/redfish/v1/Chassis/${MR_STORAGE_ID}/Drives/${drive}"
+
+  jq -n \
+    --arg name "RAID0-DATA-${drive}" \
+    --arg uri "$uri" \
+    '{Name:$name, RAIDType:"RAID0", Links:{Drives:[{"@odata.id":$uri}]}}' \
+    > /tmp/raid0-volume.json
+
+  curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+    -H 'Content-Type: application/json' \
+    -X POST \
+    -d @/tmp/raid0-volume.json \
+    "https://${BMC_HOST}/redfish/v1/Systems/1/Storage/${MR_STORAGE_ID}/Volumes"
+done
+```
+
+Expected Redfish result:
+
+- three volumes;
+- each volume has `RAIDType=RAID0`;
+- each volume is backed by exactly one drive;
+- each volume has `Status.State=Enabled` and `Status.Health=OK`.
+
+### Reboot And Validate RHCOS View
+
+```bash
+curl -sk -u "${BMC_USER}:${BMC_PASS}" \
+  -H 'Content-Type: application/json' \
+  -X POST \
+  -d '{"ResetType":"GracefulRestart"}' \
+  "https://${BMC_HOST}/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+```
+
+Wait until the node returns `Ready,SchedulingDisabled`, then validate devices:
+
+```bash
+oc debug --quiet "node/${NODE}" -- chroot /host \
+  lsblk -b -o NAME,TYPE,SIZE,MODEL,SERIAL,ROTA,TRAN,WWN,PKNAME,MOUNTPOINTS,FSTYPE
+```
+
+Expected:
+
+- `sda`, `sdb`, `sdc` exist;
+- each is approximately `2399913639936` bytes;
+- each has model `MR408i-o Gen11`;
+- none is mounted;
+- the NVMe boot volume remains mounted as the OS disk.
+
+### Uncordon
+
+```bash
+oc adm uncordon "$NODE"
+oc get node "$NODE"
+```
+
+## Recorded Result
+
+The recorded `spoke-dc-v7` result:
+
+| Worker | RHCOS data devices | Redfish volumes |
+| --- | --- | --- |
+| `spoke-dc-v7-worker-0` | `sda`, `sdb`, `sdc` | `RAID0-DATA-0`, `RAID0-DATA-1`, `RAID0-DATA-5` |
+| `spoke-dc-v7-worker-1` | `sda`, `sdb`, `sdc` | `RAID0-DATA-0`, `RAID0-DATA-1`, `RAID0-DATA-2` |
+| `spoke-dc-v7-worker-2` | `sda`, `sdb`, `sdc` | `RAID0-DATA-0`, `RAID0-DATA-1`, `RAID0-DATA-2` |
+
+Validation report:
+
+```text
+reports/spoke-dc-v7-odf-raid0-disk-prep-20260516.md
+```
+
+## Cleanup
+
+Remove temporary kubeconfigs and JSON payloads:
+
+```bash
+rm -f "$tmp" /tmp/raid0-volume.json
+unset KUBECONFIG
+```
+
+## Completion State
+
+For the recorded `spoke-dc-v7` run:
+
+- issue: `OP-GF-SPOKEDCV7-9`;
+- storage decision: one RAID0 logical volume per intended ODF data disk;
+- all physical workers expose three separate 2.4 TB data devices;
+- all physical workers returned `Ready`;
+- ODF disk preparation is complete for initial LSO/ODF planning.
