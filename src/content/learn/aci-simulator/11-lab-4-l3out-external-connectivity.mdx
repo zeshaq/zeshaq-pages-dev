@@ -1,0 +1,169 @@
+---
+title: "Lab 4: L3Out external connectivity model"
+sidebar_label: "11 — Lab 4"
+description: "Model ACI external connectivity with a routed domain, L3Out, external EPG, external subnet, and an internal-to-external contract."
+estimated_minutes: 55
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const tenantStyle = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const l3Style = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const extStyle = { background: "#fff7ed", border: "1.5px solid #c2410c", borderRadius: 8, padding: 10, color: "#0f172a", width: 185, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const contractStyle = { background: "#f8fafc", border: "1.5px solid #64748b", borderRadius: 8, padding: 10, color: "#0f172a", width: 185, textAlign: "center", fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const contractEdge = { style: { stroke: "#0369a1", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#0369a1" }, labelStyle: { fill: "#0369a1", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const provideEdge = { style: { stroke: "#15803d", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const l3outNodes = [
+  { id: "tenant", position: { x: 40, y: 70 }, data: { label: "Tenant\nlab-prod" }, style: tenantStyle },
+  { id: "vrf", position: { x: 280, y: 70 }, data: { label: "VRF\nprod-vrf" }, style: tenantStyle },
+  { id: "domain", position: { x: 520, y: 70 }, data: { label: "Routed domain\nlab-routed-domain" }, style: l3Style },
+  { id: "l3out", position: { x: 760, y: 70 }, data: { label: "L3Out\nlab-l3out" }, style: l3Style },
+  { id: "external", position: { x: 1000, y: 70 }, data: { label: "External EPG\nexternal-networks" }, style: extStyle },
+  { id: "subnet", position: { x: 1000, y: 230 }, data: { label: "External subnet\n0.0.0.0/0\nimport-security" }, style: extStyle },
+  { id: "contract", position: { x: 520, y: 270 }, data: { label: "Contract\ninternal-to-external\nTCP 443" }, style: contractStyle },
+  { id: "web", position: { x: 40, y: 250 }, data: { label: "EPG\nweb" }, style: tenantStyle },
+  { id: "app", position: { x: 200, y: 350 }, data: { label: "EPG\napp" }, style: tenantStyle },
+  { id: "db", position: { x: 360, y: 450 }, data: { label: "EPG\ndb" }, style: tenantStyle },
+];
+
+export const l3outEdges = [
+  { id: "e1", source: "tenant", target: "vrf", label: "contains", ...rel },
+  { id: "e2", source: "vrf", target: "l3out", label: "used by", ...rel },
+  { id: "e3", source: "domain", target: "l3out", label: "attached to", ...rel },
+  { id: "e4", source: "l3out", target: "external", label: "contains", ...rel },
+  { id: "e5", source: "external", target: "subnet", label: "classifies", ...rel },
+  { id: "e6", source: "web", target: "contract", label: "consumes", ...contractEdge },
+  { id: "e7", source: "app", target: "contract", label: "consumes", ...contractEdge },
+  { id: "e8", source: "db", target: "contract", label: "consumes", ...contractEdge },
+  { id: "e9", source: "external", target: "contract", label: "provides", ...provideEdge },
+];
+
+Lab 4 introduces the ACI model for networks outside the fabric. In a real deployment, this is where ACI connects to routers, firewalls, WANs, internet edges, or shared services networks. In this simulator lab, we create the policy objects and relationships only.
+
+The model is:
+
+```text
+web/app/db EPGs -> internal-to-external contract -> external-networks external EPG
+```
+
+This teaches how APIC represents external connectivity before we move to real routed adjacencies in EVE-NG.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: l3outNodes, edges: l3outEdges }} height={590} />
+
+## What you will create
+
+| Object | Name or value |
+| --- | --- |
+| Routed domain | `lab-routed-domain` |
+| L3Out | `lab-l3out` |
+| VRF association | `prod-vrf` |
+| External EPG | `external-networks` |
+| External subnet | `0.0.0.0/0` |
+| Subnet scope | `import-security` |
+| Filter | `external-https` |
+| Filter entry | TCP destination port `443` |
+| Contract | `internal-to-external` |
+| Subject | `allow-external-https` |
+| Internal consumers | `web`, `app`, `db` |
+| External provider | `external-networks` |
+
+## Understand the ACI words
+
+An L3Out is the ACI policy object for routed connectivity outside the fabric.
+
+A routed domain is the domain type used for external routed attachment.
+
+An external EPG is how ACI groups outside networks for policy. It is the outside-world equivalent of an internal EPG.
+
+An external subnet classifies which external prefixes belong to that external EPG. In this lab, `0.0.0.0/0` means the general outside network model.
+
+The `import-security` scope makes the external subnet relevant for security policy classification.
+
+## Build the L3Out model
+
+Create routed domain `lab-routed-domain`.
+
+Create L3Out `lab-l3out` inside tenant `lab-prod`.
+
+Associate `lab-l3out` with VRF `prod-vrf`.
+
+Associate `lab-l3out` with routed domain `lab-routed-domain`.
+
+Create external EPG `external-networks` under `lab-l3out`.
+
+Add external subnet `0.0.0.0/0` with `import-security` scope.
+
+## Build the external contract
+
+Create filter `external-https` with TCP destination port `443`.
+
+Create contract `internal-to-external` with subject `allow-external-https`.
+
+Attach filter `external-https` to the subject.
+
+Then apply the contract relationships:
+
+| Object | Relationship |
+| --- | --- |
+| EPG `web` | Consumes `internal-to-external` |
+| EPG `app` | Consumes `internal-to-external` |
+| EPG `db` | Consumes `internal-to-external` |
+| External EPG `external-networks` | Provides `internal-to-external` |
+
+The database outbound rule is intentionally simple for learning. In production, database outbound access is usually much tighter.
+
+## Automation
+
+The lab repo has an idempotent script:
+
+```bash
+./scripts/configure-aci-lab-4-l3out.sh
+```
+
+The latest run returned:
+
+```text
+ready: true
+tenant_fault_count: 0
+l3out: lab-l3out
+external_epg: external-networks
+external_subnet: 0.0.0.0/0
+web/app/db consume internal-to-external
+external-networks provides internal-to-external
+```
+
+## Verification checklist
+
+In APIC, check these before calling the lab complete:
+
+- Routed domain `lab-routed-domain` exists.
+- L3Out `lab-l3out` exists.
+- L3Out `lab-l3out` is tied to VRF `prod-vrf`.
+- L3Out `lab-l3out` is tied to routed domain `lab-routed-domain`.
+- External EPG `external-networks` exists.
+- External subnet `0.0.0.0/0` exists.
+- Filter `external-https` exists.
+- Filter `external-https` matches TCP destination port `443`.
+- Contract `internal-to-external` exists.
+- EPG `web` consumes `internal-to-external`.
+- EPG `app` consumes `internal-to-external`.
+- EPG `db` consumes `internal-to-external`.
+- External EPG `external-networks` provides `internal-to-external`.
+- Tenant `lab-prod` has no active faults.
+
+## What this lab teaches
+
+You should leave Lab 4 understanding:
+
+- L3Out is the ACI object for external routed connectivity.
+- External networks are modeled as external EPGs.
+- External subnets classify outside prefixes.
+- Internal EPGs use normal contracts to talk to external EPGs.
+- APIC policy can be valid even when the simulator has no real routing adjacency.
+
+This lab does not prove BGP, OSPF, firewall forwarding, NAT, or packet flow. Those belong in an EVE-NG lab with NX-OSv, IOS XRv, FRR, firewall images, and Linux endpoints.
