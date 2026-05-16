@@ -1,0 +1,173 @@
+---
+title: "Lab 2: access policies + static path binding"
+sidebar_label: "09 — Lab 2"
+description: "Build the ACI Simulator access policy chain for Lab 1 EPGs using VLAN pool, physical domain, AEP, access port policy group, and conditional static path bindings."
+estimated_minutes: 50
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const infra = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 170, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const tenant = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 160, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const path = { background: "#fff7ed", border: "1.5px solid #c2410c", borderRadius: 8, padding: 10, color: "#0f172a", width: 170, textAlign: "center", fontSize: 12 };
+export const note = { background: "#f8fafc", border: "1px solid #94a3b8", borderRadius: 8, padding: 10, color: "#0f172a", width: 185, textAlign: "center", fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const bind = { style: { stroke: "#c2410c", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#c2410c" }, labelStyle: { fill: "#c2410c", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const accessNodes = [
+  { id: "pool", position: { x: 40, y: 60 }, data: { label: "VLAN pool\nlab-vlan-pool\nVLANs 110-130" }, style: infra },
+  { id: "domain", position: { x: 280, y: 60 }, data: { label: "Physical domain\nlab-phys" }, style: infra },
+  { id: "aep", position: { x: 520, y: 60 }, data: { label: "AEP\nlab-aep" }, style: infra },
+  { id: "pg", position: { x: 760, y: 60 }, data: { label: "Access port\npolicy group\nlab-access-pg" }, style: infra },
+  { id: "path", position: { x: 1000, y: 60 }, data: { label: "Leaf/interface\npath selection" }, style: path },
+  { id: "tenant", position: { x: 280, y: 230 }, data: { label: "Tenant\nlab-prod" }, style: note },
+  { id: "ap", position: { x: 520, y: 230 }, data: { label: "Application profile\nthree-tier-app" }, style: note },
+  { id: "web", position: { x: 760, y: 205 }, data: { label: "EPG\nweb" }, style: tenant },
+  { id: "app", position: { x: 760, y: 315 }, data: { label: "EPG\napp" }, style: tenant },
+  { id: "db", position: { x: 1000, y: 315 }, data: { label: "EPG\ndb" }, style: tenant },
+];
+
+export const accessEdges = [
+  { id: "e1", source: "pool", target: "domain", label: "used by", ...rel },
+  { id: "e2", source: "domain", target: "aep", label: "attached to", ...rel },
+  { id: "e3", source: "aep", target: "pg", label: "selected by", ...rel },
+  { id: "e4", source: "pg", target: "path", label: "applies to", ...rel },
+  { id: "e5", source: "tenant", target: "ap", label: "contains", ...rel },
+  { id: "e6", source: "ap", target: "web", label: "contains", ...rel },
+  { id: "e7", source: "ap", target: "app", label: "contains", ...rel },
+  { id: "e8", source: "ap", target: "db", label: "contains", ...rel },
+  { id: "e9", source: "domain", target: "web", label: "domain association", ...rel },
+  { id: "e10", source: "domain", target: "app", label: "domain association", ...rel },
+  { id: "e11", source: "domain", target: "db", label: "domain association", ...rel },
+  { id: "e12", source: "web", target: "path", label: "static VLAN 110", ...bind },
+  { id: "e13", source: "app", target: "path", label: "static VLAN 120", ...bind },
+  { id: "e14", source: "db", target: "path", label: "static VLAN 130", ...bind },
+];
+
+Lab 2 extends the Lab 1 tenant model into the ACI access policy chain. Lab 1 created `lab-prod`, `three-tier-app`, and the `web`, `app`, and `db` EPGs. This lab makes those EPGs eligible to attach to leaf/interface paths through VLAN encapsulation.
+
+The important simulator caveat: the current simulator instance exposes no leaf/interface `fabricPathEp` objects. That means the access-policy objects and EPG domain associations can be built and verified, but static path bindings must wait until APIC exposes real paths. APIC Simulator teaches the policy objects, relationships, validation flow, and common faults. It does not prove real endpoint packet forwarding.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: accessNodes, edges: accessEdges }} height={470} />
+
+## What you will create
+
+| Object | Name or value |
+| --- | --- |
+| VLAN pool | `lab-vlan-pool` |
+| VLAN range | `110-130` |
+| Domain | Physical domain `lab-phys` |
+| AEP | `lab-aep` |
+| Access port policy group | `lab-access-pg` |
+| Path selection | A leaf and interface path, if your APIC Simulator inventory exposes one |
+| EPG domain association | Associate `web`, `app`, and `db` with `lab-phys` |
+| Future static path binding | `web` to VLAN `110` |
+| Future static path binding | `app` to VLAN `120` |
+| Future static path binding | `db` to VLAN `130` |
+
+## Build the reusable access policy chain
+
+The infrastructure objects are reusable. Build them before touching the EPG bindings.
+
+1. Create VLAN pool `lab-vlan-pool`.
+2. Add VLAN range `110-130` to the pool.
+3. Create physical domain `lab-phys`.
+4. Associate `lab-phys` with VLAN pool `lab-vlan-pool`.
+5. Create AEP `lab-aep`.
+6. Associate `lab-aep` with physical domain `lab-phys`.
+7. Create access port policy group `lab-access-pg`.
+8. Attach `lab-aep` to `lab-access-pg`.
+
+At this point, the access policy chain should read:
+
+| Chain step | Lab object |
+| --- | --- |
+| VLAN allocation | `lab-vlan-pool`, VLANs `110-130` |
+| Attachment type | Physical domain `lab-phys` |
+| Access entity | AEP `lab-aep` |
+| Interface behavior | Access port policy group `lab-access-pg` |
+
+## Check for leaf/interface paths
+
+Use a leaf and interface path that exists in your APIC Simulator inventory. The exact node and interface can vary by simulator version and discovered fabric inventory, so choose a valid path from the GUI rather than typing a made-up path.
+
+In the current lab, APIC reports zero fabric path endpoints. In that state, stop after creating the access-policy chain and EPG domain associations.
+
+If paths exist in your simulator, then for each selected access port:
+
+1. Confirm the leaf appears in the simulator fabric inventory.
+2. Confirm the interface appears as a selectable path.
+3. Apply or select the access port policy group `lab-access-pg` through the access policy profile workflow.
+4. Avoid reusing a path that already has an unrelated lab binding unless you are intentionally replacing that lab.
+
+## Associate the EPGs with the physical domain
+
+Before static path bindings can work cleanly, each EPG must know that it is allowed to use the physical domain.
+
+In tenant `lab-prod`, application profile `three-tier-app`:
+
+1. Open EPG `web`.
+2. Associate physical domain `lab-phys`.
+3. Repeat for EPG `app`.
+4. Repeat for EPG `db`.
+
+If you skip this step, APIC can show domain or deployment faults when you bind the EPG to a physical path.
+
+## Add static path bindings when paths exist
+
+Bind each EPG to the selected leaf/interface path with a different VLAN encapsulation only when APIC shows real path endpoints.
+
+| EPG | Encapsulation |
+| --- | --- |
+| `web` | VLAN `110` |
+| `app` | VLAN `120` |
+| `db` | VLAN `130` |
+
+Use the same path only if the simulator workflow allows it and you are modeling a trunk-style learning exercise. For a cleaner beginner lab, use separate available interfaces for the three EPGs when possible.
+
+For each EPG:
+
+1. Open the EPG static path binding workflow.
+2. Select the leaf/interface path from inventory.
+3. Set the encapsulation VLAN.
+4. Use the physical domain association already added to the EPG.
+5. Submit the change and check faults before moving to the next EPG.
+
+## Verification checklist
+
+Check these in APIC before calling the lab complete:
+
+- VLAN pool `lab-vlan-pool` exists.
+- VLAN pool `lab-vlan-pool` includes VLANs `110-130`.
+- Physical domain `lab-phys` points to `lab-vlan-pool`.
+- AEP `lab-aep` is associated with `lab-phys`.
+- Access port policy group `lab-access-pg` uses `lab-aep`.
+- EPG `web` is associated with `lab-phys`.
+- EPG `app` is associated with `lab-phys`.
+- EPG `db` is associated with `lab-phys`.
+- The tenant and access policy objects have no obvious APIC faults.
+
+If your simulator exposes fabric path endpoints, also verify:
+
+- The selected leaf/interface path exists in simulator inventory.
+- EPG `web` has a static path binding with VLAN `110`.
+- EPG `app` has a static path binding with VLAN `120`.
+- EPG `db` has a static path binding with VLAN `130`.
+
+In the current lab automation run, verification returned `ready: true`, `tenant_fault_count: 0`, `fabric_path_endpoint_count: 0`, and `static_bindings_skipped: 3`.
+
+## What this lab teaches
+
+You should leave Lab 2 understanding:
+
+- VLAN pools define which VLAN IDs APIC can allocate or validate.
+- A physical domain makes that VLAN pool usable for bare-metal or non-VMM attachments.
+- An AEP connects the domain side of policy to interface policy groups.
+- Access port policy groups describe how a set of ports should behave.
+- EPG domain association says an application policy object may use that physical domain.
+- Static path binding maps an EPG to a specific leaf/interface path and VLAN encapsulation.
+
+This is still policy modeling. The simulator can show object health and dependency problems, but it is not proof that real hosts can pass traffic.
