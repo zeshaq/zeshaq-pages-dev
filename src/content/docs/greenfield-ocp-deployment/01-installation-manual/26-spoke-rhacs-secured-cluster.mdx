@@ -1,0 +1,285 @@
+---
+title: "Installation Manual - 26 Spoke RHACS secured cluster"
+sidebar_label: "26 Spoke RHACS secured cluster"
+description: "How spoke-dc-v7 is onboarded to the hub RHACS Central with Vault-backed secured-cluster certificates through pull GitOps."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter installs only the RHACS secured-cluster services on
+`spoke-dc-v7`. The RHACS Central remains on `hub-dc-v7`; the spoke runs
+Sensor, Collector, Admission Control, scanner-db, and scanner-v4 components.
+
+Do this after chapter 25 proves that cert-manager, External Secrets Operator,
+Vault Kubernetes auth, and `ClusterSecretStore/vault-platform` are healthy on
+the spoke.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Governance issue | `OP-GF-SPOKEDCV7-14`, issue `#360` |
+| Cluster | `spoke-dc-v7` |
+| RHACS Central | `hub-dc-v7` |
+| Central route | `central-stackrox.apps.hub-dc-v7.v7.comptech-lab.com` |
+| SecuredCluster endpoint | `central-stackrox.apps.hub-dc-v7.v7.comptech-lab.com:443` |
+| RHACS operator CSV | `rhacs-operator.v4.10.2` |
+| GitOps commits | `0e94ec5`, `468e423` |
+| Vault path | `secret/greenfield/openshift/spoke-dc-v7/rhacs/init-bundle` |
+| SecuredCluster | `stackrox/stackrox-secured-cluster-services` |
+
+## Generate The Init Bundle
+
+Generate a fresh init bundle from the `hub-dc-v7` RHACS Central for this
+cluster. Do not reuse a bundle from another cluster.
+
+Use `roxctl` when it is available. If `roxctl` is not installed, use the
+Central API from the bootstrap host:
+
+```bash
+export HUB_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+
+ROUTE=$(oc --kubeconfig "$HUB_KUBECONFIG" -n stackrox get route central -o jsonpath='{.spec.host}')
+CENTRAL_PASSWORD=$(oc --kubeconfig "$HUB_KUBECONFIG" -n stackrox get secret central-admin-password -o jsonpath='{.data.password}' | base64 -d)
+
+curl -ksS -u "admin:${CENTRAL_PASSWORD}" \
+  -H 'Content-Type: application/json' \
+  -X POST \
+  -d '{"name":"spoke-dc-v7"}' \
+  "https://${ROUTE}/v1/cluster-init/init-bundles" \
+  -o /tmp/rhacs-initbundle-spoke-dc-v7.json
+```
+
+The API response contains a base64-encoded `kubectlBundle`. Decode it into a
+temporary YAML file, parse only the three TLS secrets, and write them to Vault.
+Do not print the decoded YAML or any PEM values.
+
+The expected Vault data keys are:
+
+```text
+admission-control-tls.ca.pem
+admission-control-tls.admission-control-cert.pem
+admission-control-tls.admission-control-key.pem
+collector-tls.ca.pem
+collector-tls.collector-cert.pem
+collector-tls.collector-key.pem
+sensor-tls.ca.pem
+sensor-tls.sensor-cert.pem
+sensor-tls.sensor-key.pem
+```
+
+Write the JSON payload to:
+
+```text
+secret/data/greenfield/openshift/spoke-dc-v7/rhacs/init-bundle
+```
+
+After the Vault write succeeds, remove all temporary init-bundle files from
+the bootstrap host.
+
+## GitOps Files
+
+Add these paths under `clusters/spoke-dc-v7`:
+
+```text
+operators/rhacs-operator/
+security/rhacs/
+```
+
+Include them in `clusters/spoke-dc-v7/kustomization.yaml`:
+
+```yaml
+resources:
+  - operators/rhacs-operator
+  - security/rhacs
+```
+
+The subscription must use the mirrored Red Hat 4.20 catalog source and pin the
+same RHACS operator version used on the hub:
+
+```yaml
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: rhacs-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: rhacs-operator.v4.10.2
+```
+
+The spoke `SecuredCluster` should point to the hub route, not an in-cluster
+service name:
+
+```yaml
+spec:
+  clusterName: spoke-dc-v7
+  centralEndpoint: central-stackrox.apps.hub-dc-v7.v7.comptech-lab.com:443
+```
+
+Create three `ExternalSecret` resources in namespace `stackrox`:
+
+- `admission-control-tls`;
+- `collector-tls`;
+- `sensor-tls`.
+
+Each `ExternalSecret` reads from the same Vault path and projects only its own
+certificate material into the target Kubernetes secret.
+
+## Managed Argo RBAC
+
+The managed spoke Argo controller needs permission to manage RHACS
+`SecuredCluster` resources:
+
+```yaml
+- apiGroups:
+    - platform.stackrox.io
+  resources:
+    - securedclusters
+  verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+```
+
+Add this rule to the managed Argo extension `ClusterRole`.
+
+During this install, Argo installed the RHACS operator but then failed to patch
+the secured-cluster CR:
+
+```text
+securedclusters.platform.stackrox.io "stackrox-secured-cluster-services" is forbidden
+```
+
+Because the RBAC object grants the permission Argo needs to continue, apply the
+committed `ClusterRole` once when this rule is first introduced:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" apply \
+  -f clusters/spoke-dc-v7/platform/argocd-extensions/clusterrole.yaml
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" auth can-i patch securedclusters.platform.stackrox.io \
+  --as system:serviceaccount:openshift-gitops:acm-openshift-gitops-argocd-application-controller \
+  -n stackrox
+```
+
+Expected:
+
+```text
+yes
+```
+
+If the Argo app has exhausted retries at the old revision, apply the committed
+`SecuredCluster` once and hard-refresh the app:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" apply \
+  -f clusters/spoke-dc-v7/security/rhacs/securedcluster.yaml
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-gitops annotate \
+  application.argoproj.io/spoke-dc-v7-cluster-config \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+After this bootstrap, Argo owns both resources from Git.
+
+## Validation
+
+Validate GitOps:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get applications.argoproj.io \
+  -n openshift-gitops spoke-dc-v7-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+```
+
+Expected:
+
+```text
+Synced Healthy 468e4233f0bbdbab26dda2f37147b3daad093217
+```
+
+Validate RHACS operator and secured cluster:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n rhacs-operator get subscription rhacs-operator \
+  -o jsonpath='{.status.state}{" "}{.status.installedCSV}{"\n"}'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n rhacs-operator get csv rhacs-operator.v4.10.2 \
+  -o jsonpath='{.status.phase}{"\n"}'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n stackrox get securedcluster stackrox-secured-cluster-services \
+  -o jsonpath='{.status.productVersion}{" "}{.status.conditions[?(@.type=="Available")].status}{" "}{.status.conditions[?(@.type=="Degraded")].status}{"\n"}'
+```
+
+Expected:
+
+```text
+AtLatestKnown rhacs-operator.v4.10.2
+Succeeded
+4.10.2 True False
+```
+
+Validate Vault-backed TLS secrets:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n stackrox get externalsecrets \
+  admission-control-tls collector-tls sensor-tls
+```
+
+Expected:
+
+```text
+Ready=True / SecretSynced
+```
+
+Validate pods:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n stackrox get pods --no-headers \
+  | awk '{print $3}' | sort | uniq -c
+```
+
+Expected:
+
+```text
+16 Running
+```
+
+Validate Central visibility without printing credentials:
+
+```bash
+curl -ksS -u "admin:${CENTRAL_PASSWORD}" \
+  "https://${ROUTE}/v1/clusters" \
+  | jq -r '.clusters[]? | select(.name=="hub-dc-v7" or .name=="spoke-dc-v7") | [.name, (.status.sensorVersion // "")] | @tsv'
+```
+
+Expected:
+
+```text
+hub-dc-v7    4.10.2
+spoke-dc-v7  4.10.2
+```
+
+Validate cluster health:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get co
+oc --kubeconfig "$SPOKE_KUBECONFIG" get mcp
+oc --kubeconfig "$HUB_KUBECONFIG" get co
+```
+
+Expected:
+
+- no non-steady ClusterOperators on either cluster;
+- `master` and `worker` MCPs are updated, not updating, and not degraded.
+
+## Next Gate
+
+After RHACS secured-cluster onboarding passes, continue the previous-platform
+security baseline on the spoke. The next gate should be selected from the
+remaining previous setup sequence and validated before changes, with compliance
+and policy controls taking priority over application workloads.
