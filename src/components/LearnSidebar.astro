@@ -3,8 +3,12 @@ import { getCollection } from "astro:content";
 import NavNode from "./NavNode.astro";
 import SectionNav from "./SectionNav.astro";
 import Search from "./Search.astro";
-import { buildLearnTree, type NavNode as NavNodeT } from "../utils/navTree";
-import { parseLearnPath, trackTitle } from "../utils/tracks";
+import {
+  buildLearnTree,
+  buildLearnTrackTree,
+  type NavNode as NavNodeT,
+} from "../utils/navTree";
+import { parseLearnPath, trackTitle, TRACK_TITLES } from "../utils/tracks";
 
 interface Props {
   currentPath: string;
@@ -14,10 +18,22 @@ const { currentPath } = Astro.props;
 
 const learn = await getCollection("learn", ({ data }) => !data.draft);
 
-const tree: NavNodeT[] = buildLearnTree(learn, "/learn");
-
+// When the reader is inside a known track (track home or any module page),
+// scope the sidebar tree to just that track so other tracks don't add noise.
+// On the master /learn/ landing, show the full set of tracks.
 const ctx = parseLearnPath(currentPath);
-const showTrackBackLink = ctx.isModule && ctx.trackId;
+const inTrack =
+  (ctx.isTrackHome || ctx.isModule) &&
+  !!ctx.trackId &&
+  ctx.trackId in TRACK_TITLES;
+const trackId = inTrack ? ctx.trackId! : undefined;
+
+const tree: NavNodeT[] = trackId
+  ? buildLearnTrackTree(learn, trackId, "/learn")
+  : buildLearnTree(learn, "/learn");
+
+const brand = trackId ? trackTitle(trackId) : "Learning";
+const brandHref = trackId ? `/learn/${trackId}/` : "/learn";
 ---
 
 <aside class="sidebar">
@@ -30,7 +46,7 @@ const showTrackBackLink = ctx.isModule && ctx.trackId;
             <polyline points="9 22 9 12 15 12 15 22" />
           </svg>
         </a>
-        <a href="/learn" class="sidebar-brand" onclick="event.stopPropagation()">Learning</a>
+        <a href={brandHref} class="sidebar-brand" onclick="event.stopPropagation()">{brand}</a>
       </div>
       <span class="sidebar-hamburger" aria-hidden="true">≡</span>
     </summary>
@@ -39,10 +55,10 @@ const showTrackBackLink = ctx.isModule && ctx.trackId;
 
     <Search />
 
-    {showTrackBackLink && (
+    {trackId && (
       <div class="sidebar-contextual">
-        <a href={`/learn/${ctx.trackId}/`} class="sidebar-context-link">
-          ← back to {trackTitle(ctx.trackId!)} modules
+        <a href="/learn/" class="sidebar-context-link">
+          ← back to all tracks
         </a>
       </div>
     )}
