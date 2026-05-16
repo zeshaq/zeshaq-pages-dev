@@ -1,0 +1,176 @@
+---
+title: "Installation Manual - 28 Spoke compliance findings triage"
+sidebar_label: "28 Spoke compliance findings triage"
+description: "How to collect the first spoke-dc-v7 Compliance Operator findings, classify them, and choose the first remediation order."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter records the read-only triage immediately after the first
+`spoke-dc-v7` compliance baseline run. Do this before applying any generated
+Compliance Operator remediations.
+
+The goal is to separate true greenfield configuration gaps from install-time
+design decisions, future-service dependencies, and manual attestations.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Governance issue | `OP-GF-SPOKEDCV7-16`, issue `#362` |
+| Cluster | `spoke-dc-v7` |
+| GitOps revision under review | `0932f14` |
+| Action type | Read-only evidence collection and classification |
+| Evidence namespace | `openshift-compliance` |
+| Local evidence report | `reports/compliance/spoke-dc-v7/20260516/triage.md` |
+
+## Collection
+
+Collect structured API output from the bootstrap host. Do not copy raw result
+PVC contents for this triage gate, and do not print Secret manifests,
+kubeconfigs, pull secrets, or token material.
+
+```bash
+export SPOKE_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+mkdir -p reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance \
+  get compliancecheckresults -o json \
+  > reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/compliancecheckresults.json
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance \
+  get complianceremediations -o json \
+  > reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/complianceremediations.json
+```
+
+Generate a compact status count:
+
+```bash
+jq -r '.items[].status' \
+  reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/compliancecheckresults.json \
+  | sort | uniq -c
+```
+
+Generate a non-pass rule list:
+
+```bash
+jq -r '
+  .items[]
+  | select(.status != "PASS")
+  | [
+      .metadata.name,
+      .status,
+      (.metadata.labels["compliance.openshift.io/rule"] // ""),
+      (.metadata.labels["compliance.openshift.io/scan-name"] // "")
+    ]
+  | @tsv
+' reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/compliancecheckresults.json \
+  > reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/nonpass-checkresults.tsv
+```
+
+Generate a remediation inventory:
+
+```bash
+jq -r '
+  .items[]
+  | [
+      .metadata.name,
+      (.metadata.labels["compliance.openshift.io/rule"] // ""),
+      (.metadata.labels["compliance.openshift.io/scan-name"] // ""),
+      (.status.applicationState // "unknown")
+    ]
+  | @tsv
+' reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/complianceremediations.json \
+  > reports/compliance/spoke-dc-v7/$(date -u +%Y%m%d)/remediations.tsv
+```
+
+## First Triage Result
+
+The first evidence run completed with all fourteen scans in `DONE` state.
+
+| Status | Count |
+| --- | ---: |
+| `PASS` | 1022 |
+| `FAIL` | 438 |
+| `MANUAL` | 107 |
+
+Unique non-pass findings:
+
+| Type | Count |
+| --- | ---: |
+| Unique non-pass rules | 247 |
+| Unique failed rules | 217 |
+| Unique manual rules | 30 |
+
+The large result count is expected for the first run because the `rhcos4-high`
+node profiles generate many MachineConfig-backed audit, sysctl, kernel module,
+SSH, and host-hardening checks.
+
+## Classification
+
+Classify findings into these groups before opening remediation work.
+
+| Group | Examples | Handling |
+| --- | --- | --- |
+| Immediate greenfield configuration gaps | `audit-profile-set`, OAuth inactivity and token age, image registry allow lists, ingress certificate and TLS checks, audit forwarding, File Integrity Operator, namespace baseline controls, login/MOTD banner | Remediate first through GitOps in small platform-config batches. |
+| Install-time or design-decision gaps | `machine-volume-encrypted`, node auditd/sysctl/kernel hardening, SSH service posture, USB boot/device posture | Require ADR or explicit issue decision before changing node posture. |
+| Documented or likely tailoring exceptions | ODF route TLS behavior, temporary HTPasswd break-glass IdP, ingress TLS profile compatibility, no cluster-wide proxy | Carry as tailored exceptions or operational attestations until policy changes. |
+| Future-service dependencies | enterprise IdP, alert receiver, Security Profiles Operator, tenant templates | Defer until the dependent service is installed. |
+| Manual attestations | RBAC least privilege, SCC review, ServiceAccount use, secrets handling, namespace partitioning | Build an evidence pack; do not treat these as automatic remediation work. |
+
+## Remediation Order
+
+Use this order after the triage gate:
+
+1. Low-risk platform config:
+   - API audit profile;
+   - OAuth inactivity and token max-age;
+   - image registry allow lists;
+   - default ingress certificate validation or fix;
+   - basic namespace baseline where appropriate.
+2. Logging and file integrity:
+   - cluster logging or selected logging stack;
+   - TLS audit forwarding;
+   - File Integrity Operator and notification path.
+3. Manual attestation pack:
+   - RBAC exports;
+   - SCC exception catalogue;
+   - ServiceAccount and secrets posture;
+   - namespace inventory;
+   - alert receiver inventory.
+4. Node hardening batches:
+   - auditd rule families;
+   - sysctl and kernel module hardening;
+   - SSH policy;
+   - USB policy;
+   - host banner, core dump, and logrotate settings.
+5. Design decisions:
+   - disk encryption posture for VM masters and physical workers;
+   - whether SSH remains enabled for operations;
+   - whether TLS `Modern` is required or `Intermediate` remains accepted;
+   - whether cluster-wide proxy is required.
+
+Do not bulk-apply all generated remediations. The first run found hundreds of
+generated remediation objects. Apply MachineConfig-backed changes in narrow
+batches and validate MachineConfigPool rollout after every batch.
+
+## Validation
+
+Reconfirm cluster health before and after evidence collection:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get co
+oc --kubeconfig "$SPOKE_KUBECONFIG" get mcp
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get compliancescan
+```
+
+Expected:
+
+- no non-steady ClusterOperators;
+- `master` and `worker` MCPs updated, not updating, and not degraded;
+- all expected compliance scans are `DONE`.
+
+The next execution gate should remediate only the low-risk platform
+configuration group, then rerun the affected scans or perform a focused
+evidence recheck.
