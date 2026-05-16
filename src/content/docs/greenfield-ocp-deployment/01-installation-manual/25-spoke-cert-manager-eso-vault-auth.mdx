@@ -1,0 +1,217 @@
+---
+title: "Installation Manual - 25 Spoke cert-manager, ESO, and Vault auth"
+sidebar_label: "25 Spoke cert-manager, ESO, and Vault auth"
+description: "How cert-manager, External Secrets Operator, and Vault Kubernetes auth are installed on spoke-dc-v7 through pull GitOps."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter installs the first post-import spoke platform foundation batch:
+
+- cert-manager Operator;
+- External Secrets Operator;
+- managed-cluster Argo RBAC for ESO bootstrap resources;
+- Vault Kubernetes auth for `spoke-dc-v7`;
+- an ESO smoke `ExternalSecret`.
+
+Do this after the spoke is imported into ACM and the managed Argo CD
+pull-model application is `Synced/Healthy`.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Cluster | `spoke-dc-v7` |
+| GitOps commits | `bfcdde1`, `5abfb0b` |
+| cert-manager CSV | `cert-manager-operator.v1.19.0` |
+| ESO CSV | `openshift-external-secrets-operator.v1.1.0` |
+| Vault auth mount | `kubernetes-spoke-dc-v7` |
+| Vault role | `eso-secrets` |
+| Vault policy | `spoke-dc-v7-eso-secrets` |
+| ClusterSecretStore | `vault-platform` |
+| Smoke ExternalSecret | `external-secrets-operator/eso-smoke` |
+
+## GitOps Files
+
+Add these paths under `clusters/spoke-dc-v7`:
+
+```text
+platform/argocd-extensions/
+operators/cert-manager-operator/
+operators/external-secrets-operator/
+secrets/vault-auth/
+secrets/eso/
+```
+
+Include them in `clusters/spoke-dc-v7/kustomization.yaml` before storage:
+
+```yaml
+resources:
+  - platform/argocd-extensions
+  - operators/cert-manager-operator
+  - operators/external-secrets-operator
+  - operators/local-storage-operator
+  - operators/odf
+  - secrets/vault-auth
+  - secrets/eso
+  - storage/local-storage
+  - storage/odf
+```
+
+The operator subscriptions use the mirrored Red Hat 4.20 catalog source:
+
+```yaml
+source: cs-redhat-operator-index-v4-20
+sourceNamespace: openshift-marketplace
+```
+
+Pin the versions used in this deployment:
+
+- cert-manager: `cert-manager-operator.v1.19.0`;
+- ESO: `openshift-external-secrets-operator.v1.1.0`.
+
+## Managed Argo RBAC
+
+The managed spoke Argo controller cannot self-grant cluster-scope permissions.
+If `platform/argocd-extensions` is added for the first time, bootstrap the
+committed `ClusterRole` and `ClusterRoleBinding` once:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" apply \
+  -f clusters/spoke-dc-v7/platform/argocd-extensions/clusterrole.yaml \
+  -f clusters/spoke-dc-v7/platform/argocd-extensions/clusterrolebinding.yaml
+```
+
+Without this, Argo reports errors like:
+
+```text
+cannot patch resource "networkpolicies" in API group "networking.k8s.io"
+cannot patch resource "clustersecretstores" in API group "external-secrets.io"
+```
+
+After the one-time bootstrap, Argo owns those RBAC objects from Git.
+
+## Configure Vault Auth
+
+Wait until GitOps creates:
+
+```text
+external-secrets-operator/vault-token-reviewer-token
+```
+
+Then run the Vault auth script:
+
+```bash
+export KUBECONFIG="$SPOKE_KUBECONFIG"
+export VAULT_ADDR=https://gf-ocp-vault-02.v7.comptech-lab.com:8200
+export VAULT_CACERT=/home/ze/codex-opp-agent/secrets/greenfield-vault/tls/ca.crt
+export VAULT_TOKEN=<redacted>
+
+/home/ze/ocp-greenfield-deployment/scripts/services/vault/configure-hub-vault-kubernetes-auth.sh \
+  --cluster spoke-dc-v7 \
+  --kubernetes-host https://api.spoke-dc-v7.v7.comptech-lab.com:6443 \
+  --reviewer-namespace external-secrets-operator \
+  --reviewer-secret vault-token-reviewer-token \
+  --eso-service-account external-secrets-operator-controller-manager \
+  --eso-namespace external-secrets-operator
+```
+
+The script configures:
+
+- auth mount `kubernetes-spoke-dc-v7`;
+- policy `spoke-dc-v7-eso-secrets`;
+- role `eso-secrets`;
+- smoke secret path
+  `secret/greenfield/openshift/spoke-dc-v7/eso-smoke`.
+
+The script must not print reviewer tokens, Vault tokens, or synced secret
+values.
+
+## Issue Found During Install
+
+The original Vault auth script had an invalid `jq` object expression while
+rendering the Vault policy. The fixed version is committed in the planning
+repo:
+
+```text
+c1fa1bf Fix Vault Kubernetes auth policy rendering
+```
+
+The policy expression must wrap string concatenation in parentheses:
+
+```text
+{
+  policy: (
+    "path ..." +
+    "path ..."
+  )
+}
+```
+
+Keep this fix before repeating the spoke ESO/Vault-auth gate.
+
+## Validation
+
+Validate GitOps:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get applications.argoproj.io \
+  -n openshift-gitops spoke-dc-v7-cluster-config
+```
+
+Expected:
+
+```text
+Synced / Healthy
+```
+
+Validate operators:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get csv -n cert-manager-operator
+oc --kubeconfig "$SPOKE_KUBECONFIG" get csv -n external-secrets-operator
+oc --kubeconfig "$SPOKE_KUBECONFIG" get pods -n cert-manager
+oc --kubeconfig "$SPOKE_KUBECONFIG" get pods -n external-secrets
+```
+
+Expected:
+
+- both CSVs are `Succeeded`;
+- cert-manager pods are `Running`;
+- external-secrets pods are `Running`.
+
+Validate Vault integration:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get clustersecretstore vault-platform
+oc --kubeconfig "$SPOKE_KUBECONFIG" get externalsecret \
+  -n external-secrets-operator eso-smoke
+oc --kubeconfig "$SPOKE_KUBECONFIG" get secret \
+  -n external-secrets-operator eso-smoke
+```
+
+Expected:
+
+- `ClusterSecretStore/vault-platform` is `Ready=True` / `Valid`;
+- `ExternalSecret/eso-smoke` is `Ready=True` / `SecretSynced`;
+- Secret `external-secrets-operator/eso-smoke` exists.
+
+Validate cluster health:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get clusterversion version
+oc --kubeconfig "$SPOKE_KUBECONFIG" get nodes
+oc --kubeconfig "$SPOKE_KUBECONFIG" get co
+oc --kubeconfig "$SPOKE_KUBECONFIG" get mcp
+oc --kubeconfig "$SPOKE_KUBECONFIG" get storagecluster -n openshift-storage
+oc --kubeconfig "$SPOKE_KUBECONFIG" get cephcluster -n openshift-storage
+```
+
+Expected:
+
+- ClusterVersion is available and not progressing;
+- all six nodes are `Ready`;
+- no non-steady ClusterOperators;
+- master and worker MCPs are updated and not degraded;
+- ODF remains `Ready`;
+- Ceph remains `HEALTH_OK`.
