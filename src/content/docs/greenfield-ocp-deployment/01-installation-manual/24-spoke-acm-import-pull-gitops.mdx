@@ -161,10 +161,48 @@ oc --kubeconfig "$HUB_KUBECONFIG" annotate applications.argoproj.io \
 The generated spoke Argo instance runs on the managed cluster. It needs a
 repository credential to read the private GitLab repository.
 
-For the bootstrap run, create the repository credential directly in the spoke
-`openshift-gitops` namespace without printing the password or token. In the
-durable production flow, move this into the approved Vault/ESO or bootstrap
-secret-management process.
+At this stage of the install, `spoke-dc-v7` does not yet have External Secrets
+Operator or Vault Kubernetes auth. Do not try to put this repository Secret in
+the GitOps repo; Argo cannot read the GitOps repo until this credential exists.
+
+Use the bootstrap script from the greenfield deployment repo instead:
+
+```bash
+/home/ze/ocp-greenfield-deployment/scripts/services/bootstrap/seed-managed-gitops-repo-credential.sh \
+  --cluster spoke-dc-v7 \
+  --kubeconfig "$SPOKE_KUBECONFIG"
+```
+
+The script reads the repository credential from Vault and creates only the
+Argo CD repository Secret in the managed cluster:
+
+```text
+Vault path:
+secret/greenfield/openshift/spoke-dc-v7/gitops/repositories/openshift-gitops
+
+Target Secret:
+openshift-gitops/openshift-gitops-gitlab-repo
+```
+
+Expected Vault keys:
+
+- `url`;
+- `username`;
+- `password`.
+
+Required environment:
+
+```bash
+export VAULT_ADDR=https://gf-ocp-vault-02.v7.comptech-lab.com:8200
+export VAULT_TOKEN=<token with read access to the path>
+```
+
+If the bootstrap host does not yet trust the greenfield Vault CA, use
+`VAULT_SKIP_VERIFY=true` only for this bootstrap step and fix CA trust later.
+
+The script does not print the password or token. It also writes the Kubernetes
+Secret with `password` from a temporary file, so the password is not passed as
+a command-line argument.
 
 Validate the credential by refreshing the spoke app:
 
@@ -172,7 +210,19 @@ Validate the credential by refreshing the spoke app:
 oc --kubeconfig "$SPOKE_KUBECONFIG" annotate applications.argoproj.io \
   -n openshift-gitops spoke-dc-v7-cluster-config \
   argocd.argoproj.io/refresh=hard --overwrite
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get applications.argoproj.io \
+  -n openshift-gitops spoke-dc-v7-cluster-config
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get secret \
+  -n openshift-gitops openshift-gitops-gitlab-repo \
+  -o jsonpath='secretType={.metadata.labels.argocd\.argoproj\.io/secret-type}{"\n"}'
 ```
+
+Expected result:
+
+- `spoke-dc-v7-cluster-config` is `Synced/Healthy`;
+- the repository Secret label is `argocd.argoproj.io/secret-type=repository`.
 
 ## Final Validation
 
