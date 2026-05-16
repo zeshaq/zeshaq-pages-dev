@@ -1,0 +1,147 @@
+---
+title: "Lab 8: cross-tenant shared services"
+sidebar_label: "16 — Lab 8"
+description: "Create a shared-services tenant and expose DNS/NTP-style contracts only to approved EPGs in production and development."
+estimated_minutes: 45
+last_updated: 2026-05-16
+---
+
+import Whiteboard from "../../../components/Whiteboard";
+
+export const tenantStyle = { background: "#eef2ff", border: "1.5px solid #4338ca", borderRadius: 8, padding: 10, color: "#0f172a", width: 180, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const sharedStyle = { background: "#fef3c7", border: "1.5px solid #b45309", borderRadius: 8, padding: 10, color: "#0f172a", width: 190, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const prodStyle = { background: "#e0f2fe", border: "1.5px solid #0369a1", borderRadius: 8, padding: 10, color: "#0f172a", width: 185, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const devStyle = { background: "#dcfce7", border: "1.5px solid #15803d", borderRadius: 8, padding: 10, color: "#0f172a", width: 185, textAlign: "center", fontWeight: 600, fontSize: 12 };
+export const contractStyle = { background: "#f8fafc", border: "1.5px solid #64748b", borderRadius: 8, padding: 10, color: "#0f172a", width: 220, textAlign: "center", fontSize: 12 };
+export const rel = { style: { stroke: "#334155", strokeWidth: 1.5 }, markerEnd: { type: "arrowclosed", color: "#334155" }, labelStyle: { fill: "#334155", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const prodEdge = { style: { stroke: "#0369a1", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#0369a1" }, labelStyle: { fill: "#0369a1", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+export const devEdge = { style: { stroke: "#15803d", strokeWidth: 1.8 }, markerEnd: { type: "arrowclosed", color: "#15803d" }, labelStyle: { fill: "#15803d", fontSize: 11 }, labelBgStyle: { fill: "#ffffff" } };
+
+export const sharedNodes = [
+  { id: "shared", position: { x: 430, y: 40 }, data: { label: "Tenant\nlab-shared\nservice owner" }, style: tenantStyle },
+  { id: "services", position: { x: 430, y: 170 }, data: { label: "EPG\ndns-ntp-services\nprovides services" }, style: sharedStyle },
+  { id: "contracts", position: { x: 700, y: 170 }, data: { label: "Contracts\nshared-dns\nshared-ntp" }, style: contractStyle },
+  { id: "prodif", position: { x: 140, y: 290 }, data: { label: "lab-prod\ncontract interfaces\nshared-dns-if\nshared-ntp-if" }, style: prodStyle },
+  { id: "prodepgs", position: { x: 140, y: 440 }, data: { label: "Approved EPGs\nweb\napp\ndb" }, style: prodStyle },
+  { id: "devif", position: { x: 700, y: 290 }, data: { label: "lab-dev\ncontract interfaces\nshared-dns-if\nshared-ntp-if" }, style: devStyle },
+  { id: "devepgs", position: { x: 700, y: 440 }, data: { label: "Approved EPGs\nfrontend\napi\ndatabase" }, style: devStyle },
+];
+
+export const sharedEdges = [
+  { id: "e1", source: "shared", target: "services", label: "owns", ...rel },
+  { id: "e2", source: "services", target: "contracts", label: "provides", ...rel },
+  { id: "e3", source: "prodif", target: "contracts", label: "points to shared contracts", ...prodEdge },
+  { id: "e4", source: "prodepgs", target: "prodif", label: "consumes local interfaces", ...prodEdge },
+  { id: "e5", source: "devif", target: "contracts", label: "points to shared contracts", ...devEdge },
+  { id: "e6", source: "devepgs", target: "devif", label: "consumes local interfaces", ...devEdge },
+];
+
+Lab 8 is the first controlled cross-tenant sharing lab.
+
+Lab 7 kept production and development completely separate. Lab 8 adds a third tenant:
+
+```text
+lab-shared
+```
+
+That tenant represents common services such as DNS and NTP.
+
+## Target model
+
+<Whiteboard client:load data={{ nodes: sharedNodes, edges: sharedEdges }} height={610} />
+
+## What you configure
+
+| Area | Value |
+| --- | --- |
+| Shared tenant | `lab-shared` |
+| Shared VRF | `shared-vrf` |
+| Shared bridge domain | `shared-bd` |
+| Shared subnet | `10.30.10.1/24` |
+| Shared app profile | `shared-services-app` |
+| Provider EPG | `dns-ntp-services` |
+| Provider contracts | `shared-dns`, `shared-ntp` |
+
+The provider tenant owns the real contracts. The consuming tenants get local contract interfaces:
+
+| Consumer tenant | Local interfaces |
+| --- | --- |
+| `lab-prod` | `shared-dns-if`, `shared-ntp-if` |
+| `lab-dev` | `shared-dns-if`, `shared-ntp-if` |
+
+Those interfaces point back to the contracts in `lab-shared`.
+
+## Approved consumers
+
+The consumer list is explicit:
+
+| Tenant | App profile | EPGs |
+| --- | --- | --- |
+| `lab-prod` | `three-tier-app` | `web`, `app`, `db` |
+| `lab-dev` | `dev-three-tier-app` | `frontend`, `api`, `database` |
+
+There is no tenant-wide shortcut in this lab. Each approved EPG consumes the shared DNS and NTP interfaces directly.
+
+## Automation
+
+The lab repo has an idempotent script:
+
+```bash
+./scripts/configure-aci-lab-8-cross-tenant-shared-services.sh
+```
+
+The latest run returned:
+
+```text
+ready: true
+shared_tenant lab-shared
+provider_epg dns-ntp-services
+approved_consumer_count 12
+observed_consumer_count 12
+unexpected_shared_interface_consumers []
+fault_counts lab-prod=0 lab-dev=0 lab-shared=0
+```
+
+## Verification checklist
+
+In APIC, check these before calling the lab complete:
+
+- Tenant `lab-shared` exists.
+- `lab-shared` has VRF `shared-vrf`.
+- `lab-shared` has bridge domain `shared-bd`.
+- `shared-bd` has subnet `10.30.10.1/24`.
+- Application profile `shared-services-app` exists.
+- EPG `dns-ntp-services` exists.
+- Contracts `shared-dns` and `shared-ntp` exist.
+- `lab-prod` has contract interfaces `shared-dns-if` and `shared-ntp-if`.
+- `lab-dev` has contract interfaces `shared-dns-if` and `shared-ntp-if`.
+- Only the approved EPGs consume those interfaces.
+- `lab-prod`, `lab-dev`, and `lab-shared` have zero active faults.
+
+## Why this matters
+
+Real ACI environments often need shared services. DNS, NTP, identity services, patch repositories, monitoring, and logging are common examples.
+
+The design mistake is to make sharing broad just because the service is common.
+
+This lab keeps the model narrow:
+
+```text
+shared service provider tenant
+named contracts
+consumer-side contract interfaces
+approved EPG consumers
+zero broad tenant-wide access
+```
+
+## What this lab teaches
+
+You should leave Lab 8 understanding:
+
+- ACI tenants can stay isolated while still consuming approved shared services.
+- The provider tenant owns the service contracts.
+- Consumer tenants can hold local contract interfaces that point to provider contracts.
+- Shared services should be named, audited, and narrow.
+- The simulator proves APIC policy relationships, not packet flow.
+
+The next lab should compare this dedicated shared-services tenant pattern with reusable policy in the built-in `common` tenant.
