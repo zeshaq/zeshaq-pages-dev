@@ -1,0 +1,81 @@
+---
+title: "ACI Simulator lab roadmap"
+sidebar_label: "15 — Roadmap"
+description: "The APIC-policy-only lab sequence for continuing the ACI Simulator track without EVE-NG dependencies."
+estimated_minutes: 20
+last_updated: 2026-05-16
+---
+
+This roadmap is only for **ACI Simulator** labs.
+
+It excludes:
+
+```text
+EVE-NG labs
+physical switching labs
+real endpoint traffic
+packet captures
+live routing adjacencies
+firewall dataplane insertion
+```
+
+The simulator track is for learning the APIC policy model safely. Every lab should be reproducible through automation and easy to inspect in the APIC GUI.
+
+## Completed
+
+| Lab | Name | What it teaches |
+| --- | --- | --- |
+| 1 | Three-tier tenant | Tenant, VRF, bridge domain, subnet, app profile, EPGs |
+| 2 | Access policies and static paths | VLAN pool, physical domain, AEP, policy group, static path binding |
+| 3 | Contracts and filters | Provider/consumer contracts, subjects, filters |
+| 4 | L3Out model | External EPG, external subnet, external contract model |
+| 5 | vzAny shared services | VRF-wide DNS/NTP contract consumption |
+| 6 | Preferred group trust zone | Trusted EPG group with database excluded |
+| 7 | Multi-tenant isolation | `lab-prod` and `lab-dev` as separate policy namespaces |
+
+## Next sequence
+
+| Lab | Name | Goal |
+| --- | --- | --- |
+| 8 | Cross-tenant shared services | Create `lab-shared` and deliberately share DNS/NTP-style services to approved tenants |
+| 9 | Common tenant reusable policy | Use `common` for reusable filters/contracts and discuss where it is risky |
+| 10 | Contract scope comparison | Compare app-profile, VRF/context, tenant, and broader contract scopes |
+| 11 | Tenant-specific L3Out models | Give production and development separate external policy models |
+| 12 | Shared L3Out governance | Model shared external connectivity with narrow consumers |
+| 13 | Service graph concept model | Build firewall-style service graph policy objects without dataplane tests |
+| 14 | Quarantine EPG | Create a restricted EPG for isolated or remediation-only systems |
+| 15 | RBAC and operator roles | Model read-only, tenant operator, and network operator access |
+| 16 | Fault-driven troubleshooting | Create a safe policy error, inspect faults, and repair it |
+| 17 | APIC audit and change review | Tie APIC audit events back to automation changes |
+| 18 | Policy export and backup | Export tenant policy snapshots for restore practice |
+| 19 | Clean rebuild rehearsal | Replay all simulator labs in order |
+| 20 | Capstone | Combine tenants, shared services, external policy, RBAC, audit, and backup |
+
+## Execution rule
+
+For every new lab:
+
+- create a dedicated script in the lab repo
+- keep the script idempotent
+- verify through the APIC REST API
+- return a clear `ready: true` result
+- keep APIC credentials outside Git
+- create a dedicated learning portal page
+- update the durable lab memory
+- commit and push after validation
+
+## Lab 8 starting point
+
+Lab 8 should create a shared-services tenant:
+
+| Object | Name |
+| --- | --- |
+| Tenant | `lab-shared` |
+| VRF | `shared-vrf` |
+| Bridge domain | `shared-bd` |
+| Application profile | `shared-services-app` |
+| EPG | `dns-ntp-services` |
+| Provided contracts | `shared-dns`, `shared-ntp` |
+| Consumers | approved EPGs in `lab-prod` and `lab-dev` |
+
+The important lesson is controlled sharing. Multi-tenant design starts isolated, then adds only the shared services that are explicitly required.
