@@ -1,0 +1,270 @@
+---
+title: "Installation Manual - 27 Spoke compliance baseline"
+sidebar_label: "27 Spoke compliance baseline"
+description: "How the Compliance Operator, CIS, NIST High, and PCI-DSS scan bindings are installed on spoke-dc-v7 through pull GitOps."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter installs the first compliance baseline on `spoke-dc-v7` after
+RHACS secured-cluster onboarding. It mirrors the previous platform compliance
+shape, but keeps the scope limited to compliance evidence and policy baseline
+work. Application workloads and unrelated operators are not part of this gate.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Governance issue | `OP-GF-SPOKEDCV7-15`, issue `#361` |
+| Cluster | `spoke-dc-v7` |
+| GitOps commit | `0932f14` |
+| Compliance Operator CSV | `compliance-operator.v1.9.0` |
+| Namespace | `openshift-compliance` |
+| ScanSetting | `workers-storage` |
+| Raw result storage | `ocs-storagecluster-ceph-rbd`, `50Gi`, rotation `3` |
+| Scan bindings | `cis`, `nist-800-53-high`, `pci-dss-3-2`, `pci-dss-4-0` |
+| PCI-DSS v4 TailoredProfile | `ocp4-pci-dss-4-0-spoke-dc-v7` |
+
+## GitOps Files
+
+Add these paths under `clusters/spoke-dc-v7`:
+
+```text
+operators/compliance-operator/
+compliance/
+```
+
+Include them in `clusters/spoke-dc-v7/kustomization.yaml`:
+
+```yaml
+resources:
+  - operators/compliance-operator
+  - compliance
+```
+
+The operator subscription is pinned to the previous-platform version:
+
+```yaml
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: compliance-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: compliance-operator.v1.9.0
+```
+
+## Managed Argo RBAC
+
+The managed spoke Argo CD controller needs permission to manage Compliance
+Operator custom resources:
+
+```yaml
+- apiGroups:
+    - compliance.openshift.io
+  resources:
+    - scansettings
+    - scansettingbindings
+    - tailoredprofiles
+  verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+```
+
+It also needs permission to manage the namespace-scoped `Role` and
+`RoleBinding` that grant ongoing access inside `openshift-compliance`:
+
+```yaml
+- apiGroups:
+    - rbac.authorization.k8s.io
+  resources:
+    - roles
+    - rolebindings
+  verbs:
+    - get
+    - list
+    - watch
+    - create
+    - update
+    - patch
+    - delete
+```
+
+Add those rules to the managed Argo extension `ClusterRole` before expecting
+Argo to reconcile the compliance resources.
+
+## Scan Settings
+
+Use one shared `ScanSetting`:
+
+```yaml
+apiVersion: compliance.openshift.io/v1alpha1
+kind: ScanSetting
+metadata:
+  name: workers-storage
+  namespace: openshift-compliance
+rawResultStorage:
+  enabled: true
+  storageClassName: ocs-storagecluster-ceph-rbd
+  size: 50Gi
+  rotation: 3
+  pvAccessModes:
+    - ReadWriteOnce
+  nodeSelector:
+    node-role.kubernetes.io/worker: ""
+roles:
+  - master
+  - worker
+strictNodeScan: false
+maxRetryOnTimeout: 3
+showNotApplicable: false
+suspend: false
+timeout: 30m
+```
+
+The first run created fourteen raw-result PVCs. At `50Gi` each, reserve roughly
+`700Gi` of ODF RBD capacity for this baseline before retention and cleanup are
+tuned.
+
+## Scan Bindings
+
+Install these bindings:
+
+```text
+cis
+nist-800-53-high
+pci-dss-3-2
+pci-dss-4-0
+```
+
+The PCI-DSS v4 binding should reference the greenfield tailored profile:
+
+```yaml
+profiles:
+  - name: ocp4-pci-dss-4-0-spoke-dc-v7
+    kind: TailoredProfile
+    apiGroup: compliance.openshift.io/v1alpha1
+  - name: ocp4-pci-dss-node-4-0
+    kind: Profile
+    apiGroup: compliance.openshift.io/v1alpha1
+```
+
+## Tailoring Notes
+
+The initial `ocp4-pci-dss-4-0-spoke-dc-v7` profile keeps the previous-platform
+tailoring shape so the first greenfield evidence run is comparable. It adapts
+cluster-specific names and records that several items are deliberately left for
+the follow-up remediation gate:
+
+- HTPasswd remains a temporary break-glass identity provider until the future
+  enterprise IdP is introduced.
+- The `kubeadmin` Secret has already been removed on `spoke-dc-v7`; keep the
+  previous disablement only for first-run parity and remove it later if the
+  rule now passes cleanly.
+- Security Profiles Operator is not part of this first compliance gate.
+- OAuth inactivity variables are set to the PCI maximum of `15m0s` / `900`
+  seconds for evidence comparison. If the day-zero OAuth timeout remains `30m`,
+  expect this to appear in first-pass findings and remediate in the next gate.
+- The ODF object-store route TLS finding remains documented as
+  operator-owned drift, governed by the PCI baseline ADR.
+
+## Validation
+
+Validate GitOps:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-gitops get application.argoproj.io \
+  spoke-dc-v7-cluster-config \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{" "}{.status.sync.revision}{"\n"}'
+```
+
+Expected:
+
+```text
+Synced Healthy 0932f14dde5b1f68c5212ead68895c8c92756b88
+```
+
+Validate operator state:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get \
+  subscriptions.operators.coreos.com compliance-operator \
+  -o jsonpath='{.status.state}{" "}{.status.installedCSV}{"\n"}'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get csv \
+  compliance-operator.v1.9.0 \
+  -o jsonpath='{.status.phase}{"\n"}'
+```
+
+Expected:
+
+```text
+AtLatestKnown compliance-operator.v1.9.0
+Succeeded
+```
+
+Validate profile bundles:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get profilebundle
+```
+
+Expected:
+
+```text
+ocp4     VALID
+rhcos4   VALID
+```
+
+Validate scan resources:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get scansetting workers-storage
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get scansettingbinding
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get tailoredprofile ocp4-pci-dss-4-0-spoke-dc-v7
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-compliance get compliancescan
+```
+
+First-run result from this installation:
+
+```text
+ocp4-cis                            DONE  NON-COMPLIANT
+ocp4-cis-node-master                DONE  COMPLIANT
+ocp4-cis-node-worker                DONE  COMPLIANT
+ocp4-high                           DONE  NON-COMPLIANT
+ocp4-high-node-master               DONE  NON-COMPLIANT
+ocp4-high-node-worker               DONE  NON-COMPLIANT
+ocp4-pci-dss-3-2                    DONE  NON-COMPLIANT
+ocp4-pci-dss-4-0-spoke-dc-v7        DONE  NON-COMPLIANT
+ocp4-pci-dss-node-3-2-master        DONE  COMPLIANT
+ocp4-pci-dss-node-3-2-worker        DONE  COMPLIANT
+ocp4-pci-dss-node-4-0-master        DONE  NON-COMPLIANT
+ocp4-pci-dss-node-4-0-worker        DONE  COMPLIANT
+rhcos4-high-master                  DONE  NON-COMPLIANT
+rhcos4-high-worker                  DONE  NON-COMPLIANT
+```
+
+Validate cluster health:
+
+```bash
+oc --kubeconfig "$SPOKE_KUBECONFIG" get co
+oc --kubeconfig "$SPOKE_KUBECONFIG" get mcp
+oc --kubeconfig "$HUB_KUBECONFIG" get co
+```
+
+Expected:
+
+- no non-steady ClusterOperators on hub or spoke;
+- `master` and `worker` MCPs are updated, not updating, and not degraded.
+
+## Next Gate
+
+The next gate should collect the first compliance findings into an evidence
+report and decide the remediation sequence. Start with findings that are true
+configuration gaps in the greenfield platform, then leave documented
+operator-owned or future-service exceptions in the tailored profile.
