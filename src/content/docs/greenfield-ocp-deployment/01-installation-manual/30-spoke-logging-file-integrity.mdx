@@ -1,0 +1,371 @@
+---
+title: "Installation Manual - 30 Spoke logging and file integrity"
+sidebar_label: "30 Spoke logging and file integrity"
+description: "How to install OpenShift Logging audit forwarding, Loki, and File Integrity Operator on spoke-dc-v7."
+last_reviewed: 2026-05-16
+draft: false
+---
+
+This chapter records the second remediation batch after the
+`spoke-dc-v7` Compliance Operator findings triage. It installs OpenShift
+Logging, a local LokiStack backed by ODF/NooBaa, audit log forwarding, and
+File Integrity Operator.
+
+Do this after the low-risk platform config gate and before MachineConfig-backed
+node hardening.
+
+## Target State
+
+| Item | Value |
+| --- | --- |
+| Governance issue | `OP-GF-SPOKEDCV7-18`, issue `#364` |
+| Cluster | `spoke-dc-v7` |
+| GitOps repo | `/home/ze/greenfield-ops/openshift-gitops` |
+| GitOps commits | `ff6a7db`, `c10b5fd`, `5fabd1b` |
+| Spoke app | `spoke-dc-v7-cluster-config` |
+| Logging operator | `cluster-logging.v6.5.0` |
+| Loki operator | `loki-operator.v6.5.0` |
+| File Integrity Operator | `file-integrity-operator.v1.3.8` |
+
+## GitOps Layout
+
+Add these directories under `clusters/spoke-dc-v7` and include them from the
+cluster kustomization.
+
+```text
+clusters/spoke-dc-v7/
+  operators/
+    cluster-logging/
+    loki-operator/
+    file-integrity-operator/
+  platform-services/
+    logging/
+      clusterlogforwarder.yaml
+      externalsecret-loki-storage.yaml
+      kustomization.yaml
+      loki-rbac.yaml
+      lokistack.yaml
+      objectbucketclaim-loki.yaml
+  file-integrity/
+    fileintegrity-spoke-dc.yaml
+    kustomization.yaml
+    prometheusrule-file-integrity-failed.yaml
+```
+
+The managed spoke Argo CD controller needs permissions for:
+
+- core `serviceaccounts`;
+- `rbac.authorization.k8s.io` `clusterrolebindings`;
+- `objectbucket.io` `objectbucketclaims`;
+- `loki.grafana.com` `lokistacks`;
+- `observability.openshift.io` `clusterlogforwarders`;
+- `fileintegrity.openshift.io` `fileintegrities`;
+- `monitoring.coreos.com` `prometheusrules`.
+
+## Operators
+
+Install the exact mirrored operator versions used by this platform baseline:
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-logging
+  namespace: openshift-logging
+spec:
+  channel: stable-6.5
+  installPlanApproval: Automatic
+  name: cluster-logging
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: cluster-logging.v6.5.0
+```
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: loki-operator
+  namespace: openshift-operators-redhat
+spec:
+  channel: stable-6.5
+  installPlanApproval: Automatic
+  name: loki-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: loki-operator.v6.5.0
+```
+
+```yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: file-integrity-operator
+  namespace: openshift-file-integrity
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: file-integrity-operator
+  source: cs-redhat-operator-index-v4-20
+  sourceNamespace: openshift-marketplace
+  startingCSV: file-integrity-operator.v1.3.8
+```
+
+## Loki Storage
+
+Use the existing ODF NooBaa object bucket provisioner for Loki object storage:
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: loki-bucket
+  namespace: openshift-logging
+spec:
+  bucketName: loki-spoke-dc-v7
+  storageClassName: openshift-storage.noobaa.io
+```
+
+The OBC creates `Secret/loki-bucket` with uppercase S3 credential keys. The
+LokiStack expects lowercase keys, so use an External Secrets Kubernetes
+provider bridge to create `Secret/logging-loki-s3`.
+
+Codify External Secrets API defaults in Git to avoid Argo drift:
+
+```yaml
+target:
+  name: logging-loki-s3
+  creationPolicy: Owner
+  deletionPolicy: Retain
+  template:
+    type: Opaque
+    engineVersion: v2
+    mergePolicy: Replace
+    metadata: {}
+```
+
+Also include these defaults on each `remoteRef`:
+
+```yaml
+conversionStrategy: Default
+decodingStrategy: None
+metadataPolicy: None
+```
+
+## LokiStack
+
+Use the same compact stack shape as the previous platform pattern:
+
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: logging-loki
+  namespace: openshift-logging
+spec:
+  size: 1x.demo
+  managementState: Managed
+  storage:
+    schemas:
+      - version: v13
+        effectiveDate: "2024-10-22"
+    secret:
+      name: logging-loki-s3
+      type: s3
+  storageClassName: ocs-storagecluster-ceph-rbd
+  tenants:
+    mode: openshift-logging
+```
+
+## Audit Forwarding
+
+Create `ServiceAccount/logging-collector` and bind the standard collector
+roles:
+
+```text
+collect-application-logs
+collect-infrastructure-logs
+collect-audit-logs
+logging-collector-logs-writer
+```
+
+Create one `ClusterLogForwarder` that sends application, infrastructure, and
+audit logs to the in-cluster LokiStack:
+
+```yaml
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  managementState: Managed
+  serviceAccount:
+    name: logging-collector
+  outputs:
+    - name: lokistack-out
+      type: lokiStack
+      lokiStack:
+        target:
+          name: logging-loki
+          namespace: openshift-logging
+        authentication:
+          token:
+            from: serviceAccount
+  pipelines:
+    - name: application-logs
+      inputRefs: [application]
+      outputRefs: [lokistack-out]
+    - name: infrastructure-logs
+      inputRefs: [infrastructure]
+      outputRefs: [lokistack-out]
+    - name: audit-logs
+      inputRefs: [audit]
+      outputRefs: [lokistack-out]
+```
+
+The in-cluster LokiStack gateway uses service-account token authentication and
+the OpenShift Logging tenant model. This satisfies the early audit-forwarding
+gate without introducing an external SIEM dependency.
+
+## File Integrity
+
+Create a single all-node `FileIntegrity` CR:
+
+```yaml
+apiVersion: fileintegrity.openshift.io/v1alpha1
+kind: FileIntegrity
+metadata:
+  name: spoke-dc-v7-fileintegrity
+  namespace: openshift-file-integrity
+spec:
+  config:
+    gracePeriod: 900
+  tolerations:
+    - operator: Exists
+      effect: NoSchedule
+    - operator: Exists
+      effect: NoExecute
+```
+
+Create a PrometheusRule for file integrity notification evidence:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: file-integrity-failed
+  namespace: openshift-file-integrity
+spec:
+  groups:
+    - name: file-integrity-alerts
+      rules:
+        - alert: FileIntegrityFailed
+          expr: file_integrity_operator_node_failed > 0
+          for: 5m
+```
+
+The first AIDE cycle waits for the configured grace period. Expect the
+`FileIntegrity` CR to become `Active` and the AIDE pods to run before
+`FileIntegrityNodeStatus` objects appear.
+
+## Render And Reconcile
+
+Render before pushing:
+
+```bash
+cd /home/ze/greenfield-ops/openshift-gitops
+oc kustomize clusters/spoke-dc-v7 >/tmp/spoke-dc-v7-kustomize.yaml
+git diff --check
+```
+
+A full one-shot server dry run can report missing namespaces or missing CRDs
+for the new namespaced resources. That is expected before Argo applies earlier
+sync waves and before OLM installs the operator CRDs. Verify that new CRD
+consumers include `SkipDryRunOnMissingResource=true` where needed.
+
+Push and refresh:
+
+```bash
+export HUB_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+
+oc --kubeconfig "$HUB_KUBECONFIG" -n openshift-gitops \
+  annotate application.argoproj.io/spoke-dc-v7-cluster-config \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+If an ExternalSecret remains OutOfSync only because the API defaulted missing
+fields, codify the defaulted fields instead of ignoring drift.
+
+## Validation
+
+Run these checks from the bootstrap host.
+
+```bash
+export HUB_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/hub-dc-v7/auth/kubeconfig
+export SPOKE_KUBECONFIG=/home/ze/ocp-greenfield-deployment/artifacts/openshift/spoke-dc-v7/auth/kubeconfig
+
+oc --kubeconfig "$HUB_KUBECONFIG" -n openshift-gitops \
+  get application.argoproj.io spoke-dc-v7-cluster-config
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-gitops \
+  get application.argoproj.io spoke-dc-v7-cluster-config
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get co --no-headers \
+  | awk '$3!="True" || $4!="False" || $5!="False" {print}'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get mcp
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get sub -A \
+  | egrep 'cluster-logging|loki-operator|file-integrity'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get csv \
+  -n openshift-logging cluster-logging.v6.5.0
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get csv \
+  -n openshift-operators-redhat loki-operator.v6.5.0
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" get csv \
+  -n openshift-file-integrity file-integrity-operator.v1.3.8
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-logging \
+  get lokistack logging-loki
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-logging \
+  get clusterlogforwarder instance -o json \
+  | jq -r '.status.conditions[] | [.type,.status,.reason] | @tsv'
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-logging get pods
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-file-integrity \
+  get fileintegrity spoke-dc-v7-fileintegrity
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-file-integrity get pods
+
+oc --kubeconfig "$SPOKE_KUBECONFIG" -n openshift-file-integrity \
+  get prometheusrule file-integrity-failed
+```
+
+Expected:
+
+- hub and spoke Argo apps are `Synced` and `Healthy`;
+- no non-steady ClusterOperators are printed;
+- MCPs are updated, not updating, and not degraded;
+- all three CSVs are `Succeeded`;
+- `LokiStack/logging-loki` is ready;
+- `ClusterLogForwarder/instance` is authorized, valid, and ready;
+- collector, Loki, logging operator, File Integrity Operator, and six AIDE
+  pods are running;
+- `FileIntegrity/spoke-dc-v7-fileintegrity` phase is `Active`;
+- `PrometheusRule/file-integrity-failed` exists.
+
+## Lessons
+
+Do not treat a one-shot `oc apply --dry-run=server -f rendered.yaml` failure
+as fatal when the failure is caused by namespaces or CRDs that are created by
+earlier sync waves. Validate render quality and operator packages, then let
+Argo apply the wave order.
+
+Keep Argo drift at zero. If an operator or admission webhook adds default
+fields to a managed object, codify those defaults in Git when they are stable
+and harmless.
