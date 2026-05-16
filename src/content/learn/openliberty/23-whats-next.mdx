@@ -1,15 +1,15 @@
 ---
 title: "What's next"
-sidebar_label: "13 — What's next"
+sidebar_label: "23 — What's next"
 description: "What this track deliberately didn't cover, and where to go for each piece. The roadmap for the engineer who finished module 12."
 estimated_minutes: 10
-last_updated: 2026-05-15
-prereqs: ["12 — API gateway with WSO2 API Manager"]
+last_updated: 2026-05-16
+prereqs: ["22 — Feature: GUI tour"]
 ---
 
-The track ends here. What you've built is genuinely the shape of a small production backend: a Java application, persistence, cache, event bus, identity, gateway, mediator, full-stack observability — all running together on one host. Plenty of insurance startups have shipped real customer traffic on less.
+The track ends here. What you've built is the shape of a real production backend: a Java application, persistence, cache, event bus, identity, gateway, mediator, full-stack observability — and nine features riding on top of that platform, each illustrating a distinct enterprise pattern. Plenty of insurance startups have shipped real customer traffic on less.
 
-What this track **didn't** cover is intentional — every omission is either a separate course or a topic you can deepen alone now that you have the scaffolding.
+What this track **didn't** cover is intentional — every omission below is either a separate course or a topic you can deepen alone now that you have the scaffolding.
 
 ## CI/CD — separate track
 
@@ -38,10 +38,27 @@ The hardest parts aren't the YAML; they're the operational ones — namespaces, 
 
 Topics that fit *into* this track but that we'd need a different cadence to do justice to:
 
-- **Domain modeling.** The `Policy` entity in module 07 is the simplest possible shape. Real insurance has Policy / Quote / Claim / Endorsement / Payment / Document / Party, each with its own lifecycle. Build them gradually; let the model emerge from the business processes.
-- **Testing.** REST Assured for API tests, Testcontainers for integration tests against a real Postgres, Pact for contract tests against APIM-defined contracts. None of these were in the track; all are essential.
-- **Concurrency and transactions.** What happens when two requests update the same policy at the same time? JPA's `@Version` for optimistic locking, plus careful transaction boundaries. The class of bugs that don't show up until you have ten users at once.
-- **Schema evolution.** Adding a NOT-NULL column to a 100M-row table. Backfilling. Zero-downtime migrations. Blue/green schema patterns. Easy to talk about, hard to do under load.
+- **Domain modeling.** The feature chapters (13–22) walk through nine
+  shapes — Quote, Policy, Payment, Notification, Claim, Agent
+  dashboard, Reporting, Audit, Search — each with state transitions
+  modeled explicitly. The next level: state machines that the
+  business reads (e.g. Spring Statemachine, or hand-rolled with an
+  enum + transition table), and an explicit policy-document model
+  separated from the policy-state model.
+- **Testing.** REST Assured for API tests, Testcontainers for
+  integration tests against a real Postgres, Pact for contract
+  tests against APIM-defined contracts. The smoke script in the
+  insurance-app repo (`scripts/smoke.sh`) is a fine reference for
+  the *shape* of full-stack tests but doesn't replace any of the
+  three layers above.
+- **Concurrency and transactions.** What happens when two requests
+  update the same policy at the same time? The Policy bind feature
+  introduces Redlock for distributed locking; you'll still want
+  JPA's `@Version` for optimistic locking on long-running edits.
+- **Schema evolution.** Flyway covered the additive case
+  (`V1`…`V7` in the repo). The harder one — adding a NOT-NULL
+  column to a 100M-row table, backfilling, zero-downtime migrations,
+  blue/green schema — was out of scope.
 
 ## Secrets management
 
@@ -59,12 +76,19 @@ When you have 8 services talking to each other on one network and you want mTLS,
 
 ## What I'd build next, in order
 
-If you're following this track and want a project arc beyond it:
+The feature chapters already gave you the domain model (Policy + Quote + Claim + Payment + Notification + Audit) and a vanilla-JS GUI. From here:
 
-1. **A real domain model** — Policy + Quote + Claim, with state transitions modeled explicitly.
-2. **Tests at three levels** — unit, API (REST Assured), integration (Testcontainers).
-3. **A frontend** — React or Astro, hitting the APIM-published API with OIDC login.
-4. **CI/CD** (the other track), all the way to a real environment.
+1. **Tests at three levels** — unit, API (REST Assured), integration
+   (Testcontainers). The smoke script is a starting reference but not
+   a replacement for layered tests.
+2. **A real frontend** — replace the slice-15 vanilla-JS GUI with
+   a React or Astro app, full OIDC login through WSO2 IS instead of
+   the dev-token shortcut. The slice-18 follow-up branch covers
+   exactly this if you want a worked example.
+3. **CI/CD** (the other track), all the way to a real environment.
+4. **OpenShift deployment** — Helm or Kustomize charts per service,
+   the `Operators` for the stateful pieces (Postgres, Kafka, SigNoz
+   all ship operators).
 
 By that point the artifact you have is no longer a learning exercise; it's a starting point for a real product.
 
@@ -72,4 +96,4 @@ By that point the artifact you have is no longer a learning exercise; it's a sta
 
 The thing this track tries hardest to teach is not any one tool — it is the **layered shape** of a real backend: the application is the smallest piece, surrounded by infrastructure that exists to make it useful. Most engineers learn the application code; few have a complete picture of the rest. Now you do.
 
-— *End of track.*
+— *End of track. Twenty-three modules; one platform, nine features, one GUI.*

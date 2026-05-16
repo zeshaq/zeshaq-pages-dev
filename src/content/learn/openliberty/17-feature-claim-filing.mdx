@@ -1,0 +1,265 @@
+---
+title: "Feature: Claim filing"
+sidebar_label: "17 — Feature: Claim filing"
+description: "Multipart upload to MinIO, OCR via MI + WireMock, and mTLS to a partner carrier API for cross-coverage lookup. Slices 9 + 10 in the insurance-app repo."
+estimated_minutes: 90
+last_updated: 2026-05-16
+prereqs: ["16 — Feature: Notification"]
+---
+
+Filing a claim is the most multimedia-dense operation in the demo:
+a photo or PDF, optional cross-carrier data, and OCR text extraction
+all join one Postgres row. Three new platform pieces enter the
+stack: **object storage**, **mutual TLS**, and **multipart HTTP
+upload** through JAX-RS.
+
+Companion commits: `24433ba` (multipart + MinIO + OCR) and
+`82fbef3` (mTLS partner). Two slices, one feature.
+
+## API shape
+
+```
+POST /api/claims  (multipart/form-data)
+  policyNumber    — required text part
+  description     — optional text part
+  otherPartyVin   — optional; triggers the mTLS partner lookup
+  attachment      — file (image/* or application/pdf)
+
+  → 201 Created  {id, policyNumber, photoKey, ocrText, ocrConfidence,
+                   otherPartyVin, otherPartyPolicy, otherPartyCarrier, ...}
+```
+
+## Multipart upload — Jakarta REST 3.1's EntityPart
+
+```java
+@POST
+@Consumes(MediaType.MULTIPART_FORM_DATA)
+@RolesAllowed("APPLICATION")
+public Response file(List<EntityPart> parts) {
+    String policyNumber = null;
+    InputStream content = null;
+    String contentType  = null;
+    String originalName = null;
+
+    for (EntityPart part : parts) {
+        switch (part.getName()) {
+            case "policyNumber" -> policyNumber = part.getContent(String.class);
+            case "attachment"   -> {
+                content      = part.getContent();
+                contentType  = part.getMediaType().toString();
+                originalName = part.getFileName().orElse(null);
+            }
+            // …
+        }
+    }
+    // service.file(...);
+}
+```
+
+Jakarta REST 3.1 (`restfulWS-3.1`, included via `webProfile-10.0`)
+introduced `EntityPart` as the **portable** multipart abstraction.
+No RESTEasy- or Jersey-specific `@FormDataParam` annotation needed.
+Liberty's implementation works out of the box.
+
+The `attachment.getContent()` returns an `InputStream`, not a byte
+array — large uploads stream straight to MinIO without buffering
+in heap.
+
+## MinIO — bucket auto-create on PostConstruct
+
+```java
+@ApplicationScoped
+public class MinioStorageService {
+    private MinioClient client;
+
+    @PostConstruct
+    void init() {
+        client = MinioClient.builder()
+            .endpoint("http://minio:9000")
+            .credentials("minioadmin", "minioadmin")
+            .build();
+        if (!client.bucketExists(BucketExistsArgs.builder().bucket("claims").build())) {
+            client.makeBucket(MakeBucketArgs.builder().bucket("claims").build());
+        }
+    }
+
+    public String upload(InputStream content, long size, String contentType, String name) {
+        String key = UUID.randomUUID().toString();
+        if (name != null && name.contains(".")) key += name.substring(name.lastIndexOf('.'));
+
+        long objectSize = size > 0 ? size : -1;
+        long partSize   = size > 0 ? -1 : 5L * 1024 * 1024;   // 5 MB parts when size unknown
+
+        client.putObject(PutObjectArgs.builder()
+            .bucket("claims").object(key)
+            .stream(content, objectSize, partSize)
+            .contentType(contentType)
+            .build());
+        return key;
+    }
+}
+```
+
+The non-obvious bit: `EntityPart` does NOT expose `Content-Length`
+of the part. So we pass `size=-1` to MinIO and use a 5 MB part size,
+letting the SDK do chunked multi-part upload internally. Works for
+any size.
+
+The bucket key (e.g. `c9b3...4f.jpg`) is what we store in the
+Postgres `claim.photo_key` column. **Binary never lives in
+Postgres** — the row holds the *reference*, the bucket holds the
+bytes. Standard pattern for any blob-shaped column.
+
+## OCR — same MI-mediated pattern
+
+```
+Liberty
+  → POST http://insurance-mi:8290/ocr/extract  {photoKey, contentType}
+    → POST http://wiremock:8080/ocr-vision/extract
+       (returns synthetic text + 0.95 confidence)
+```
+
+`OcrClient` is an `mpRestClient` interface. `OcrInvoker` carries the
+`@Retry(maxRetries=2)` annotation, on its own bean — same
+proxy-boundary rule from chapter 15 (the @Retry interceptor only
+fires across CDI proxy crossings).
+
+OCR failure does **not** block claim filing: the row is saved with
+null ocr fields, an operator-replay job (future slice) can fill them
+in later. Best-effort enrichment.
+
+## mTLS to the partner carrier — the four-keystore dance
+
+The hardest piece of the curriculum. The setup:
+
+```
+Liberty
+  ─── mTLS (TLS 1.2/1.3 with client cert) ──► partner-mock (nginx)
+                                              ssl_verify_client on
+                                              /partner/lookup?vin=…
+```
+
+`partner-mock` is an nginx container that demands client cert
+verification against an `insurance-demo-ca` CA. Liberty needs:
+
+1. Its **own client cert + key** to present
+2. The **CA cert** that signed partner-mock's server cert (for
+   server verification)
+
+These are pre-generated by `scripts/gen-certs.sh` into
+`compose/certs/{ca,server,client}.{crt,key}` plus JKS stores. The
+directory is gitignored — students run the script once on a fresh
+clone.
+
+### The Liberty config gotcha
+
+mpRestClient-3.0 in Liberty 24.0.0.12 **ignores** the per-client
+`trustStore` / `keyStore` properties on `mp-rest/...`. Both file
+paths and `<keyStore>`-id references silently fall through to
+`defaultSSLConfig`. The working fix in `server.xml`:
+
+```xml
+<keyStore id="defaultKeyStore"
+          location="/config/partner-certs/mi-keystore.jks"
+          type="JKS" password="wso2carbon"/>
+<keyStore id="defaultTrustStore"
+          location="/config/partner-certs/mi-truststore.jks"
+          type="JKS" password="wso2carbon"/>
+<ssl id="defaultSSLConfig"
+     keyStoreRef="defaultKeyStore"
+     trustStoreRef="defaultTrustStore"/>
+```
+
+Override the JVM defaults so the default SSL context already has the
+partner CA + client cert. The explicit `<ssl id="defaultSSLConfig">`
+mapping is **non-negotiable**: without it Liberty uses
+`defaultKeyStore` as the truststore (its fallback), and the JKS only
+has the client cert, not the CA.
+
+Side-effect of this fix: Liberty's own HTTPS endpoint on `9443` now
+presents the insurance-mi-client cert as its server cert. Harmless
+for the smoke (everything uses 9080) but worth knowing before a
+production deploy. Captured as gotcha 18.
+
+### The partner-mock nginx config
+
+```nginx
+server {
+    listen 8443 ssl;
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_client_certificate /etc/nginx/certs/ca.crt;
+    ssl_verify_client      on;
+
+    location = /partner/lookup {
+        return 200 '{"covers":true,"policyNumber":"P-12345-RIVAL","carrier":"RivalInsurance"}';
+    }
+}
+```
+
+Self-signed CA, no cert renewal, no CA rotation. Demo-grade. A real
+deployment needs at minimum a documented CA-rotation runbook and an
+expiry-monitoring story.
+
+## ClaimService — best-effort enrichment
+
+```java
+public Claim file(String policyNumber, String description, InputStream content, …, String otherPartyVin) {
+    Policy policy = policyRepo.findByNumber(policyNumber);  // 404 if missing
+    String key = (content != null) ? storage.upload(content, …) : null;
+    Claim filed = saveFiled(...);
+
+    Claim afterOcr = filed;
+    if (key != null) {
+        try { OcrResponse r = ocr.extract(…); afterOcr = saveOcr(…); }
+        catch (Exception e) { LOG.warn(…); }   // claim stays FILED, no OCR
+    }
+    if (otherPartyVin != null && !otherPartyVin.isBlank()) {
+        try { PartnerResponse p = partner.lookup(otherPartyVin); afterOcr = savePartner(…); }
+        catch (Exception e) { LOG.warn(…); afterOcr = savePartner(…, null, null); }
+    }
+    return afterOcr;
+}
+```
+
+The OCR + partner sub-calls are **inside `try/catch`** so they
+never block the core claim creation. The row commits as FILED with
+whatever enrichments succeeded. Recovery is operator work.
+
+## Verify
+
+```bash
+source ~/insurance-app/.wso2is-creds
+AT=$(…)
+
+# Need a POL from chapter 14. Make a fake photo.
+dd if=/dev/urandom of=/tmp/photo.jpg bs=1024 count=32
+
+curl -X POST http://localhost:9080/api/claims \
+  -H "Authorization: Bearer $AT" \
+  -F "policyNumber=$POL" \
+  -F "description=fender bender" \
+  -F "otherPartyVin=OTHER-1" \
+  -F "attachment=@/tmp/photo.jpg;type=image/jpeg" \
+  | jq '{id, photoKey, ocrText, otherPartyCarrier}'
+```
+
+You should see:
+
+- `photoKey` = a UUID-shaped string
+- `ocrText` = the WireMock-stubbed extraction
+- `otherPartyCarrier` = `"RivalInsurance"` (from partner-mock)
+
+Browse MinIO at `https://minio.insurance-app.comptech-lab.com`,
+bucket `claims` — your photo is there.
+
+## What you have
+
+- Portable multipart upload via Jakarta REST 3.1 `EntityPart`.
+- MinIO bucket with bytes; Postgres row with reference.
+- OCR via the MI → WireMock pattern (same as credit-bureau).
+- A working mTLS client config in Liberty.
+- The four-defense pattern (try/catch around every enrichment so the
+  core write always commits).
+
+Next: [18 — Feature: Agent dashboard →](/learn/openliberty/feature-agent-dashboard)

@@ -1,0 +1,196 @@
+---
+title: "Feature: GUI tour"
+sidebar_label: "22 — Feature: GUI tour"
+description: "Vanilla HTML + JS pages served by Liberty from src/main/webapp/, with a server-side dev-token shortcut so students never type credentials. One page per feature. Slices 15–17 in the insurance-app repo."
+estimated_minutes: 75
+last_updated: 2026-05-16
+prereqs: ["21 — Feature: Search"]
+---
+
+The application is feature-complete as a JAX-RS API by the end of
+chapter 21 — but a JSON API isn't *seeable*. This chapter wraps a
+nine-page browser tour around it: one HTML page per feature, no
+build step, no framework. Students click through the API they just
+built and watch the platform services light up in real time.
+
+Companion commits: `460e9fb` (foundation + money chain), `895a6e1`
+(claim + dashboard), `f91ef64` (search + audit + report).
+
+## Goal frame
+
+The GUI is **for the demo / tour layer**, not a customer-facing
+product. The optimization targets:
+
+- Zero build pipeline. No npm, no React, no Webpack.
+- One page per feature.
+- HTTP visible in DevTools — students *see* the bearer token
+  pattern.
+- Easy for a student to read and extend.
+
+These constraints rule out React/Vue (build complexity), JSF
+(2010-era enterprise feel), HTMX (server-side HTML fragments don't
+match the JAX-RS-returns-JSON contract). What's left: vanilla HTML
++ JS + CSS, served by Liberty from `src/main/webapp/`.
+
+## The page map
+
+| Path | Feature |
+| --- | --- |
+| `/` (index.html) | Tour landing — every feature as a clickable card, with links to admin UIs |
+| `/quote.html` | Slices 1–5: quote form, premium calc, watch Redis cache + Kafka topic light up |
+| `/policy.html` | Slice 6: bind a quote — try the submit-twice demo to see 201 → 200 idempotent contract |
+| `/payment.html` | Slice 7: idempotency-key visible in the form, amount=9999 triggers the DLQ |
+| `/claim.html` | Slices 9–10: multipart upload + photo preview + OCR result + mTLS partner data |
+| `/dashboard.html` | Slice 11: live WebSocket feed; INITIAL_STATE replay + live Pub/Sub fan-out |
+| `/search.html` | Slice 14: full-text search over CDC-indexed claims |
+| `/audit.html` | Slice 13: side-by-side compacted vs retention contrast + an Approve button |
+| `/report.html` | Slice 12: auto-refreshing Kafka Streams totals + scheduled-task table |
+
+Each page is one HTML file (~80–150 lines) sourcing two shared
+files: `/static/app.js` (token helper + fetch wrapper) and
+`/static/app.css` (minimal monochrome system fonts).
+
+## The dev-token shortcut — no login screen
+
+The cleanest demo UX is "open the page, click around" — no
+credentials to type. The mechanism that makes this work without
+abandoning the JWT-bearer pattern students learned in chapter 11:
+
+```java
+@Path("/auth")
+@Produces(MediaType.APPLICATION_JSON)
+@ApplicationScoped
+public class DevTokenResource {
+
+    @GET
+    @Path("/token")
+    public Response token() {
+        String clientId     = System.getenv("WSO2IS_CLIENT_ID");
+        String clientSecret = System.getenv("WSO2IS_CLIENT_SECRET");
+        try {
+            String jwt = ensureFresh(clientId, clientSecret);
+            return Response.ok(Map.of("jwt", jwt, "expiresIn", … )).build();
+        } catch (Exception e) {
+            return Response.status(BAD_GATEWAY).entity(Map.of("error", e.toString())).build();
+        }
+    }
+
+    private synchronized String ensureFresh(String id, String sec) throws Exception {
+        if (cachedJwt != null && Instant.now().isBefore(cachedExpiry.minus(Duration.ofMinutes(5))))
+            return cachedJwt;
+        // POST to http://wso2is:9763/oauth2/token grant_type=client_credentials
+        // cache for 55 min
+    }
+}
+```
+
+On page load, JS calls `GET /api/auth/token` once, stashes the JWT
+in memory, and attaches `Authorization: Bearer …` to every
+subsequent fetch:
+
+```javascript
+const App = (() => {
+  let jwt = null;
+  async function ensureToken() {
+    if (jwt && now < jwtExpiresAt - 60) return jwt;
+    const r = await fetch('/api/auth/token');
+    jwt = (await r.json()).jwt;
+    return jwt;
+  }
+  async function api(method, path, { body, headers } = {}) {
+    const token = await ensureToken();
+    return fetch(path, { method, headers: { Authorization: 'Bearer ' + token, ...headers }, body });
+  }
+  return { ensureToken, api, ... };
+})();
+window.addEventListener('DOMContentLoaded', () => { App.ensureToken().catch(…); });
+```
+
+DevTools → Network shows:
+
+1. `GET /api/auth/token` on first page load.
+2. Every subsequent fetch carrying `Authorization: Bearer eyJ…`.
+
+Same bearer mechanism the rest of the curriculum teaches — just no
+login screen in front of it. **This is a demo shortcut**, not a
+real auth flow. A future slice 18 replaces it with a real OIDC dance
+through Liberty's `<openidConnectClient>` element and a browser
+redirect to WSO2 IS.
+
+## Liberty container env vars
+
+The token endpoint reads `WSO2IS_CLIENT_ID` / `_SECRET` from env
+vars. The launch command becomes:
+
+```bash
+source ~/insurance-app/.wso2is-creds && \
+podman run -d --replace --name insurance-app --network insurance-net \
+  -v $HOME/insurance-app/compose/certs:/config/partner-certs:ro \
+  -e WSO2IS_CLIENT_ID=$WSO2IS_CLIENT_ID \
+  -e WSO2IS_CLIENT_SECRET=$WSO2IS_CLIENT_SECRET \
+  -p 9080:9080 -p 9443:9443 insurance-app:dev
+```
+
+Note `.wso2is-creds` needs `export` (not bare assignment) for the
+variables to reach podman's `-e` flags through the `source`.
+
+## `web.xml` welcome-file
+
+```xml
+<welcome-file-list>
+    <welcome-file>index.html</welcome-file>
+</welcome-file-list>
+```
+
+Liberty serves `index.html` for `/` automatically once that's
+declared. The bare root no longer 404s.
+
+## Highlights — the visually-best pages
+
+**`/payment.html`** has a visible `Idempotency-Key` field with a
+"Generate a fresh key" button. Submit twice with the same key:
+status goes 201 → 200, same externalRef in the body. Submit with
+`amount=9999`: 502 + the DLQ record appears in Kafka UI.
+
+**`/claim.html`** has drag-drop file upload with a thumbnail
+preview, optional otherPartyVin field, and inline boxes that pop in
+after submission to show OCR text + the partner-mock-returned
+carrier name.
+
+**`/dashboard.html`** opens a WebSocket on page load. Open it in
+one tab + `/claim.html` in another, file a claim, watch the new
+event appear in the feed instantly. Auto-reconnects if dropped.
+
+**`/audit.html`** has both **Get contrast** and **Approve** buttons.
+File a claim, type its id, click Get contrast (snapshot=FILED,
+events=[FILED]), then click Approve. The view re-fetches: snapshot
+flips to APPROVED, events become [FILED, APPROVED]. The slice 13
+teaching moment in two clicks.
+
+## Verify
+
+Open `https://app.insurance-app.comptech-lab.com/` in a browser.
+DevTools → Network. You should see:
+
+1. `GET /` → `index.html`
+2. `GET /static/app.js` → the shared helpers
+3. `GET /static/app.css` → minimal styling
+4. `GET /api/auth/token` → server-minted JWT
+5. (Once you click around) `POST /api/quotes`, `/policies`, etc.
+   each with `Authorization: Bearer …`
+
+The smoke section 19 covers the static + token paths; the existing
+section 4.5 + per-feature sections cover the JWT round trip.
+
+## What you have
+
+- A nine-page browser tour wired to the JAX-RS API students built.
+- A server-side dev-token shortcut that preserves the JWT-bearer
+  pattern while removing the login-screen friction.
+- The `welcome-file-list` + `/static/...` pattern for any future
+  static assets.
+- A demo flow you can hand to a non-Liberty-literate viewer —
+  click through each page, look at the matching admin UI in the
+  next tab, see all the platforms come alive.
+
+Next: [23 — What's next →](/learn/openliberty/whats-next)

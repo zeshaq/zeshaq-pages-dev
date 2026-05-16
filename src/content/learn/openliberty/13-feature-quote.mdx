@@ -1,0 +1,254 @@
+---
+title: "Feature: Quote"
+sidebar_label: "13 — Feature: Quote"
+description: "The foundational feature — POST /api/quotes that calculates an insurance premium, caches in Redis, rate-limits, publishes to Kafka, and verifies a WSO2 IS JWT. Five enterprise capabilities in one feature, built across slices 1–5 of the insurance-app repo."
+estimated_minutes: 90
+last_updated: 2026-05-16
+prereqs: ["12 — API gateway with WSO2 API Manager"]
+---
+
+The first feature is the foundation: every other feature in the track depends on a working `Quote` row in Postgres and the platform plumbing around it. This chapter walks through five slices in the companion `insurance-app` repo (commits `681234a` → `bcd1823`), each adding one capability on top of the previous.
+
+> **Answer keys.** Every section names a commit hash. Build along, but when stuck, `git checkout <hash>` shows the exact file diff. The slices are designed to be self-contained.
+
+## What you build
+
+```
+POST /api/quotes  {vehicleVin, driverAge, coverageType}
+  → premium = BASE × coverageFactor × ageFactor × creditFactor
+  → Redis cache key quote:{id}, 15-min TTL
+  → rate limit (5/min per vehicleVin)
+  → Kafka producer publishes quote.calculated event
+  → MI → WireMock credit-bureau call adjusts premium
+  → @RolesAllowed("APPLICATION") via mpJwt → WSO2 IS JWT
+
+GET /api/quotes/{id} (no auth, read-through cached)
+```
+
+By the end you have a JAX-RS resource exercising every layer of the
+platform: persistence (chapter 07), observability (08), caching (09),
+messaging (10), the ESB (06), and identity (11).
+
+## Slice 1 — basic CRUD
+
+Commit `681234a` scaffolds the project. The shape:
+
+```
+src/main/java/com/example/insurance/quote/
+  Quote.java               ← JPA entity, IDENTITY id
+  QuoteRequest.java        ← record DTO for the POST body
+  QuoteRepository.java     ← em.persist + em.flush (load-bearing!)
+  QuoteService.java        ← premium calc
+  QuoteResource.java       ← @POST /api/quotes, @GET /api/quotes/{id}
+src/main/resources/db/migration/
+  V1__init.sql             ← quote table
+```
+
+The non-obvious bit is `em.flush()` immediately after `em.persist()` in
+`QuoteRepository.save`:
+
+```java
+@Transactional
+public Quote save(Quote q) {
+    if (q.getId() == null) {
+        em.persist(q);
+        em.flush();   // ← force INSERT now so the IDENTITY id is assigned
+        return q;
+    }
+    return em.merge(q);
+}
+```
+
+JPA's spec says the INSERT runs immediately for `GenerationType.IDENTITY`,
+but EclipseLink-on-Liberty inside a JTA `@Transactional` method defers
+the INSERT until commit. Without the explicit `flush()`, `q.getId()`
+is still `null` when the caller hands the entity to the cache or to a
+Kafka emit — and you get a single `quote:null` cache key collecting
+every quote.
+
+This is one of the gotchas baked into the repo's `pom.xml`/`server.xml`/
+`persistence.xml` configuration. The full list is in `build_gotchas.md`
+in the companion repo's memory directory.
+
+**Verify:**
+
+```bash
+curl -X POST http://localhost:9080/api/quotes \
+  -H "Content-Type: application/json" \
+  -d '{"vehicleVin":"VIN-1","driverAge":35,"coverageType":"STANDARD"}'
+# → {"id":1, "premium":750.00, "status":"CALCULATED", …}
+
+curl http://localhost:9080/api/quotes/1
+```
+
+## Slice 2 — Redis cache + rate limit
+
+Commit `da60739` (and earlier slice 2 work) adds:
+
+- **Read-through cache**: `QuoteService.getById()` checks Redis first
+  (`quote:{id}` key), falls back to DB, populates cache on miss.
+- **Sliding-window rate limiter**: a Redis sorted set keyed by
+  `ratelimit:vehicleVin:<vin>`, with timestamps as scores. The 6th
+  POST for the same VIN within 1 minute returns `429`.
+
+`QuoteCache.java` and `RateLimiter.java` are tiny — ~30 lines each. The
+real concept they teach is **Redis as a sidecar to Postgres**: hot reads
+go through Redis, cold reads fall through to the DB and warm Redis on
+the way back.
+
+**Verify:**
+
+```bash
+# Cache hit: second GET takes ~3 ms instead of ~30 ms
+time curl http://localhost:9080/api/quotes/1
+time curl http://localhost:9080/api/quotes/1
+
+# Rate-limit: 6 rapid POSTs same VIN → 6th is 429
+for i in 1 2 3 4 5 6; do
+  curl -sS -o /dev/null -w "%{http_code} " \
+    -X POST http://localhost:9080/api/quotes \
+    -H "Content-Type: application/json" \
+    -d '{"vehicleVin":"BURST","driverAge":35,"coverageType":"BASIC"}'
+done
+```
+
+Open RedisInsight (`https://redis.insurance-app.comptech-lab.com`) and
+watch the keys live.
+
+## Slice 3 — Kafka producer
+
+Commit `6e4ae40` publishes `quote.calculated` events. The key files:
+
+- `QuoteEvent.java` — the event payload (event id, quote id, premium,
+  vin, timestamp).
+- `QuotePublisher.java` — `@Inject @Channel("quote-events") Emitter<String>
+  emitter;` — pure MicroProfile Reactive Messaging.
+- `microprofile-config.properties` — `mp.messaging.outgoing.quote-events.*`
+  keys (connector, topic, bootstrap servers, serializer).
+
+`QuoteService.createQuote()` gets one extra line at the end:
+
+```java
+publisher.publishCalculated(saved);
+```
+
+The producer side is straightforward. The **consumer** side (`@Incoming`)
+was punted in slice 3 — the @Incoming bean appeared to deploy but no
+consumer group ever registered. Resolved in 2026-05-16: the channel
+binding requires `mp.messaging.incoming.<channel>.*` keys, not just the
+annotation. The commented-out recipe lives in `microprofile-config.properties`
+of the repo. Slice 3 ships only the producer.
+
+**Verify:**
+
+```bash
+# Watch the topic
+podman exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:9092 --topic quote-events --from-beginning
+
+# Each POST /api/quotes appends a record.
+```
+
+In Kafka UI: topic `quote-events`, three partitions, records keyed
+round-robin (slice 3 doesn't key them; slice 6 introduces keyed records
+when the policy-events compacted topic needs ordering).
+
+## Slice 4 — MI credit-bureau lookup
+
+Commit `96af7fd` adds an external dependency to the premium calc: a
+credit-bureau call that adjusts the premium by a credit-factor.
+
+The chain:
+
+```
+QuoteService.lookupCreditFactor(vin)
+  → CreditScoreCache (Redis, 1h TTL, key credit:{vin})
+  → CreditBureauClient (mpRestClient @RegisterRestClient(configKey="credit-bureau"))
+  → MI synapse API at http://insurance-mi:8290/credit/check?vin={vin}
+  → MI forwards to http://wiremock:8080/credit/score?vin={vin}
+  → WireMock returns synthetic score → factor
+```
+
+Two WireMock mappings (`compose/infra/wiremock/mappings/credit-bureau-*.json`)
+make the score deterministic by VIN: default returns 720 → factor 1.0;
+any VIN starting with `RISKY` returns 550 → factor 1.5.
+
+The cache key is the **requested** VIN, not the VIN in WireMock's
+response — there was a bug in an earlier slice where the cache key
+became `default` or `RISKY` (the WireMock vin marker) instead of the
+real VIN, and every quote collapsed onto two cache buckets. Fixed in
+`da60739`.
+
+**Verify:**
+
+```bash
+# Normal VIN — premium 750 (base 500 × coverage 1.5 × age 1.0 × credit 1.0)
+curl -X POST http://localhost:9080/api/quotes -d \
+  '{"vehicleVin":"NORM","driverAge":30,"coverageType":"STANDARD"}'
+
+# RISKY-prefixed VIN — premium 1125 (× credit 1.5)
+curl -X POST http://localhost:9080/api/quotes -d \
+  '{"vehicleVin":"RISKY-X","driverAge":30,"coverageType":"STANDARD"}'
+```
+
+## Slice 5 — JWT auth (the gnarly one)
+
+Commit `bcd1823`. Adding `@RolesAllowed("APPLICATION")` to
+`QuoteResource.POST` is the easy part. Making Liberty's mpJwt actually
+process the bearer token from WSO2 IS — that was a half-day of debug.
+Captured exhaustively in `build_gotchas` item 13. The minimum config:
+
+```xml
+<mpJwt id="defaultMpJwt"
+       jwksUri="http://wso2is:9763/oauth2/jwks"
+       issuer="https://is.insurance-app.comptech-lab.com/oauth2/token"
+       userNameAttribute="sub"
+       groupNameAttribute="aut"/>
+
+<ltpa keysPassword="…"/>
+
+<basicRegistry id="basic" realm="insurance-app">
+  <user name="<the WSO2 client_id>" password="unused"/>
+</basicRegistry>
+
+<webAppSecurity allowFailOverToBasicAuth="false"/>
+```
+
+Plus on the webapp side:
+
+- `@LoginConfig(authMethod="MP-JWT")` on `InsuranceApplication`
+- `<login-config><auth-method>MP-JWT</auth-method></login-config>` in
+  `web.xml`
+- `<application-bnd>` mapping `APPLICATION` role to
+  `ALL_AUTHENTICATED_USERS`
+- mpConfig keys `mp.jwt.verify.publickey.location` +
+  `mp.jwt.verify.issuer`
+
+The full reason for every one of those (especially the `<ltpa>` element,
+which is the part that bites everyone first) is in module 11.
+
+**Verify:**
+
+```bash
+# Unauth → 401
+curl -X POST http://localhost:9080/api/quotes -H "Content-Type: application/json" \
+  -d '{"vehicleVin":"AUTH","driverAge":30,"coverageType":"BASIC"}'
+
+# Auth → 201
+source ~/insurance-app/.wso2is-creds
+AT=$(curl -k -sS -X POST -u "$WSO2IS_CLIENT_ID:$WSO2IS_CLIENT_SECRET" \
+        "$WSO2IS_TOKEN_URL" -d "grant_type=client_credentials" \
+     | jq -r .access_token)
+curl -X POST http://localhost:9080/api/quotes \
+  -H "Authorization: Bearer $AT" -H "Content-Type: application/json" \
+  -d '{"vehicleVin":"AUTH","driverAge":30,"coverageType":"BASIC"}'
+```
+
+## What you have
+
+After 5 slices: a single endpoint exercising **persistence, cache,
+rate limit, mediation, identity, and observability** — all of the
+platform layers chapters 07–11 introduced. Every subsequent feature
+builds on this scaffolding.
+
+Next: [14 — Feature: Policy bind →](/learn/openliberty/feature-policy-bind)

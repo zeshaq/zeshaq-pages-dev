@@ -3,7 +3,7 @@ title: "Identity with WSO2 Identity Server"
 sidebar_label: "11 — Identity"
 description: "WSO2 IS as the OpenID Connect provider, MicroProfile JWT verifying access tokens in Liberty, and @RolesAllowed on every endpoint that needs to know who you are."
 estimated_minutes: 75
-last_updated: 2026-05-15
+last_updated: 2026-05-16
 prereqs: ["10 — Async messaging with Kafka"]
 ---
 
@@ -35,14 +35,47 @@ First boot pulls and initializes the DB; allow 60–120 seconds. The admin conso
 
 ## Registering an OIDC application
 
-In the management console:
+You can click through the IS console (Applications → New Application →
+OIDC Web Application) — fine for one-off exploration. For anything
+reproducible — including the SETUP.md runbook — use the **Dynamic
+Client Registration** endpoint instead. One curl, deterministic output:
 
-1. **Applications** → **New Application** → **OIDC Web Application**.
-2. Name: `insurance-app`.
-3. Allowed grant types: **Authorization Code**, **Client Credentials** (for service-to-service later).
-4. Note the **Client ID** and **Client Secret** — you'll inject them as env vars.
-5. Add an **Authorized Redirect URL** that matches your test client (e.g. `http://localhost:8080/callback` from a curl-friendly OIDC tester).
-6. Under **User Attributes**, ensure `groups` is in the list — Liberty's `@RolesAllowed` will map JWT `groups` claim values to role names.
+```bash
+RESP=$(curl -k -sS -X POST -u admin:admin \
+  https://localhost:9444/api/identity/oauth2/dcr/v1.1/register \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "client_name": "insurance-app",
+    "grant_types": ["client_credentials"],
+    "ext_token_type": "JWT"
+  }')
+echo "$RESP" | jq
+```
+
+Two non-obvious bits:
+
+- **Path is `/api/identity/oauth2/dcr/v1.1/register`.** In IS 7.0 the
+  `oauth2/dcr` segment changed from `oauth2-dcr` (hyphen) in earlier
+  versions. The old path silently returns 401. Catch by reading the
+  error body, not the status code.
+- **`ext_token_type: JWT` is non-negotiable** for our setup. Without
+  it, IS issues an opaque UUID reference token, not a JWT — Liberty's
+  `mpJwt` then rejects every request with no useful log message.
+
+Save the returned `client_id` + `client_secret` to a gitignored
+`.wso2is-creds` file that the rest of the stack will source:
+
+```bash
+cat > ~/insurance-app/.wso2is-creds <<EOF
+export WSO2IS_CLIENT_ID=$(echo "$RESP" | jq -r .client_id)
+export WSO2IS_CLIENT_SECRET=$(echo "$RESP" | jq -r .client_secret)
+export WSO2IS_TOKEN_URL=https://localhost:9444/oauth2/token
+EOF
+```
+
+The `export` keyword matters: subsequent `podman run -e WSO2IS_CLIENT_ID`
+(no value, inherit-from-env form) only finds the variable if it's
+exported.
 
 ## Liberty side: mpJwt
 
@@ -54,19 +87,76 @@ In `server.xml`:
     <feature>mpJwt-2.1</feature>
 </featureManager>
 
-<mpJwt id="wso2is"
-       jwksUri="https://wso2is:9443/oauth2/jwks"
-       issuer="https://wso2is:9443/oauth2/token"
-       audiences="insurance-app"/>
+<!-- The id MUST be defaultMpJwt. Liberty creates a default mpJwt config
+     internally; a custom-id config is treated as a *second* config and
+     the auth chain uses the default one. -->
+<mpJwt id="defaultMpJwt"
+       jwksUri="http://wso2is:9763/oauth2/jwks"
+       issuer="https://is.insurance-app.comptech-lab.com/oauth2/token"
+       userNameAttribute="sub"
+       groupNameAttribute="aut"
+       ignoreApplicationAuthMethod="false"
+       mapToUserRegistry="false"/>
+
+<!-- LTPA keys: Liberty's appSecurity-5.0 mints an SSO token after every
+     successful JWT auth. Without <ltpa> configured, the SSO step blows
+     up and the whole login is treated as failed even though the JWT
+     validated fine. -->
+<ltpa keysPassword="ltpaP@ssw0rd"/>
+
+<!-- Empty basicRegistry placeholder. appSecurity-5.0 needs *some* user
+     registry to be configured even when mpJwt is the only auth path;
+     the JWT's `sub` claim has to appear here as a user, or the
+     HashtableLoginModule downstream of mpJwt rejects the principal. -->
+<basicRegistry id="basic" realm="insurance-app">
+    <user name="<the JWT sub — i.e. WSO2 client_id>" password="unused"/>
+</basicRegistry>
+
+<webAppSecurity allowFailOverToBasicAuth="false"/>
 ```
 
-Three things are happening:
+In `web.xml`, declare MP-JWT as the auth method:
 
-- **`jwksUri`** — Liberty fetches the public keys from WSO2 IS at startup (and on refresh) to verify token signatures. No shared-secret nonsense.
-- **`issuer`** — Tokens not minted by this IS are rejected, even if the signature is valid.
-- **`audiences`** — Tokens not intended for this service are rejected.
+```xml
+<login-config>
+    <auth-method>MP-JWT</auth-method>
+    <realm-name>insurance-app</realm-name>
+</login-config>
+<security-role><role-name>APPLICATION</role-name></security-role>
+```
 
-You will need to import the WSO2 IS self-signed certificate into Liberty's truststore for the JWKS fetch to work — or, for dev only, set `trustStoreRef` to a permissive store. Production uses a real CA-signed cert.
+And bind the role to any authenticated user via `<application-bnd>` on
+the `<webApplication>` element (or in `ibm-application-bnd.xml`):
+
+```xml
+<webApplication contextRoot="/" location="insurance-app.war">
+    <application-bnd>
+        <security-role name="APPLICATION">
+            <special-subject type="ALL_AUTHENTICATED_USERS"/>
+        </security-role>
+    </application-bnd>
+</webApplication>
+```
+
+Why all this scaffolding for what looks like a one-line mpJwt config?
+Because Liberty 24.0.0.12's mpJwt does **not** bypass the rest of
+appSecurity-5.0. The full working stack is: mpJwt validates the
+signature + iss + audience, then appSecurity drives `HashtableLoginModule`
+which expects the JWT subject to be a user in *some* registry — even
+with `mapToUserRegistry=false`. The basicRegistry + application-bnd +
+ltpa combo is the minimal recipe to keep all of that happy. See
+`build_gotchas` item 13 in the companion repo for the full debug story.
+
+Three things still happen at the high level:
+
+- **`jwksUri`** — Liberty fetches public keys from WSO2 IS to verify
+  token signatures. We use the **HTTP port 9763** instead of HTTPS
+  9443 to dodge the self-signed-cert chain dance for the JWKS fetch.
+- **`issuer`** — Tokens whose `iss` claim doesn't match are rejected.
+  After IS's hostname swap (see SETUP.md Phase 6.5), the iss is the
+  public hostname, not `localhost:9443`.
+- **`userNameAttribute=sub`** — IS doesn't put the standard `upn`
+  claim in tokens; we use `sub`.
 
 ## Protecting endpoints
 
@@ -125,9 +215,30 @@ We're out of scope for those here — they belong to the secrets-management modu
 
 ## Common stumbles
 
-- **JWKS fetch fails at Liberty startup.** Truststore doesn't trust the WSO2 IS cert. For dev, the simplest fix is to extract the cert and add it to Liberty's `key.p12`.
-- **403 even with the right role.** WSO2 IS doesn't put `groups` into the access token by default; you have to map the user's roles into the JWT in the application's claim configuration.
-- **Token expiry surprises.** Default access-token lifetime is short (5–15 min). Set up refresh-token flow for any UI client.
+- **DCR returns 401 on `oauth2-dcr/v1.1/register`.** The path renamed
+  to `oauth2/dcr/v1.1/register` (slash, not hyphen) in IS 7.0. The
+  old path still answers, with a misleading 401.
+- **Token mints but body has an opaque UUID, not a JWT.** Forgot
+  `ext_token_type: JWT` on the DCR call. Re-register with the
+  parameter, or PATCH the existing app config.
+- **Every authed POST returns 401 with a fresh, valid token.** Two
+  causes: (1) the JWT `iss` claim doesn't match Liberty's `mpJwt
+  issuer` — if you ran the IS hostname swap, both have to use the
+  public-hostname form. (2) The `<basicRegistry>` user in `server.xml`
+  is stale; the new JWT carries a different `sub` claim.
+- **Recreating the `wso2is` container loses my DCR client.** The
+  stock IS image has no volume mount on its H2 database. The
+  insurance-app runbook adds a `wso2is-data` named volume on
+  `/home/wso2carbon/wso2is-7.0.0/repository/database` to fix this —
+  re-create the container the first time with the volume in place,
+  then DCR clients + the admin user survive across restarts.
+- **JWKS fetch fails at Liberty startup.** Switch to `http://wso2is:9763/oauth2/jwks`
+  (HTTP variant on the same host inside `insurance-net`). Avoids the
+  self-signed cert chain entirely, since the JWT signatures are
+  independently authenticated regardless of transport.
+- **Token expiry surprises.** Default access-token lifetime is short
+  (5–15 min for end users; ~1 h for client_credentials). Set up
+  refresh-token flow for any UI client.
 
 ## What you have
 

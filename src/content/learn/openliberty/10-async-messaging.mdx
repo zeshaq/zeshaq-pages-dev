@@ -3,7 +3,7 @@ title: "Async messaging with Kafka"
 sidebar_label: "10 — Async messaging"
 description: "Kafka in KRaft mode (no ZooKeeper), a producer and consumer wired via MicroProfile Reactive Messaging, and the two-step pattern that turns synchronous endpoints into eventful ones."
 estimated_minutes: 75
-last_updated: 2026-05-15
+last_updated: 2026-05-16
 prereqs: ["09 — Caching with Redis"]
 ---
 
@@ -28,18 +28,23 @@ Kafka used to require **ZooKeeper** as a separate coordination service — a sec
 
 ```bash
 podman run -d --replace --name kafka --network insurance-net \
-  -p 9092:9092 -p 9093:9093 \
-  -e KAFKA_CFG_NODE_ID=1 \
-  -e KAFKA_CFG_PROCESS_ROLES=controller,broker \
-  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
-  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
-  -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
-  -e KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
-  -e ALLOW_PLAINTEXT_LISTENER=yes \
-  docker.io/bitnami/kafka:3.8
+  -p 9092:9092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=controller,broker \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
+  -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+  docker.io/apache/kafka:4.0.2
 ```
+
+> Note the image is the **official `apache/kafka`** image, not the
+> historically-popular `bitnami/kafka:3.8` — Bitnami's docker.io
+> distribution disappeared in the 2025 Broadcom reshuffle. The env
+> vars also lose the `_CFG_` infix in the move from Bitnami's wrapper
+> to the upstream entrypoint.
 
 Create a topic:
 
@@ -56,19 +61,29 @@ Three partitions is more than this app needs; it's there so you can demonstrate 
 Direct Kafka client code is fine, but **MicroProfile Reactive Messaging** is the idiomatic Liberty path. Enable in `server.xml`:
 
 ```xml
-<feature>messagingClient-3.0</feature>
 <feature>mpReactiveMessaging-3.0</feature>
 ```
 
-Add the connector:
+That feature already includes the `liberty-kafka` connector — no
+separate dependency. But the connector ships only the *plumbing*; you
+still need the Kafka client classes on the WAR's classpath:
 
 ```xml
 <dependency>
-    <groupId>io.openliberty.features</groupId>
-    <artifactId>io.openliberty.connectors.kafka-3.0</artifactId>
-    <type>esa</type>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-clients</artifactId>
+    <version>3.9.0</version>
+    <scope>compile</scope>
 </dependency>
 ```
+
+Without `kafka-clients`, Liberty fails app startup with `CWMRX1006E:
+Classes from the kafka-clients JAR file could not be loaded`. The
+scope can be `runtime` if you only use `@Channel` + `Emitter`, but
+gets bumped to `compile` the moment any code imports
+`org.apache.kafka.clients.producer.ProducerRecord` directly (which
+you'll want for keyed producers against compacted topics — covered
+in the policy-bind feature chapter).
 
 Configure connections in `microprofile-config.properties` (under `src/main/resources/META-INF/`):
 
@@ -76,16 +91,20 @@ Configure connections in `microprofile-config.properties` (under `src/main/resou
 mp.messaging.outgoing.policy-events.connector=liberty-kafka
 mp.messaging.outgoing.policy-events.topic=policy-events
 mp.messaging.outgoing.policy-events.bootstrap.servers=kafka:9092
+mp.messaging.outgoing.policy-events.key.serializer=org.apache.kafka.common.serialization.StringSerializer
 mp.messaging.outgoing.policy-events.value.serializer=org.apache.kafka.common.serialization.StringSerializer
 
 mp.messaging.incoming.policy-events-in.connector=liberty-kafka
 mp.messaging.incoming.policy-events-in.topic=policy-events
 mp.messaging.incoming.policy-events-in.bootstrap.servers=kafka:9092
 mp.messaging.incoming.policy-events-in.group.id=insurance-app
+mp.messaging.incoming.policy-events-in.key.deserializer=org.apache.kafka.common.serialization.StringDeserializer
 mp.messaging.incoming.policy-events-in.value.deserializer=org.apache.kafka.common.serialization.StringDeserializer
+mp.messaging.incoming.policy-events-in.auto.offset.reset=earliest
+mp.messaging.incoming.policy-events-in.enable.auto.commit=false
 ```
 
-Same topic, two channels — one for the producer side, one for the consumer side.
+Same topic, two channels — one for the producer side, one for the consumer side. The consumer side **also** needs the deserializer + offset-reset + commit-mode keys; without them, `@Incoming` deploys without error but silently fails to subscribe, no consumer group is ever registered, and no messages arrive. (See `build_gotchas` item 12 in the companion `insurance-app` repo memory.)
 
 ## Producer: emit an event on write
 

@@ -1,0 +1,197 @@
+---
+title: "Feature: Payment"
+sidebar_label: "15 — Feature: Payment"
+description: "Idempotency-Key header for replay-safe charges, @Retry against a transient gateway, and a Dead-Letter Queue for charges that exhausted retries. Slice 7 in the insurance-app repo."
+estimated_minutes: 75
+last_updated: 2026-05-16
+prereqs: ["14 — Feature: Policy bind"]
+---
+
+Charging money is the canonical "must not double-execute" operation.
+This chapter teaches three paired patterns that show up around every
+real payment flow: the **Idempotency-Key** HTTP header, the **@Retry**
+fault-tolerance interceptor, and the **DLQ** (dead-letter queue) for
+charges that need operator attention.
+
+Companion commit: `e4547e3` in `insurance-app`.
+
+## API shape
+
+```
+POST /api/payments
+  Idempotency-Key: <client-supplied-uuid>   ← REQUIRED
+  Body: {policyNumber, amount, currency}
+  → 201 Created  (first call) — body has externalRef from the gateway
+  → 200 OK       (replay with same Idempotency-Key) — same body
+  → 400          (missing Idempotency-Key)
+  → 401          (no/bad JWT)
+  → 502          (gateway exhausted retries)
+```
+
+Two response codes for success (201 vs 200) makes the idempotent
+replay explicit on the wire — clients can distinguish "I charged a
+new payment" from "this Idempotency-Key already exists, here's the
+prior result." Stripe's API does this; so should yours.
+
+## Idempotency — Redis cache + DB UNIQUE
+
+Two layers of defense:
+
+1. **Redis cache `idempotency:payment:<key>`** with 24-hour TTL —
+   the fast path. A retrying client (mobile network blip, browser
+   nav mid-submit) hits this and gets the same response back.
+2. **DB `UNIQUE(idempotency_key)` constraint** — the correctness
+   backstop. If Redis evicts early, a duplicate POST hits the
+   UNIQUE violation and the service replays from the DB row.
+
+```java
+public Result process(String idempotencyKey, PaymentRequest req) {
+    Payment replayed = idem.lookup(idempotencyKey);
+    if (replayed == null) replayed = repo.findByIdempotencyKey(idempotencyKey);
+    if (replayed != null) {
+        idem.store(idempotencyKey, replayed);   // re-warm cache on DB hit
+        return new Result(replayed, true);      // boolean = "replayed"
+    }
+    return new Result(createAndCharge(idempotencyKey, req), false);
+}
+```
+
+## @Retry on the gateway call — proxy-boundary gotcha
+
+The gateway call wraps `@Retry(maxRetries=2, delay=200)` from
+`mpFaultTolerance`. Critical: this annotation must live on a method
+of a **separate CDI bean**, not on a private method called from
+within the same bean.
+
+```java
+@ApplicationScoped
+public class PaymentGatewayInvoker {
+    @Inject @RestClient PaymentGatewayClient gateway;
+
+    @Retry(maxRetries = 2, delay = 200)
+    public PaymentGatewayResponse charge(PaymentGatewayChargeRequest req) {
+        return gateway.charge(req);
+    }
+}
+```
+
+Then in `PaymentService`:
+
+```java
+@Inject PaymentGatewayInvoker gatewayInvoker;
+// ...
+PaymentGatewayResponse resp = gatewayInvoker.charge(req);
+```
+
+Why a separate bean? **mpFaultTolerance interceptors run on the
+CDI proxy boundary.** If you call `this.chargeWithRetry(...)` from
+within the same bean, the call skips the proxy entirely and
+`@Retry` never fires. The first slice 7 build shipped with this
+mistake — the gateway saw exactly 1 attempt, no retries — even
+though the DLQ record claimed `attempts=3`. A lie.
+
+Same trap applies to `@Transactional`, `@Async`, `@Timeout`. The
+fix is universal: extract the annotated method onto its own bean
+and inject it.
+
+## Transactions — REQUIRES_NEW for the FAILED row
+
+Second non-obvious bit:
+
+```java
+@Transactional
+Payment savePending(...) { … }
+
+@Transactional(Transactional.TxType.REQUIRES_NEW)
+Payment saveSuccess(Long id, String ref) { … }
+
+@Transactional(Transactional.TxType.REQUIRES_NEW)
+Payment saveFailure(Long id, String reason) { … }
+```
+
+The first build of slice 7 had a single `@Transactional` method that
+threw `WebApplicationException(502)` after persisting the FAILED
+row. JTA promptly rolled the FAILED row back — and we lost the
+durable record of every failed charge.
+
+`REQUIRES_NEW` on the finalize methods commits them in a fresh
+transaction, independent of whatever the orchestrating code does
+afterward. The pattern: **outer orchestrator opens no transaction;
+inner save methods each open their own.**
+
+## DLQ — a separate topic, keyed by idempotency-key
+
+`payment-dlq` is its own topic (not a status field on
+`payment-events`). Operators alert on it specifically — filtering
+`payment-events` for `status=FAILED` is the kind of detail that
+gets forgotten between people and silently bypasses the alert.
+
+`PaymentDlqPublisher` is a raw KafkaProducer keyed by
+idempotency-key, so a downstream operator-replay tool sees exactly
+one DLQ record per failed charge attempt.
+
+## WireMock for the (mocked) gateway
+
+`compose/infra/wiremock/mappings/payment-gateway-{default,fail}.json`:
+
+- `amount < 9000` → 200 with `{externalRef: "ext-…"}` (Mustache
+  template via WireMock's response-template transformer).
+- `amount >= 9000` → 503 (matched by JSONPath
+  `$.[?(@.amount >= 9000)]`).
+
+The MI synapse `PaymentAPI.xml` proxies through:
+
+```
+Liberty
+  → http://insurance-mi:8290/payment/charge
+    → http://wiremock:8080/payment-gateway/charge
+```
+
+The same indirection-through-MI pattern as the credit-bureau call
+in slice 4. In a real deployment, MI is where PCI-DSS controls,
+mTLS to the acquiring bank, and per-merchant retry policies live.
+
+## Verify
+
+```bash
+source ~/insurance-app/.wso2is-creds
+AT=$(curl -k -sS -X POST -u "$WSO2IS_CLIENT_ID:$WSO2IS_CLIENT_SECRET" \
+        "$WSO2IS_TOKEN_URL" -d "grant_type=client_credentials" | jq -r .access_token)
+
+# (assume POL is from chapter 14)
+KEY="demo-$RANDOM"
+
+# Success path → 201 + externalRef
+curl -i -X POST http://localhost:9080/api/payments \
+  -H "Authorization: Bearer $AT" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $KEY" \
+  -d "{\"policyNumber\":\"$POL\",\"amount\":100,\"currency\":\"USD\"}"
+
+# Replay → 200, same externalRef
+curl -i -X POST http://localhost:9080/api/payments \
+  -H "Authorization: Bearer $AT" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $KEY" \
+  -d "{\"policyNumber\":\"$POL\",\"amount\":100,\"currency\":\"USD\"}"
+
+# DLQ path → 502, then watch Kafka UI / payment-dlq
+curl -i -X POST http://localhost:9080/api/payments \
+  -H "Authorization: Bearer $AT" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: bad-$RANDOM" \
+  -d "{\"policyNumber\":\"$POL\",\"amount\":9999,\"currency\":\"USD\"}"
+```
+
+Verify the @Retry config actually fired by checking WireMock's
+request log — `curl http://localhost:8888/__admin/requests` should
+show **3** hits to `/payment-gateway/charge` for the failing
+amount, not 1.
+
+## What you have
+
+- Idempotent POST with explicit 201 vs 200 contract.
+- `@Retry` on the gateway call, across the proxy boundary.
+- Failed charges land in `payment-dlq` and **also** as durable
+  FAILED rows in Postgres.
+- The transaction-split pattern that guarantees the FAILED row
+  survives even when the gateway call throws.
+
+Next: [16 — Feature: Notification →](/learn/openliberty/feature-notification)
